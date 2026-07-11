@@ -1,0 +1,17 @@
+# Pipeline infrastructure
+workspace
+.worktrees
+.claude
+CLAUDE.md
+
+# Danger files (Outline Book: danger-files, Patterns node)
+.mcp.json
+*.db*
+*.sqlite*
+.env*
+
+# Allowlist (Outline Book: danger-files, Allowlist node)
+!.env.example
+!.env.sample
+!.env.template
+!.env.dist
