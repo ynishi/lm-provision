@@ -1,0 +1,30 @@
+[package]
+name = "lm-provision-mcp"
+description = "MCP server exposing lm-provision (validate/hash/plan/apply) and the push-driver ledger as MCP tools (10-mcp.md, Phase H)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+name = "lm_provision_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lm-provision-mcp"
+path = "src/main.rs"
+
+[dependencies]
+lm-provision = { path = "../lm-provision" }
+lm-provision-driver = { path = "../lm-provision-driver" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

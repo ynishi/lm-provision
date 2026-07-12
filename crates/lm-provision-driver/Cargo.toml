@@ -1,0 +1,15 @@
+[package]
+name = "lm-provision-driver"
+description = "Push driver protocol (upload/invoke/collect) and append-only apply ledger for lm-provision (08/09 spec, Phase G)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jiff = { workspace = true }
