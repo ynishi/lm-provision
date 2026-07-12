@@ -32,13 +32,20 @@ ambient default-allow.
   functions (`type`, `pairs`, `ipairs`, `tostring`, `assert`,
   `error`, `pcall`, ...), and `print` (redirected, chapter 04).
 - Custom `require`: resolves only the embedded module allowlist —
-  `lm.profile`, `lm.env`, `lm.ir`, `lm.validate`, `lm.canonical`,
-  `lm.hash`, `lm.plan`, `lm.dispatch`, `lm.apply`, `lm.report` —
-  from sources baked into the binary at compile time
-  (`include_str!`). Results are cached (standard require
-  idempotency, one evaluation per module per VM). Any other name is
-  a Lua error listing the allowlist. There is no filesystem require
-  path.
+  the ten Lua-facing `lm.*` modules
+  (`lm.profile`, `lm.env`, `lm.ir`, `lm.validate`, `lm.canonical`,
+  `lm.hash`, `lm.plan`, `lm.dispatch`, `lm.apply`, `lm.report`)
+  plus `lm.catalog_data`, the single shared-vocabulary data file
+  (22 phase kinds, `KNOWN_CAPABILITIES`, the secret-key and
+  sensitive-key substring sets) that chapter 02 §Shared vocabulary
+  mandates as one canonical source referenced by both the Lua and
+  Rust hosts — from sources baked into the binary at compile time
+  (`include_str!`). `lm.catalog_data` carries no logic and no
+  effectful surface: it is a pure data table, requireable so the
+  domain modules (`lm.validate` et al.) read the same bytes the Rust
+  host reads. Results are cached (standard require idempotency, one
+  evaluation per module per VM). Any other name is a Lua error
+  listing the allowlist. There is no filesystem require path.
 - Bytecode prohibition: every host-initiated chunk load (profile
   file, embedded modules) is forced to text mode; combined with the
   stripped `load*` family there is no bytecode ingestion path.
