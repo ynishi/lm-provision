@@ -38,6 +38,9 @@
 //!   M4-2).
 //! - [`embed`] — compile-time `include_str!` of the `lm.*` module set.
 //! - [`cli`] — subcommand / flag surface (07-cli.md).
+//! - [`codegen`] — `.d.lua` EmmyLua annotation emitter for the `codegen`
+//!   subcommand (07-cli.md), reading `lm.catalog_data`'s shared
+//!   vocabulary at codegen time rather than duplicating it in Rust.
 //!
 //! ## Static binary
 //!
@@ -59,6 +62,7 @@ pub mod audit;
 pub mod batteries;
 pub mod bridge;
 pub mod cli;
+pub mod codegen;
 pub mod embed;
 pub mod sandbox;
 pub mod secret;

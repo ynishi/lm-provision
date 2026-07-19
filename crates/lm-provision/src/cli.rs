@@ -40,7 +40,10 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The four MVP subcommands (07-cli.md §Invocation table).
+/// The subcommand surface (07-cli.md §Invocation table). The four MVP
+/// subcommands (`validate` / `hash` / `plan` / `apply`) plus `codegen`,
+/// an additive read-only subcommand (07 §Stability: "additions
+/// expected" through Phase H).
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// load → declarations → validate (read-only, no effects).
@@ -55,6 +58,11 @@ pub enum Command {
     },
     /// load → declarations → plan (read-only, no effects).
     Plan {
+        /// Path to the profile file.
+        profile: PathBuf,
+    },
+    /// load → declarations → codegen (read-only, no effects).
+    Codegen {
         /// Path to the profile file.
         profile: PathBuf,
     },
@@ -89,6 +97,7 @@ pub fn run(command: &Command) -> ExitCode {
         Command::Validate { profile } => run_validate(profile),
         Command::Hash { profile } => run_hash(profile),
         Command::Plan { profile } => run_plan(profile),
+        Command::Codegen { profile } => run_codegen(profile),
         Command::Apply { profile, dry_run } => run_apply(profile, *dry_run),
     }
 }
@@ -142,7 +151,11 @@ pub type PipelineResult<T> = std::result::Result<T, RunError>;
 /// `require(module)` via the profile's sandboxed VM — the same path a
 /// profile author's own `require('lm.<x>')` call takes
 /// (05-sandbox-layer-contract.md §L1).
-fn require_module(lua: &Lua, module: &str) -> mlua::Result<Table> {
+///
+/// `pub(crate)` so [`crate::codegen`]'s `codegen_pipeline` can reuse this
+/// exact helper rather than forking a second copy (avoids drift between
+/// the two `require("lm.catalog_data")` call sites).
+pub(crate) fn require_module(lua: &Lua, module: &str) -> mlua::Result<Table> {
     let require_fn: Function = lua.globals().get("require")?;
     require_fn.call(module)
 }
@@ -272,6 +285,20 @@ fn run_plan(profile: &Path) -> ExitCode {
     }
 }
 
+/// `codegen <profile>` (07-cli.md §Invocation: load → declarations →
+/// codegen). Prints the `.d.lua` EmmyLua annotation string
+/// ([`crate::codegen::codegen_pipeline`]) verbatim, mirroring
+/// [`run_hash`]'s single-string stdout artifact.
+fn run_codegen(profile: &Path) -> ExitCode {
+    match crate::codegen::codegen_pipeline(profile) {
+        Ok(rendered) => {
+            println!("{rendered}");
+            ExitCode::from(0)
+        }
+        Err(err) => print_failure("codegen", err),
+    }
+}
+
 /// `apply <profile> [--dry-run]` (07-cli.md §Invocation: load →
 /// declarations → gate → bridges → plan → dispatch → apply; milestone
 /// M4-3). Delegates the pipeline itself to
@@ -343,6 +370,13 @@ mod tests {
         let cli = Cli::try_parse_from(["lm-provision", "plan", "profile.lua"])
             .expect("plan should parse");
         assert!(matches!(cli.command, Command::Plan { .. }));
+    }
+
+    #[test]
+    fn parses_codegen_subcommand() {
+        let cli = Cli::try_parse_from(["lm-provision", "codegen", "profile.lua"])
+            .expect("codegen should parse");
+        assert!(matches!(cli.command, Command::Codegen { .. }));
     }
 
     #[test]

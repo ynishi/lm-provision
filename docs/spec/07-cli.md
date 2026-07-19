@@ -24,6 +24,7 @@ lm-provision <subcommand> <profile-path> [flags]
 | `validate <path>` | load → declarations → validate | none (read-only) |
 | `hash <path>` | load → declarations → canonical → hash | none (read-only) |
 | `plan <path>` | load → declarations → plan | none (read-only) |
+| `codegen <path>` | load → declarations → codegen | none (read-only) |
 | `apply <path> [--dry-run]` | load → declarations → gate → bridges → plan → dispatch → apply | executes the dispatched op stream (dry-run: decode + policy + secret resolution only, chapter 04) |
 
 ### Global flags
@@ -61,6 +62,8 @@ lm-provision <subcommand> <profile-path> [flags]
   newline. Nothing else.
 - `plan`: the plan artifact (chapter 03 §plan) as pretty-printed
   JSON.
+- `codegen`: a `.d.lua` EmmyLua annotation file (lua-language-server
+  compatible) as a single string, not JSON. Nothing else.
 - `apply`: the apply report (chapter 09) as pretty-printed JSON —
   printed on **both** success and step failure, so the collecting
   side always receives the report even when apply fails.
