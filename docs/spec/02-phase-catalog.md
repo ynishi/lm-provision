@@ -13,12 +13,12 @@ Rust host (pre-flight static checks).
 
 ## Inputs
 
-A phase is a plain table `{ kind = "<kind>", ...payload... }`
-(chapter 01). The catalog below is exhaustive: **22 user-facing
-kinds**. An unknown `kind` is not an error at plan time — see
-§Unknown kinds.
+A phase is represented as a variant of the unified `ProfileNode` AST enum (chapter 01) deriving `DslNode`, `DslSchema`, `DslBuild`, and `DslExec`. In JSON, each phase is represented as an object with `"type": "<KindName>"`. In canonical text, each phase is spelled `<KindName>(...)`.
+
+The catalog below is exhaustive: **22 user-facing phase variants**.
 
 ### Catalog kinds (setup lifecycle)
+
 
 | kind | payload | required capability |
 |---|---|---|

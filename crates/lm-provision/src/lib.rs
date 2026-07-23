@@ -63,7 +63,9 @@ pub mod batteries;
 pub mod bridge;
 pub mod cli;
 pub mod codegen;
+pub mod dsl_poc;
 pub mod embed;
 pub mod sandbox;
 pub mod secret;
 pub mod vm;
+

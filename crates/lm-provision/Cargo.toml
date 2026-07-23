@@ -28,6 +28,12 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 nix = { workspace = true }
 ureq = { workspace = true }
+dsl-kit = { workspace = true }
+dsl-kit-macros = { workspace = true }
+dsl-kit-core = { workspace = true }
+dsl-kit-schema = { workspace = true }
+dsl-kit-parse = { workspace = true }
+
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

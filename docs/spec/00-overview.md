@@ -26,16 +26,15 @@ uses the terms in exactly this sense.
 |---|---|
 | `lm-provision` | Tool name — the CLI binary, the crate group, the MCP server. What operators install and invoke. |
 | `lm.profile/1` | Wire schema tag — literal string embedded in every canonical artifact. Identifies the artifact format, not the tool. |
-| `lm.*` (Lua modules) | The Lua-facing library surface (`lm.profile`, `lm.env`, `lm.validate`, `lm.canonical`, `lm.hash`, `lm.plan`, `lm.dispatch`, `lm.apply`, `lm.report`, `lm.ir`). What profile authors `require`. |
+| `ProfileNode` (dsl-kit AST) | The typed Rust enum AST (`dsl-kit`) defining the Profile Spec and Phase variants. Single source of truth for Schema, PEG Parser, JSON bridge, Builder, and MCP debugging. |
 
 The wire schema tag `lm.profile/1` is intentionally independent of
 the tool name so the artifact identity survives a tool rename.
 
-Throughout these specs, **IR** (intermediate representation) names
-the normalized in-memory profile table produced by the DSL surface
-(chapter 01) and consumed by the pipeline stages (chapter 03). The
-`lm.ir` module owns it. Chapters use "IR" consistently for this
-value; no separate "AST" vocabulary exists in this spec set.
+Throughout these specs, **AST** (and the typed `ProfileNode`) names
+the normalized in-memory profile structure produced by the `dsl-kit` DSL surface
+(chapter 01) and consumed by the pipeline stages (chapter 03).
+
 
 ## Chapter dependency layers
 

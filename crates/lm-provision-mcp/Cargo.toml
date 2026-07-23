@@ -21,7 +21,15 @@ lm-provision = { path = "../lm-provision" }
 lm-provision-driver = { path = "../lm-provision-driver" }
 rmcp = { workspace = true }
 tokio = { workspace = true }
+dsl-kit = { workspace = true }
+dsl-kit-mcp = { workspace = true }
+dsl-kit-parse = { workspace = true }
+
+dsl-kit-schema = { workspace = true }
+
+async-trait = "0.1"
 schemars = { workspace = true }
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
