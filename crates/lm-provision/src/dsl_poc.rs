@@ -2,76 +2,10 @@
 
 use std::sync::Arc;
 use dsl_kit::{
-    DerivedAst, DslSemantics, Engine, LoopDecision, NodeId, Op, OpRegistry, ReducerRegistry,
+    DslExec as DslExecTrait, DslSemantics, Engine, LoopDecision, NodeId, Op, OpRegistry,
+    OwnedDerivedAst, ReducerRegistry,
 };
 use dsl_kit_macros::{DslBuild, DslExec, DslNode, DslSchema};
-use dsl_kit_parse::{
-    BuildError, Diagnostic, ParseTree, RawValue, codes,
-    peg::{choice, token},
-    schema_gen::SyntaxOverrides,
-};
-
-/// Custom builder function for `Vec<String>` payload fields.
-pub fn parse_vec_string(tree: &ParseTree, name: &str) -> Result<Vec<String>, BuildError> {
-    match tree.field(name) {
-        Some(RawValue::Json(v)) => serde_json::from_value(v.clone()).map_err(|e| {
-            BuildError::single(
-                Diagnostic::error(codes::FIELD_TYPE, format!("field `{name}`: {e}"))
-                    .with_span(tree.span),
-            )
-        }),
-        Some(RawValue::Text(s)) => serde_json::from_str(s).map_err(|e| {
-            BuildError::single(
-                Diagnostic::error(codes::FIELD_TYPE, format!("field `{name}`: {e}"))
-                    .with_span(tree.span),
-            )
-        }),
-        None => Err(BuildError::single(
-            Diagnostic::error(
-                codes::MISSING_FIELD,
-                format!("missing required field `{name}`"),
-            )
-            .with_span(tree.span),
-        )),
-    }
-}
-
-/// Custom builder function for optional `Vec<String>` fields (missing → empty list).
-pub fn parse_vec_string_opt(tree: &ParseTree, name: &str) -> Result<Vec<String>, BuildError> {
-    match tree.field(name) {
-        None => Ok(Vec::new()),
-        Some(_) => parse_vec_string(tree, name),
-    }
-}
-
-/// Custom builder function for `Option<String>` payload fields.
-pub fn parse_opt_string(tree: &ParseTree, name: &str) -> Result<Option<String>, BuildError> {
-    match tree.field(name) {
-        Some(RawValue::Json(v)) => serde_json::from_value(v.clone()).map_err(|e| {
-            BuildError::single(
-                Diagnostic::error(codes::FIELD_TYPE, format!("field `{name}`: {e}"))
-                    .with_span(tree.span),
-            )
-        }),
-        Some(RawValue::Text(s)) => {
-            if s == "none" || s.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(s.trim_matches('"').to_string()))
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-/// Syntax overrides for payload fields in canonical text format.
-pub fn profile_syntax_overrides() -> SyntaxOverrides {
-    SyntaxOverrides::new()
-        .for_type("Vec<String>", |ids| token(ids, "%str"))
-        .for_type("Option<String>", |ids| {
-            choice(ids, vec![token(ids, "%kw:none"), token(ids, "%str")])
-        })
-}
 
 /// Unified AST for provision profile declarations and 22 Phase catalog kinds (`02-phase-catalog.md`).
 #[derive(Debug, Clone, PartialEq, Eq, DslNode, DslSchema, DslBuild, DslExec)]
@@ -84,19 +18,14 @@ pub enum ProfileNode {
         /// Profile name.
         name: String,
         /// Profile version (semver string, defaults host-side to "0.0.0").
-        #[dsl_build(with = parse_opt_string)]
         version: Option<String>,
         /// Human-readable description.
-        #[dsl_build(with = parse_opt_string)]
         description: Option<String>,
         /// Allowed capabilities.
-        #[dsl_build(with = parse_vec_string_opt)]
         capabilities: Vec<String>,
         /// Non-secret env allowlist.
-        #[dsl_build(with = parse_vec_string_opt)]
         env: Vec<String>,
         /// Secret env allowlist.
-        #[dsl_build(with = parse_vec_string_opt)]
         env_secrets: Vec<String>,
         /// Sequential list of phases.
         phases: Vec<ProfileNode>,
@@ -110,7 +39,6 @@ pub enum ProfileNode {
         /// Stable node ID.
         id: NodeId,
         /// List of package names to install.
-        #[dsl_build(with = parse_vec_string)]
         packages: Vec<String>,
     },
 
@@ -122,7 +50,6 @@ pub enum ProfileNode {
         /// Git ref / commit hash.
         ref_name: String,
         /// Optional repository owner/name.
-        #[dsl_build(with = parse_opt_string)]
         repo: Option<String>,
     },
 
@@ -141,7 +68,6 @@ pub enum ProfileNode {
         /// Stable node ID.
         id: NodeId,
         /// List of python dependencies.
-        #[dsl_build(with = parse_vec_string)]
         deps: Vec<String>,
         /// Install inside ComfyUI venv if true.
         in_comfy_venv: bool,
@@ -264,7 +190,6 @@ pub enum ProfileNode {
         /// Stable node ID.
         id: NodeId,
         /// Argument vector.
-        #[dsl_build(with = parse_vec_string)]
         argv: Vec<String>,
     },
 
@@ -416,13 +341,18 @@ pub fn profile_op_registry(executed_log: Arc<std::sync::Mutex<Vec<String>>>) -> 
     Arc::new(r)
 }
 
+/// Owned AST projection: the engine borrows nothing, so hosts can hold
+/// program and engine together without `Box::leak`.
+pub type ProfileAst =
+    OwnedDerivedAst<<ProfileNode as DslExecTrait>::LitValue, ProfileSemantics>;
+
 /// Instantiates a dsl-kit-core Engine for driving execution of a ProfileNode AST.
-pub fn create_profile_engine<'a>(
-    root: &'a ProfileNode,
+pub fn create_profile_engine(
+    root: &ProfileNode,
     executed_log: Arc<std::sync::Mutex<Vec<String>>>,
-) -> Engine<DerivedAst<'a, ProfileNode, ProfileSemantics>> {
+) -> Engine<ProfileAst> {
     Engine::new_with_ops(
-        DerivedAst::new(root, ProfileSemantics),
+        OwnedDerivedAst::new(root, ProfileSemantics),
         Arc::new(ReducerRegistry::new()),
         profile_op_registry(executed_log),
     )
@@ -443,12 +373,8 @@ mod tests {
         let schema = ProfileNode::schema();
         assert_eq!(schema.name, "ProfileNode");
 
-        let grammar = schema_gen::checked_grammar_from_schema_with(
-            &schema,
-            &id_gen,
-            &profile_syntax_overrides(),
-        )
-        .expect("grammar generation failed");
+        let grammar = schema_gen::checked_grammar_from_schema(&schema, &id_gen)
+            .expect("grammar generation failed");
 
         let examples = example_gen::examples_from_grammar(&grammar)
             .expect("example generation failed");
@@ -464,10 +390,7 @@ mod tests {
             "type": "Spec",
             "name": "comfyui-vllm-pod",
             "version": "1.0.0",
-            "description": null,
             "capabilities": ["sh.exec", "net.transfer"],
-            "env": [],
-            "env_secrets": [],
             "phases": [
                 {
                     "type": "SystemApt",
@@ -502,9 +425,8 @@ mod tests {
         let profile_ast = ProfileNode::from_parse_tree(&tree, &id_gen)
             .expect("failed to build ProfileNode AST from ParseTree");
 
-        // Optional Spec fields: `null` binds to None, `[]` binds to empty list.
-        // NOTE: the current dsl-kit build layer requires every payload field
-        // to be present on the wire; field-level omission is upstream feedback.
+        // Optional Spec fields (dsl-kit 0.3): omitted keys bind to
+        // None / empty list via the built-in Option<T> / Vec<T> mapping.
         match &profile_ast {
             ProfileNode::Spec {
                 version,

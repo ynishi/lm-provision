@@ -3,31 +3,26 @@
 use std::sync::Arc;
 use dsl_kit::{BreakpointSet, DslNode, Engine, IdGen, Pending, StepOutcome, Stepper};
 use dsl_kit_mcp::host::{
-    DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, PendingProjection, ResolvedCall,
+    DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, PendingProjection,
 };
 use dsl_kit_mcp::resources::ResourceEntry;
-use lm_provision::dsl_poc::{
-    ProfileNode, ProfileSemantics, ProfileValue, create_profile_engine,
-};
+use lm_provision::dsl_poc::{ProfileAst, ProfileNode, ProfileValue, create_profile_engine};
 
 /// `DslHost` adapter for profile AST execution and MCP debugging.
 ///
-/// KNOWN LIMITATION: the AST is leaked exactly once per host (`Box::leak`)
-/// to satisfy the engine's `'static` borrow; `reset` reuses the same leaked
-/// reference, so repeated resets do not accumulate memory.
+/// The engine runs over [`ProfileAst`] (`OwnedDerivedAst`), so the host
+/// owns program and engine together without `Box::leak`.
 pub struct ProfileHost {
-    program: &'static ProfileNode,
+    program: ProfileNode,
     executed_log: Arc<std::sync::Mutex<Vec<String>>>,
-    engine: Engine<dsl_kit::DerivedAst<'static, ProfileNode, ProfileSemantics>>,
+    engine: Engine<ProfileAst>,
 }
 
 impl ProfileHost {
     /// Builds a host around a given `ProfileNode` AST.
     pub fn new(program: ProfileNode) -> Self {
         let executed_log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        // Leak once to provide the 'static reference the Engine requires.
-        let program: &'static ProfileNode = Box::leak(Box::new(program));
-        let engine = create_profile_engine(program, Arc::clone(&executed_log));
+        let engine = create_profile_engine(&program, Arc::clone(&executed_log));
         Self {
             program,
             executed_log,
@@ -117,15 +112,19 @@ impl DslHost for ProfileHost {
         self.program.node_id().0
     }
 
+    fn supports_calls(&self) -> bool {
+        false
+    }
+
     fn root_summary(&self) -> String {
-        match self.program {
+        match &self.program {
             ProfileNode::Spec { name, .. } => format!("Profile Spec ({name})"),
             _ => "Profile Node".to_string(),
         }
     }
 
     fn ast_size(&self) -> usize {
-        1 + match self.program {
+        1 + match &self.program {
             ProfileNode::Spec { phases, .. } => phases.len(),
             _ => 0,
         }
@@ -203,30 +202,9 @@ impl DslHost for ProfileHost {
         Ok(step_outcome_to_host(outcome, self.engine.pending()))
     }
 
-    async fn step_to_done(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
-        let mut steps = 0;
-        loop {
-            let outcome = self
-                .engine
-                .run_to_yield_with_breakpoints(breakpoints)
-                .map_err(|e| e.to_string())?;
-            if matches!(outcome, StepOutcome::Done(_)) {
-                return Ok(HostOutcome::Done);
-            }
-            steps += 1;
-            if steps > 1000 {
-                return Err("exceeded step limit".to_string());
-            }
-        }
-    }
-
-    async fn resolve(&mut self, _result: Option<String>) -> Result<ResolvedCall, String> {
-        Err("resolve not implemented for static provision host".to_string())
-    }
-
     fn reset(&mut self) {
         self.executed_log.lock().unwrap().clear();
-        self.engine = create_profile_engine(self.program, Arc::clone(&self.executed_log));
+        self.engine = create_profile_engine(&self.program, Arc::clone(&self.executed_log));
     }
 
     fn resources(&self) -> Vec<ResourceEntry> {
