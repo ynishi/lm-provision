@@ -11,8 +11,12 @@ use lm_provision::dsl_poc::{
 };
 
 /// `DslHost` adapter for profile AST execution and MCP debugging.
+///
+/// KNOWN LIMITATION: the AST is leaked exactly once per host (`Box::leak`)
+/// to satisfy the engine's `'static` borrow; `reset` reuses the same leaked
+/// reference, so repeated resets do not accumulate memory.
 pub struct ProfileHost {
-    program: ProfileNode,
+    program: &'static ProfileNode,
     executed_log: Arc<std::sync::Mutex<Vec<String>>>,
     engine: Engine<dsl_kit::DerivedAst<'static, ProfileNode, ProfileSemantics>>,
 }
@@ -21,9 +25,9 @@ impl ProfileHost {
     /// Builds a host around a given `ProfileNode` AST.
     pub fn new(program: ProfileNode) -> Self {
         let executed_log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        // Leak program to provide 'static reference for Engine
-        let leaked_program: &'static ProfileNode = Box::leak(Box::new(program.clone()));
-        let engine = create_profile_engine(leaked_program, Arc::clone(&executed_log));
+        // Leak once to provide the 'static reference the Engine requires.
+        let program: &'static ProfileNode = Box::leak(Box::new(program));
+        let engine = create_profile_engine(program, Arc::clone(&executed_log));
         Self {
             program,
             executed_log,
@@ -37,7 +41,11 @@ impl ProfileHost {
         let program = ProfileNode::Spec {
             id: id_gen.node(),
             name: "demo-comfyui-vllm-pod".to_string(),
+            version: Some("0.0.0".to_string()),
+            description: None,
             capabilities: vec!["sh.exec".to_string(), "net.transfer".to_string()],
+            env: Vec::new(),
+            env_secrets: Vec::new(),
             phases: vec![
                 ProfileNode::SystemApt {
                     id: id_gen.node(),
@@ -110,14 +118,14 @@ impl DslHost for ProfileHost {
     }
 
     fn root_summary(&self) -> String {
-        match &self.program {
+        match self.program {
             ProfileNode::Spec { name, .. } => format!("Profile Spec ({name})"),
             _ => "Profile Node".to_string(),
         }
     }
 
     fn ast_size(&self) -> usize {
-        1 + match &self.program {
+        1 + match self.program {
             ProfileNode::Spec { phases, .. } => phases.len(),
             _ => 0,
         }
@@ -217,9 +225,8 @@ impl DslHost for ProfileHost {
     }
 
     fn reset(&mut self) {
-        let leaked_program: &'static ProfileNode = Box::leak(Box::new(self.program.clone()));
         self.executed_log.lock().unwrap().clear();
-        self.engine = create_profile_engine(leaked_program, Arc::clone(&self.executed_log));
+        self.engine = create_profile_engine(self.program, Arc::clone(&self.executed_log));
     }
 
     fn resources(&self) -> Vec<ResourceEntry> {

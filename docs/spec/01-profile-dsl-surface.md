@@ -19,13 +19,15 @@ pub enum ProfileNode {
     Spec {
         id: NodeId,
         name: String,
+        #[dsl_build(with = parse_opt_string)]
         version: Option<String>,
+        #[dsl_build(with = parse_opt_string)]
         description: Option<String>,
-        #[dsl_build(with = parse_vec_string)]
+        #[dsl_build(with = parse_vec_string_opt)]
         capabilities: Vec<String>,
-        #[dsl_build(with = parse_vec_string)]
+        #[dsl_build(with = parse_vec_string_opt)]
         env: Vec<String>,
-        #[dsl_build(with = parse_vec_string)]
+        #[dsl_build(with = parse_vec_string_opt)]
         env_secrets: Vec<String>,
         phases: Vec<ProfileNode>,
     },
@@ -52,7 +54,10 @@ A human-readable, left-recursion-free canonical syntax generated directly from t
 Spec(
     name: "vllm-pod",
     version: "1.0.0",
+    description: none,
     capabilities: "[\"sh.exec\", \"net.transfer\"]",
+    env: "[]",
+    env_secrets: "[]",
     phases: [
         SystemApt(packages: "[\"git\", \"curl\", \"ffmpeg\"]"),
         PythonDeps(deps: "[\"torch\", \"vllm\"]", in_comfy_venv: false),
@@ -70,7 +75,10 @@ An AI-native JSON representation ideal for programmatic generation and tool inte
   "type": "Spec",
   "name": "vllm-pod",
   "version": "1.0.0",
+  "description": null,
   "capabilities": ["sh.exec", "net.transfer"],
+  "env": [],
+  "env_secrets": [],
   "phases": [
     {
       "type": "SystemApt",
@@ -100,6 +108,12 @@ An AI-native JSON representation ideal for programmatic generation and tool inte
 | `env` | list\<string\> | no | `{}` | non-secret env allowlist |
 | `env_secrets` | list\<string\> | no | `{}` | secret allowlist |
 | `phases` | list\<ProfileNode\> | no | `{}` | phase nodes per chapter 02 |
+
+"required: no" is semantic: the current dsl-kit build layer requires
+every payload field to be present on the wire, so an empty value is
+spelled explicitly — `null` / `none` for `Option` fields, `[]` for
+list fields. Field-level omission is tracked as dsl-kit upstream
+feedback (`Vec<T>` / `Option<T>` standard mapping).
 
 ## Escape / Fragment Policy
 

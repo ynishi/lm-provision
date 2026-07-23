@@ -36,6 +36,14 @@ pub fn parse_vec_string(tree: &ParseTree, name: &str) -> Result<Vec<String>, Bui
     }
 }
 
+/// Custom builder function for optional `Vec<String>` fields (missing → empty list).
+pub fn parse_vec_string_opt(tree: &ParseTree, name: &str) -> Result<Vec<String>, BuildError> {
+    match tree.field(name) {
+        None => Ok(Vec::new()),
+        Some(_) => parse_vec_string(tree, name),
+    }
+}
+
 /// Custom builder function for `Option<String>` payload fields.
 pub fn parse_opt_string(tree: &ParseTree, name: &str) -> Result<Option<String>, BuildError> {
     match tree.field(name) {
@@ -75,9 +83,21 @@ pub enum ProfileNode {
         id: NodeId,
         /// Profile name.
         name: String,
+        /// Profile version (semver string, defaults host-side to "0.0.0").
+        #[dsl_build(with = parse_opt_string)]
+        version: Option<String>,
+        /// Human-readable description.
+        #[dsl_build(with = parse_opt_string)]
+        description: Option<String>,
         /// Allowed capabilities.
-        #[dsl_build(with = parse_vec_string)]
+        #[dsl_build(with = parse_vec_string_opt)]
         capabilities: Vec<String>,
+        /// Non-secret env allowlist.
+        #[dsl_build(with = parse_vec_string_opt)]
+        env: Vec<String>,
+        /// Secret env allowlist.
+        #[dsl_build(with = parse_vec_string_opt)]
+        env_secrets: Vec<String>,
         /// Sequential list of phases.
         phases: Vec<ProfileNode>,
     },
@@ -443,7 +463,11 @@ mod tests {
         let json_data = serde_json::json!({
             "type": "Spec",
             "name": "comfyui-vllm-pod",
+            "version": "1.0.0",
+            "description": null,
             "capabilities": ["sh.exec", "net.transfer"],
+            "env": [],
+            "env_secrets": [],
             "phases": [
                 {
                     "type": "SystemApt",
@@ -477,6 +501,25 @@ mod tests {
         // 2. Build typed AST
         let profile_ast = ProfileNode::from_parse_tree(&tree, &id_gen)
             .expect("failed to build ProfileNode AST from ParseTree");
+
+        // Optional Spec fields: `null` binds to None, `[]` binds to empty list.
+        // NOTE: the current dsl-kit build layer requires every payload field
+        // to be present on the wire; field-level omission is upstream feedback.
+        match &profile_ast {
+            ProfileNode::Spec {
+                version,
+                description,
+                env,
+                env_secrets,
+                ..
+            } => {
+                assert_eq!(version.as_deref(), Some("1.0.0"));
+                assert_eq!(*description, None);
+                assert!(env.is_empty());
+                assert!(env_secrets.is_empty());
+            }
+            other => panic!("expected Spec root, got {other:?}"),
+        }
 
         // 3. Instantiate dsl-kit-core Engine
         let executed_log = Arc::new(std::sync::Mutex::new(Vec::new()));
