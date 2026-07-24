@@ -23,6 +23,7 @@ use crate::dsl_poc::ProfileNode;
 
 pub mod capgate;
 pub mod effects;
+pub mod lifecycle;
 pub mod payload;
 pub mod registry;
 

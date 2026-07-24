@@ -9,11 +9,11 @@
 //!   `net_http_post` / `net_transfer` / `mount_bind` / `mount_umount`)
 //!   render a trace line in `DryRun` and call [`effects`](super::effects)
 //!   in `Real`.
-//! - **lifecycle 15 ops** are placeholders until their real wiring
-//!   lands: the capability is still checked and the payload still looked
-//!   up, but the op only pushes a `"<op> (lifecycle: wiring pending)"`
-//!   line and succeeds, in either mode — the engine requires all 22 ops
-//!   registered.
+//! - **lifecycle 15 ops** delegate to [`lifecycle::expand`](super::lifecycle::expand)
+//!   for step composition, then render each step in `DryRun` and execute
+//!   each step (via [`lifecycle::execute_step`](super::lifecycle::execute_step))
+//!   in `Real`. A single per-op log line joins the per-step summaries
+//!   with `; `, preserving the direct-op shape (`"<op> ..."`).
 //!
 //! An [`ExecError`] from any step surfaces as
 //! [`EngineError::EvalFailed`], carrying the node at which it happened.
@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use dsl_kit::{EngineError, NodeContext, NodeId, Op, OpRegistry, Path};
 
-use super::{effects, ExecContext, ExecError, ExecMode};
+use super::{effects, lifecycle, ExecContext, ExecError, ExecMode};
 use crate::dsl_poc::{ProfileNode, ProfileValue};
 
 /// The seven direct ops with real effect wiring.
@@ -36,8 +36,7 @@ const DIRECT_OPS: [&str; 7] = [
     "mount_umount",
 ];
 
-/// The fifteen lifecycle ops carried as placeholders until their real
-/// wiring lands.
+/// The fifteen lifecycle ops handled through [`lifecycle::expand`].
 const LIFECYCLE_OPS: [&str; 15] = [
     "system_apt",
     "comfyui_install",
@@ -128,8 +127,7 @@ impl ProfileOp {
         }
 
         if LIFECYCLE_OPS.contains(&self.name) {
-            let line = format!("{} (lifecycle: wiring pending)", self.name);
-            return Ok(self.record(line));
+            return self.run_lifecycle(payload);
         }
 
         match self.name {
@@ -151,6 +149,21 @@ impl ProfileOp {
     fn record(&self, line: String) -> ProfileValue {
         self.ctx.log.lock().unwrap().push(line.clone());
         ProfileValue::Success(line)
+    }
+
+    /// Compose a lifecycle op's steps, then render (dry-run) or execute
+    /// (real) each one and collapse the results into the single per-op
+    /// log line.
+    fn run_lifecycle(&self, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
+        let steps = lifecycle::expand(payload)?;
+        let renders: Vec<String> = match self.ctx.mode {
+            ExecMode::DryRun => steps.iter().map(lifecycle::render_dry).collect(),
+            ExecMode::Real => steps
+                .iter()
+                .map(|step| lifecycle::execute_step(step, self.name))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(self.record(format!("{} {}", self.name, renders.join("; "))))
     }
 
     fn variant_err(&self, node: NodeId, expected: &'static str) -> ExecError {
