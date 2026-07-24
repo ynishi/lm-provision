@@ -1,0 +1,1 @@
+Spec(name: "demo-ast", version: "1.0.0", description: "AST frontend fixture (JSON form)", capabilities: ["fs.write", "sh.exec"], env: ["PATH", "HOME"], env_secrets: ["HF_TOKEN"], phases: [SystemApt(packages: ["git", "curl"]), PythonDeps(deps: ["torch", "vllm"], in_comfy_venv: false), ShExec(argv: ["echo", "ok"]), FsWrite(path: "/tmp/x", content: "hello")])

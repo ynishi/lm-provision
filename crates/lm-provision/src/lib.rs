@@ -73,6 +73,7 @@ pub mod codegen;
 pub mod dsl_poc;
 pub mod embed;
 pub mod exec;
+pub mod frontend;
 pub mod sandbox;
 pub mod secret;
 pub mod vm;

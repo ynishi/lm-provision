@@ -1,0 +1,15 @@
+{
+  "type": "Spec",
+  "name": "demo-ast",
+  "version": "1.0.0",
+  "description": "AST frontend fixture (JSON form)",
+  "capabilities": ["sh.exec", "fs.write"],
+  "env": ["HOME", "PATH"],
+  "env_secrets": ["HF_TOKEN"],
+  "phases": [
+    { "type": "SystemApt", "packages": ["git", "curl"] },
+    { "type": "PythonDeps", "deps": ["torch", "vllm"], "in_comfy_venv": false },
+    { "type": "ShExec", "argv": ["echo", "ok"] },
+    { "type": "FsWrite", "path": "/tmp/x", "content": "hello" }
+  ]
+}

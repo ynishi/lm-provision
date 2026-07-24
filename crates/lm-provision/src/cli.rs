@@ -144,6 +144,12 @@ impl From<serde_json::Error> for RunError {
     }
 }
 
+impl From<crate::frontend::FrontendError> for RunError {
+    fn from(err: crate::frontend::FrontendError) -> Self {
+        RunError(err.to_string())
+    }
+}
+
 /// The `Result` alias every read-only pipeline function below returns.
 /// `pub` for the same reason [`RunError`] is (milestone M6, see there).
 pub type PipelineResult<T> = std::result::Result<T, RunError>;
@@ -265,8 +271,41 @@ fn run_validate(profile: &Path) -> ExitCode {
     }
 }
 
+/// True when `path`'s extension is `lua` (case-insensitive).
+///
+/// Used by the `hash` / `plan` subcommands to route a profile file
+/// between the legacy Lua pipeline ([`hash_pipeline`] /
+/// [`plan_pipeline`], preserved bit-for-bit) and the new AST frontend
+/// ([`crate::frontend::load_profile`]). Any non-`.lua` extension
+/// (`.json` / `.txt` / bare / …) goes through the AST path; the
+/// frontend then picks JSON vs canonical text by its own extension
+/// check.
+pub(crate) fn is_lua_profile(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
+}
+
+/// AST-path `hash` pipeline: load profile → canonical hash.
+///
+/// Deliberately mirrors [`hash_pipeline`]'s "load → declarations →
+/// canonical → hash" shape (07-cli.md §Invocation) without the Lua VM
+/// hop — [`crate::frontend::load_profile`] produces the same
+/// [`crate::dsl_poc::ProfileNode`] AST both frontends converge on, and
+/// [`crate::canonical::hash`] is already frontend-agnostic (see
+/// `tests/canonical_frontend_parity.rs`).
+pub(crate) fn ast_hash(profile: &Path) -> PipelineResult<String> {
+    let node = crate::frontend::load_profile(profile)?;
+    Ok(crate::canonical::hash(&node))
+}
+
 fn run_hash(profile: &Path) -> ExitCode {
-    match hash_pipeline(profile) {
+    let result = if is_lua_profile(profile) {
+        hash_pipeline(profile)
+    } else {
+        ast_hash(profile)
+    };
+    match result {
         Ok(hex) => {
             println!("{hex}");
             ExitCode::from(0)
