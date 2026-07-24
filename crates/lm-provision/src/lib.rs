@@ -25,6 +25,12 @@
 //!   declaration-gated `std.*` battery surface (04-bridge.md
 //!   §Registration order step 6, milestone M3); M2 ships only the
 //!   sha256 hash provider `lm.hash` calls into.
+//! - [`canonical`] — deterministic byte encoder + SHA-256 profile hash
+//!   over the [`dsl_poc::ProfileNode`] AST
+//!   (03-pipeline-stage-artifacts.md §canonical / §hash respecified
+//!   onto the typed AST). Frontend-independent by construction:
+//!   `NodeId` is excluded, declared lists are sorted, phase order
+//!   preserved.
 //! - [`sandbox`] — the four-layer sandbox (05-sandbox-layer-contract.md):
 //!   L2 execution-control isolation, L3 declaration-derived policies,
 //!   L4 the capability gate, wired onto an [`vm::eval::ExtractedProfile`]
@@ -61,6 +67,7 @@ pub mod apply;
 pub mod audit;
 pub mod batteries;
 pub mod bridge;
+pub mod canonical;
 pub mod cli;
 pub mod codegen;
 pub mod dsl_poc;

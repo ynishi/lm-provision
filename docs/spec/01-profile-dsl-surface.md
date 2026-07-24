@@ -103,6 +103,19 @@ Optional fields (`Option<T>` / list-typed) may be omitted on the wire
 empty list. Explicit `null` (JSON) / `none` (canonical text) / `[]`
 remain accepted spellings of the same values.
 
+The declared lists `capabilities`, `env`, and `env_secrets` are
+**set-shaped** (declaration order is not significant): the canonical
+encoder (chapter 03 §canonical) sorts them lexicographically before
+hashing, so two profiles that differ only in the order these entries
+were written yield the same profile hash. Phase order is semantic
+and is preserved by canonical.
+
+The profile hash (chapter 03 §hash) is **frontend-independent**: the
+canonical text grammar and the JSON serde bridge that both build the
+same `ProfileNode` AST produce byte-identical canonical output and
+therefore the same hash, even though `NodeId`s minted by `IdGen`
+differ between the two builds.
+
 ## Escape / Fragment Policy
 
 - **Inner escape**: `PostInstall` carries an arbitrary shell `script` string (chapter 02). This is the single sanctioned place for raw shell inside a profile.

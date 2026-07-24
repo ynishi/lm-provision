@@ -14,9 +14,11 @@ apply stage (chapter 04 consumers) has effects.
 ## Inputs
 
 - validate: the IR table from chapter 01.
-- canonical: any IR-shaped Lua value (encode); canonical JSON bytes
-  (decode).
-- hash: canonical bytes (a Lua string).
+- canonical: a `ProfileNode` AST value (encode). Decode
+  (canonical bytes → AST) is not defined in the current scope; see
+  §canonical.
+- hash: a `ProfileNode` AST value (the function computes the
+  canonical bytes internally).
 - plan: the IR table.
 - dispatch: the plan artifact.
 
@@ -49,40 +51,74 @@ matching `[A-Za-z0-9._/@:+=~-]+` (the with-spaces variant additionally
 allows single spaces, never double). Safe strings can be interpolated
 into argv without quoting.
 
-### canonical — `lm.canonical.encode(ir)` / `lm.canonical.decode(bytes)`
+### canonical — `canonical::encode(&ProfileNode) -> String`
 
-Encode produces deterministic JSON bytes:
+Encode produces deterministic JSON bytes over the `ProfileNode` AST
+(chapter 01). The encoding is a function of the AST's *type
+structure* alone; the wire text that produced the AST (canonical
+text vs JSON, whitespace, key order, optional-field spelling) is
+irrelevant. The two frontends (canonical text grammar / JSON serde
+bridge) that represent the same logical profile yield the same AST,
+and therefore byte-identical canonical output.
 
-- Objects: keys sorted lexicographically (recursive).
-- Arrays (contiguous integer-keyed tables): element order preserved.
-- **Empty-table rule**: an empty table encodes as `{}` — empty array
-  and empty object are indistinguishable in canonical form.
-- Strings: `"` `\` and control characters escaped (`\n` `\r` `\t`
-  `\b` `\f`, others as `\u00XX`).
-- Numbers: integers with `|v| < 1e15` as `%d`; other finite numbers
-  as `%.17g`; NaN / ±Inf raise an error (not encodable).
-- Secret markers: the table `{ __secret = "NAME" }` (exactly one key)
-  is the canonical representation of a secret reference. A SecretRef
-  userdata (chapter 06) opts in via the `__lm_secret_name` metamethod
-  and encodes to the identical marker — userdata refs and literal
-  marker tables are canonical-equivalent.
-- Any other userdata / function / thread value raises an error.
+- **NodeId is excluded** from every variant. `IdGen` mints fresh
+  ids per parse-run (they differ between the two frontends and
+  between runs); keeping them would break the frontend-parity
+  guarantee.
+- **Variant tag**: each `ProfileNode` variant encodes as an object
+  carrying `"type": "<VariantName>"` (Rust variant identifier —
+  same discriminator the JSON serde bridge uses on input).
+- **Objects**: keys sorted lexicographically (recursive). Object
+  keys are the Rust field identifiers (`packages`, `argv`, `url`,
+  `ref_name`, `nodes_json`, `port`, `check_url`, `name`,
+  `platform_kind`, `deps`, `in_comfy_venv`, `path`, `content`,
+  `src`, `dst`, `script`, `models_json`, `want`, plus the `Spec`
+  fields).
+- **Declared lists**: the `Spec` fields `capabilities`, `env`, and
+  `env_secrets` are set-shaped (declaration-order
+  independent). Canonical sorts them lexicographically before
+  encoding (the AST is not mutated).
+- **Phase order**: `Spec.phases` is order-preserving — phase order
+  is semantic.
+- **`Option<String>`**: `None` omits the key entirely; `Some(x)`
+  emits `"key":"x"`.
+- **Empty `Vec`** encodes as `[]`. The typed AST removes the
+  array/object ambiguity that motivated the legacy
+  empty-table-as-`{}` rule, so that rule is retired.
+- **Strings**: `"` `\` and the named control escapes
+  (`\n` `\r` `\t` `\b` `\f`); any other codepoint `< 0x20` as
+  `\u00xx` (lowercase hex); all other characters pass through as
+  their UTF-8 bytes.
+- **Numbers**: the current AST carries only `u16` (port), rendered
+  as decimal integer. Float payload fields do not exist in the
+  AST, so the legacy `%.17g` branch has no encode input.
+- **Booleans**: `true` / `false`.
 
-Decode is the inverse: canonical JSON bytes → IR table, with
-`{"__secret":"NAME"}` markers rehydrated into SecretRef userdata on
-the Lua side (opacity preserved through the round-trip). Encode ∘
-decode is byte-identity on canonical bytes. This bidirectionality is
-what enables ledger reconstruction and cross-pod profile persistence
-(chapter 09).
+Secret markers (`{"__secret":"NAME"}`) are not part of the current
+AST canonical form because `ProfileNode` has no secret *value*
+type — the `env_secrets` field carries only *names* (bare strings). If
+a future AST revision introduces a secret value type (e.g. an
+`env` payload wired to `SecretRef`), the marker convention may be
+reintroduced at that time.
 
-### hash — `lm.hash.sha256_hex(bytes)`
+Decode (canonical bytes → AST) is out of scope in the current
+revision: the ledger persists JSON Lines and does not require
+canonical→AST reconstruction. Encode alone is sufficient for the
+hash contract below.
+
+### hash — `canonical::hash(&ProfileNode) -> String`
 
 SHA-256 over the canonical bytes, rendered as a 64-character
 lowercase hex string with no prefix. The profile hash is defined as
-`sha256_hex(canonical.encode(ir))`. Because declared lists are
-pre-sorted (chapter 01) and canonical encoding is deterministic, the
-hash is byte-identical across declaration-order permutations of the
-declared lists, and sensitive to phase order (which is semantic).
+`sha256_hex(canonical::encode(node))`. Because canonical sorts the
+declared lists (`capabilities`, `env`, `env_secrets`) and excludes
+`NodeId` during encoding, the hash is:
+
+- byte-identical across declaration-order permutations of the
+  declared lists;
+- byte-identical across the two frontends (text grammar / JSON
+  serde bridge) for the same logical profile;
+- sensitive to phase order (which is semantic).
 
 ### plan — `lm.plan.expand(ir)`
 
@@ -131,9 +167,9 @@ per route). Scheme routing rules are chapter 02 §Dispatch routing.
 - validate: precondition errors, returned as `{ ok = false, error }`
   (never thrown). Not retryable without editing the profile. No
   effects have run.
-- canonical encode: raises on non-finite numbers and non-encodable
-  types. decode: raises on malformed canonical bytes. Precondition
-  class.
+- canonical encode: total over `ProfileNode` (every variant / field
+  type has a defined encoding); does not raise. Decode is not
+  defined in this revision.
 - hash: raises when the batteries hash provider is unavailable
   (host wiring bug — internal invariant, not a consumer state).
 - plan / dispatch: raise only on malformed stage input (non-table);
@@ -145,10 +181,15 @@ per route). Scheme routing rules are chapter 02 §Dispatch routing.
 
 ## Stability
 
-- Canonical form (all encode rules above, including the empty-table
-  rule and the secret-marker convention): **stable** — the profile
-  hash depends on every one of them.
+- Canonical form (all encode rules above — variant tag under
+  `"type"`, `NodeId` exclusion, declared-list sort, phase-order
+  preservation, `Option::None` key elision, empty-`Vec`-as-`[]`,
+  string escape, integer rendering, recursive object-key sort):
+  **stable** — the profile hash depends on every one of them.
 - Hash function (SHA-256, lowercase hex, no prefix): **stable**.
+- Canonical **decode**: not defined in the current revision (see
+  §canonical). May be introduced in a future spec revision if a
+  bidirectional round-trip becomes required.
 - validate result shape, plan artifact shape, dispatch artifact
   shape and the op enum: **stable**.
 - Single-error validate reporting (vs multi-error collection):
@@ -159,11 +200,14 @@ per route). Scheme routing rules are chapter 02 §Dispatch routing.
 
 ## Upstream references
 
-- chapter 01 profile DSL surface — IR shape, list-shape rule.
+- chapter 01 profile DSL surface — `ProfileNode` AST shape,
+  optional-field defaults, declared-list shape rule.
 - chapter 02 phase catalog — per-kind payload schemas, phase
   ordering, dispatch routing, shared vocabulary.
-- chapter 06 secret handling — marker convention, `env.ref`
-  validation-time deferral (why stages 1–5 never resolve secrets).
+- chapter 06 secret handling — `env.ref` validation-time deferral
+  (why stages 1–5 never resolve secrets). The AST-canonical
+  secret marker convention is deferred until the AST gains a
+  secret value type; see §canonical.
 
 ## MVP scope
 
@@ -173,5 +217,9 @@ regression suite (validate rejects for `bad-*` fixtures; hash
 byte-identity across reordered fixtures; full dispatch fan-out under
 `apply --dry-run`).
 
-Canonical **decode** is contract-complete here but is exercised only
-by the ledger path (chapter 09); it has no CLI subcommand of its own.
+The AST-based `canonical::encode` / `canonical::hash` land as a
+self-contained Rust module. CLI wiring (`validate` / `hash` / `plan`
+subcommands operating on `ProfileNode`) is a follow-up scope: this
+revision defines the contract and ships the encoder + hash + a
+frontend-parity test suite proving the byte-identity guarantee
+between the text and JSON frontends.
