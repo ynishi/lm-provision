@@ -16,3 +16,6 @@ CLAUDE.md
 !.env.sample
 !.env.template
 !.env.dist
+.metadata_cache/
+.ryo/
+logs/
