@@ -74,6 +74,7 @@ pub mod dsl_poc;
 pub mod embed;
 pub mod exec;
 pub mod frontend;
+pub mod plan;
 pub mod sandbox;
 pub mod secret;
 pub mod vm;

@@ -314,8 +314,27 @@ fn run_hash(profile: &Path) -> ExitCode {
     }
 }
 
+/// AST-path `plan` pipeline: load profile → expand into the plan
+/// artifact.
+///
+/// Mirrors [`plan_pipeline`]'s "load → declarations → plan" shape
+/// (07-cli.md §Invocation) without the Lua VM hop:
+/// [`crate::frontend::load_profile`] produces the same
+/// [`crate::dsl_poc::ProfileNode`] AST both frontends converge on,
+/// and [`crate::plan::expand`] is the Rust port of the legacy
+/// `lm.plan.expand`.
+pub(crate) fn ast_plan(profile: &Path) -> PipelineResult<serde_json::Value> {
+    let node = crate::frontend::load_profile(profile)?;
+    Ok(crate::plan::expand(&node))
+}
+
 fn run_plan(profile: &Path) -> ExitCode {
-    match plan_pipeline(profile) {
+    let result = if is_lua_profile(profile) {
+        plan_pipeline(profile)
+    } else {
+        ast_plan(profile)
+    };
+    match result {
         Ok(value) => {
             print_json(&value);
             ExitCode::from(0)
