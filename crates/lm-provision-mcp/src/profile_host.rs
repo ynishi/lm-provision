@@ -1,12 +1,13 @@
 //! `DslHost` adapter for `lm-provision`'s `ProfileNode` DSL.
 
-use std::sync::Arc;
 use dsl_kit::{BreakpointSet, DslNode, Engine, IdGen, Pending, StepOutcome, Stepper};
 use dsl_kit_mcp::host::{
     DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, PendingProjection,
 };
 use dsl_kit_mcp::resources::ResourceEntry;
-use lm_provision::dsl_poc::{ProfileAst, ProfileNode, ProfileValue, create_profile_engine};
+use lm_provision::dsl_poc::{create_profile_engine, ProfileAst, ProfileNode, ProfileValue};
+use lm_provision::exec::ExecMode;
+use std::sync::Arc;
 
 /// `DslHost` adapter for profile AST execution and MCP debugging.
 ///
@@ -22,7 +23,8 @@ impl ProfileHost {
     /// Builds a host around a given `ProfileNode` AST.
     pub fn new(program: ProfileNode) -> Self {
         let executed_log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let engine = create_profile_engine(&program, Arc::clone(&executed_log));
+        let engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&executed_log))
+            .expect("profile engine construction should succeed");
         Self {
             program,
             executed_log,
@@ -71,10 +73,7 @@ fn pending_to_location(ctx: &dsl_kit::NodeContext) -> HostLocation {
     }
 }
 
-fn step_outcome_to_host(
-    outcome: StepOutcome<ProfileValue>,
-    pending: &[Pending],
-) -> HostOutcome {
+fn step_outcome_to_host(outcome: StepOutcome<ProfileValue>, pending: &[Pending]) -> HostOutcome {
     match outcome {
         StepOutcome::Done(_) => HostOutcome::Done,
         StepOutcome::Ready => HostOutcome::Advanced,
@@ -204,7 +203,12 @@ impl DslHost for ProfileHost {
 
     fn reset(&mut self) {
         self.executed_log.lock().unwrap().clear();
-        self.engine = create_profile_engine(&self.program, Arc::clone(&self.executed_log));
+        self.engine = create_profile_engine(
+            &self.program,
+            ExecMode::DryRun,
+            Arc::clone(&self.executed_log),
+        )
+        .expect("profile engine reconstruction should succeed");
     }
 
     fn resources(&self) -> Vec<ResourceEntry> {
