@@ -74,10 +74,10 @@ and therefore byte-identical canonical output.
   `platform_kind`, `deps`, `in_comfy_venv`, `path`, `content`,
   `src`, `dst`, `script`, `models_json`, `want`, plus the `Spec`
   fields).
-- **Declared lists**: the `Spec` fields `capabilities`, `env`, and
-  `env_secrets` are set-shaped (declaration-order
-  independent). Canonical sorts them lexicographically before
-  encoding (the AST is not mutated).
+- **Declared lists**: the `Spec` fields `capabilities`, `env`,
+  `env_secrets`, `paths`, and `http_allowlist` are set-shaped
+  (declaration-order independent). Canonical sorts them
+  lexicographically before encoding (the AST is not mutated).
 - **Phase order**: `Spec.phases` is order-preserving — phase order
   is semantic.
 - **`Option<String>`**: `None` omits the key entirely; `Some(x)`
@@ -111,8 +111,8 @@ hash contract below.
 SHA-256 over the canonical bytes, rendered as a 64-character
 lowercase hex string with no prefix. The profile hash is defined as
 `sha256_hex(canonical::encode(node))`. Because canonical sorts the
-declared lists (`capabilities`, `env`, `env_secrets`) and excludes
-`NodeId` during encoding, the hash is:
+declared lists (`capabilities`, `env`, `env_secrets`, `paths`,
+`http_allowlist`) and excludes `NodeId` during encoding, the hash is:
 
 - byte-identical across declaration-order permutations of the
   declared lists;

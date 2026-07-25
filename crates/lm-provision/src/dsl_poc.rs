@@ -27,6 +27,17 @@ pub enum ProfileNode {
         env: Vec<String>,
         /// Secret env allowlist.
         env_secrets: Vec<String>,
+        /// Allowed filesystem path roots. `fs.write` / `mount.*` /
+        /// `net.transfer` destinations are rejected when the target
+        /// path is not under one of these roots (chapter 05 §L3 path
+        /// policy).
+        paths: Vec<String>,
+        /// Allowed HTTP URL patterns. `net.http_get` / `net.http_post` /
+        /// `net.transfer` (when `src` is `http://` or `https://`) URLs
+        /// are rejected when they match no pattern (chapter 05 §L3
+        /// HTTP policy). Pattern = literal prefix with an optional
+        /// single `*` confined to the authority component.
+        http_allowlist: Vec<String>,
         /// Sequential list of phases.
         phases: Vec<ProfileNode>,
     },
@@ -466,6 +477,8 @@ mod tests {
             "capabilities: [\"sh.exec\"], ",
             "env: [], ",
             "env_secrets: [], ",
+            "paths: [], ",
+            "http_allowlist: [], ",
             "phases: [",
             "SystemApt(packages: [\"git\", \"curl\"]), ",
             "ShExec(argv: [\"ls\", \"-la\"])",

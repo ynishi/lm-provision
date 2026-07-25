@@ -43,6 +43,12 @@ impl ProfileHost {
             capabilities: vec!["sh.exec".to_string(), "net.transfer".to_string()],
             env: Vec::new(),
             env_secrets: Vec::new(),
+            // The demo profile only wires lifecycle ops (SystemApt /
+            // PythonDeps / PostInstall). Lifecycle ops do not run
+            // through the direct-op path / URL policy check, so leaving
+            // both allowlists empty preserves the dry-run trace shape.
+            paths: Vec::new(),
+            http_allowlist: Vec::new(),
             phases: vec![
                 ProfileNode::SystemApt {
                     id: id_gen.node(),

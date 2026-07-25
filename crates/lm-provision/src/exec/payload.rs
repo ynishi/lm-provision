@@ -49,6 +49,8 @@ mod tests {
             capabilities: vec!["sh.exec".to_string()],
             env: Vec::new(),
             env_secrets: Vec::new(),
+            paths: Vec::new(),
+            http_allowlist: Vec::new(),
             phases: vec![
                 ProfileNode::SystemApt {
                     id: apt_id,

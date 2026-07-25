@@ -8,7 +8,10 @@
 //! - **direct 7 ops** (`sh_exec` / `fs_write` / `net_http_get` /
 //!   `net_http_post` / `net_transfer` / `mount_bind` / `mount_umount`)
 //!   render a trace line in `DryRun` and call [`effects`](super::effects)
-//!   in `Real`.
+//!   in `Real`. Path- and URL-carrying ops (all six except `sh_exec`)
+//!   additionally consult [`policy`](super::policy) in both modes
+//!   (spec 07 "dry-run does policy"), rejecting targets that fall
+//!   outside the profile's declared `paths` / `http_allowlist`.
 //! - **lifecycle 15 ops** delegate to [`lifecycle::expand`](super::lifecycle::expand)
 //!   for step composition, then render each step in `DryRun` and execute
 //!   each step (via [`lifecycle::execute_step`](super::lifecycle::execute_step))
@@ -202,6 +205,8 @@ impl ProfileOp {
         let ProfileNode::FsWrite { path, content, .. } = payload else {
             return Err(self.variant_err(node, "FsWrite"));
         };
+        // Path policy runs in both modes (spec 07 "dry-run does policy").
+        self.ctx.path_policy.check(path)?;
         match self.ctx.mode {
             ExecMode::DryRun => {
                 Ok(self.record(format!("fs_write path={path} bytes={}", content.len())))
@@ -217,6 +222,7 @@ impl ProfileOp {
         let ProfileNode::NetHttpGet { url, .. } = payload else {
             return Err(self.variant_err(node, "NetHttpGet"));
         };
+        self.ctx.http_policy.check(url)?;
         match self.ctx.mode {
             ExecMode::DryRun => Ok(self.record(format!("net_http_get url={url}"))),
             ExecMode::Real => {
@@ -234,6 +240,7 @@ impl ProfileOp {
         let ProfileNode::NetHttpPost { url, .. } = payload else {
             return Err(self.variant_err(node, "NetHttpPost"));
         };
+        self.ctx.http_policy.check(url)?;
         match self.ctx.mode {
             ExecMode::DryRun => Ok(self.record(format!("net_http_post url={url}"))),
             ExecMode::Real => {
@@ -247,6 +254,13 @@ impl ProfileOp {
         let ProfileNode::NetTransfer { src, dst, .. } = payload else {
             return Err(self.variant_err(node, "NetTransfer"));
         };
+        // Destination is always a local path; source is HTTP-checked
+        // when it carries an `http(s)://` scheme (a download). Local
+        // sources are left to the effect layer's own routing.
+        self.ctx.path_policy.check(dst)?;
+        if src.starts_with("http://") || src.starts_with("https://") {
+            self.ctx.http_policy.check(src)?;
+        }
         match self.ctx.mode {
             ExecMode::DryRun => Ok(self.record(format!("net_transfer src={src} dst={dst}"))),
             ExecMode::Real => {
@@ -267,6 +281,8 @@ impl ProfileOp {
         let ProfileNode::MountBind { src, dst, .. } = payload else {
             return Err(self.variant_err(node, "MountBind"));
         };
+        self.ctx.path_policy.check(src)?;
+        self.ctx.path_policy.check(dst)?;
         match self.ctx.mode {
             ExecMode::DryRun => Ok(self.record(format!("mount_bind src={src} dst={dst}"))),
             ExecMode::Real => {
@@ -284,6 +300,7 @@ impl ProfileOp {
         let ProfileNode::MountUmount { path, .. } = payload else {
             return Err(self.variant_err(node, "MountUmount"));
         };
+        self.ctx.path_policy.check(path)?;
         match self.ctx.mode {
             ExecMode::DryRun => Ok(self.record(format!("mount_umount path={path}"))),
             ExecMode::Real => {

@@ -39,6 +39,11 @@ fn an_undeclared_capability_fails_the_op_even_in_dry_run() {
         capabilities: Vec::new(),
         env: Vec::new(),
         env_secrets: Vec::new(),
+        // sh_exec does not consult path / http policy, so the empty
+        // allowlists are fine for this fixture — the point is that the
+        // capability gate rejects the op first.
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
         phases: vec![ProfileNode::ShExec {
             id: ids.node(),
             argv: vec!["echo".to_string(), "hi".to_string()],
@@ -87,6 +92,14 @@ fn dry_run_traces_every_direct_op() {
         ],
         env: Vec::new(),
         env_secrets: Vec::new(),
+        // Declared roots cover every filesystem target the phases
+        // touch (FsWrite path, NetTransfer dst, MountBind src / dst,
+        // MountUmount path) and the URL allowlist covers every URL
+        // (both NetHttp* ops and the NetTransfer source), so policy
+        // check passes for every direct op and the dry-run trace
+        // reaches its full 7-line shape.
+        paths: vec!["/tmp".to_string(), "/src".to_string(), "/dst".to_string()],
+        http_allowlist: vec!["https://example.com".to_string()],
         phases: vec![
             ProfileNode::ShExec {
                 id: ids.node(),
@@ -165,6 +178,10 @@ fn real_mode_runs_sh_exec_and_summarises_the_result() {
         capabilities: vec!["sh.exec".to_string()],
         env: Vec::new(),
         env_secrets: Vec::new(),
+        // sh_exec has no path / URL surface, so the empty allowlists
+        // are inert here.
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
         phases: vec![ProfileNode::ShExec {
             id: ids.node(),
             argv: vec!["echo".to_string(), "hello".to_string()],
@@ -219,6 +236,12 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
         capabilities: vec!["sh.exec".to_string(), "net.transfer".to_string()],
         env: Vec::new(),
         env_secrets: Vec::new(),
+        // Lifecycle ops do not run through the direct-op path / URL
+        // policy check (spec 07 §"lifecycle op internal steps" is
+        // deferred to a later revision), so this fixture leaves both
+        // allowlists empty and still traces every lifecycle op.
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
         phases: vec![
             ProfileNode::SystemApt {
                 id: ids.node(),
@@ -345,6 +368,11 @@ fn staging_push_fails_in_dry_run_pending_ast_env_extension() {
         capabilities: vec!["net.transfer".to_string()],
         env: Vec::new(),
         env_secrets: Vec::new(),
+        // StagingPush is a lifecycle op that surfaces `Unsupported`
+        // before any policy check; the allowlists never come into
+        // play.
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
         phases: vec![ProfileNode::StagingPush {
             id: ids.node(),
             src: "/workspace/out.bin".to_string(),
@@ -400,6 +428,11 @@ fn comfyui_health_polls_a_local_server_when_executing_effects() {
         capabilities: vec!["sh.exec".to_string()],
         env: Vec::new(),
         env_secrets: Vec::new(),
+        // ComfyUiHealth is a lifecycle op; the direct-op HTTP policy
+        // does not gate its internal poll (see the lifecycle carry
+        // note).
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
         phases: vec![ProfileNode::ComfyUiHealth {
             id: ids.node(),
             port,
@@ -420,5 +453,195 @@ fn comfyui_health_polls_a_local_server_when_executing_effects() {
         log[0].contains("status=200"),
         "summary should record status=200: {}",
         log[0]
+    );
+}
+
+/// A dry-run `FsWrite` whose target path is not covered by any
+/// declared `paths` root fails with `PathDenied` — spec 07 says
+/// "dry-run does policy", so the physical enforcement runs even
+/// though no bytes reach the filesystem.
+#[test]
+fn fs_write_to_an_undeclared_path_root_fails_in_dry_run() {
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "no-paths".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["fs.write".to_string()],
+        env: Vec::new(),
+        env_secrets: Vec::new(),
+        // Capability is declared but the path allowlist is empty:
+        // policy denies even before the dry-run trace is recorded.
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
+        phases: vec![ProfileNode::FsWrite {
+            id: ids.node(),
+            path: "/tmp/blocked".to_string(),
+            content: "x".to_string(),
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds with a declared fs.write capability");
+    let err = run_to_done(&mut engine).expect_err("undeclared path must be rejected");
+    assert!(matches!(
+        err,
+        ExecError::Engine(EngineError::EvalFailed { .. })
+    ));
+    let source = err
+        .source()
+        .expect("EvalFailed carries the ExecError source");
+    assert!(
+        source.to_string().contains("outside profile.paths"),
+        "expected the path-denied cause, got: {source}"
+    );
+    // Nothing traced: policy fired before the dry-run record step.
+    assert!(log.lock().unwrap().is_empty());
+}
+
+/// The same profile with `/tmp` declared traces the dry-run line
+/// (proves the failure above is not a compile-time artefact — the
+/// path policy is the only thing standing between denial and success).
+#[test]
+fn fs_write_under_a_declared_path_root_traces_in_dry_run() {
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "declared-paths".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["fs.write".to_string()],
+        env: Vec::new(),
+        env_secrets: Vec::new(),
+        paths: vec!["/tmp".to_string()],
+        http_allowlist: Vec::new(),
+        phases: vec![ProfileNode::FsWrite {
+            id: ids.node(),
+            path: "/tmp/allowed".to_string(),
+            content: "x".to_string(),
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds with a declared fs.write capability");
+    run_to_done(&mut engine).expect("declared path must pass the policy check");
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(log[0].starts_with("fs_write"));
+    assert!(log[0].contains("/tmp/allowed"));
+}
+
+/// A dry-run `NetHttpGet` whose URL matches no declared pattern
+/// fails with `HttpDenied` — the HTTP policy runs in dry-run too.
+#[test]
+fn http_get_to_an_undeclared_url_fails_in_dry_run() {
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "no-http".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["net.http_get".to_string()],
+        env: Vec::new(),
+        env_secrets: Vec::new(),
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
+        phases: vec![ProfileNode::NetHttpGet {
+            id: ids.node(),
+            url: "https://denied.example/".to_string(),
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds with a declared net.http_get capability");
+    let err = run_to_done(&mut engine).expect_err("undeclared URL must be rejected");
+    let source = err
+        .source()
+        .expect("EvalFailed carries the ExecError source");
+    assert!(
+        source
+            .to_string()
+            .contains("matches no pattern in profile.http_allowlist"),
+        "expected the http-denied cause, got: {source}"
+    );
+    assert!(log.lock().unwrap().is_empty());
+}
+
+/// A `NetTransfer` whose source is an HTTP URL is denied when the
+/// URL is not on the allowlist, *even though* the destination path
+/// is declared: both checks apply.
+#[test]
+fn net_transfer_denies_when_the_http_source_is_not_allowlisted() {
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "half-declared".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["net.transfer".to_string()],
+        env: Vec::new(),
+        env_secrets: Vec::new(),
+        // Path is declared but HTTP source is not.
+        paths: vec!["/tmp".to_string()],
+        http_allowlist: Vec::new(),
+        phases: vec![ProfileNode::NetTransfer {
+            id: ids.node(),
+            src: "https://denied.example/a".to_string(),
+            dst: "/tmp/a".to_string(),
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds with a declared net.transfer capability");
+    let err = run_to_done(&mut engine).expect_err("undeclared HTTP source must be rejected");
+    let source = err
+        .source()
+        .expect("EvalFailed carries the ExecError source");
+    assert!(
+        source
+            .to_string()
+            .contains("matches no pattern in profile.http_allowlist"),
+        "expected the http-denied cause, got: {source}"
+    );
+}
+
+/// `MountBind` checks both `src` and `dst`; a rejection on either
+/// side surfaces `PathDenied` and no trace line is recorded.
+#[test]
+fn mount_bind_denies_when_only_the_source_is_declared() {
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "half-mount".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["mount.bind".to_string()],
+        env: Vec::new(),
+        env_secrets: Vec::new(),
+        paths: vec!["/src".to_string()],
+        http_allowlist: Vec::new(),
+        phases: vec![ProfileNode::MountBind {
+            id: ids.node(),
+            src: "/src".to_string(),
+            dst: "/dst".to_string(),
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds with a declared mount.bind capability");
+    let err = run_to_done(&mut engine).expect_err("undeclared destination must be rejected");
+    let source = err
+        .source()
+        .expect("EvalFailed carries the ExecError source");
+    assert!(
+        source.to_string().contains("outside profile.paths"),
+        "expected the path-denied cause, got: {source}"
     );
 }

@@ -15,10 +15,10 @@
 //! - `NodeId` is excluded from every variant. IdGen mints fresh ids
 //!   per parse-run; keeping them in canonical would break the
 //!   frontend-parity guarantee that is the point of this module.
-//! - the `Spec` fields `capabilities`, `env`, and `env_secrets` are
-//!   declaration-order independent (set-shaped) — canonical sorts
-//!   them lexicographically before encoding (the AST itself is not
-//!   mutated).
+//! - the `Spec` fields `capabilities`, `env`, `env_secrets`, `paths`,
+//!   and `http_allowlist` are declaration-order independent
+//!   (set-shaped) — canonical sorts them lexicographically before
+//!   encoding (the AST itself is not mutated).
 //! - `Spec.phases` is order-preserving (phase order is semantic).
 //! - `Option::None` omits the key; `Option::Some(x)` emits it.
 //! - Empty `Vec` encodes as `[]` (the typed AST removes the
@@ -92,6 +92,8 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             capabilities,
             env,
             env_secrets,
+            paths,
+            http_allowlist,
             phases,
         } => {
             let mut fields = variant_object("Spec");
@@ -101,6 +103,8 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             fields.insert("capabilities".into(), sorted_string_array(capabilities));
             fields.insert("env".into(), sorted_string_array(env));
             fields.insert("env_secrets".into(), sorted_string_array(env_secrets));
+            fields.insert("http_allowlist".into(), sorted_string_array(http_allowlist));
+            fields.insert("paths".into(), sorted_string_array(paths));
             fields.insert(
                 "phases".into(),
                 CanonValue::Array(phases.iter().map(to_canon).collect()),
@@ -390,6 +394,8 @@ mod tests {
             capabilities: vec![],
             env: vec![],
             env_secrets: vec![],
+            paths: vec![],
+            http_allowlist: vec![],
             phases: vec![],
         }
     }
@@ -420,6 +426,8 @@ mod tests {
             capabilities: vec!["net.transfer".into(), "sh.exec".into()],
             env: vec!["FOO".into(), "BAR".into()],
             env_secrets: vec!["S2".into(), "S1".into()],
+            paths: vec!["/workspace".into(), "/tmp".into()],
+            http_allowlist: vec!["https://b.example/".into(), "https://a.example/".into()],
             phases: vec![],
         };
         let b = ProfileNode::Spec {
@@ -430,6 +438,8 @@ mod tests {
             capabilities: vec!["sh.exec".into(), "net.transfer".into()],
             env: vec!["BAR".into(), "FOO".into()],
             env_secrets: vec!["S1".into(), "S2".into()],
+            paths: vec!["/tmp".into(), "/workspace".into()],
+            http_allowlist: vec!["https://a.example/".into(), "https://b.example/".into()],
             phases: vec![],
         };
         assert_eq!(encode(&a), encode(&b));
@@ -455,6 +465,8 @@ mod tests {
             capabilities: vec![],
             env: vec![],
             env_secrets: vec![],
+            paths: vec![],
+            http_allowlist: vec![],
             phases: vec![apt(), sh()],
         };
         let b = ProfileNode::Spec {
@@ -465,6 +477,8 @@ mod tests {
             capabilities: vec![],
             env: vec![],
             env_secrets: vec![],
+            paths: vec![],
+            http_allowlist: vec![],
             phases: vec![sh(), apt()],
         };
         assert_ne!(encode(&a), encode(&b));
@@ -489,6 +503,8 @@ mod tests {
             capabilities: vec![],
             env: vec![],
             env_secrets: vec![],
+            paths: vec![],
+            http_allowlist: vec![],
             phases: vec![],
         };
         let bytes = encode(&some);
@@ -503,6 +519,8 @@ mod tests {
         assert!(bytes.contains("\"capabilities\":[]"), "bytes: {bytes}");
         assert!(bytes.contains("\"env\":[]"), "bytes: {bytes}");
         assert!(bytes.contains("\"env_secrets\":[]"), "bytes: {bytes}");
+        assert!(bytes.contains("\"http_allowlist\":[]"), "bytes: {bytes}");
+        assert!(bytes.contains("\"paths\":[]"), "bytes: {bytes}");
         assert!(bytes.contains("\"phases\":[]"), "bytes: {bytes}");
     }
 
@@ -538,6 +556,8 @@ mod tests {
             capabilities: vec!["sh.exec".into()],
             env: vec![],
             env_secrets: vec![],
+            paths: vec![],
+            http_allowlist: vec![],
             phases: vec![
                 ProfileNode::SystemApt {
                     id: new_id(&gen),
@@ -558,7 +578,9 @@ mod tests {
             "\"capabilities\":[\"sh.exec\"],",
             "\"env\":[],",
             "\"env_secrets\":[],",
+            "\"http_allowlist\":[],",
             "\"name\":\"demo\",",
+            "\"paths\":[],",
             "\"phases\":[",
             "{\"packages\":[\"git\",\"curl\"],\"type\":\"SystemApt\"},",
             "{\"argv\":[\"ls\",\"-la\"],\"type\":\"ShExec\"}",
@@ -594,7 +616,9 @@ mod tests {
             "\"capabilities\":[],",
             "\"env\":[],",
             "\"env_secrets\":[],",
+            "\"http_allowlist\":[],",
             "\"name\":\"p\",",
+            "\"paths\":[],",
             "\"phases\":[],",
             "\"type\":\"Spec\"",
             "}",
@@ -610,6 +634,37 @@ mod tests {
             s
         };
         assert_eq!(h, computed);
+    }
+
+    #[test]
+    fn paths_and_http_allowlist_are_sorted_lexicographically() {
+        let gen = IdGen::new();
+        let node = ProfileNode::Spec {
+            id: new_id(&gen),
+            name: "p".into(),
+            version: None,
+            description: None,
+            capabilities: vec![],
+            env: vec![],
+            env_secrets: vec![],
+            paths: vec!["/workspace".into(), "/tmp".into()],
+            http_allowlist: vec![
+                "https://b.example.com/".into(),
+                "https://a.example.com/".into(),
+            ],
+            phases: vec![],
+        };
+        let bytes = encode(&node);
+        assert!(
+            bytes.contains("\"paths\":[\"/tmp\",\"/workspace\"]"),
+            "paths must be sorted: {bytes}"
+        );
+        assert!(
+            bytes.contains(
+                "\"http_allowlist\":[\"https://a.example.com/\",\"https://b.example.com/\"]"
+            ),
+            "http_allowlist must be sorted: {bytes}"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub mod capgate;
 pub mod effects;
 pub mod lifecycle;
 pub mod payload;
+pub mod policy;
 pub mod registry;
 
 /// Whether effects run for real or only render a dry-run trace.
@@ -56,6 +57,24 @@ pub enum ExecError {
     /// physical "declared ⊆ used" enforcement point.
     #[error("capability '{0}' not declared in profile.capabilities")]
     CapabilityDenied(String),
+
+    /// An op targeted a filesystem path outside every declared root in
+    /// `profile.paths` (or a non-absolute / `..`-containing path) —
+    /// the physical L3 path-policy enforcement point (spec 05 §L3).
+    #[error("'{path}' is not absolute, contains '..', or lies outside profile.paths")]
+    PathDenied {
+        /// The rejected path.
+        path: String,
+    },
+
+    /// An op targeted an HTTP URL that matches no pattern in
+    /// `profile.http_allowlist` — the physical L3 HTTP-policy
+    /// enforcement point (spec 05 §L3).
+    #[error("'{url}' matches no pattern in profile.http_allowlist")]
+    HttpDenied {
+        /// The rejected URL.
+        url: String,
+    },
 
     /// No payload node was recorded for the op's `NodeId` (an AST/host
     /// wiring bug, not a profile-author error).
@@ -96,6 +115,14 @@ pub struct ExecContext {
     pub mode: ExecMode,
     /// The declared-capability gate.
     pub gate: capgate::CapabilityGate,
+    /// The declared-path allowlist. Direct ops that write to /
+    /// mount / unmount a filesystem path consult this in both
+    /// [`ExecMode::DryRun`] and [`ExecMode::Real`] (spec 07 "dry-run
+    /// does policy").
+    pub path_policy: policy::PathPolicy,
+    /// The declared-URL allowlist. Direct ops that reach an HTTP URL
+    /// consult this in both modes, matching `path_policy`.
+    pub http_policy: policy::HttpPolicy,
     /// `NodeId -> ProfileNode` payload lookup (dsl-kit does not pass leaf
     /// payloads into [`dsl_kit::Op::apply`]).
     pub payloads: Arc<HashMap<NodeId, ProfileNode>>,
@@ -106,25 +133,36 @@ pub struct ExecContext {
 impl ExecContext {
     /// Build a context from the profile `root`.
     ///
-    /// The declared `capabilities` come from a [`ProfileNode::Spec`]
-    /// root; any other root is treated as declaring no capabilities (a
-    /// pure-computation profile). The capability gate is validated
-    /// against [`capgate::KNOWN_CAPABILITIES`] here, so an unknown
-    /// declared capability fails before any op runs.
+    /// The declared `capabilities` / `paths` / `http_allowlist` come
+    /// from a [`ProfileNode::Spec`] root; any other root is treated as
+    /// declaring nothing (a pure-computation profile with empty
+    /// policies that deny every path / URL). The capability gate is
+    /// validated against [`capgate::KNOWN_CAPABILITIES`] here, so an
+    /// unknown declared capability fails before any op runs.
     pub fn from_root(
         root: &ProfileNode,
         mode: ExecMode,
         log: Arc<Mutex<Vec<String>>>,
     ) -> Result<Self, ExecError> {
-        let declared: Vec<String> = match root {
-            ProfileNode::Spec { capabilities, .. } => capabilities.clone(),
-            _ => Vec::new(),
+        let (declared, paths, http_allowlist): (Vec<String>, Vec<String>, Vec<String>) = match root
+        {
+            ProfileNode::Spec {
+                capabilities,
+                paths,
+                http_allowlist,
+                ..
+            } => (capabilities.clone(), paths.clone(), http_allowlist.clone()),
+            _ => (Vec::new(), Vec::new(), Vec::new()),
         };
         let gate = capgate::CapabilityGate::build(&declared)?;
+        let path_policy = policy::PathPolicy::new(&paths);
+        let http_policy = policy::HttpPolicy::new(&http_allowlist);
         let payloads = Arc::new(payload::build_payload_map(root));
         Ok(Self {
             mode,
             gate,
+            path_policy,
+            http_policy,
             payloads,
             log,
         })

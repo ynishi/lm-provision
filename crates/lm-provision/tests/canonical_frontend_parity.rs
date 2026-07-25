@@ -26,6 +26,9 @@ const TEXT_PROFILE: &str = concat!(
     "capabilities: [\"sh.exec\", \"fs.write\", \"net.transfer\"], ",
     "env: [\"HOME\", \"PATH\"], ",
     "env_secrets: [\"HF_TOKEN\"], ",
+    // … and declares paths / http_allowlist in one order …
+    "paths: [\"/workspace\", \"/tmp\"], ",
+    "http_allowlist: [\"https://b.example.com\", \"https://a.example.com\"], ",
     "phases: [",
     "SystemApt(packages: [\"git\", \"curl\"]), ",
     "PythonDeps(deps: [\"torch\"], in_comfy_venv: false), ",
@@ -45,6 +48,10 @@ fn json_profile() -> serde_json::Value {
         "capabilities": ["net.transfer", "sh.exec", "fs.write"],
         "env": ["PATH", "HOME"],
         "env_secrets": ["HF_TOKEN"],
+        // … and the JSON frontend declares paths / http_allowlist in
+        // the reverse order to prove canonical sorts them too.
+        "paths": ["/tmp", "/workspace"],
+        "http_allowlist": ["https://a.example.com", "https://b.example.com"],
         "phases": [
             { "type": "SystemApt", "packages": ["git", "curl"] },
             { "type": "PythonDeps", "deps": ["torch"], "in_comfy_venv": false },

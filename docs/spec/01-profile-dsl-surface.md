@@ -24,6 +24,8 @@ pub enum ProfileNode {
         capabilities: Vec<String>,
         env: Vec<String>,
         env_secrets: Vec<String>,
+        paths: Vec<String>,
+        http_allowlist: Vec<String>,
         phases: Vec<ProfileNode>,
     },
     // Catalog phase variants defined in chapter 02 ...
@@ -96,6 +98,8 @@ An AI-native JSON representation ideal for programmatic generation and tool inte
 | `capabilities` | list\<string\> | no | `{}` | entries from `KNOWN_CAPABILITIES` (chapter 05 L4) |
 | `env` | list\<string\> | no | `{}` | non-secret env allowlist |
 | `env_secrets` | list\<string\> | no | `{}` | secret allowlist |
+| `paths` | list\<string\> | no | `{}` | filesystem path root allowlist (chapter 05 §L3 path policy) |
+| `http_allowlist` | list\<string\> | no | `{}` | HTTP URL pattern allowlist (chapter 05 §L3 HTTP policy) |
 | `phases` | list\<ProfileNode\> | no | `{}` | phase nodes per chapter 02 |
 
 Optional fields (`Option<T>` / list-typed) may be omitted on the wire
@@ -103,12 +107,12 @@ Optional fields (`Option<T>` / list-typed) may be omitted on the wire
 empty list. Explicit `null` (JSON) / `none` (canonical text) / `[]`
 remain accepted spellings of the same values.
 
-The declared lists `capabilities`, `env`, and `env_secrets` are
-**set-shaped** (declaration order is not significant): the canonical
-encoder (chapter 03 §canonical) sorts them lexicographically before
-hashing, so two profiles that differ only in the order these entries
-were written yield the same profile hash. Phase order is semantic
-and is preserved by canonical.
+The declared lists `capabilities`, `env`, `env_secrets`, `paths`,
+and `http_allowlist` are **set-shaped** (declaration order is not
+significant): the canonical encoder (chapter 03 §canonical) sorts them
+lexicographically before hashing, so two profiles that differ only in
+the order these entries were written yield the same profile hash.
+Phase order is semantic and is preserved by canonical.
 
 The profile hash (chapter 03 §hash) is **frontend-independent**: the
 canonical text grammar and the JSON serde bridge that both build the
