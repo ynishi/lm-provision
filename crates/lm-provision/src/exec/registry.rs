@@ -157,16 +157,42 @@ impl ProfileOp {
     /// Compose a lifecycle op's steps, then render (dry-run) or execute
     /// (real) each one and collapse the results into the single per-op
     /// log line.
+    ///
+    /// The phase's `env` keyed slot (present on `sync.pull` /
+    /// `staging.push`) is resolved once through the
+    /// [`EnvPolicy`](super::policy::EnvPolicy) — in **both** modes
+    /// (spec 06 §Resolution "dry-run resolves too"), so an undeclared or
+    /// missing secret fails a dry run identically — and injected into the
+    /// composed [`lifecycle::Step::Sh`] steps.
     fn run_lifecycle(&self, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
+        let env = self.resolve_phase_env(payload)?;
         let steps = lifecycle::expand(payload)?;
         let renders: Vec<String> = match self.ctx.mode {
-            ExecMode::DryRun => steps.iter().map(lifecycle::render_dry).collect(),
+            ExecMode::DryRun => steps
+                .iter()
+                .map(|step| lifecycle::render_dry(step, &env))
+                .collect(),
             ExecMode::Real => steps
                 .iter()
-                .map(|step| lifecycle::execute_step(step, self.name))
+                .map(|step| lifecycle::execute_step(step, self.name, &env))
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(self.record(format!("{} {}", self.name, renders.join("; "))))
+    }
+
+    /// Resolve the phase's `env` keyed slot into a concrete `name →
+    /// value` map (empty for phases without an `env` field). Fail-fast on
+    /// an undeclared or missing secret.
+    fn resolve_phase_env(
+        &self,
+        payload: &ProfileNode,
+    ) -> Result<std::collections::BTreeMap<String, String>, ExecError> {
+        match payload {
+            ProfileNode::SyncPull { env, .. } | ProfileNode::StagingPush { env, .. } => {
+                self.ctx.env_policy.resolve(env)
+            }
+            _ => Ok(std::collections::BTreeMap::new()),
+        }
     }
 
     fn variant_err(&self, node: NodeId, expected: &'static str) -> ExecError {
@@ -180,19 +206,24 @@ impl ProfileOp {
         let ProfileNode::ShExec { argv, env, .. } = payload else {
             return Err(self.variant_err(node, "ShExec"));
         };
-        // A non-empty `env` needs exec-time env injection (step ③);
-        // fail loudly rather than running with the injection dropped.
-        if !env.is_empty() {
-            return Err(ExecError::Unsupported(
-                "sh_exec: env injection not yet implemented; \
-                 pending exec env injection (spec 02 dispatch routing)"
-                    .to_string(),
-            ));
-        }
+        // Resolve the env-injection map in both modes (spec 06
+        // §Resolution "dry-run resolves too"): an undeclared or missing
+        // secret fails a dry run identically to a real run.
+        let resolved_env = self.ctx.env_policy.resolve(env)?;
         match self.ctx.mode {
-            ExecMode::DryRun => Ok(self.record(format!("sh_exec argv={argv:?}"))),
+            ExecMode::DryRun => {
+                let line = if resolved_env.is_empty() {
+                    format!("sh_exec argv={argv:?}")
+                } else {
+                    format!(
+                        "sh_exec argv={argv:?} env_keys={:?}",
+                        resolved_env.keys().collect::<Vec<_>>()
+                    )
+                };
+                Ok(self.record(line))
+            }
             ExecMode::Real => {
-                let outcome = effects::sh_exec(argv, &effects::ShOpts)?;
+                let outcome = effects::sh_exec(argv, &effects::ShOpts::new(resolved_env))?;
                 if outcome.exit_code != 0 {
                     return Err(ExecError::EffectFailed {
                         op: "sh_exec".to_string(),

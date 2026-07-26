@@ -12,12 +12,17 @@
 //!   as `Ok(outcome)`, not an error — the caller decides.
 //! - `http_get` / `http_post` use `ureq` (sync, rustls) with redirect
 //!   following disabled, reporting the raw status.
-//! - `transfer` implements only `https://` download; `b2://` / `hf://`
-//!   sources and URL destinations (uploads) return
-//!   [`ExecError::Unsupported`] pending an AST `env` field.
+//! - `transfer` implements only `https://` download. `b2://` / `hf://`
+//!   downloads and uploads that carry credentials are routed to the
+//!   native CLIs over `sh.exec` one layer up (see [`super::lifecycle`],
+//!   spec 02 §Dispatch routing), so they never reach here; a `b2://` /
+//!   `hf://` source or a URL destination that *does* reach `transfer` is
+//!   the public `net.transfer`-bridge scheme resolution (chapter 04),
+//!   which is not implemented yet and returns [`ExecError::Unsupported`].
 //! - `mount_bind` / `umount` are Linux-only; elsewhere they are
 //!   [`ExecError::Unsupported`].
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -34,11 +39,38 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// Default request timeout.
 const DEFAULT_TIMEOUT_SEC: f64 = 30.0;
 
-/// Options for [`sh_exec`]. Empty for the MVP (cwd / env / timeout are
-/// deferred); kept as a struct so those can be added without a signature
+/// Options for [`sh_exec`]. Carries the resolved env-injection map
+/// (spec 06 §Resolution: the caller resolves `env.ref` / literal slots
+/// into `name → value` and hands them here). `cwd` / `timeout` remain
+/// deferred; the struct shape lets those be added without a signature
 /// change.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ShOpts;
+///
+/// The [`std::fmt::Debug`] impl is deliberately hand-written to redact
+/// the resolved values — a `ShOpts` printed with `{:?}` shows only the
+/// env *keys*, never the secret values (spec 06 opacity: resolved values
+/// are never logged).
+#[derive(Default, Clone)]
+pub struct ShOpts {
+    /// Resolved `name → value` env injected into the child process.
+    env: BTreeMap<String, String>,
+}
+
+impl ShOpts {
+    /// Build options carrying the resolved env-injection map.
+    pub fn new(env: BTreeMap<String, String>) -> Self {
+        Self { env }
+    }
+}
+
+impl std::fmt::Debug for ShOpts {
+    /// Redacts values: only the env key names are rendered so that a
+    /// stray `{:?}` of a `ShOpts` can never leak a resolved secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShOpts")
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
 
 /// Result of a [`sh_exec`] call.
 #[derive(Debug, Clone)]
@@ -79,7 +111,7 @@ fn tail(bytes: &[u8]) -> String {
 ///
 /// A non-zero exit is returned as `Ok(outcome)` (the caller judges it);
 /// only a spawn failure or an empty `argv` is an [`ExecError`].
-pub fn sh_exec(argv: &[String], _opts: &ShOpts) -> Result<ExecOutcome, ExecError> {
+pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError> {
     if argv.is_empty() {
         return Err(ExecError::EffectFailed {
             op: "sh_exec".to_string(),
@@ -89,6 +121,7 @@ pub fn sh_exec(argv: &[String], _opts: &ShOpts) -> Result<ExecOutcome, ExecError
 
     let output = Command::new(&argv[0])
         .args(&argv[1..])
+        .envs(&opts.env)
         .stdin(Stdio::null())
         .output()
         .map_err(|err| ExecError::EffectFailed {
@@ -159,20 +192,24 @@ fn http_outcome(response: ureq::http::Response<ureq::Body>) -> Result<HttpOutcom
 /// Transfer `src` to `dst`.
 ///
 /// MVP: `https://` (or `http://`) source → GET and stream to the `dst`
-/// path. `b2://` / `hf://` sources and URL destinations (uploads) need
-/// env-routed CLI dispatch, which is deferred pending an AST `env` field
-/// (plan.md §KNOWN LIMITATION), so they return [`ExecError::Unsupported`].
+/// path. Credential-carrying `b2://` / `hf://` downloads and uploads are
+/// routed to the native CLIs over `sh.exec` one layer up (see
+/// [`super::lifecycle`], spec 02 §Dispatch routing) and never reach
+/// here. A `b2://` / `hf://` source or a URL destination that *does*
+/// reach `transfer` is the public `net.transfer`-bridge scheme
+/// resolution (chapter 04), which is not implemented yet, so it returns
+/// [`ExecError::Unsupported`].
 pub fn transfer(src: &str, dst: &str) -> Result<TransferOutcome, ExecError> {
     if src.starts_with("b2://") || src.starts_with("hf://") {
         return Err(ExecError::Unsupported(format!(
-            "net.transfer '{src}': requires env-routed CLI dispatch; \
-             pending AST env field extension"
+            "net.transfer '{src}': public b2:// / hf:// download over the \
+             net.transfer bridge (chapter 04 scheme resolution) is not implemented"
         )));
     }
     if dst.contains("://") {
         return Err(ExecError::Unsupported(format!(
-            "net.transfer to '{dst}': upload requires env-routed CLI dispatch; \
-             pending AST env field extension"
+            "net.transfer to '{dst}': upload over the net.transfer bridge \
+             (HTTP PUT) is not implemented"
         )));
     }
     if !(src.starts_with("https://") || src.starts_with("http://")) {
@@ -338,17 +375,52 @@ mod tests {
 
     #[test]
     fn sh_exec_runs_echo_and_captures_stdout() {
-        let outcome =
-            sh_exec(&["echo".to_string(), "hello".to_string()], &ShOpts).expect("echo should run");
+        let outcome = sh_exec(
+            &["echo".to_string(), "hello".to_string()],
+            &ShOpts::default(),
+        )
+        .expect("echo should run");
         assert_eq!(outcome.exit_code, 0);
         assert!(outcome.stdout_tail.contains("hello"));
+    }
+
+    #[test]
+    fn sh_exec_injects_the_resolved_env_into_the_child_process() {
+        let key = format!("LM_EXEC_INJECT_{}", std::process::id());
+        let mut env = BTreeMap::new();
+        env.insert(key.clone(), "injected-value".to_string());
+        // `printf %s "$KEY"` echoes the injected value on stdout iff the
+        // child process actually received it in its environment.
+        let outcome = sh_exec(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("printf %s \"${key}\""),
+            ],
+            &ShOpts::new(env),
+        )
+        .expect("sh should run");
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout_tail, "injected-value");
+    }
+
+    #[test]
+    fn sh_opts_debug_redacts_the_env_values() {
+        let mut env = BTreeMap::new();
+        env.insert("HF_TOKEN".to_string(), "super-secret-value".to_string());
+        let rendered = format!("{:?}", ShOpts::new(env));
+        assert!(rendered.contains("HF_TOKEN"), "keys are shown: {rendered}");
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "values must be redacted: {rendered}"
+        );
     }
 
     #[test]
     fn sh_exec_reports_a_non_zero_exit_as_ok() {
         let outcome = sh_exec(
             &["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
-            &ShOpts,
+            &ShOpts::default(),
         )
         .expect("a non-zero exit is not an error, it is an outcome");
         assert_eq!(outcome.exit_code, 7);
@@ -356,7 +428,7 @@ mod tests {
 
     #[test]
     fn sh_exec_rejects_empty_argv() {
-        let err = sh_exec(&[], &ShOpts).expect_err("empty argv must be an error");
+        let err = sh_exec(&[], &ShOpts::default()).expect_err("empty argv must be an error");
         assert!(err.to_string().contains("argv"));
     }
 
@@ -423,8 +495,8 @@ mod tests {
             .expect_err("b2:// source must be unsupported");
         let message = err.to_string();
         assert!(
-            message.contains("pending AST env field extension"),
-            "expected the KNOWN LIMITATION message, got: {message}"
+            message.contains("net.transfer bridge") && message.contains("not implemented"),
+            "expected the public-bridge KNOWN LIMITATION message, got: {message}"
         );
     }
 

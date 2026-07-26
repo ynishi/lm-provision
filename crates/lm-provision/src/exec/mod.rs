@@ -90,6 +90,25 @@ pub enum ExecError {
         expected: &'static str,
     },
 
+    /// An `env` map carried an [`ProfileNode::EnvSecret`] whose logical
+    /// name is not in `profile.env_secrets` — the consumption-time
+    /// allowlist check (spec 06 §Error surface). Carries only the logical
+    /// name, never a resolved value.
+    #[error("secret '{name}' is not declared in profile.env_secrets")]
+    SecretUndeclared {
+        /// The rejected logical secret name.
+        name: String,
+    },
+
+    /// A declared, consumed secret was absent from the host process
+    /// environment — fail-fast, no empty-string substitution (spec 06
+    /// §Resolution). Carries only the logical name.
+    #[error("secret '{name}' missing in host env")]
+    SecretMissingInHostEnv {
+        /// The logical secret name absent from the host env.
+        name: String,
+    },
+
     /// An effect ran but failed (non-zero exit, transport error, I/O
     /// error, ...). `op` is the registry op name.
     #[error("{op}: {message}")]
@@ -123,6 +142,11 @@ pub struct ExecContext {
     /// The declared-URL allowlist. Direct ops that reach an HTTP URL
     /// consult this in both modes, matching `path_policy`.
     pub http_policy: policy::HttpPolicy,
+    /// The declared-secret env-injection policy. `sh.exec` and the
+    /// env-routed CLI dispatch steps (`sync.pull` / `staging.push`)
+    /// resolve their `env` map through this in both modes (spec 06
+    /// §Resolution "dry-run resolves too").
+    pub env_policy: policy::EnvPolicy,
     /// `NodeId -> ProfileNode` payload lookup (dsl-kit does not pass leaf
     /// payloads into [`dsl_kit::Op::apply`]).
     pub payloads: Arc<HashMap<NodeId, ProfileNode>>,
@@ -133,10 +157,11 @@ pub struct ExecContext {
 impl ExecContext {
     /// Build a context from the profile `root`.
     ///
-    /// The declared `capabilities` / `paths` / `http_allowlist` come
-    /// from a [`ProfileNode::Spec`] root; any other root is treated as
-    /// declaring nothing (a pure-computation profile with empty
-    /// policies that deny every path / URL). The capability gate is
+    /// The declared `capabilities` / `paths` / `http_allowlist` /
+    /// `env_secrets` come from a [`ProfileNode::Spec`] root; any other
+    /// root is treated as declaring nothing (a pure-computation profile
+    /// with empty policies that deny every path / URL / secret). The
+    /// capability gate is
     /// validated against [`capgate::KNOWN_CAPABILITIES`] here, so an
     /// unknown declared capability fails before any op runs.
     pub fn from_root(
@@ -144,25 +169,37 @@ impl ExecContext {
         mode: ExecMode,
         log: Arc<Mutex<Vec<String>>>,
     ) -> Result<Self, ExecError> {
-        let (declared, paths, http_allowlist): (Vec<String>, Vec<String>, Vec<String>) = match root
-        {
+        let (declared, paths, http_allowlist, env_secrets): (
+            Vec<String>,
+            Vec<String>,
+            Vec<String>,
+            Vec<String>,
+        ) = match root {
             ProfileNode::Spec {
                 capabilities,
                 paths,
                 http_allowlist,
+                env_secrets,
                 ..
-            } => (capabilities.clone(), paths.clone(), http_allowlist.clone()),
-            _ => (Vec::new(), Vec::new(), Vec::new()),
+            } => (
+                capabilities.clone(),
+                paths.clone(),
+                http_allowlist.clone(),
+                env_secrets.clone(),
+            ),
+            _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
         let gate = capgate::CapabilityGate::build(&declared)?;
         let path_policy = policy::PathPolicy::new(&paths);
         let http_policy = policy::HttpPolicy::new(&http_allowlist);
+        let env_policy = policy::EnvPolicy::new(&env_secrets);
         let payloads = Arc::new(payload::build_payload_map(root));
         Ok(Self {
             mode,
             gate,
             path_policy,
             http_policy,
+            env_policy,
             payloads,
             log,
         })

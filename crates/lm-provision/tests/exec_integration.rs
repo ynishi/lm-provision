@@ -356,14 +356,12 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
     );
 }
 
-/// `staging_push` is structurally unsupported until the AST grows an
-/// `env` field — dry-run surfaces the failure at step time so an
-/// operator cannot ship a profile that would silently no-op in real
-/// mode.
+/// `staging_push` to an `hf://` dst now composes a concrete
+/// `huggingface-cli upload` step (spec 02 §Dispatch routing); a dry run
+/// renders the CLI trace without touching the network. The upload is
+/// always CLI-routed regardless of `env` (04-bridge §net.transfer).
 #[test]
-fn staging_push_fails_in_dry_run_pending_ast_env_extension() {
-    use std::error::Error;
-
+fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
     let ids = IdGen::new();
     let program = ProfileNode::Spec {
         id: ids.node(),
@@ -373,29 +371,138 @@ fn staging_push_fails_in_dry_run_pending_ast_env_extension() {
         capabilities: vec!["net.transfer".to_string()],
         env: Vec::new(),
         env_secrets: Vec::new(),
-        // StagingPush is a lifecycle op that surfaces `Unsupported`
-        // before any policy check; the allowlists never come into
-        // play.
         paths: Vec::new(),
         http_allowlist: Vec::new(),
         phases: vec![ProfileNode::StagingPush {
             id: ids.node(),
             src: "/workspace/out.bin".to_string(),
-            dst: "hf://owner/repo".to_string(),
+            dst: "hf://owner/repo/artifact.bin".to_string(),
             env: Default::default(),
-            revision: None,
+            revision: Some("main".to_string()),
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine =
+        create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log)).expect("engine builds");
+    run_to_done(&mut engine).expect("staging_push hf dst composes a dry-run trace");
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(log[0].starts_with("staging_push"), "{}", log[0]);
+    assert!(
+        log[0].contains("huggingface-cli")
+            && log[0].contains("upload")
+            && log[0].contains("owner/repo")
+            && log[0].contains("--revision")
+            && log[0].contains("main"),
+        "dry-run trace should carry the upload argv: {}",
+        log[0]
+    );
+}
+
+/// A `ShExec` referencing a secret that is not declared in
+/// `profile.env_secrets` fails at step time even under dry-run — spec 06
+/// §Resolution "dry-run resolves too": the decode path runs, so the
+/// undeclared-secret error surfaces identically whether or not the
+/// effect executes.
+#[test]
+fn sh_exec_undeclared_secret_fails_in_dry_run() {
+    use std::error::Error;
+
+    let ids = IdGen::new();
+    let mut env = std::collections::BTreeMap::new();
+    env.insert(
+        "HF_TOKEN".to_string(),
+        ProfileNode::EnvSecret {
+            id: ids.node(),
+            name: "HF_TOKEN".to_string(),
+        },
+    );
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "undeclared-secret".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["sh.exec".to_string()],
+        env: Vec::new(),
+        // env_secrets is EMPTY: HF_TOKEN is referenced but not declared.
+        env_secrets: Vec::new(),
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
+        phases: vec![ProfileNode::ShExec {
+            id: ids.node(),
+            argv: vec!["true".to_string()],
+            env,
         }],
     };
 
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut engine = create_profile_engine(&program, ExecMode::DryRun, log).expect("engine builds");
-    let err = run_to_done(&mut engine).expect_err("staging_push must fail");
+    let err = run_to_done(&mut engine).expect_err("an undeclared secret must fail even in dry-run");
     let source = err
         .source()
         .expect("EvalFailed carries the ExecError source");
     assert!(
-        source.to_string().contains("env-routed CLI dispatch"),
-        "expected the KNOWN LIMITATION message, got: {source}"
+        source
+            .to_string()
+            .contains("is not declared in profile.env_secrets"),
+        "expected the undeclared-secret error, got: {source}"
+    );
+}
+
+/// Real-mode `ShExec` injects a resolved secret into the child process:
+/// the declared secret is read from the host env and appears in the
+/// child's environment (proven by echoing it back on stdout). The trace
+/// line records the env *key* only, never the value.
+#[test]
+fn sh_exec_injects_a_declared_secret_into_the_child_in_real_mode() {
+    let var = format!("LM_EXEC_IT_SECRET_{}", std::process::id());
+    std::env::set_var(&var, "top-secret-token");
+
+    let ids = IdGen::new();
+    let mut env = std::collections::BTreeMap::new();
+    env.insert(
+        "SLOT".to_string(),
+        ProfileNode::EnvSecret {
+            id: ids.node(),
+            name: var.clone(),
+        },
+    );
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "inject-secret".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["sh.exec".to_string()],
+        env: Vec::new(),
+        env_secrets: vec![var.clone()],
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
+        phases: vec![ProfileNode::ShExec {
+            id: ids.node(),
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf %s \"$SLOT\"".to_string(),
+            ],
+            env,
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine =
+        create_profile_engine(&program, ExecMode::Real, Arc::clone(&log)).expect("engine builds");
+    let result = run_to_done(&mut engine);
+    std::env::remove_var(&var);
+    result.expect("real-mode sh_exec with an injected secret succeeds");
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(
+        log[0].contains("top-secret-token"),
+        "the child echoed the injected secret back on stdout: {}",
+        log[0]
     );
 }
 

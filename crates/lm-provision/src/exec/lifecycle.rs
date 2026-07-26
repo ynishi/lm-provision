@@ -19,24 +19,44 @@
 //!
 //! The `ProfileNode` payload is still a partial projection of the full
 //! spec-02 payload (`ServiceStart` has no platform detail, `PythonDeps`
-//! has no `force_reinstall`, and so on). `SyncPull` / `StagingPush` now
-//! carry an `env` keyed slot and a `revision` (step ②), but the
-//! exec-time consumption of those fields — env-routed CLI dispatch,
-//! spec 02 §Dispatch routing — is deferred to step ③. So:
+//! has no `force_reinstall`, and so on). So:
 //!
 //! - Fields with a defensible built-in default are constant-substituted
 //!   (`PythonDeps.in_comfy_venv=false` → the system `pip` on `PATH`;
 //!   `ComfyUiInstall.repo=None` → `comfyanonymous/ComfyUI`; a `models`
 //!   entry with no `subdir`/`kind` → `checkpoints`).
 //! - Ops whose invocation cannot be constructed from the AST fields
-//!   alone (`ComfyUiRestart`, `ServiceStart`) expand to a single
+//!   alone (`ComfyUiRestart` lacks its restart command / `extra_args`;
+//!   `ServiceStart` lacks per-platform launch detail) expand to a single
 //!   [`Step::Note`] recording that fact, rather than inventing an argv.
-//! - `SyncPull` with a non-empty `env`, a `b2://` / `hf://` src, and
-//!   `StagingPush` (always) return [`ExecError::Unsupported`]: all need
-//!   the env-routed CLI dispatch documented in spec 02 §Dispatch
-//!   routing. A `SyncPull` whose `env` is empty keeps its prior
-//!   behaviour (an `https://` src maps to a plain download).
+//!
+//! ## Env-routed CLI dispatch (spec 02 §Dispatch routing, step ③)
+//!
+//! `SyncPull` / `StagingPush` carry an `env` keyed slot and a `revision`
+//! (step ②); this module now consumes them (step ③). The registry
+//! resolves the phase `env` map once through
+//! [`EnvPolicy`](super::policy::EnvPolicy) and hands the resolved
+//! `name → value` map to [`render_dry`] / [`execute_step`], which inject
+//! it into the composed [`Step::Sh`] steps. Scheme routing:
+//!
+//! - `SyncPull` `b2://` src **with a non-empty `env`** → the native
+//!   `b2 download-file-by-name <bucket> <path> <dst>` over `sh.exec`.
+//! - `SyncPull` `hf://` src with a non-empty `env` → a deferred
+//!   [`Step::Note`]: `huggingface-cli download --local-dir` names a
+//!   destination *directory*, while `dst` here is an exact destination
+//!   *file* path (04-bridge §net.transfer), so no concrete argv is
+//!   invented — mirroring the POC `lua/lm/dispatch.lua` decision (a
+//!   spec 02 vs 04 tension, see plan.md §KNOWN LIMITATION).
+//! - `SyncPull` with an empty `env` keeps its prior behaviour (an
+//!   `https://` src maps to a plain download; a `b2://` / `hf://` src is
+//!   [`ExecError::Unsupported`] — the public `net.transfer`-bridge
+//!   scheme resolution is not implemented).
+//! - `StagingPush` uploads are **always** CLI-routed (04-bridge
+//!   §net.transfer): `b2://` dst → `b2 upload-file`, `hf://` dst →
+//!   `huggingface-cli upload`; an `https://` dst (HTTP PUT) is
+//!   [`ExecError::Unsupported`].
 
+use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -118,10 +138,9 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
         ProfileNode::SyncPush { src, dst, .. } => Ok(vec![Step::Note(format!(
             "sync_push src={src} dst={dst}: marker only; not executed during apply"
         ))]),
-        ProfileNode::StagingPush { src, dst, .. } => Err(ExecError::Unsupported(format!(
-            "staging_push '{src}' -> '{dst}': requires env-routed CLI dispatch; \
-             pending exec env injection (spec 02 dispatch routing)"
-        ))),
+        ProfileNode::StagingPush {
+            src, dst, revision, ..
+        } => expand_staging_push(src, dst, revision.as_deref()),
         ProfileNode::Models { models_json, .. } => expand_models(models_json),
         ProfileNode::LlmModels { models_json, .. } => expand_llm_models(models_json),
         ProfileNode::PostInstall { script, .. } => Ok(vec![Step::Sh(vec![
@@ -130,8 +149,9 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             script.clone(),
         ])]),
         ProfileNode::ComfyUiRestart { port, .. } => Ok(vec![Step::Note(format!(
-            "comfyui_restart port={port}: restart argv unsupported \
-             pending AST extension"
+            "comfyui_restart port={port}: restart argv unsupported — the AST \
+             carries no restart command or extra_args (spec 02 comfyui.restart), \
+             out of scope for the env-injection work"
         ))]),
         ProfileNode::ComfyUiHealth { port, .. } => Ok(vec![Step::HttpPoll {
             url: format!("http://127.0.0.1:{port}/"),
@@ -246,30 +266,158 @@ fn expand_custom_nodes(json: &str) -> Result<Vec<Step>, ExecError> {
     Ok(steps)
 }
 
+/// Route a `sync.pull` download (spec 02 §Dispatch routing).
+///
+/// The resolved env is not needed here — the registry resolves the phase
+/// `env` map and injects it into the emitted [`Step::Sh`] steps; this
+/// function only decides the *shape* of those steps from the scheme and
+/// whether `env` is non-empty.
 fn expand_sync_pull(
     src: &str,
     dst: &str,
-    env: &std::collections::BTreeMap<String, ProfileNode>,
+    env: &BTreeMap<String, ProfileNode>,
 ) -> Result<Vec<Step>, ExecError> {
-    // A non-empty `env` needs env-routed CLI dispatch, which the exec
-    // layer does not yet implement (step ③). Fail loudly rather than
-    // silently dropping the injection.
-    if !env.is_empty() {
-        return Err(ExecError::Unsupported(format!(
-            "sync_pull '{src}': env injection not yet implemented; \
-             pending exec env injection (spec 02 dispatch routing)"
-        )));
+    if env.is_empty() {
+        // Public download: `https://` streams to the destination file;
+        // a public `b2://` / `hf://` src would need the net.transfer
+        // bridge's scheme resolution (chapter 04), not implemented yet.
+        if src.starts_with("b2://") || src.starts_with("hf://") {
+            return Err(ExecError::Unsupported(format!(
+                "sync_pull '{src}': public b2:// / hf:// download over the \
+                 net.transfer bridge (chapter 04 scheme resolution) is not implemented"
+            )));
+        }
+        return Ok(vec![Step::Transfer {
+            src: src.to_string(),
+            dst: dst.to_string(),
+        }]);
     }
-    if src.starts_with("b2://") || src.starts_with("hf://") {
-        return Err(ExecError::Unsupported(format!(
-            "sync_pull '{src}': requires env-routed CLI dispatch; \
-             pending exec env injection (spec 02 dispatch routing)"
-        )));
+
+    // Non-empty env → credential-carrying download routed to the native
+    // CLI over sh.exec (spec 02 §Dispatch routing).
+    if let Some(rest) = src.strip_prefix("b2://") {
+        let (bucket, path) = split_b2_uri(rest, "sync_pull", src)?;
+        return Ok(vec![Step::Sh(vec![
+            "b2".to_string(),
+            "download-file-by-name".to_string(),
+            bucket.to_string(),
+            path.to_string(),
+            dst.to_string(),
+        ])]);
     }
+    if src.starts_with("hf://") {
+        // Deferred, not invented: `huggingface-cli download`'s
+        // `--local-dir` names a destination *directory*, but `dst` here
+        // is an exact destination *file* path (04-bridge §net.transfer).
+        // Mirrors the POC lua/lm/dispatch.lua degradation to a visible
+        // no-op (spec 02 vs 04 tension; see the module header).
+        return Ok(vec![Step::Note(format!(
+            "sync_pull '{src}' -> '{dst}': hf:// CLI download routing is unconfirmed — \
+             huggingface-cli download's --local-dir names a destination directory, but \
+             dst here is an exact destination file path (04 §net.transfer); deferred"
+        ))]);
+    }
+    // Any other scheme (e.g. https://) with a non-empty env stays on the
+    // plain download path — env is inert for a bridge download (spec 02
+    // §Dispatch routing: only b2/hf route to a CLI).
     Ok(vec![Step::Transfer {
         src: src.to_string(),
         dst: dst.to_string(),
     }])
+}
+
+/// Route a `staging.push` upload (spec 02 §Dispatch routing).
+///
+/// Unlike downloads, a `b2://` / `hf://` upload dst is **always**
+/// CLI-routed, unconditional on `env` (04-bridge §net.transfer). The
+/// resolved env is injected by the registry into the emitted
+/// [`Step::Sh`] step.
+fn expand_staging_push(
+    src: &str,
+    dst: &str,
+    revision: Option<&str>,
+) -> Result<Vec<Step>, ExecError> {
+    if let Some(rest) = dst.strip_prefix("b2://") {
+        let (bucket, path) = split_b2_uri(rest, "staging_push", dst)?;
+        return Ok(vec![Step::Sh(vec![
+            "b2".to_string(),
+            "upload-file".to_string(),
+            bucket.to_string(),
+            src.to_string(),
+            path.to_string(),
+        ])]);
+    }
+    if let Some(rest) = dst.strip_prefix("hf://") {
+        let (owner, repo, url_rev, path_in_repo) = parse_hf_uri(rest, "staging_push", dst)?;
+        let rev = url_rev.or_else(|| revision.map(str::to_string));
+        let mut argv = vec![
+            "huggingface-cli".to_string(),
+            "upload".to_string(),
+            format!("{owner}/{repo}"),
+            src.to_string(),
+        ];
+        if let Some(path_in_repo) = path_in_repo {
+            argv.push(path_in_repo);
+        }
+        if let Some(rev) = rev {
+            argv.push("--revision".to_string());
+            argv.push(rev);
+        }
+        return Ok(vec![Step::Sh(argv)]);
+    }
+    // `https://` dst is an HTTP PUT upload over the net.transfer bridge,
+    // which is not implemented yet.
+    Err(ExecError::Unsupported(format!(
+        "staging_push '{src}' -> '{dst}': upload over the net.transfer bridge \
+         (HTTP PUT) is not implemented"
+    )))
+}
+
+/// Split the remainder of a `b2://<bucket>/<path>` URI into its bucket
+/// and path components, both required non-empty (spec 02 `sync.pull` /
+/// `sync.push` route shape).
+fn split_b2_uri<'a>(rest: &'a str, op: &str, uri: &str) -> Result<(&'a str, &'a str), ExecError> {
+    match rest.split_once('/') {
+        Some((bucket, path)) if !bucket.is_empty() && !path.is_empty() => Ok((bucket, path)),
+        _ => Err(ExecError::EffectFailed {
+            op: op.to_string(),
+            message: format!("malformed b2:// URI (missing bucket or path): {uri}"),
+        }),
+    }
+}
+
+/// Parse the remainder of an `hf://` URI (everything after `hf://`) into
+/// its owner / repo / revision / trailing-path parts (spec 02 §Dispatch
+/// routing: `hf://<owner>/<repo>@<rev>/<path>` — the `@<rev>` suffix on
+/// the repo segment pins a revision; `@` is rejected in the owner
+/// segment). Ported from the POC `lua/lm/dispatch.lua` `parse_hf_uri`.
+fn parse_hf_uri(
+    rest: &str,
+    op: &str,
+    uri: &str,
+) -> Result<(String, String, Option<String>, Option<String>), ExecError> {
+    let fail = |message: String| ExecError::EffectFailed {
+        op: op.to_string(),
+        message,
+    };
+    let (owner, remainder) = rest
+        .split_once('/')
+        .ok_or_else(|| fail(format!("hf:// URI is missing an owner/repo segment: {uri}")))?;
+    if owner.contains('@') {
+        return Err(fail(format!(
+            "'@' is not allowed in the hf:// owner segment: {owner}"
+        )));
+    }
+    let (repo_and_rev, path_in_repo) = match remainder.split_once('/') {
+        Some((repo_and_rev, path)) if !path.is_empty() => (repo_and_rev, Some(path.to_string())),
+        Some((repo_and_rev, _)) => (repo_and_rev, None),
+        None => (remainder, None),
+    };
+    let (repo, rev) = match repo_and_rev.split_once('@') {
+        Some((repo, rev)) => (repo.to_string(), Some(rev.to_string())),
+        None => (repo_and_rev.to_string(), None),
+    };
+    Ok((owner.to_string(), repo, rev, path_in_repo))
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,10 +534,16 @@ fn expand_llm_models(json: &str) -> Result<Vec<Step>, ExecError> {
 ///
 /// Used by the registry to build a single per-op log line
 /// (`"<op> <step_1>; <step_2>; ..."`) without touching the filesystem
-/// or network.
-pub fn render_dry(step: &Step) -> String {
+/// or network. `env` is the phase's resolved env-injection map (empty
+/// for env-less ops); a [`Step::Sh`] renders its *key* names only —
+/// resolved values are never logged (spec 06 opacity).
+pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
     match step {
-        Step::Sh(argv) => format!("sh argv={argv:?}"),
+        Step::Sh(argv) if env.is_empty() => format!("sh argv={argv:?}"),
+        Step::Sh(argv) => format!(
+            "sh argv={argv:?} env_keys={:?}",
+            env.keys().collect::<Vec<_>>()
+        ),
         Step::Transfer { src, dst } => format!("transfer src={src} dst={dst}"),
         Step::HttpPoll { url, timeout_sec } => {
             format!("http_poll url={url} timeout={timeout_sec}s")
@@ -403,10 +557,15 @@ pub fn render_dry(step: &Step) -> String {
 ///
 /// `op` is the registry op name — used only to label the
 /// [`ExecError::EffectFailed`] surface, so the engine's node-located
-/// error carries the op that ran.
-pub fn execute_step(step: &Step, op: &str) -> Result<String, ExecError> {
+/// error carries the op that ran. `env` is the phase's resolved
+/// env-injection map, injected into a [`Step::Sh`] child process.
+pub fn execute_step(
+    step: &Step,
+    op: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<String, ExecError> {
     match step {
-        Step::Sh(argv) => execute_sh(argv, op),
+        Step::Sh(argv) => execute_sh(argv, op, env),
         Step::Transfer { src, dst } => {
             let outcome = effects::transfer(src, dst)?;
             Ok(format!(
@@ -419,8 +578,12 @@ pub fn execute_step(step: &Step, op: &str) -> Result<String, ExecError> {
     }
 }
 
-fn execute_sh(argv: &[String], op: &str) -> Result<String, ExecError> {
-    let outcome = effects::sh_exec(argv, &effects::ShOpts)?;
+fn execute_sh(
+    argv: &[String],
+    op: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<String, ExecError> {
+    let outcome = effects::sh_exec(argv, &effects::ShOpts::new(env.clone()))?;
     if outcome.exit_code != 0 {
         return Err(ExecError::EffectFailed {
             op: op.to_string(),
@@ -666,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_sync_pull_rejects_a_b2_source_as_unsupported() {
+    fn expand_sync_pull_rejects_a_public_b2_source_without_env_as_unsupported() {
         let ids = IdGen::new();
         let payload = ProfileNode::SyncPull {
             id: node_id(&ids),
@@ -675,28 +838,88 @@ mod tests {
             env: Default::default(),
             revision: None,
         };
-        let err = expand(&payload).expect_err("b2:// must be unsupported");
+        let err = expand(&payload).expect_err("public b2:// (no env) must be unsupported");
         match err {
             ExecError::Unsupported(msg) => {
-                assert!(msg.contains("env-routed CLI dispatch"));
+                assert!(msg.contains("net.transfer bridge") && msg.contains("not implemented"));
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 
     #[test]
-    fn expand_sync_pull_with_a_non_empty_env_is_unsupported() {
+    fn expand_sync_pull_b2_with_env_routes_to_the_native_cli() {
         let ids = IdGen::new();
-        let mut env = std::collections::BTreeMap::new();
+        let mut env = BTreeMap::new();
         env.insert(
-            "B2_KEY".to_string(),
+            "B2_APPLICATION_KEY".to_string(),
             ProfileNode::EnvSecret {
                 id: node_id(&ids),
-                name: "B2_KEY".to_string(),
+                name: "B2_APPLICATION_KEY".to_string(),
             },
         );
-        // Even an otherwise-downloadable https src must fail while exec
-        // env injection is pending (step ③).
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: "b2://my-bucket/models/model.bin".to_string(),
+            dst: "/workspace/model.bin".to_string(),
+            env,
+            revision: None,
+        };
+        let steps = expand(&payload).expect("b2 + env expands to a CLI step");
+        assert_eq!(
+            steps,
+            vec![Step::Sh(vec![
+                "b2".to_string(),
+                "download-file-by-name".to_string(),
+                "my-bucket".to_string(),
+                "models/model.bin".to_string(),
+                "/workspace/model.bin".to_string(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn expand_sync_pull_hf_with_env_degrades_to_a_deferred_note() {
+        let ids = IdGen::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HF_TOKEN".to_string(),
+            ProfileNode::EnvSecret {
+                id: node_id(&ids),
+                name: "HF_TOKEN".to_string(),
+            },
+        );
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: "hf://owner/repo/file.bin".to_string(),
+            dst: "/workspace/file.bin".to_string(),
+            env,
+            revision: None,
+        };
+        let steps = expand(&payload).expect("hf + env degrades to a note, not an error");
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            Step::Note(msg) => {
+                assert!(
+                    msg.contains("directory") && msg.contains("unconfirmed"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected a deferred Note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_sync_pull_https_with_env_stays_a_plain_transfer() {
+        let ids = IdGen::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "SOME_VAR".to_string(),
+            ProfileNode::EnvLiteral {
+                id: node_id(&ids),
+                value: "x".to_string(),
+            },
+        );
         let payload = ProfileNode::SyncPull {
             id: node_id(&ids),
             src: "https://example.com/m.bin".to_string(),
@@ -704,13 +927,14 @@ mod tests {
             env,
             revision: None,
         };
-        let err = expand(&payload).expect_err("non-empty env must be unsupported");
-        match err {
-            ExecError::Unsupported(msg) => {
-                assert!(msg.contains("env injection not yet implemented"), "{msg}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        let steps = expand(&payload).expect("https + env stays on the plain download path");
+        assert_eq!(
+            steps,
+            vec![Step::Transfer {
+                src: "https://example.com/m.bin".to_string(),
+                dst: "/workspace/m.bin".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -733,19 +957,91 @@ mod tests {
     }
 
     #[test]
-    fn expand_staging_push_is_unsupported_pending_the_ast_env_extension() {
+    fn expand_staging_push_b2_dst_builds_the_upload_argv() {
         let ids = IdGen::new();
         let payload = ProfileNode::StagingPush {
             id: node_id(&ids),
             src: "/workspace/out.bin".to_string(),
-            dst: "hf://owner/repo".to_string(),
+            dst: "b2://bucket/out/out.bin".to_string(),
             env: Default::default(),
             revision: None,
         };
-        let err = expand(&payload).expect_err("staging_push must be unsupported");
+        let steps = expand(&payload).expect("b2 staging upload expands to a CLI step");
+        assert_eq!(
+            steps,
+            vec![Step::Sh(vec![
+                "b2".to_string(),
+                "upload-file".to_string(),
+                "bucket".to_string(),
+                "/workspace/out.bin".to_string(),
+                "out/out.bin".to_string(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn expand_staging_push_hf_dst_builds_upload_argv_with_revision_and_path_in_repo() {
+        let ids = IdGen::new();
+        let payload = ProfileNode::StagingPush {
+            id: node_id(&ids),
+            src: "/workspace/out.bin".to_string(),
+            dst: "hf://owner/repo/artifact.bin".to_string(),
+            env: Default::default(),
+            revision: Some("main".to_string()),
+        };
+        let steps = expand(&payload).expect("hf staging upload expands to a CLI step");
+        assert_eq!(
+            steps,
+            vec![Step::Sh(vec![
+                "huggingface-cli".to_string(),
+                "upload".to_string(),
+                "owner/repo".to_string(),
+                "/workspace/out.bin".to_string(),
+                "artifact.bin".to_string(),
+                "--revision".to_string(),
+                "main".to_string(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn expand_staging_push_hf_url_revision_wins_over_opts_revision() {
+        let ids = IdGen::new();
+        let payload = ProfileNode::StagingPush {
+            id: node_id(&ids),
+            src: "/workspace/out.bin".to_string(),
+            dst: "hf://owner/repo@urlrev/artifact.bin".to_string(),
+            env: Default::default(),
+            revision: Some("optsrev".to_string()),
+        };
+        let steps = expand(&payload).expect("hf staging upload expands");
+        match &steps[0] {
+            Step::Sh(argv) => {
+                assert_eq!(argv[2], "owner/repo");
+                // The URL-carried @urlrev wins over the opts revision.
+                assert_eq!(argv.last().map(String::as_str), Some("urlrev"));
+            }
+            other => panic!("expected Sh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_staging_push_https_dst_is_unsupported() {
+        let ids = IdGen::new();
+        let payload = ProfileNode::StagingPush {
+            id: node_id(&ids),
+            src: "/workspace/out.bin".to_string(),
+            dst: "https://example.com/out.bin".to_string(),
+            env: Default::default(),
+            revision: None,
+        };
+        let err = expand(&payload).expect_err("https upload must be unsupported");
         match err {
             ExecError::Unsupported(msg) => {
-                assert!(msg.contains("env-routed CLI dispatch"));
+                assert!(
+                    msg.contains("HTTP PUT") && msg.contains("not implemented"),
+                    "{msg}"
+                );
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -894,7 +1190,7 @@ mod tests {
         match &steps[0] {
             Step::Note(msg) => {
                 assert!(msg.contains("port=8188"));
-                assert!(msg.contains("pending AST extension"));
+                assert!(msg.contains("extra_args") && msg.contains("out of scope"));
             }
             other => panic!("expected Note, got {other:?}"),
         }
@@ -975,17 +1271,42 @@ mod tests {
 
     #[test]
     fn render_dry_labels_each_step_shape() {
-        assert!(render_dry(&Step::Sh(vec!["ls".into()])).starts_with("sh argv="));
-        assert!(render_dry(&Step::Transfer {
-            src: "s".into(),
-            dst: "d".into()
-        })
+        let no_env = BTreeMap::new();
+        assert_eq!(
+            render_dry(&Step::Sh(vec!["ls".into()]), &no_env),
+            "sh argv=[\"ls\"]"
+        );
+        assert!(render_dry(
+            &Step::Transfer {
+                src: "s".into(),
+                dst: "d".into()
+            },
+            &no_env
+        )
         .starts_with("transfer src=s dst=d"));
-        assert!(render_dry(&Step::HttpPoll {
-            url: "u".into(),
-            timeout_sec: 5
-        })
+        assert!(render_dry(
+            &Step::HttpPoll {
+                url: "u".into(),
+                timeout_sec: 5
+            },
+            &no_env
+        )
         .starts_with("http_poll url=u timeout=5s"));
-        assert!(render_dry(&Step::Note("n".into())).starts_with("note "));
+        assert!(render_dry(&Step::Note("n".into()), &no_env).starts_with("note "));
+    }
+
+    #[test]
+    fn render_dry_shows_env_keys_but_not_values_for_a_sh_step() {
+        let mut env = BTreeMap::new();
+        env.insert("HF_TOKEN".to_string(), "super-secret".to_string());
+        let rendered = render_dry(&Step::Sh(vec!["huggingface-cli".into()]), &env);
+        assert!(
+            rendered.contains("env_keys=") && rendered.contains("HF_TOKEN"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret"),
+            "values must be redacted: {rendered}"
+        );
     }
 }
