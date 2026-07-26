@@ -27,7 +27,7 @@ The catalog below is exhaustive: **22 user-facing phase variants**.
 | `python.version_check` | `want` string (e.g. `"3.11"`); suppressed from the plan when `want` equals the default `3.12` | `sh.exec` |
 | `python.deps` | `deps` list\<string\> (shell-safe); `in_comfy_venv` bool (venv pip vs system pip); `force_reinstall` bool | `sh.exec` |
 | `custom_nodes` | `nodes` list of `{ name, repo = "<owner>/<name>", ref?, pip? bool }`, all strings shell-safe | `sh.exec` |
-| `sync.pull` | `src` = `b2://<bucket>/<path>`; `dst` absolute path, no `..`; `env` table\<string, string\|SecretRef\> optional; `revision` string optional (hf) | `net.transfer`, or `sh.exec` when routed to a CLI (§Dispatch routing) |
+| `sync.pull` | `src` = `b2://<bucket>/<path>` \| `hf://<owner>/<repo>[@<rev>]/<path>` \| `https://...`; `dst` absolute path, no `..` (a **file** path, except on the hf-cli route — §Dispatch routing); `env` table\<string, string\|SecretRef\> optional; `revision` string optional (hf) | `net.transfer`, or `sh.exec` when routed to a CLI (§Dispatch routing) |
 | `sync.push` | `src` absolute path; `dst` = `b2://...` or `hf://<owner>/<repo>/<path>`; `{pod_id}` placeholder allowed in dst | none — marker only, not executed during apply |
 | `staging.push` | same shape as `sync.push` plus `env`, `revision`, `commit_message`, `include` list, `exclude` list, `content_type` | `net.transfer` or `sh.exec` (§Dispatch routing) |
 | `models` | `models` list of `{ src, dst? \| name?, subdir? \| kind? (default "checkpoints"), sha256? }` → downloads to `/workspace/ComfyUI/models/<subdir>/<dst>` | `net.transfer` |
@@ -111,11 +111,28 @@ Dispatch turns each planned step into one or more bridge invocations
 
 - Downloads (`sync.pull`, `net.transfer` download): `b2://` or
   `hf://` src **with a non-empty `env` table** routes to the native
-  CLI over `sh.exec` (`b2 download-file-by-name ...`,
-  `huggingface-cli download ...`) so credentials flow through
-  exec-time env injection. Public `b2://` / `hf://` and `https://`
-  stay on the `net.transfer` bridge (scheme resolution in
-  chapter 04).
+  CLI over `sh.exec` so credentials flow through exec-time env
+  injection. Public `b2://` / `hf://` and `https://` stay on the
+  `net.transfer` bridge (scheme resolution in chapter 04). The two
+  CLI argv shapes:
+
+  ```
+  b2 download-file-by-name <bucket> <path> <dst>
+  huggingface-cli download <owner>/<repo> <path> --local-dir <dst> [--revision <rev>]
+  ```
+
+  **`dst` means different things on these two routes.** `b2` takes the
+  destination file path; `huggingface-cli` exposes no output-file flag
+  at all, only `--local-dir`, so the file lands at
+  `<dst>/<path>` and `dst` names a *directory*. The asymmetry is the
+  CLI's, and a profile author has to know it — a `sync.pull` with an
+  `hf://` src and a credential `env` writes into `dst` as a directory,
+  while the same phase with a `b2://` src writes `dst` itself.
+
+  The alternative — downloading to a temporary directory and renaming
+  into a file path — is deliberately not synthesized: it would add an
+  invented step to the operator's pod that no chapter describes, to
+  hide a convention the CLI states plainly.
 - Uploads (`staging.push`, `net.transfer` upload): `hf://` dst →
   `huggingface-cli upload` argv; `b2://` dst → `b2 upload-file` argv;
   `https://` dst → `net.transfer` bridge (HTTP PUT).

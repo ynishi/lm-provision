@@ -133,7 +133,10 @@ those options are deferred, not withdrawn.
 - Credential-carrying transfers do not run here. `b2://` / `hf://`
   downloads and every upload are routed to the native CLIs over
   `sh.exec` by the lifecycle layer (chapter 02 §Dispatch routing), so
-  they never reach this primitive.
+  they never reach this primitive. Note that the destination
+  convention differs there: `huggingface-cli download` takes a
+  `--local-dir`, so on that route the phase's `dst` is a *directory*,
+  not the file path this primitive writes.
 - A `b2://` / `hf://` source or a URL destination that *does* reach
   this primitive is the public scheme-resolution surface
   (`hf://<owner>/<repo>/<path>` →

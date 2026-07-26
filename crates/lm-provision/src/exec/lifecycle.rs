@@ -43,12 +43,14 @@
 //!
 //! - `SyncPull` `b2://` src **with a non-empty `env`** → the native
 //!   `b2 download-file-by-name <bucket> <path> <dst>` over `sh.exec`.
-//! - `SyncPull` `hf://` src with a non-empty `env` → a deferred
-//!   [`Step::Note`]: `huggingface-cli download --local-dir` names a
-//!   destination *directory*, while `dst` here is an exact destination
-//!   *file* path (04-bridge §net.transfer), so no concrete argv is
-//!   invented — mirroring the POC `lua/lm/dispatch.lua` decision (a
-//!   spec 02 vs 04 tension, see plan.md §KNOWN LIMITATION).
+//! - `SyncPull` `hf://` src **with a non-empty `env`** → the native
+//!   `huggingface-cli download <owner>/<repo> <path> --local-dir <dst>
+//!   [--revision <rev>]`. On this route `dst` is the `--local-dir`
+//!   target, so the file lands at `<dst>/<path>` and `dst` names a
+//!   *directory* — asymmetric with the b2 route, where `dst` is the
+//!   destination file path. The asymmetry is hf-cli's (it exposes no
+//!   output-file flag) and is recorded in spec 02 §Dispatch routing
+//!   rather than papered over with a synthesized rename step.
 //! - `SyncPull` with an empty `env` keeps its prior behaviour (an
 //!   `https://` src maps to a plain download; a `b2://` / `hf://` src is
 //!   [`ExecError::Unsupported`] — the public `net.transfer`-bridge
@@ -136,7 +138,13 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             ..
         } => Ok(expand_python_deps(deps, *in_comfy_venv)),
         ProfileNode::CustomNodes { nodes_json, .. } => expand_custom_nodes(nodes_json),
-        ProfileNode::SyncPull { src, dst, env, .. } => expand_sync_pull(src, dst, env),
+        ProfileNode::SyncPull {
+            src,
+            dst,
+            env,
+            revision,
+            ..
+        } => expand_sync_pull(src, dst, env, revision.as_deref()),
         ProfileNode::SyncPush { src, dst, .. } => Ok(vec![Step::Note(format!(
             "sync_push src={src} dst={dst}: marker only; not executed during apply"
         ))]),
@@ -295,6 +303,7 @@ fn expand_sync_pull(
     src: &str,
     dst: &str,
     env: &BTreeMap<String, ProfileNode>,
+    revision: Option<&str>,
 ) -> Result<Vec<Step>, ExecError> {
     if env.is_empty() {
         // Public download: `https://` streams to the destination file;
@@ -324,17 +333,38 @@ fn expand_sync_pull(
             dst.to_string(),
         ])]);
     }
-    if src.starts_with("hf://") {
-        // Deferred, not invented: `huggingface-cli download`'s
-        // `--local-dir` names a destination *directory*, but `dst` here
-        // is an exact destination *file* path (04-bridge §net.transfer).
-        // Mirrors the POC lua/lm/dispatch.lua degradation to a visible
-        // no-op (spec 02 vs 04 tension; see the module header).
-        return Ok(vec![Step::Note(format!(
-            "sync_pull '{src}' -> '{dst}': hf:// CLI download routing is unconfirmed — \
-             huggingface-cli download's --local-dir names a destination directory, but \
-             dst here is an exact destination file path (04 §net.transfer); deferred"
-        ))]);
+    if let Some(rest) = src.strip_prefix("hf://") {
+        let (owner, repo, url_rev, path_in_repo) = parse_hf_uri(rest, "sync_pull", src)?;
+        // A download needs the file path inside the repo — an
+        // `hf://<owner>/<repo>` with no trailing path names a repo, not
+        // a file (that is `llm_models`' snapshot shape).
+        let Some(path_in_repo) = path_in_repo else {
+            return Err(ExecError::EffectFailed {
+                op: "sync_pull".to_string(),
+                message: format!("hf:// download URI is missing the file path segment: {src}"),
+            });
+        };
+        // The URL-carried revision wins over the payload's (spec 02
+        // §Dispatch routing: "a URL-carried revision wins over
+        // opts.revision") — the URL is the more specific address.
+        let rev = url_rev.or_else(|| revision.map(str::to_string));
+        let mut argv = vec![
+            "huggingface-cli".to_string(),
+            "download".to_string(),
+            format!("{owner}/{repo}"),
+            path_in_repo,
+            // `dst` is the --local-dir target: hf-cli lands the file at
+            // `<dst>/<path_in_repo>`, so on this route `dst` names a
+            // *directory*, asymmetric with the b2 route's file path.
+            // Spec 02 §Dispatch routing records the asymmetry.
+            "--local-dir".to_string(),
+            dst.to_string(),
+        ];
+        if let Some(rev) = rev {
+            argv.push("--revision".to_string());
+            argv.push(rev);
+        }
+        return Ok(vec![Step::Sh(argv)]);
     }
     // Any other scheme (e.g. https://) with a non-empty env stays on the
     // plain download path — env is inert for a bridge download (spec 02
@@ -897,8 +927,11 @@ mod tests {
         );
     }
 
+    /// The credential-carrying hf download routes to hf-cli with `dst`
+    /// as the `--local-dir` target (the file lands at
+    /// `<dst>/<path_in_repo>`, spec 02 §Dispatch routing).
     #[test]
-    fn expand_sync_pull_hf_with_env_degrades_to_a_deferred_note() {
+    fn expand_sync_pull_hf_with_env_routes_to_the_native_cli() {
         let ids = IdGen::new();
         let mut env = BTreeMap::new();
         env.insert(
@@ -910,22 +943,115 @@ mod tests {
         );
         let payload = ProfileNode::SyncPull {
             id: node_id(&ids),
-            src: "hf://owner/repo/file.bin".to_string(),
-            dst: "/workspace/file.bin".to_string(),
+            src: "hf://my-org/private-lora/weights/v1.safetensors".to_string(),
+            dst: "/workspace/loras".to_string(),
             env,
             revision: None,
         };
-        let steps = expand(&payload).expect("hf + env degrades to a note, not an error");
-        assert_eq!(steps.len(), 1);
+        let steps = expand(&payload).expect("hf + env expands to a CLI step");
+        assert_eq!(
+            steps,
+            vec![Step::Sh(vec![
+                "huggingface-cli".to_string(),
+                "download".to_string(),
+                "my-org/private-lora".to_string(),
+                "weights/v1.safetensors".to_string(),
+                "--local-dir".to_string(),
+                "/workspace/loras".to_string(),
+            ])]
+        );
+    }
+
+    /// A URL-carried `@<rev>` wins over the payload's `revision`
+    /// (spec 02 §Dispatch routing: the URL is the more specific
+    /// address).
+    #[test]
+    fn expand_sync_pull_hf_prefers_the_url_revision_over_the_payload_one() {
+        let ids = IdGen::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HF_TOKEN".to_string(),
+            ProfileNode::EnvSecret {
+                id: node_id(&ids),
+                name: "HF_TOKEN".to_string(),
+            },
+        );
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: "hf://owner/repo@v2.0/weights/model.bin".to_string(),
+            dst: "/workspace/models".to_string(),
+            env,
+            revision: Some("ignored-payload-rev".to_string()),
+        };
+        let steps = expand(&payload).expect("hf + env + @rev expands");
+        assert_eq!(
+            steps,
+            vec![Step::Sh(vec![
+                "huggingface-cli".to_string(),
+                "download".to_string(),
+                "owner/repo".to_string(),
+                "weights/model.bin".to_string(),
+                "--local-dir".to_string(),
+                "/workspace/models".to_string(),
+                "--revision".to_string(),
+                "v2.0".to_string(),
+            ])]
+        );
+    }
+
+    /// With no `@<rev>` in the URL the payload's `revision` is used.
+    #[test]
+    fn expand_sync_pull_hf_falls_back_to_the_payload_revision() {
+        let ids = IdGen::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HF_TOKEN".to_string(),
+            ProfileNode::EnvSecret {
+                id: node_id(&ids),
+                name: "HF_TOKEN".to_string(),
+            },
+        );
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: "hf://owner/repo/model.bin".to_string(),
+            dst: "/workspace/models".to_string(),
+            env,
+            revision: Some("abc123".to_string()),
+        };
+        let steps = expand(&payload).expect("hf + env + payload revision expands");
         match &steps[0] {
-            Step::Note(msg) => {
-                assert!(
-                    msg.contains("directory") && msg.contains("unconfirmed"),
-                    "{msg}"
-                );
+            Step::Sh(argv) => {
+                assert_eq!(argv[argv.len() - 2..], ["--revision", "abc123"]);
             }
-            other => panic!("expected a deferred Note, got {other:?}"),
+            other => panic!("expected Sh, got {other:?}"),
         }
+    }
+
+    /// `hf://<owner>/<repo>` with no trailing path names a repo, not a
+    /// file — that is `llm_models`' snapshot shape, not a `sync.pull`.
+    #[test]
+    fn expand_sync_pull_hf_without_a_file_path_is_an_error() {
+        let ids = IdGen::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HF_TOKEN".to_string(),
+            ProfileNode::EnvSecret {
+                id: node_id(&ids),
+                name: "HF_TOKEN".to_string(),
+            },
+        );
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: "hf://owner/repo".to_string(),
+            dst: "/workspace/models".to_string(),
+            env,
+            revision: None,
+        };
+        let err = expand(&payload).expect_err("a repo-only hf:// URI must fail");
+        assert!(
+            err.to_string().contains("missing the file path segment"),
+            "{err}"
+        );
     }
 
     #[test]
