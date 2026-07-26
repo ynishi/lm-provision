@@ -32,7 +32,12 @@ const TEXT_PROFILE: &str = concat!(
     "phases: [",
     "SystemApt(packages: [\"git\", \"curl\"]), ",
     "PythonDeps(deps: [\"torch\"], in_comfy_venv: false), ",
-    "ShExec(argv: [\"echo\", \"ok\"]), ",
+    // … and writes the `env` keyed slot's entries in one key order
+    // (01 §Env keyed slots: bare identifier keys, brace-delimited).
+    "ShExec(argv: [\"echo\", \"ok\"], env: {",
+    "HF_TOKEN: EnvSecret(name: \"HF_TOKEN\"), ",
+    "MODE: EnvLiteral(value: \"fast\")",
+    "}), ",
     "FsWrite(path: \"/tmp/x\", content: \"hello\")",
     "])",
 );
@@ -55,7 +60,13 @@ fn json_profile() -> serde_json::Value {
         "phases": [
             { "type": "SystemApt", "packages": ["git", "curl"] },
             { "type": "PythonDeps", "deps": ["torch"], "in_comfy_venv": false },
-            { "type": "ShExec", "argv": ["echo", "ok"] },
+            // … and the JSON frontend writes the same `env` entries in
+            // the reverse key order, to prove the keyed slot is
+            // normalised the same way the sortable lists are.
+            { "type": "ShExec", "argv": ["echo", "ok"], "env": {
+                "MODE": { "type": "EnvLiteral", "value": "fast" },
+                "HF_TOKEN": { "type": "EnvSecret", "name": "HF_TOKEN" },
+            } },
             { "type": "FsWrite", "path": "/tmp/x", "content": "hello" },
         ],
     })

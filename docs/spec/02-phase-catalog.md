@@ -126,10 +126,9 @@ Dispatch turns each planned step into one or more bridge invocations
 ### Shared vocabulary (frozen literal sets)
 
 This chapter is the source of truth for three literal sets consumed
-elsewhere.
-Both the Lua modules and the Rust host embed them; the implementation
-form of the sharing (single data file vs mirrored constants) is
-internal, byte equality of the sets is the contract.
+elsewhere. The host embeds them; the implementation form of the
+sharing (single data file vs mirrored constants) is internal, byte
+equality of the sets is the contract.
 
 - Secret-shaped key substrings (chapter 06 rejects `env` keys
   containing any, case-insensitive):
@@ -144,13 +143,18 @@ internal, byte equality of the sets is the contract.
   declaring it passes the gate build but no bridge exists for it yet,
   so no operation is reachable).
 
-### Editor completion
+### Authoring support
 
-The per-kind payload schemas form a discriminated union on `kind`.
-A codegen step emits `.d.lua` from this union for editor completion;
-the same schema is walkable by the Rust host for pre-flight static
-checks. The generated artifacts are derived — this chapter's tables
-are the source.
+The per-kind payload schemas form a discriminated union on `kind`,
+expressed as the `ProfileNode` enum (chapter 01). The machine-derived
+`DslSchema` is what tooling reads: it drives the canonical-text
+grammar, the JSON bridge, and machine-generated examples, and it is
+walkable by the host for pre-flight static checks. These artifacts are
+derived — this chapter's tables are the source.
+
+A `codegen` step emitting a `.d.lua` annotation file served the
+removed Lua authoring frontend and no longer exists (chapter 07
+§MVP scope).
 
 ### Built-in path constants
 

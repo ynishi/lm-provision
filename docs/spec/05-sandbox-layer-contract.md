@@ -5,92 +5,101 @@ Upstream deps: 04. MVP: Phase F.
 
 ## Purpose
 
-The four-layer sandbox that gates every Lua execution. Contract for
-what each layer enforces and what a consumer (profile author,
-security reviewer, host maintainer) can rely on. Layers compose: an
-operation must pass every applicable layer; passing one never
-bypasses another.
+The four-layer sandbox that gates every profile execution. Contract for
+what each layer enforces and what a consumer (profile author, security
+reviewer, host maintainer) can rely on. Layers compose: an operation
+must pass every applicable layer; passing one never bypasses another.
 
 ## Inputs
 
-The layers are configured from exactly two sources: the embedded
-module set compiled into the binary (L1) and the profile's declared
-lists (L3 + L4). There is no host-side configuration file and no
-ambient default-allow.
+The layers are configured from exactly two sources: the frontend set
+compiled into the binary (L1) and the profile's declared lists
+(L3 + L4). There is no host-side configuration file and no ambient
+default-allow.
 
 ## Outputs
 
-### L1 — stdlib restriction + require allowlist
+### L1 — data-only ingestion
 
-- The VM boots with the mlua safe stdlib set, then the host strips
-  these globals to nil: `os`, `io`, `package`, `debug`, `loadfile`,
-  `dofile`, `load`, `loadstring`.
-  - Consequence: no process / filesystem / clock access via stdlib,
-    no default module loading, no debug-hook tampering, and **no
-    runtime chunk loading at all** from profile code.
-- Retained: `string`, `table`, `math`, `coroutine`, `utf8`, the base
-  functions (`type`, `pairs`, `ipairs`, `tostring`, `assert`,
-  `error`, `pcall`, ...), and `print` (redirected, chapter 04).
-- Custom `require`: resolves only the embedded module allowlist —
-  the ten Lua-facing `lm.*` modules
-  (`lm.profile`, `lm.env`, `lm.ir`, `lm.validate`, `lm.canonical`,
-  `lm.hash`, `lm.plan`, `lm.dispatch`, `lm.apply`, `lm.report`)
-  plus `lm.catalog_data`, the single shared-vocabulary data file
-  (22 phase kinds, `KNOWN_CAPABILITIES`, the secret-key and
-  sensitive-key substring sets) that chapter 02 §Shared vocabulary
-  mandates as one canonical source referenced by both the Lua and
-  Rust hosts — from sources baked into the binary at compile time
-  (`include_str!`). `lm.catalog_data` carries no logic and no
-  effectful surface: it is a pure data table, requireable so the
-  domain modules (`lm.validate` et al.) read the same bytes the Rust
-  host reads. Results are cached (standard require idempotency, one
-  evaluation per module per VM). Any other name is a Lua error
-  listing the allowlist. There is no filesystem require path.
-- Bytecode prohibition: every host-initiated chunk load (profile
-  file, embedded modules) is forced to text mode; combined with the
-  stripped `load*` family there is no bytecode ingestion path.
+- A profile is parsed into a `ProfileNode` AST (chapter 01) from JSON
+  or canonical text. **Neither frontend can express behaviour**: the
+  result of parsing is a value, not a program. There is no host-side
+  eval, no interpreter, and therefore no chunk-loading, bytecode, or
+  module-resolution surface to restrict.
+- `.lua` paths are rejected before any I/O
+  (`Lua profiles are no longer supported`, chapter 07 §Profile input
+  format), so the removed authoring frontend cannot be reached by a
+  filename.
+- Effects reachable from a profile are exactly the primitives of
+  chapter 04, selected by *which phase kinds the profile declares* —
+  not by what code it runs.
 
-### L2 — execution control (isolation runtime)
+> **Predecessor.** L1 previously specified an mlua stdlib nil-out
+> (`os`, `io`, `package`, `debug`, `load*`, ...), a custom `require`
+> restricted to embedded `lm.*` modules, and a bytecode prohibition.
+> Those mechanisms existed to keep author-supplied *code* from reaching
+> the host. With the embedded VM removed there is no author-supplied
+> code, so the guarantee is structural rather than enforced. The
+> attack surface they closed is closed by absence.
 
-- The VM runs on a dedicated thread owned by an isolation driver;
-  the host and the VM exchange **strings only** (eval results and
-  serialized JSON), never live Lua references. Dropping the driver
-  tears the VM down.
-- One VM per subcommand run; nothing persists between runs
-  (statelessness at the VM level).
-- Cooperative cancellation and wall-clock timeout are capabilities
-  of the isolation layer; the current contract does not bind a global
-  per-run timeout (step-level timeouts are `sh.exec` /
-  `net.*` opts, chapter 04). A host-level run timeout is
-  provisional (see Stability).
+### L2 — execution model
+
+- One execution context per subcommand run, built from the profile
+  root (chapter 04 §Execution context build order) and discarded when
+  the run ends. Nothing persists between runs.
+- Execution is a step loop over the AST inside the host process; there
+  is no separate VM, no cross-thread value exchange, and no live
+  reference a profile could retain.
+- The loop is bounded by a step ceiling so a pathological AST cannot
+  spin indefinitely. Per-effect timeouts belong to the individual
+  primitives (chapter 04); a host-level wall-clock run timeout and
+  cooperative cancellation remain out of the current contract
+  (see Stability).
+
+> **Predecessor.** L2 previously specified a dedicated VM thread owned
+> by an isolation driver exchanging strings only, with the driver drop
+> tearing the VM down. Statelessness and the absence of shared live
+> references survive; the thread-isolation mechanism does not, because
+> there is no second language runtime to isolate.
 
 ### L3 — policy layer (declaration-derived allowlists)
 
-Three policies are built from the profile's declared lists and shared
-by both the batteries `std.*` surface and the host's own bridges —
-one allowlist, seen identically by every consumer:
+Three policies are built from the profile's declared lists before any
+op is reachable, and consulted in **both** dry-run and real mode
+(chapter 04 §Common conventions):
 
-- **Env policy** (`env` / `env_secrets`):
-  - `env.get(key)` — allowed iff `key ∈ env`. A key in
-    `env_secrets` is rejected with an explicit "use env.ref()"
-    error (second wall, chapter 06). Undeclared keys are rejected.
-  - `env.set` — always rejected: Lua never mutates the host
-    environment.
-- **HTTP policy** (`http_allowlist`): a URL is allowed iff it
-  matches one of the declared patterns. A pattern is a literal URL
-  prefix, optionally with a single `*` wildcard whose match is
-  confined to the host portion (e.g.
-  `https://*.b2.backblazeb2.com`); the wildcard never matches into
-  the path.
+- **Secret env policy** (`env_secrets`): an `EnvSecret` value node is
+  resolved from the host environment only when its name appears in
+  `env_secrets`; an undeclared name is rejected, and a declared name
+  absent from the host environment is a fail-fast error. This is the
+  only path by which the host environment is read (chapter 06).
+- **HTTP policy** (`http_allowlist`): a URL is allowed iff it matches
+  one of the declared patterns. A pattern is a literal URL prefix,
+  optionally with a single `*` wildcard whose match is confined to the
+  authority component (e.g. `https://*.b2.backblazeb2.com`); the
+  wildcard never matches into the path.
 - **Path policy** (`paths`): a path is accepted iff it is absolute,
   contains no `..` segment, and lies under a declared root with
   component-aligned prefix matching (`/workspace_x` is NOT under
-  `/workspace`). This is a lexical policy: it does not chase
-  symlinks. Deployment targets are fresh single-tenant pods where
-  the profile itself creates the tree; symlink-racing an
-  already-compromised host is out of threat model. An
-  openat2/`RESOLVE_BENEATH`-based upgrade slot exists in the
-  batteries layer if the threat model changes.
+  `/workspace`). This is a lexical policy: it does not chase symlinks.
+  Deployment targets are fresh single-tenant pods where the profile
+  itself creates the tree; symlink-racing an already-compromised host
+  is out of threat model. An `openat2` / `RESOLVE_BENEATH`-based
+  upgrade slot remains available if the threat model changes.
+
+An empty declared list denies everything in its domain: a profile that
+declares no `paths` cannot write any path, and one that declares no
+`http_allowlist` cannot reach any URL.
+
+The `env` declared list (the non-secret allowlist) is currently
+consumed by **validate only** — it must contain no secret-shaped key
+and every entry must be shell-safe (chapter 03 §validate). It carries
+no execution-time role, because the plain host-env read surface it used
+to gate (`env.get`) no longer exists: a non-secret env value is written
+into the profile as an `EnvLiteral` and never read from the host. The
+list is retained as a declaration and as the anchor for the
+secret-shaped-key rejection; re-binding it to an execution-time role is
+a design opening, not a silent gap (see Stability).
 
 ### L4 — capability gate (operation-level)
 
@@ -99,33 +108,40 @@ one allowlist, seen identically by every consumer:
   `mount.bind`, `mount.umount`, `mount.volume_attach` (reserved).
 - Granularity is the operation, not the namespace: declaring
   `net.transfer` does not grant `net.http_get`.
-- Two-strategy enforcement:
-  1. **Register skip** (structural): bridges for undeclared
-     operations are never installed — the call site hits nil.
-  2. **Entry check** (defence in depth): every installed bridge
-     re-validates the gate per call.
-- Declared-but-unknown capability → fail-fast at load
+- Enforcement is a per-op **entry check**: every op handler validates
+  the gate before touching its payload's targets, in dry-run and real
+  alike. Lifecycle phases are gated by the capability of the effect
+  they expand into (e.g. every `sh.exec`-composing lifecycle op
+  requires `sh.exec`; `sync.pull` / `staging.push` / `models` require
+  `net.transfer`).
+- Declared-but-unknown capability → fail-fast at context-build time
   (`capability '<x>' declared but not implemented by host`), before
-  any Lua user code runs. No silent skip.
-- `capabilities = {}` is valid and means a pure-computation profile
-  (validate / hash / plan work; apply can execute nothing but
-  pending steps).
+  any op runs. No silent skip.
+- `capabilities = []` is valid and means a pure-computation profile
+  (validate / hash / plan work; apply can execute nothing).
 - L3 and L4 stack: L4 grants the operation, L3 still constrains its
-  arguments (a granted `fs.write` still cannot write outside
-  `paths`).
+  arguments (a granted `fs.write` still cannot write outside `paths`).
+
+> **Predecessor.** L4 previously specified a two-strategy model:
+> register skip (bridges for undeclared operations were never
+> installed, so the call site hit nil) plus the entry check as defence
+> in depth. Register skip was a property of a *namespace exposed to
+> author code*; with no such namespace, the registry installs every op
+> and the entry check is the single enforcement point. The
+> "declared ⊆ used" guarantee is unchanged — what changed is that a
+> denial is now a named error instead of a nil-call.
 
 ## Error surface
 
-- L1: forbidden stdlib access → nil-value error at the call site;
-  forbidden require → allowlist error (both precondition class,
-  before effects).
-- L2: VM-thread failure / cancellation surfaces to the host as an
-  isolation error aborting the subcommand (runtime class; the VM is
-  discarded, no partial state survives).
-- L3: policy rejection → Lua error naming the key / URL / path and
-  the declared list that excludes it.
-- L4: structural nil-call, or gate-check error naming the missing
-  capability; load-time fail-fast for unknown declared capabilities.
+- L1: a `.lua` path → load rejection; malformed JSON / text → parse
+  error (both precondition class, before any effect).
+- L2: an engine-internal failure aborts the subcommand; the context is
+  discarded and no partial state survives the process.
+- L3: policy rejection → an error naming the offending secret name /
+  URL / path and the declared list that excludes it, recorded on the
+  step's report entry (precondition class, fires under dry-run too).
+- L4: gate-check error naming the missing capability; context-build
+  fail-fast for unknown declared capabilities.
 
 All sandbox errors leave the target system untouched except for
 effects already performed by **earlier** steps of the same apply
@@ -133,28 +149,33 @@ effects already performed by **earlier** steps of the same apply
 
 ## Stability
 
-- Layer count, responsibility split, and the two-strategy L4 model:
+- Layer count and the responsibility split (ingestion / execution
+  model / policy / capability): **stable**.
+- L1 as data-only ingestion, and the rejection of `.lua` paths:
   **stable**.
-- L1 strip set and the embedded require allowlist mechanism:
-  **stable** (the allowlist contents grow with the `lm.*` module
-  set).
-- L3 semantics as specified (env dual-list, single-`*` host
-  wildcard, lexical path policy): **stable**. The symlink-aware
-  path-policy upgrade: **provisional**.
-- Host-level per-run wall-clock timeout: **provisional** (not part
-  of the current contract).
-- `mount.volume_attach` reserved key: **provisional**.
+- L2 statelessness (one context per run, nothing persisted):
+  **stable**. Host-level per-run wall-clock timeout and cooperative
+  cancellation: **provisional** (not part of the current contract).
+- L3 semantics as specified (secret-env gating, single-`*` authority
+  wildcard, lexical path policy, empty-list-denies-all): **stable**.
+  The symlink-aware path-policy upgrade: **provisional**. An
+  execution-time role for the `env` declared list: **provisional**.
+- L4 entry-check enforcement and the frozen `KNOWN_CAPABILITIES` set:
+  **stable**. `mount.volume_attach` reserved key: **provisional**.
 
 ## Upstream references
 
-- chapter 00 §Sandbox layers — layer definitions, defer pattern.
+- chapter 00 §Sandbox layers — layer definitions.
+- chapter 01 profile DSL surface — the declared lists that configure
+  L3 and L4.
 - chapter 02 phase catalog — `KNOWN_CAPABILITIES` and shared
   vocabulary.
-- chapter 04 bridge — registration order; result-vs-error
-  convention.
+- chapter 04 bridge — context build order; result-vs-error convention.
+- chapter 06 secret handling — the secret-env policy in detail.
 
 ## MVP scope
 
 Ships in Phase F: all four layers wired as specified for the on-pod
 binary, with negative fixtures for undeclared capabilities,
-out-of-root paths, undeclared URLs, and secret-shaped env reads.
+out-of-root paths, undeclared URLs, undeclared secret names, and
+secret-shaped `env` keys.

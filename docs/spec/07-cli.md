@@ -24,8 +24,22 @@ lm-provision <subcommand> <profile-path> [flags]
 | `validate <path>` | load → declarations → validate | none (read-only) |
 | `hash <path>` | load → declarations → canonical → hash | none (read-only) |
 | `plan <path>` | load → declarations → plan | none (read-only) |
-| `codegen <path>` | load → declarations → codegen | none (read-only) |
 | `apply <path> [--dry-run]` | load → declarations → gate → bridges → plan → dispatch → apply | executes the dispatched op stream (dry-run: decode + policy + secret resolution only, chapter 04) |
+
+### Profile input format
+
+The profile path is loaded into the `ProfileNode` AST (chapter 01) by
+the frontend, which selects the parser purely by file extension:
+
+| extension | frontend |
+|---|---|
+| `.json` | JSON serde bridge (`serde_bridge::from_json_value`) |
+| anything else (`.txt`, `.profile`, no extension, ...) | canonical text grammar (PEG, chapter 01 §Canonical Text Format) |
+| `.lua` | rejected before any I/O: `Lua profiles are no longer supported` |
+
+Both accepted frontends build the identical AST, so the profile hash
+is frontend-independent (chapter 01 §Spec fields). Lua authoring was
+removed together with the embedded VM; profiles are data, not code.
 
 ### Global flags
 
@@ -62,8 +76,6 @@ lm-provision <subcommand> <profile-path> [flags]
   newline. Nothing else.
 - `plan`: the plan artifact (chapter 03 §plan) as pretty-printed
   JSON.
-- `codegen`: a `.d.lua` EmmyLua annotation file (lua-language-server
-  compatible) as a single string, not JSON. Nothing else.
 - `apply`: the apply report (chapter 09) as pretty-printed JSON —
   printed on **both** success and step failure, so the collecting
   side always receives the report even when apply fails.
@@ -75,7 +87,7 @@ lm-provision <subcommand> <profile-path> [flags]
 | code | meaning |
 |---|---|
 | 0 | subcommand succeeded (`validate` ok / hash printed / plan printed / apply report `ok = true`) |
-| 1 | any failure: profile load error, validate rejection, sandbox / policy / secret error, apply report `ok = false`, I/O or VM error |
+| 1 | any failure: profile load error (including a `.lua` path), validate rejection, capability / policy / secret error, apply report `ok = false`, I/O or exec-engine error |
 | 2 | CLI usage error (unknown subcommand / flag) — emitted by the argument parser with usage text on stderr |
 
 Failure detail is on stderr as the final error line (e.g.
@@ -128,3 +140,10 @@ A `canonical` subcommand (dump canonical bytes without hashing) is
 intentionally absent — hash is the operator-facing artifact; the
 canonical stage is exercised through `hash` and the ledger
 (chapter 09).
+
+A `codegen` subcommand emitting a `.d.lua` EmmyLua annotation file
+was specified and shipped while profiles were authored in Lua. It was
+removed with the Lua frontend: editor completion for a `.d.lua` stub
+only serves Lua authoring, and the JSON / canonical-text surface is
+described instead by the machine-derived `DslSchema` (chapter 01
+§Core Schema Source of Truth), which needs no separate emit step.

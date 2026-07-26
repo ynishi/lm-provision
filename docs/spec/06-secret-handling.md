@@ -1,137 +1,175 @@
-# 06. Secret handling (Lua-facing only)
+# 06. Secret handling
 
 Status: specified. Layer 3.
 Upstream deps: 01, 04. MVP: Phase F.
 
 ## Purpose
 
-The Lua-facing surface for referring to secrets without ever handing
-their resolved values back to Lua. Consumer: profile author.
+The surface for referring to a secret from a profile without the
+secret's value ever entering the profile, the AST, the trace log, or
+the report. Consumer: profile author.
 
-Audit-log redaction (report-side contract) is specified in
-chapter 09, not here.
+Audit-log redaction (report-side contract) is specified in chapter 09,
+not here.
 
 ## Inputs
 
-### `env.ref(name) -> SecretRef`
+### `EnvSecret { name }` — the secret reference
 
-- A thin factory: wraps `name` in an opaque SecretRef userdata. It
-  performs **no policy check** at call time.
-- Validation timing rationale: `env.ref` is registered before the
-  profile body runs, because profile bodies reference secrets inside
-  declared fields (phase payloads). Checking `name` against
-  `env_secrets` at ref time would require the declarations to be
-  extracted first — a chicken-and-egg. The `env_secrets` allowlist
-  is therefore enforced at **bridge consumption time**: every bridge
-  that accepts a SecretRef checks `ref.name ∈ env_secrets` before
-  resolving.
-- Consumption points (the complete set): `sh.exec` `opts.env`
-  values, `net.transfer` `opts.auth_bearer`, `fs.write` `content`.
-  A SecretRef appearing anywhere else is inert data (it canonicalizes
-  to its marker, chapter 03, and prints redacted).
+- A value node inhabiting an `env` keyed slot (chapter 04 §Env value
+  nodes). It carries the **logical name only**; there is no field, no
+  spelling, and no encoding in which a value could be written.
 
-### `env.get(name) -> string`
+  ```json
+  { "type": "ShExec",
+    "argv": ["huggingface-cli", "whoami"],
+    "env": { "HF_TOKEN": { "type": "EnvSecret", "name": "HF_TOKEN" } } }
+  ```
 
-- Returns the host env value for `name` iff `name ∈ env` (the
-  declared non-secret list).
-- Rejects `name ∈ env_secrets` with an explicit "use env.ref(),
-  env.get() is forbidden" error — the second wall: even a declared
-  secret name never yields its value through the plain-read path.
-- Rejects undeclared names.
+- Two-stage allowlist enforcement against the declared `env_secrets`:
+  - **validate stage** (chapter 03): every `EnvSecret` in every phase
+    is cross-checked against `Spec.env_secrets`, so an undeclared
+    reference is a static rejection — the profile never reaches apply.
+  - **consumption stage** (apply): the same check runs again
+    immediately before resolution, so a profile that reaches apply
+    without validate (chapter 07 §Invocation: `apply` does not run
+    validate first) is gated identically.
 
-### `env.set` — prohibited
+  The static half is new to the AST surface. Under the former Lua
+  frontend `env.ref(name)` was a factory registered *before* the
+  profile body ran, so the declared lists did not exist yet and the
+  check could only happen at consumption — a chicken-and-egg that a
+  declarative AST does not have.
 
-Always rejected. All environment injection happens through explicit
-exec-time env (`sh.exec` `opts.env`); Lua cannot mutate the host
-environment.
+### `EnvLiteral { value }` — the non-secret sibling
+
+Carries a plain string written in the profile. It does **not** read the
+host environment, so it needs no allowlist: what it injects is already
+visible in the profile text (and in the profile hash).
+
+### Plain host-env reads — no surface
+
+There is no `env.get`. A profile cannot read an arbitrary host
+environment variable: the only host-env read path is `EnvSecret`
+resolution, gated by `env_secrets`. The former "second wall"
+(`env.get` rejecting secret-shaped names with *use `env.ref()`*) is
+subsumed — the plain-read path it guarded does not exist.
+
+### Host-env writes — no surface
+
+There is no `env.set`. Environment injection is explicit and per-step:
+the `env` keyed slot of the consuming phase. Nothing a profile
+expresses can mutate the host process environment.
 
 ### Profile declarations
 
 - `env_secrets` lists the secret names a profile may reference. The
   names must be shell-safe (chapter 03 §validate).
-- `env` (the plain list) must not contain secret-shaped keys —
-  validate rejects any key containing one of the secret-key
-  substrings (chapter 02 §Shared vocabulary, case-insensitive):
-  `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PWD`, `AUTH`, `CRED`,
-  `APIKEY`. Secret-shaped configuration belongs in `env_secrets`.
+- `env` (the plain list) must not contain secret-shaped keys — validate
+  rejects any key containing one of the secret-key substrings
+  (chapter 02 §Shared vocabulary, case-insensitive): `KEY`, `SECRET`,
+  `TOKEN`, `PASSWORD`, `PWD`, `AUTH`, `CRED`, `APIKEY`. Secret-shaped
+  configuration belongs in `env_secrets`.
 
 ## Outputs
 
-### SecretRef userdata — the opacity contract
+### The opacity contract
 
-- The only value-bearing operation visible to Lua is `tostring(ref)`
-  → `"[secret:NAME]"` (redacted marker, never the value).
-- `ref:name()` returns the logical name (for report / correlation
-  use) — never the value.
-- Field access, indexing, and arithmetic are unimplemented: there is
-  no `__index` / `__newindex`, so `ref.anything` is nil and
-  assignment errors. Opacity is physical (userdata), not
-  conventional.
-- Canonical-encoding hook: the metatable exposes `__lm_secret_name`
-  so `lm.canonical` encodes the ref as the marker table
-  `{"__secret":"NAME"}` (chapter 03). Decode rehydrates markers back
-  into SecretRef, preserving opacity across the round-trip.
+- An `EnvSecret` node has no value-bearing field. Opacity is a property
+  of the *shape*, not of a runtime wrapper: there is nothing to
+  dereference, index, or stringify into a value.
+- Canonical encoding (chapter 03) renders it as the marker
+  `{"__secret":"NAME"}`, so the profile hash covers the reference
+  without covering any value, and a canonical round-trip rehydrates the
+  same node.
+- The resolved value exists only inside the host's resolution map for
+  the duration of one step. That map's diagnostic rendering prints
+  **keys only** — a resolved value cannot reach the trace log through a
+  stray debug format.
+- The report (chapter 09) carries the step's argv, status, and captured
+  output; it never carries the resolution map.
 
-### Resolution — host thread only
+> **Predecessor.** The Lua-facing form was a `SecretRef` userdata whose
+> only visible operation was `tostring(ref)` → `"[secret:NAME]"`, with
+> `__index` / `__newindex` closed so opacity was physical rather than
+> conventional. With no language runtime handed the reference, the
+> userdata is unnecessary: a node that has no value field cannot leak
+> one. The `[secret:NAME]` rendering survives as the audit-log
+> redaction form (chapter 09).
 
-- Resolution reads the host process environment (`NAME` → value) on
-  the host thread, at bridge consumption time, immediately before
-  the effect. The resolved value flows into exactly one of: child
-  process env (`sh.exec`), an `Authorization: Bearer` header
-  (`net.transfer`), or file bytes (`fs.write`). It is never
-  returned to Lua, never stored, and never logged.
+### Resolution — host process, consumption time
+
+- Resolution reads the host process environment (`NAME` → value) at
+  consumption time, immediately before the effect. The resolved value
+  flows into exactly one destination — the child process environment of
+  the consuming step — and is never stored, returned, or logged.
+- Consumption points currently implemented: the `env` keyed slot of
+  `sh.exec` (`ShExec`), `sync.pull` (`SyncPull`), and `staging.push`
+  (`StagingPush`). The latter two are what make the credential-carrying
+  CLI dispatch route work (chapter 02 §Dispatch routing).
+- Consumption points specified but deferred (chapter 04): a
+  `net.transfer` `auth_bearer` (→ an `Authorization: Bearer` header)
+  and an `fs.write` `content` (→ file bytes). Each will adopt the
+  identical check-then-resolve protocol.
 - Missing host env is fail-fast: a declared, consumed secret absent
   from the host environment aborts the step with
   `secret 'NAME' missing in host env` — no silent fallback, no
   empty-string substitution.
-- **Dry-run resolves too**: `opts.dry_run` skips the effect but not
-  the decode path, so undeclared-secret and missing-env errors
-  surface identically under dry-run. A dry-run that passes proves
-  the secret plumbing, not just the shapes.
+- **Dry-run resolves too**: `apply --dry-run` skips the effect but not
+  the resolution, so undeclared-secret and missing-env errors surface
+  identically under dry-run. A dry-run that passes proves the secret
+  plumbing, not just the shapes.
 
 ## Error surface
 
 All precondition class, fail-fast, no effect executed by the failing
 step:
 
-- SecretRef consumed with `name ∉ env_secrets` →
-  `secret 'NAME' is not declared in profile.env_secrets` (Lua
-  error, named per consumption point).
+- `EnvSecret` whose `name ∉ env_secrets` →
+  `secret 'NAME' is not declared in profile.env_secrets` at
+  consumption, and a validate-stage rejection naming the phase index
+  and env key before that.
 - Declared + consumed but absent from host env →
   `secret 'NAME' missing in host env`.
-- `env.get` with a secret name → "use env.ref()" rejection; with an
-  undeclared name → "not declared in profile.env" rejection.
-- `env.set` → unconditional rejection.
-- Secret-shaped key in `env` → validate-stage rejection
-  (chapter 03).
+- Secret-shaped key in `env` → validate-stage rejection (chapter 03).
+- Non-shell-safe name in `env` / `env_secrets` → validate-stage
+  rejection (chapter 03).
 
 ## Stability
 
-- SecretRef as userdata (vs pure marker table): **stable** —
-  physical opacity is preferred over a structural rule; the
-  IR-as-data purity tradeoff is recorded in chapter 00.
-- The opacity contract (tostring form, `name()`, no field access),
-  the consumption-time validation model, the resolution rules
-  (host-thread, fail-fast, dry-run-resolves): **stable**.
-- The consumption-point set: **provisional** — new bridges may join,
-  each adopting the identical check-then-resolve protocol.
-- Secret-key substring set: sourced from chapter 02 shared
-  vocabulary, **stable once frozen** (frozen there).
+- Secret opacity by node shape (a reference with no value field):
+  **stable**. It replaces the userdata mechanism while strengthening
+  the guarantee — the earlier tradeoff note (physical opacity vs
+  IR-as-data purity, chapter 00) is resolved in favour of both.
+- Two-stage (validate + consumption) allowlist enforcement, and the
+  resolution rules (host-process, consumption-time, fail-fast,
+  dry-run-resolves): **stable**.
+- The `{"__secret":"NAME"}` canonical marker: **stable** (chapter 03
+  owns the encoding).
+- The consumption-point set: **provisional** — the two deferred points
+  above join it, each adopting the identical protocol.
+- Secret-key substring set: sourced from chapter 02 shared vocabulary,
+  **stable once frozen** (frozen there).
 
 ## Upstream references
 
-- chapter 00 §Secret handling — opacity, deferred policy,
-  host-side resolution, `env.set` prohibition, fail-fast.
+- chapter 00 §Secret handling — opacity, host-side resolution,
+  no-host-env-mutation, fail-fast.
 - chapter 01 profile DSL surface — `env` / `env_secrets` declared
   lists.
 - chapter 02 phase catalog — secret-key substring set.
-- chapter 04 bridge — consumption points and the check-then-resolve
-  protocol.
+- chapter 03 pipeline stage artifacts — the validate-stage
+  cross-check and the canonical secret marker.
+- chapter 04 bridge — env value nodes and the consumption points.
 
 ## MVP scope
 
-Ships in Phase F: `env.ref`, SecretRef opacity, `env.get` double
-wall, `env.set` prohibition, host-thread resolution at all three
-consumption points, fail-fast missing-env behaviour including under
-dry-run, with negative fixtures for undeclared refs, secret-shaped
-env keys, and missing host env.
+Ships in Phase F: `EnvSecret` / `EnvLiteral` value nodes, the
+two-stage allowlist enforcement, host-process resolution at the three
+implemented consumption points, and fail-fast missing-env behaviour
+including under dry-run — with negative fixtures for undeclared
+references, secret-shaped `env` keys, and a missing host env.
+
+Deferred: the `net.transfer` `auth_bearer` and `fs.write` `content`
+consumption points, each blocked on the corresponding AST field
+(chapter 04 §MVP scope).

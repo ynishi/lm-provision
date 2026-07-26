@@ -19,13 +19,15 @@ defined at the command + stdio level so it is transport-agnostic
 
 - A single statically linked executable, target
   `x86_64-unknown-linux-musl` (additional targets are additive).
-- Embeds the Lua runtime (vendored Lua 5.4 via mlua) and every
-  `lm.*` module (`include_str!`, chapter 05 L1) — the pod needs zero
-  preinstalled dependencies for the binary itself to run.
-- Build shape (crate contract): one Cargo workspace; one host crate
-  producing `[[bin]] name = "lm-provision"`; the `lua/lm/*.lua`
-  sources are compile-time inputs of that crate. Adding an `lm.*`
-  module is a recompile, not a deploy-time file.
+- Carries no language runtime and loads nothing at run time: the
+  domain logic is compiled Rust and a profile is data (chapter 05 L1).
+  The pod needs zero preinstalled dependencies for the binary itself
+  to run.
+- Build shape (crate contract): one Cargo workspace; the host crate
+  produces `[[bin]] name = "lm-provision"` — the artifact this
+  protocol ships. Sibling crates in the same workspace produce the
+  driver side and the MCP server (chapter 10); neither is uploaded
+  into the pod.
 - External tools invoked *by profiles* (`apt-get`, `git`, `pip`,
   `curl`, `b2`, `huggingface-cli`, ...) are pod-image prerequisites
   of the specific profile, not of the binary. A missing tool fails
@@ -90,8 +92,8 @@ defined at the command + stdio level so it is transport-agnostic
   delete) stays with the external pod manager; only provisioning is
   owned by `lm-provision`. The pod-provider API client is **not**
   pulled into this repo. **Stable.**
-- Static-binary embeddability constraint (musl, vendored Lua,
-  embedded modules, no runtime file dependencies): **stable**.
+- Static-binary embeddability constraint (musl, no language runtime,
+  no runtime file dependencies): **stable**.
 - Binary target set (musl x86_64 as the baseline): **provisional**
   (additive).
 - Driver implementation home (standalone CLI wrapper vs an external

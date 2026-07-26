@@ -35,20 +35,37 @@ downstream analysis) and the push driver's collect step.
 Step entry — common fields:
 
 ```
-{ id, kind, op, ok = bool, status = int, dry_run?, ...op fields... }
+{ id, kind, op, ok = bool, status = int, dry_run?, reason?, ...op fields... }
 ```
+
+- `id`: `<phase_index>_<kind>` for a direct-op phase, and
+  `<phase_index>_<kind>_<n>` for the `n`-th sub-step of a lifecycle
+  phase (chapter 03 §dispatch). Unique within a report.
+- `kind`: the phase kind; `op`: the effect actually run.
+- `status`: process exit code / HTTP status / `0` for a successful
+  effectless step / `-1` for a failure that happened before the
+  effect.
+- `dry_run`: present (and `true`) for effect-bearing steps under
+  `--dry-run`. An effectless `note` step does not carry it.
+- `reason`: present iff `ok = false` — the failure text that also
+  drives the envelope's `error` line.
 
 Per-op additional fields:
 
 | op | fields |
 |---|---|
-| `sh.exec` | `argv`, `stdout`, `stderr` (`timed_out` surfaces via stderr suffix and `status = -1`) |
+| `sh.exec` | `argv`, `stdout`, `stderr` (captured tails, real mode) |
 | `fs.write` | `path`, `bytes` |
-| `net.http_get` / `net.http_post` | `url`, `body_bytes`, `stderr` (= bridge `error`) |
-| `net.transfer` | `src`, `dst`, `bytes`, `sha256`, `stderr` (= bridge `error`) |
-| `mount.bind` | `src`, `dst`, `stderr` (= bridge `error`) |
-| `mount.umount` | `path`, `stderr` (= bridge `error`) |
-| `dispatch_pending` | `note` — a visible skip; `ok = true`, `status = 0` |
+| `net.http_get` / `net.http_post` | `url` (status in the common `status` field) |
+| `net.transfer` | `src`, `dst`, `bytes` |
+| `mount.bind` | `src`, `dst` |
+| `mount.umount` | `path` |
+| `note` | `note` — a visible skip; `ok = true`, `status = 0` |
+
+A lifecycle sub-step's entry carries the step's *inputs* (`argv` /
+`src` + `dst` / `url`), not its captured output: the composed-step
+outcome is summarised into the trace line rather than the report
+(chapter 04 §Trace output).
 
 Semantics:
 
@@ -56,31 +73,44 @@ Semantics:
   that step is the last entry in `steps` and populates `error`.
   Steps after it never ran and do not appear — absence from the
   report means "not reached".
-- A step whose required bridge is not registered (capability
-  undeclared) fails in-report (`status = -1`, stderr names the
-  missing capability) rather than crashing the run.
-- `dispatch_pending` entries are successes: they record what the
-  dispatch layer intentionally skipped (chapter 02 §Unknown kinds,
-  `sync.push` markers) so the report is a complete trace of the
-  plan, executed or not.
-- Report content is redaction-safe by construction: secrets never
-  enter the Lua side (chapter 06), so argv / stdout / stderr carry
-  at most the `[secret:NAME]` marker or values the executed command
-  itself chose to print.
+- A step whose required capability is undeclared fails in-report
+  (`status = -1`, `reason` names the missing capability) rather than
+  crashing the run. The same holds for a path / URL policy rejection
+  and an undeclared or missing secret — including under `--dry-run`.
+- `note` entries are successes: they record what a lifecycle phase
+  decided when it had no concrete invocation to make, so the report
+  stays a complete trace of the plan, executed or not. `note`
+  replaces the former `dispatch_pending` op, which implied a pending
+  dispatch that the exec layer no longer has.
+- Report content is redaction-safe by construction: a secret's value
+  never enters the AST, the resolution map is never serialised into
+  the report (chapter 06), and argv is shell-safety-checked by
+  validate — so argv / stdout / stderr carry at most values the
+  executed command itself chose to print.
 
 ### Audit log (stderr transcript)
 
-Every bridge invocation emits one structured tracing line before the
+**Status: specified, not yet implemented.** The binary installs a
+stderr tracing subscriber honouring `--log-level` / `RUST_LOG`
+(chapter 07 §Global flags), but no effect currently emits a tracing
+event: stderr carries only the final error line. The exec layer does
+build a per-phase trace line, and wiring it to this transcript under
+the rules below is the outstanding work (chapter 04 §Trace output).
+The rules are frozen here so the wiring has a contract to satisfy
+rather than being invented at implementation time.
+
+Every effect invocation emits one structured tracing line before the
 effect. Redaction rules:
 
 - Env keys: key **names** are logged; a name matching the
   sensitive-key set is logged as `<KEY> [REDACTED]`. Values are
   never logged, sensitive or not.
-- Secret markers: a SecretRef renders as `[secret:NAME]` everywhere
-  (print redirect, audit fields).
+- Secret markers: an `EnvSecret` reference renders as
+  `[secret:NAME]` in every audit field.
 - `fs.write`: logs path + byte count + `content_source` — the
-  string `"string"` for literal content or `"secret:<name>"` when a
-  SecretRef wrote the file. Content bytes are never logged.
+  string `"string"` for literal content or `"secret:<name>"` once the
+  secret-content form lands (chapter 04 §`fs.write`). Content bytes
+  are never logged.
 - HTTP: URL, status, and body byte counts are logged; header
   **names** are logged, header values never (headers may carry
   tokens); bodies never.
@@ -109,10 +139,11 @@ One row per apply invocation:
   analysis (external pod-manager integration, audit, SLA reporting).
 - `(pod_id, profile_hash)` is deliberately **not** unique — re-applies
   and retries append additional rows; the full history is the value.
-- The canonical decode path (chapter 03) reconstructs the profile IR
-  from a stored canonical form when a ledger consumer needs more
-  than the hash; storing canonical bytes alongside rows is a
-  consumer choice, not part of the row schema.
+- Storing canonical bytes alongside rows is a consumer choice, not
+  part of the row schema. Reconstructing the profile AST from those
+  bytes would need a canonical **decode** path, which chapter 03
+  leaves undefined in this revision — a consumer needing more than
+  the hash keeps the source profile.
 - Physical encoding (JSON Lines file, SQLite table, ...) is the
   ledger owner's choice: the row schema and append-only semantics
   are the contract, the storage engine is internal.
@@ -130,7 +161,7 @@ One row per apply invocation:
 ## Stability
 
 - Report top-level shape (`ok` / `dry_run` / `profile_name` /
-  `steps` / `error`) and the fail-fast + pending semantics:
+  `steps` / `error`) and the fail-fast + `note` semantics:
   **stable once frozen** — frozen here.
 - Per-op step fields: **provisional** through Phase H (additive
   growth as bridges gain fields; removals are breaking).
@@ -160,6 +191,10 @@ One row per apply invocation:
 Ships in Phase G: ledger append + `collected_at` stamping in the
 driver.
 
-The report shape, fail-fast semantics, pending entries, and every
-redaction rule above ship binary-side in Phase F; Phase G consumes
-them unchanged.
+The report shape, the fail-fast semantics, and `note` entries ship
+binary-side in Phase F; Phase G consumes them unchanged.
+
+The stderr audit transcript and its redaction rules are specified but
+not yet emitted (see §Audit log). This does not weaken the report
+contract — the report never carried secret values in the first place —
+but an operator watching stderr today sees only the final error line.

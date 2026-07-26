@@ -96,8 +96,8 @@ An AI-native JSON representation ideal for programmatic generation and tool inte
 | `version` | string | no | `"0.0.0"` | semver string |
 | `description` | string | no | `nil` | — |
 | `capabilities` | list\<string\> | no | `{}` | entries from `KNOWN_CAPABILITIES` (chapter 05 L4) |
-| `env` | list\<string\> | no | `{}` | non-secret env allowlist |
-| `env_secrets` | list\<string\> | no | `{}` | secret allowlist |
+| `env` | list\<string\> | no | `{}` | non-secret env name declaration (distinct from a phase's `env` keyed slot, below) |
+| `env_secrets` | list\<string\> | no | `{}` | secret allowlist; every `EnvSecret` reference must name an entry here |
 | `paths` | list\<string\> | no | `{}` | filesystem path root allowlist (chapter 05 §L3 path policy) |
 | `http_allowlist` | list\<string\> | no | `{}` | HTTP URL pattern allowlist (chapter 05 §L3 HTTP policy) |
 | `phases` | list\<ProfileNode\> | no | `{}` | phase nodes per chapter 02 |
@@ -119,6 +119,64 @@ canonical text grammar and the JSON serde bridge that both build the
 same `ProfileNode` AST produce byte-identical canonical output and
 therefore the same hash, even though `NodeId`s minted by `IdGen`
 differ between the two builds.
+
+## Env keyed slots and value nodes
+
+Phases that inject environment variables (`sh.exec`, `sync.pull`,
+`staging.push` — chapter 02) carry an `env` field that is a **keyed
+slot**: an ordered map from variable name to a *value node*, rather
+than a scalar map. There are exactly two value nodes:
+
+| node | meaning |
+|---|---|
+| `EnvLiteral { value }` | a plain string written in the profile |
+| `EnvSecret { name }` | a reference to a host-environment secret, resolved at consumption time (chapter 06) |
+
+Both are value nodes: they inhabit an `env` slot and never appear as a
+top-level phase. `EnvSecret` carries the logical name only — there is
+no field in which a secret value could be written, which is what makes
+opacity a property of the shape (chapter 06 §The opacity contract).
+
+JSON form:
+
+```json
+{
+  "type": "ShExec",
+  "argv": ["huggingface-cli", "whoami"],
+  "env": {
+    "HF_HUB_ENABLE_HF_TRANSFER": { "type": "EnvLiteral", "value": "1" },
+    "HF_TOKEN": { "type": "EnvSecret", "name": "HF_TOKEN" }
+  }
+}
+```
+
+Canonical text form — braces distinguish a keyed slot from the
+bracketed list idiom; a key is written bare when it is an identifier
+and quoted otherwise:
+
+```text
+ShExec(
+    argv: ["huggingface-cli", "whoami"],
+    env: {
+        HF_HUB_ENABLE_HF_TRANSFER: EnvLiteral(value: "1"),
+        HF_TOKEN: EnvSecret(name: "HF_TOKEN")
+    }
+)
+```
+
+An omitted `env` binds to the empty map. Key order is not significant:
+the slot is stored ordered by key, and canonical (chapter 03) emits it
+in that order, so two profiles differing only in the order env entries
+were written hash identically.
+
+Representing env as a keyed slot of nodes — rather than a JSON string
+field, a list of pairs, or a scalar map — is what lets the schema, the
+grammar, validate, and canonical all see *inside* the value: validate
+cross-checks each `EnvSecret` name against `env_secrets`, and canonical
+encodes it as the `{"__secret":"NAME"}` marker. `dsl-kit`'s
+`Multiplicity::Map` supports self-recursive node values, which is
+exactly this shape; a map of *scalar* values is not yet supported
+upstream, which is why the value side is a node rather than a string.
 
 ## Escape / Fragment Policy
 

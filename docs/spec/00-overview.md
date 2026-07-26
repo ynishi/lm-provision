@@ -9,13 +9,23 @@ guarantee requires it.
 ## Grounding
 
 These specs are **not** greenfield: they are grounded in a working
-reference implementation (Rust host crate + embedded `lm.*` Lua
-modules + an example-profile regression suite). Chapters 01–07 and
-the report/redaction half of 09 describe behaviour that
-implementation already proves; 08 (driver side), the ledger half of
-09, and 10 are the contracts the next build phases implement
-against. Where a chapter marks something provisional, it is a
-genuine design opening — not an unimplemented TODO.
+reference implementation (a Rust workspace whose host crate carries
+the whole pipeline, plus a profile regression suite). Chapters 01–07
+and the report half of 09 describe behaviour that implementation
+already proves; 08 (driver side), the ledger half of 09, and 10 are
+the contracts the next build phases implement against. Where a
+chapter marks something provisional, it is a genuine design opening —
+not an unimplemented TODO. Where a chapter marks something *specified
+but not yet implemented* (currently: the audit transcript of 09 and
+the per-primitive option sets of 04), it says so at the point of use.
+
+**The embedded-Lua frontend is gone.** The original design split the
+system as "Rust host / Lua domain" and authored profiles as Lua code
+executed in an embedded mlua VM. Profiles are now data — JSON or
+canonical text parsed into the `ProfileNode` AST — and the whole
+pipeline is Rust. Chapters below record the decisions that were made
+under the old split and note where each one was superseded, rather
+than deleting the rationale.
 
 ## Naming and vocabulary separation
 
@@ -57,10 +67,9 @@ Layer 2 — Contract
               ▼             ▼                     ▼
 Layer 3 — Runtime
     04  Bridge          05  Sandbox layer    06  Secret handling
-        (sh / net /         contract             (Lua-facing only:
-         fs / mount /       (L1 / L2 /            SecretRef userdata,
-         secret)            L3 / L4)              env.ref factory,
-              │             │                     env.get reject)
+        (sh / net /         contract             (EnvSecret node,
+         fs / mount /       (L1 / L2 /            two-stage allowlist,
+         env values)        L3 / L4)              host-side resolve)
               │             │                     │
               └──────┬──────┴─────────────────────┘
                      ▼
@@ -85,9 +94,9 @@ Layer 5 — Integration
 | 01 | Profile DSL surface | 1 | — | F | specified |
 | 02 | Phase catalog | 1 | — | F | specified |
 | 03 | Pipeline stage artifacts | 2 | 01, 02 | F | specified |
-| 04 | Bridge (sh / net / fs / mount / secret) | 3 | 03 | F | specified |
+| 04 | Bridge (sh / net / fs / mount / env values) | 3 | 03 | F | specified |
 | 05 | Sandbox layer contract (L1 / L2 / L3 / L4) | 3 | 04 | F | specified |
-| 06 | Secret handling (Lua-facing only) | 3 | 01, 04 | F | specified |
+| 06 | Secret handling | 3 | 01, 04 | F | specified |
 | 07 | CLI | 4 | 03 | G | specified |
 | 08 | Push driver protocol (on-pod agent model) | 4 | 07, 04, 06 | G | specified |
 | 09 | Apply report + audit redact + ledger schema | 4 | 08 | G | specified |
@@ -165,20 +174,25 @@ absorbs it, so the graph stays acyclic.
 
 ### Boundary and stack
 
-- **Rust host / Lua domain, 100% split.** All domain logic
-  (validate, canonical, hash, plan, dispatch, apply orchestration,
-  report shape) lives in Lua modules. The Rust host is a pure
-  infrastructure executor: mlua VM setup, bridge implementations,
-  sandbox layer wiring, CLI transport, audit log. Rust carries no
-  domain vocabulary.
-  Absorbed by 03 (Lua-side pipeline shape) and 04 (bridge as sole
-  effectful surface).
-- **mlua embedded VM is the transport.** The Rust host embeds Lua
-  via mlua; Lua code is not invoked as a subprocess over JSON. The
-  boundary is function calls across the mlua bridge, not a wire
-  protocol.
-  Absorbed by 04; constrains 05 (sandbox layers must be expressible
-  as mlua configuration + register-time gating).
+- ~~**Rust host / Lua domain, 100% split.**~~ **Superseded: one Rust
+  stack over a typed AST.** All domain logic (validate, canonical,
+  hash, plan, dispatch, apply orchestration, report shape) originally
+  lived in Lua modules, with Rust as a pure infrastructure executor
+  carrying no domain vocabulary. The split cost a language boundary in
+  the middle of every stage and made the schema, the grammar, and the
+  validator three separate things to keep in step. Domain logic is now
+  Rust over the `ProfileNode` AST, with the schema as the single
+  source both frontends and the validator derive from.
+  Absorbed by 03 (pipeline shape) and 04 (bridge as sole effectful
+  surface).
+- ~~**mlua embedded VM is the transport.**~~ **Superseded: a profile
+  is data.** There is no interpreter and no transport between
+  languages: parsing a profile yields a value, and applying it is a
+  step loop over that value. The property the VM boundary was meant to
+  provide — that author input cannot reach the host except through the
+  declared primitives — now holds because author input is not code.
+  Absorbed by 04; simplifies 05 (the L1 / L2 mechanisms it required
+  are no longer necessary).
 - **Stateless.** No client-side state machine, no drift detection,
   no Terraform-style desired-state reconciliation. A single apply
   runs the phase sequence once, fail-fast, and returns a report.
@@ -200,18 +214,23 @@ absorbs it, so the graph stays acyclic.
   capabilities); consumed by 05 (sandbox uses declared set as
   allowlist).
 - **Schema as data with editor completion.** Phase schema is a
-  discriminated union expressed in a schema library; a codegen step
-  emits `.d.lua` for editors.
-  Absorbed by 02; referenced by 04 for bridge signatures.
+  discriminated union expressed in a schema library. The `.d.lua`
+  codegen step this originally implied served Lua authoring and was
+  removed with it; the machine-derived `DslSchema` is what tooling
+  reads now.
+  Absorbed by 02; referenced by 04 for primitive signatures.
 - **Ten-phase lifecycle: bucketed surface, deferred.** Surfacing the
   lifecycle as buckets instead of a flat list with hidden reorder
   is a breaking change and is deferred out of MVP Phase F unless
   explicitly promoted.
   Recorded in 01 and 02 as a deferred item.
 - **Escape / fragment policy.** Inner escape stays inside
-  `hooks/sh`; fragment reuse is done by extracting host Lua
-  functions (outer escape) rather than growing DSL vocabulary.
-  Absorbed by 01; referenced by 04 (shell bridge).
+  `hooks/sh`; fragment reuse is done outside the profile — by whatever
+  generates the JSON / canonical text against the exported schema —
+  rather than growing DSL vocabulary. (The original wording named
+  "extracting host Lua functions" as the outer escape; the principle
+  survives the frontend that motivated it.)
+  Absorbed by 01; referenced by 04 (shell primitive).
 - **Declared lists are stable-sorted; phase order is user-defined.**
   `capabilities`, `env`, `env_secrets`, `paths`, and
   `http_allowlist` are stable-sorted so hash is independent of
@@ -221,14 +240,19 @@ absorbs it, so the graph stays acyclic.
 
 ### Sandbox layers (from 05)
 
-- **Four-layer sandbox.** L1 = standard-library nil-out plus embedded
-  `lm.*` require allowlist plus bytecode / `string.dump` prohibition.
-  L2 = execution-control isolation (thread isolation, cancel hook,
-  wall-clock timeout). L3 = policy trait implementations for env,
-  path, and HTTP allowlist. L4 = capability gate over the operation
-  set (`sh.exec`, `net.transfer`, `net.http_get`, `net.http_post`,
-  `fs.write`, `mount.bind`, `mount.umount`, `env.ref`, plus reserved
+- **Four-layer sandbox.** L1 = keeping author input from reaching the
+  host as code. L2 = execution model (statelessness, bounded run).
+  L3 = policy implementations for secret env, path, and HTTP
+  allowlist. L4 = capability gate over the operation set (`sh.exec`,
+  `net.transfer`, `net.http_get`, `net.http_post`, `fs.write`,
+  `mount.bind`, `mount.umount`, `env.ref`, plus reserved
   `mount.volume_attach`).
+  L1 and L2 originally named concrete mlua mechanisms — stdlib
+  nil-out, an embedded-module require allowlist, a bytecode
+  prohibition, and a dedicated VM thread with a cancel hook. Those
+  mechanisms went with the VM; the two layers keep their
+  responsibilities and are now satisfied structurally (05 §L1 / §L2
+  record each predecessor).
   Absorbed by 05.
 - **`KNOWN_CAPABILITIES` allowlist.** The initial known set is
   operation-scoped (`sh.exec`, not `sh`) so bearer-authenticated
@@ -236,42 +260,55 @@ absorbs it, so the graph stays acyclic.
   `net.http_get`.
   Absorbed by 05; referenced by 02 (phase kinds cite capabilities
   from this set).
-- **Defer pattern as security invariant.** Bridge primitives are
-  registered only after declared-list extraction completes. A
-  profile that tries to reach a bridge primitive during declaration
-  extraction fails with `attempt to call a nil value` before any
-  effect can run. This is a physical guarantee, not a lint.
-  Absorbed by 05; referenced by 04 (registration order).
+- **Declared lists are derived before any effect is reachable.**
+  Originally a *defer pattern*: primitives were registered only after
+  declared-list extraction finished, so a profile reaching for one
+  during extraction died on `attempt to call a nil value`. With no
+  author code to run during extraction, the ordering is a property of
+  the pipeline rather than a staged registration — the invariant is
+  unchanged and strengthened.
+  Absorbed by 05; referenced by 04 (context build order).
 
 ### Secret handling (from 06 and 09)
 
-- **`SecretRef` userdata is opaque.** The only defined operation is
-  `tostring` returning `[secret:NAME]`. Field access, indexing, and
-  arithmetic are unimplemented.
+- **A secret reference is opaque.** Originally a `SecretRef` userdata
+  whose only defined operation was `tostring` → `[secret:NAME]`, with
+  field access and indexing unimplemented. It is now the `EnvSecret`
+  AST node, which carries a name and has no value field at all —
+  opacity became a property of the shape, so the userdata mechanism
+  is unnecessary.
   Absorbed by 06.
-- **`env.ref(name)` is a factory; policy check is deferred to
-  bridge consumption.** Validation-time policy checks would create a
-  chicken-and-egg with the declared list (which itself contains
-  refs).
-  Absorbed by 06; timing recorded in 03.
-- **`env.get(name)` rejects secret-shaped keys.** Secret names are
-  reachable only via `env.ref`. This is a second wall on top of the
-  userdata opacity.
+- ~~**`env.ref(name)` is a factory; policy check is deferred to
+  bridge consumption.**~~ **Superseded: checked at both stages.** The
+  deferral existed because `env.ref` was registered before the
+  declared lists were extracted — a chicken-and-egg a declarative AST
+  does not have. Validate now rejects an undeclared reference
+  statically, *and* consumption re-checks it.
+  Absorbed by 06; validate-stage check recorded in 03.
+- ~~**`env.get(name)` rejects secret-shaped keys.**~~ **Superseded:
+  no plain-read surface exists.** The "second wall" guarded a path by
+  which a profile could read an arbitrary host env var. That path is
+  gone; the only host-env read is `EnvSecret` resolution, gated by
+  `env_secrets`. The secret-shaped-key rejection survives as a
+  validate rule on the declared `env` list.
   Absorbed by 06.
-- **Secret resolution happens on the host thread, not in Lua.** The
-  resolved value flows into child process env, HTTP body, or file
-  bytes; it is never handed back to Lua.
-  Absorbed by 06 (Lua-facing rule) and 04 (bridge implementation
-  constraint).
-- **`env.set` is prohibited.** All environment injection goes
-  through explicit exec-time env; Lua cannot mutate the host env.
+- **Secret resolution happens host-side, never in the profile.** The
+  resolved value flows into the consuming step's child-process
+  environment and nowhere else; it never enters the AST, the trace,
+  or the report.
+  Absorbed by 06 and 04 (implementation constraint).
+- **Host environment mutation is prohibited.** All environment
+  injection goes through the consuming phase's explicit `env` keyed
+  slot; nothing a profile expresses can mutate the host env. (The
+  original rule named `env.set`, the Lua surface that had to be
+  withheld.)
   Absorbed by 06.
 - **Missing host env is fail-fast.** If a declared secret is absent
   from the host environment at apply time, apply fails with a
   specific error; no silent fallback.
   Absorbed by 06; error class recorded in 03 and 09.
-- **Audit redact rule is a report-side contract, not a Lua-side
-  contract.** Case-insensitive substring match on
+- **Audit redact rule is a report-side contract, not an
+  authoring-side contract.** Case-insensitive substring match on
   `key / token / secret / password / pwd / auth / cred / apikey`
   drives `[REDACTED]` in the audit log; `content_source` becomes
   `"secret:<name>"` when a `SecretRef` writes a file.
@@ -289,10 +326,13 @@ absorbs it, so the graph stays acyclic.
   provisioning is owned by lm-provision. The pod-provider API client
   is not pulled into the core.
   Absorbed by 08; referenced by 10.
-- **Static provisioner.** The binary is musl-static and embeds the
-  Lua runtime plus the `lm.*` modules via `include_str!`, so the
-  target environment carries zero dependency prerequisites.
-  Absorbed by 08; constrains 04 (bridges must be embeddable).
+- **Static provisioner.** The binary is musl-static and carries no
+  language runtime and no runtime file dependencies, so the target
+  environment carries zero prerequisites for the binary itself.
+  (Originally this meant embedding the Lua runtime and the `lm.*`
+  modules via `include_str!`; removing the interpreter satisfies the
+  constraint more directly.)
+  Absorbed by 08; constrains 04 (effects must be embeddable).
 - **Append-only ledger.** Apply outcomes are stored as
   `(pod_id, profile_hash, report)` in an append-only ledger. The
   ledger is the source of truth for downstream analysis (external
@@ -306,28 +346,29 @@ lm-provision is positioned as: surface = constructor-based DSL;
 artifact = IR as data; execution = Def → Compile → Exec pipeline.
 The following refinements are adopted.
 
-- **Phase catalog uses discriminated-union schema + typed codegen.**
-  Per-kind payload schemas are expressed as a discriminated union in
-  a schema library; a codegen step emits `.d.lua` for editor
-  completion. The same schema is walkable by the Rust host for
-  pre-flight static checks. This is the canonical implementation of
-  the schema-as-data decision.
+- **Phase catalog uses a discriminated-union schema.** Per-kind
+  payload schemas are expressed as a discriminated union — the
+  `ProfileNode` enum — from which the schema, the canonical-text
+  grammar, and the JSON bridge are all derived. This is the canonical
+  implementation of the schema-as-data decision. The `.d.lua` codegen
+  half of the original decision went with the Lua frontend.
   Absorbed by 02.
-- **Shared vocabulary lives in one canonical data file.** The 22
-  phase kinds (enumerated in 02), `KNOWN_CAPABILITIES`, the secret-key substring set
-  (used by 06 to reject secret-shaped plain env reads), and the
-  sensitive-key substring set (used by 09 for audit redaction) live
-  in one canonical data file. Both the Lua host and the Rust host
-  reference the same file. The implementation form — Lua source
-  parsed at Rust build, a shared YAML / JSON, or equivalent — is
-  not fixed by this spec.
+- **Shared vocabulary has one source of truth.** The 22 phase kinds
+  (enumerated in 02), `KNOWN_CAPABILITIES`, the secret-key substring
+  set (used by 06 to reject secret-shaped `env` declarations), and
+  the sensitive-key substring set (used by 09 for audit redaction)
+  are defined once. With a single host there is no cross-language
+  mirroring left to keep in step; byte equality of the sets remains
+  the contract and the implementation form is internal.
   Absorbed by 02 (Inputs, Stability); referenced by 05, 06, 09.
-- **Canonical stage is round-trippable.** The canonical stage
-  contract is bidirectional: encode (IR → canonical JSON bytes) and
-  decode (canonical JSON bytes → IR). Secret refs survive the
-  round-trip as marker tables and are rehydrated back into
-  `SecretRef` on the Lua side, preserving opacity. This enables
-  ledger reconstruction and cross-pod profile persistence.
+- **Canonical stage is round-trippable — deferred to encode-only.**
+  The bidirectional contract (encode AST → bytes, decode bytes → AST)
+  was specified to enable ledger reconstruction and cross-pod profile
+  persistence. Only encode is defined in the current revision: the
+  ledger persists the report and the hash, and no consumer has needed
+  reconstruction. Secret references survive encoding as the
+  `{"__secret":"NAME"}` marker, so a future decode has an
+  opacity-preserving form to rehydrate into.
   Absorbed by 03 (canonical stage Outputs).
 
 Deferred applications, recorded so a future revision can cite the
@@ -350,12 +391,13 @@ original rationale:
   `depends_on` fields with topological sort (a dependency DAG) is a
   future revision, not MVP.
   Recorded in 02 Stability.
-- **`SecretRef` stays userdata, not a marker table.** Keeping the
-  Lua-facing form as userdata preserves physical opacity (`__index`
-  returns nothing, `__newindex` is closed). Converting to a pure
-  marker table would raise IR-as-data purity to 100 % at the cost
-  of downgrading opacity from a physical guarantee to a structural
-  rule; the tradeoff is not accepted.
+- ~~**`SecretRef` stays userdata, not a marker table.**~~
+  **Resolved — the tradeoff dissolved.** The decision weighed physical
+  opacity (userdata with `__index` closed) against 100 % IR-as-data
+  purity, and refused to trade the former for the latter. Removing
+  the language runtime removed the party the reference had to be kept
+  opaque *from*: `EnvSecret` is pure data **and** has no field a value
+  could be read out of. Both sides of the tradeoff are now satisfied.
   Recorded in 06.
 
 ## Conventions
