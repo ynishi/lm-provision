@@ -5,14 +5,13 @@
 //! declared-capability contract, [`payload`] recovers each node's
 //! payload from the AST (dsl-kit does not pass leaf payloads into
 //! [`dsl_kit::Op::apply`]), [`effects`] carries the pure-Rust effect
-//! implementations (ported from the old `src/bridge/*` mlua bridges with
-//! the Lua layer stripped), and [`registry`] wires all 22 catalog ops
-//! onto the engine.
+//! implementations (ported from the former `src/bridge/*` mlua bridges
+//! with the Lua layer stripped), and [`registry`] wires all 22 catalog
+//! ops onto the engine.
 //!
-//! The old mlua stack (`src/bridge/`, `src/sandbox/`, ...) is left
-//! untouched — it is scheduled for removal in a later backlog item, and
-//! its `mlua::Table` in/out shape makes a pure-Rust re-port cheaper than
-//! an adapter.
+//! This is now the sole execution path: the former mlua stack
+//! (`src/bridge/`, `src/sandbox/`, `src/vm/`, ...) has been removed and
+//! the profile frontend is JSON / canonical text only.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

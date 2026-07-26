@@ -1,24 +1,24 @@
 //! CLI subcommand surface and pipeline wiring (07-cli.md).
 //!
-//! `validate` / `hash` / `plan` each run the pipeline-stages column
-//! 07-cli.md §Invocation names for that subcommand, reached through the
-//! same sandboxed VM + `require('lm.*')` path a profile author's own
-//! code takes (registration order steps 1-5, 04-bridge.md §Registration
-//! order, via [`crate::vm::eval::evaluate_profile_file`]) — no bridge
-//! primitive is registered for these subcommands, matching their
-//! "none (read-only)" effects column in 07 §Invocation. `apply` (07
-//! §Invocation: "load → declarations → gate → bridges → plan → dispatch
-//! → apply") wires [`crate::apply::run_apply`] (milestone M4-1) instead —
-//! see [`run_apply`] below (milestone M4-3).
+//! `validate` / `hash` / `plan` each run the read-only pipeline stages
+//! 07-cli.md §Invocation names for that subcommand over the
+//! [`crate::dsl_poc::ProfileNode`] AST produced by
+//! [`crate::frontend::load_profile`] — no effect is run for these three
+//! subcommands, matching their "none (read-only)" effects column in 07
+//! §Invocation. `apply` (07 §Invocation: "load → declarations → gate →
+//! bridges → plan → dispatch → apply") wires [`crate::apply::run_apply_ast`]
+//! instead.
+//!
+//! The input format is chosen purely by file extension inside
+//! [`crate::frontend::load_profile`] (`.json` → JSON serde bridge,
+//! anything else → canonical text grammar, `.lua` → an explicit
+//! `Lua profiles are no longer supported` error). The legacy embedded-Lua
+//! authoring frontend and its VM pipeline have been removed.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use mlua::{Function, Lua, Table};
-
-use crate::batteries;
-use crate::vm::eval::{evaluate_profile_file, EvalError};
 
 /// `lm-provision <subcommand> <profile-path> [flags]`
 /// (07-cli.md §Invocation).
@@ -41,35 +41,28 @@ pub struct Cli {
 }
 
 /// The subcommand surface (07-cli.md §Invocation table). The four MVP
-/// subcommands (`validate` / `hash` / `plan` / `apply`) plus `codegen`,
-/// an additive read-only subcommand (07 §Stability: "additions
-/// expected" through Phase H).
+/// subcommands: `validate` / `hash` / `plan` / `apply`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// load → declarations → validate (read-only, no effects).
     Validate {
         /// Path to the profile file.
-        profile: PathBuf,
+        profile: std::path::PathBuf,
     },
     /// load → declarations → canonical → hash (read-only, no effects).
     Hash {
         /// Path to the profile file.
-        profile: PathBuf,
+        profile: std::path::PathBuf,
     },
     /// load → declarations → plan (read-only, no effects).
     Plan {
         /// Path to the profile file.
-        profile: PathBuf,
-    },
-    /// load → declarations → codegen (read-only, no effects).
-    Codegen {
-        /// Path to the profile file.
-        profile: PathBuf,
+        profile: std::path::PathBuf,
     },
     /// load → declarations → gate → bridges → plan → dispatch → apply.
     Apply {
         /// Path to the profile file.
-        profile: PathBuf,
+        profile: std::path::PathBuf,
         /// Decode + policy + secret resolution only, no effects
         /// (04-bridge.md dry-run convention).
         #[arg(long)]
@@ -97,50 +90,26 @@ pub fn run(command: &Command) -> ExitCode {
         Command::Validate { profile } => run_validate(profile),
         Command::Hash { profile } => run_hash(profile),
         Command::Plan { profile } => run_plan(profile),
-        Command::Codegen { profile } => run_codegen(profile),
         Command::Apply { profile, dry_run } => run_apply(profile, *dry_run),
     }
 }
 
 /// The error type every read-only pipeline function below returns.
-/// Carries only a rendered message rather than the source error: `mlua
-/// ::Error`'s `ExternalError` variant boxes a plain `dyn
-/// std::error::Error` (not `Send + Sync`), so it cannot flow through a
-/// `Send + Sync`-bounded error type such as `anyhow::Error` — capturing
-/// the `Display` output immediately sidesteps that, and is all
-/// 07-cli.md §Error surface's "final error line" needs.
+/// Carries only a rendered message rather than the source error so the
+/// single "final error line" 07-cli.md §Error surface needs is all a
+/// caller has to preserve.
 ///
 /// `pub` (rather than crate-private) so [`lm-provision-mcp`'s MCP tool
 /// wrappers][../../lm-provision-mcp] can surface the same message text
-/// `print_failure` renders to stderr without depending on `mlua` /
-/// `serde_json` error types directly (10-mcp.md §Error surface
-/// "precondition ... class preserved"). Widening this visibility does
-/// not change any CLI behavior — [`run_validate`], [`run_hash`], and
-/// [`run_plan`] below are untouched.
+/// `print_failure` renders to stderr without depending on the underlying
+/// error types directly (10-mcp.md §Error surface "precondition ... class
+/// preserved").
 #[derive(Debug)]
 pub struct RunError(String);
 
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-impl From<EvalError> for RunError {
-    fn from(err: EvalError) -> Self {
-        RunError(err.to_string())
-    }
-}
-
-impl From<mlua::Error> for RunError {
-    fn from(err: mlua::Error) -> Self {
-        RunError(err.to_string())
-    }
-}
-
-impl From<serde_json::Error> for RunError {
-    fn from(err: serde_json::Error) -> Self {
-        RunError(err.to_string())
     }
 }
 
@@ -157,97 +126,8 @@ impl From<crate::validate::ValidateError> for RunError {
 }
 
 /// The `Result` alias every read-only pipeline function below returns.
-/// `pub` for the same reason [`RunError`] is (milestone M6, see there).
+/// `pub` for the same reason [`RunError`] is.
 pub type PipelineResult<T> = std::result::Result<T, RunError>;
-
-/// `require(module)` via the profile's sandboxed VM — the same path a
-/// profile author's own `require('lm.<x>')` call takes
-/// (05-sandbox-layer-contract.md §L1).
-///
-/// `pub(crate)` so [`crate::codegen`]'s `codegen_pipeline` can reuse this
-/// exact helper rather than forking a second copy (avoids drift between
-/// the two `require("lm.catalog_data")` call sites).
-pub(crate) fn require_module(lua: &Lua, module: &str) -> mlua::Result<Table> {
-    let require_fn: Function = lua.globals().get("require")?;
-    require_fn.call(module)
-}
-
-/// `validate <profile>` pipeline (07-cli.md §Invocation: load →
-/// declarations → validate). Returns the validated profile name on
-/// success. A validate-stage rejection (`{ ok = false, error }`,
-/// 03-pipeline-stage-artifacts.md §validate) and any earlier-stage
-/// error (profile load / Lua eval, 07 §Error surface "Precondition")
-/// both surface as `Err` here — 07's exit-code mapping collapses every
-/// failure to exit code 1 regardless of which one it was; the message
-/// on stderr is what distinguishes them for a human reader.
-pub fn validate_pipeline(profile: &Path) -> PipelineResult<String> {
-    let extracted = evaluate_profile_file(profile)?;
-
-    let validate_mod = require_module(&extracted.lua, "lm.validate")?;
-    let validate_fn: Function = validate_mod.get("validate")?;
-    let result: Table = validate_fn.call(extracted.ir.clone())?;
-
-    let ok: bool = result.get("ok")?;
-    if !ok {
-        let message: String = result.get("error")?;
-        return Err(RunError(message));
-    }
-    Ok(result.get("name")?)
-}
-
-/// `hash <profile>` pipeline (07-cli.md §Invocation: load →
-/// declarations → canonical → hash). Deliberately does **not** run
-/// `lm.validate` first — 07 §Invocation's pipeline-stages column for
-/// `hash` names only load → declarations → canonical → hash, and
-/// 03-pipeline-stage-artifacts.md §Error surface confirms canonical /
-/// hash "raise only on malformed stage input", i.e. content-level
-/// validation is validate's job, not a precondition of these two
-/// stages. Returns the 64-character lowercase hex digest.
-pub fn hash_pipeline(profile: &Path) -> PipelineResult<String> {
-    let extracted = evaluate_profile_file(profile)?;
-    batteries::hash::install(&extracted.lua)?;
-
-    let canonical_mod = require_module(&extracted.lua, "lm.canonical")?;
-    let encode_fn: Function = canonical_mod.get("encode")?;
-    let bytes: mlua::String = encode_fn.call(extracted.ir.clone())?;
-
-    let hash_mod = require_module(&extracted.lua, "lm.hash")?;
-    let sha256_hex_fn: Function = hash_mod.get("sha256_hex")?;
-    Ok(sha256_hex_fn.call(bytes)?)
-}
-
-/// `plan <profile>` pipeline (07-cli.md §Invocation: load →
-/// declarations → plan — no validate step, for the same reason as
-/// [`hash_pipeline`]). Returns the plan artifact as a
-/// `serde_json::Value`, ready to pretty-print.
-///
-/// Routed through `lm.canonical.encode` rather than a bespoke Lua-table
-/// -> JSON walk on the Rust side: a plan step's `payload` can carry a
-/// `SecretRef` userdata verbatim (e.g. an `env.ref(...)` value used as
-/// `fs.write.content`, passed through unresolved by every read-only
-/// stage), and `lm.canonical` is the module that already knows how to
-/// encode that opaquely as `{"__secret":"NAME"}`
-/// (03-pipeline-stage-artifacts.md §canonical) — reusing it here avoids
-/// duplicating that rule (or worse, leaking a userdata's raw
-/// representation) in a second, Rust-side serializer. The resulting
-/// object-key order is `lm.canonical`'s lexicographic order, not the
-/// field order 03 §plan's Lua-table example happens to list them in;
-/// JSON object key order carries no meaning, so this is not a shape
-/// deviation from the frozen contract (03 §Stability: "plan artifact
-/// shape ... stable").
-pub fn plan_pipeline(profile: &Path) -> PipelineResult<serde_json::Value> {
-    let extracted = evaluate_profile_file(profile)?;
-
-    let plan_mod = require_module(&extracted.lua, "lm.plan")?;
-    let expand_fn: Function = plan_mod.get("expand")?;
-    let plan_table: Table = expand_fn.call(extracted.ir.clone())?;
-
-    let canonical_mod = require_module(&extracted.lua, "lm.canonical")?;
-    let encode_fn: Function = canonical_mod.get("encode")?;
-    let bytes: String = encode_fn.call(plan_table)?;
-
-    Ok(serde_json::from_str(&bytes)?)
-}
 
 /// Print `<subcommand> failed: <err>` to stderr (07-cli.md §Error
 /// surface's literal failure-line form) and return exit code 1
@@ -267,18 +147,17 @@ fn print_json(value: &serde_json::Value) {
     );
 }
 
-/// AST-path `validate` pipeline: load profile → run the AST validate
-/// checks → return the validated profile name.
-///
-/// Mirrors [`validate_pipeline`]'s "load → declarations → validate"
-/// shape (07-cli.md §Invocation) without the Lua VM hop:
-/// [`crate::frontend::load_profile`] produces the same
-/// [`crate::dsl_poc::ProfileNode`] AST both frontends converge on, and
-/// [`crate::validate::validate`] is the Rust port of the legacy
-/// `lm.validate.validate`. The name is read off the `Spec` node itself —
-/// a successful validate guarantees the root is a
+/// `validate <profile>` pipeline (07-cli.md §Invocation: load →
+/// declarations → validate). Load the profile into a
+/// [`crate::dsl_poc::ProfileNode`] AST, run the AST validate checks
+/// ([`crate::validate::validate`], the port of the legacy
+/// `lm.validate.validate`), and return the validated profile name read
+/// off the `Spec` node. A successful validate guarantees the root is a
 /// [`crate::dsl_poc::ProfileNode::Spec`].
-pub(crate) fn ast_validate(profile: &Path) -> PipelineResult<String> {
+///
+/// `pub` so [`lm-provision-mcp`'s `lm_validate` tool][../../lm-provision-mcp]
+/// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
+pub fn ast_validate(profile: &Path) -> PipelineResult<String> {
     let node = crate::frontend::load_profile(profile)?;
     crate::validate::validate(&node)?;
     let name = match &node {
@@ -291,12 +170,7 @@ pub(crate) fn ast_validate(profile: &Path) -> PipelineResult<String> {
 }
 
 fn run_validate(profile: &Path) -> ExitCode {
-    let result = if is_lua_profile(profile) {
-        validate_pipeline(profile)
-    } else {
-        ast_validate(profile)
-    };
-    match result {
+    match ast_validate(profile) {
         Ok(name) => {
             print_json(&serde_json::json!({ "ok": true, "name": name }));
             ExitCode::from(0)
@@ -305,41 +179,22 @@ fn run_validate(profile: &Path) -> ExitCode {
     }
 }
 
-/// True when `path`'s extension is `lua` (case-insensitive).
-///
-/// Used by the `hash` / `plan` subcommands to route a profile file
-/// between the legacy Lua pipeline ([`hash_pipeline`] /
-/// [`plan_pipeline`], preserved bit-for-bit) and the new AST frontend
-/// ([`crate::frontend::load_profile`]). Any non-`.lua` extension
-/// (`.json` / `.txt` / bare / …) goes through the AST path; the
-/// frontend then picks JSON vs canonical text by its own extension
-/// check.
-pub(crate) fn is_lua_profile(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
-}
-
-/// AST-path `hash` pipeline: load profile → canonical hash.
-///
-/// Deliberately mirrors [`hash_pipeline`]'s "load → declarations →
-/// canonical → hash" shape (07-cli.md §Invocation) without the Lua VM
-/// hop — [`crate::frontend::load_profile`] produces the same
-/// [`crate::dsl_poc::ProfileNode`] AST both frontends converge on, and
-/// [`crate::canonical::hash`] is already frontend-agnostic (see
+/// `hash <profile>` pipeline (07-cli.md §Invocation: load → declarations
+/// → canonical → hash). Deliberately does **not** run validate first —
+/// 07 §Invocation's pipeline-stages column for `hash` names only load →
+/// declarations → canonical → hash. Returns the 64-character lowercase
+/// hex digest via the frontend-agnostic [`crate::canonical::hash`] (see
 /// `tests/canonical_frontend_parity.rs`).
-pub(crate) fn ast_hash(profile: &Path) -> PipelineResult<String> {
+///
+/// `pub` so [`lm-provision-mcp`'s `lm_hash` tool][../../lm-provision-mcp]
+/// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
+pub fn ast_hash(profile: &Path) -> PipelineResult<String> {
     let node = crate::frontend::load_profile(profile)?;
     Ok(crate::canonical::hash(&node))
 }
 
 fn run_hash(profile: &Path) -> ExitCode {
-    let result = if is_lua_profile(profile) {
-        hash_pipeline(profile)
-    } else {
-        ast_hash(profile)
-    };
-    match result {
+    match ast_hash(profile) {
         Ok(hex) => {
             println!("{hex}");
             ExitCode::from(0)
@@ -348,27 +203,21 @@ fn run_hash(profile: &Path) -> ExitCode {
     }
 }
 
-/// AST-path `plan` pipeline: load profile → expand into the plan
-/// artifact.
+/// `plan <profile>` pipeline (07-cli.md §Invocation: load → declarations
+/// → plan — no validate step, for the same reason as [`ast_hash`]).
+/// Load the profile into an AST and expand it into the plan artifact
+/// ([`crate::plan::expand`], the port of the legacy `lm.plan.expand`),
+/// returned as a `serde_json::Value` ready to pretty-print.
 ///
-/// Mirrors [`plan_pipeline`]'s "load → declarations → plan" shape
-/// (07-cli.md §Invocation) without the Lua VM hop:
-/// [`crate::frontend::load_profile`] produces the same
-/// [`crate::dsl_poc::ProfileNode`] AST both frontends converge on,
-/// and [`crate::plan::expand`] is the Rust port of the legacy
-/// `lm.plan.expand`.
-pub(crate) fn ast_plan(profile: &Path) -> PipelineResult<serde_json::Value> {
+/// `pub` so [`lm-provision-mcp`'s `lm_plan` tool][../../lm-provision-mcp]
+/// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
+pub fn ast_plan(profile: &Path) -> PipelineResult<serde_json::Value> {
     let node = crate::frontend::load_profile(profile)?;
     Ok(crate::plan::expand(&node))
 }
 
 fn run_plan(profile: &Path) -> ExitCode {
-    let result = if is_lua_profile(profile) {
-        plan_pipeline(profile)
-    } else {
-        ast_plan(profile)
-    };
-    match result {
+    match ast_plan(profile) {
         Ok(value) => {
             print_json(&value);
             ExitCode::from(0)
@@ -377,58 +226,28 @@ fn run_plan(profile: &Path) -> ExitCode {
     }
 }
 
-/// `codegen <profile>` (07-cli.md §Invocation: load → declarations →
-/// codegen). Prints the `.d.lua` EmmyLua annotation string
-/// ([`crate::codegen::codegen_pipeline`]) verbatim, mirroring
-/// [`run_hash`]'s single-string stdout artifact.
-fn run_codegen(profile: &Path) -> ExitCode {
-    match crate::codegen::codegen_pipeline(profile) {
-        Ok(rendered) => {
-            println!("{rendered}");
-            ExitCode::from(0)
-        }
-        Err(err) => print_failure("codegen", err),
-    }
-}
-
 /// `apply <profile> [--dry-run]` (07-cli.md §Invocation: load →
-/// declarations → gate → bridges → plan → dispatch → apply). Routes on
-/// the profile file's extension, mirroring [`run_hash`] / [`run_plan`] /
-/// [`run_validate`]:
+/// declarations → gate → bridges → plan → dispatch → apply). Runs the
+/// AST exec engine ([`crate::apply::run_apply_ast`]) over the profile
+/// and prints its report JSON to stdout.
 ///
-/// - **`.lua`** → the legacy Lua pipeline ([`crate::apply::run_apply`],
-///   preserved bit-for-bit) — the report JSON it returns is already
-///   pretty-printed via `lm.canonical.encode`.
-/// - **anything else** (`.json` / canonical text) → the AST exec engine
-///   ([`crate::apply::run_apply_ast`]), whose report is envelope-compatible
-///   with the legacy one but reports the AST exec layer's own step
-///   structure (see that function's doc comment).
+/// Two distinct failure shapes map onto 07 §Exit codes' single "1 — any
+/// failure" bucket:
 ///
-/// Both paths return a pretty-printed report JSON string, printed to
-/// stdout verbatim. Two distinct failure shapes map onto 07 §Exit codes'
-/// single "1 — any failure" bucket:
-///
-/// - A precondition failure before either pipeline produces a report
-///   (profile load / Lua eval / sandbox wiring / capability-gate build
-///   error) — nothing is printed to stdout, matching every other
-///   subcommand's failure path ([`print_failure`]); 07 §Error surface
-///   "Precondition: ... nothing executed."
+/// - A precondition failure before the pipeline produces a report
+///   (profile load / capability-gate build error) — nothing is printed
+///   to stdout, matching every other subcommand's failure path
+///   ([`print_failure`]); 07 §Error surface "Precondition: ... nothing
+///   executed."
 /// - A report with `ok = false` (fail-fast, a step failed) — the report
 ///   is still printed to stdout (07 §Per-subcommand stdout `apply`:
 ///   "printed on both success and step failure"), and the report's own
 ///   `error` string is echoed to stderr as the "final error line" 07
 ///   §Error surface's literal form calls for (`"apply failed: <message>"`).
 fn run_apply(profile: &Path, dry_run: bool) -> ExitCode {
-    let report_json = if is_lua_profile(profile) {
-        match crate::apply::run_apply(profile, dry_run) {
-            Ok(report_json) => report_json,
-            Err(err) => return print_failure("apply", err),
-        }
-    } else {
-        match crate::apply::run_apply_ast(profile, dry_run) {
-            Ok(report_json) => report_json,
-            Err(err) => return print_failure("apply", err),
-        }
+    let report_json = match crate::apply::run_apply_ast(profile, dry_run) {
+        Ok(report_json) => report_json,
+        Err(err) => return print_failure("apply", err),
     };
 
     println!("{report_json}");
@@ -454,35 +273,28 @@ mod tests {
 
     #[test]
     fn parses_validate_subcommand() {
-        let cli = Cli::try_parse_from(["lm-provision", "validate", "profile.lua"])
+        let cli = Cli::try_parse_from(["lm-provision", "validate", "profile.json"])
             .expect("validate should parse");
         assert!(matches!(cli.command, Command::Validate { .. }));
     }
 
     #[test]
     fn parses_hash_subcommand() {
-        let cli = Cli::try_parse_from(["lm-provision", "hash", "profile.lua"])
+        let cli = Cli::try_parse_from(["lm-provision", "hash", "profile.json"])
             .expect("hash should parse");
         assert!(matches!(cli.command, Command::Hash { .. }));
     }
 
     #[test]
     fn parses_plan_subcommand() {
-        let cli = Cli::try_parse_from(["lm-provision", "plan", "profile.lua"])
+        let cli = Cli::try_parse_from(["lm-provision", "plan", "profile.json"])
             .expect("plan should parse");
         assert!(matches!(cli.command, Command::Plan { .. }));
     }
 
     #[test]
-    fn parses_codegen_subcommand() {
-        let cli = Cli::try_parse_from(["lm-provision", "codegen", "profile.lua"])
-            .expect("codegen should parse");
-        assert!(matches!(cli.command, Command::Codegen { .. }));
-    }
-
-    #[test]
     fn parses_apply_with_dry_run() {
-        let cli = Cli::try_parse_from(["lm-provision", "apply", "profile.lua", "--dry-run"])
+        let cli = Cli::try_parse_from(["lm-provision", "apply", "profile.json", "--dry-run"])
             .expect("apply --dry-run should parse");
         match cli.command {
             Command::Apply { dry_run, .. } => assert!(dry_run),
@@ -492,7 +304,7 @@ mod tests {
 
     #[test]
     fn apply_without_dry_run_flag_defaults_to_false() {
-        let cli = Cli::try_parse_from(["lm-provision", "apply", "profile.lua"])
+        let cli = Cli::try_parse_from(["lm-provision", "apply", "profile.json"])
             .expect("apply without --dry-run should parse");
         match cli.command {
             Command::Apply { dry_run, .. } => assert!(!dry_run),
@@ -502,19 +314,19 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_is_a_usage_error() {
-        let result = Cli::try_parse_from(["lm-provision", "bogus", "profile.lua"]);
+        let result = Cli::try_parse_from(["lm-provision", "bogus", "profile.json"]);
         assert!(result.is_err(), "unknown subcommand must be a parse error");
     }
 
     #[test]
     fn unknown_flag_is_a_usage_error() {
-        let result = Cli::try_parse_from(["lm-provision", "validate", "profile.lua", "--bogus"]);
+        let result = Cli::try_parse_from(["lm-provision", "validate", "profile.json", "--bogus"]);
         assert!(result.is_err(), "unknown flag must be a parse error");
     }
 
     #[test]
     fn log_level_defaults_to_info() {
-        let cli = Cli::try_parse_from(["lm-provision", "validate", "profile.lua"])
+        let cli = Cli::try_parse_from(["lm-provision", "validate", "profile.json"])
             .expect("should parse with default log-level");
         assert_eq!(cli.log_level, "info");
     }

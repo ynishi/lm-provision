@@ -73,7 +73,7 @@ fn step_ops(report: &serde_json::Value) -> Vec<&str> {
 #[test]
 fn apply_dry_run_via_local_exec_transport_collects_a_report_with_secret_env_injected() {
     let binary = lm_provision_bin();
-    let profile = fixture("apply-secret.lua");
+    let profile = fixture("apply-secret.json");
 
     let local_hash =
         driver::hash_locally(&binary, &profile).expect("local hash subcommand should succeed");
@@ -113,7 +113,7 @@ fn apply_dry_run_via_local_exec_transport_collects_a_report_with_secret_env_inje
         serde_json::json!("demo-driver-apply-secret")
     );
     let ops = step_ops(&collected.report);
-    assert!(ops.contains(&"fs.write"), "ops: {ops:?}");
+    assert!(ops.contains(&"sh.exec"), "ops: {ops:?}");
     for step in collected.report["steps"].as_array().unwrap() {
         assert_eq!(
             step["ok"],
@@ -164,7 +164,7 @@ fn apply_dry_run_via_local_exec_transport_collects_a_report_with_secret_env_inje
 #[test]
 fn apply_failing_step_report_is_collected_as_a_richer_signal_not_a_driver_error() {
     let binary = lm_provision_bin();
-    let profile = fixture("apply-failing.lua");
+    let profile = fixture("apply-failing.json");
 
     let local_hash =
         driver::hash_locally(&binary, &profile).expect("local hash subcommand should succeed");
@@ -202,7 +202,7 @@ fn apply_failing_step_report_is_collected_as_a_richer_signal_not_a_driver_error(
 #[test]
 fn upload_stages_a_real_binary_and_profile_that_can_be_re_hashed_on_the_pod() {
     let binary = lm_provision_bin();
-    let profile = fixture("apply-secret.lua");
+    let profile = fixture("apply-secret.json");
     let local_hash =
         driver::hash_locally(&binary, &profile).expect("local hash subcommand should succeed");
 

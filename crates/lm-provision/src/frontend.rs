@@ -9,7 +9,12 @@
 //! - anything else → canonical text grammar
 //!   ([`dsl_kit_parse::peg::Grammar::from_schema`])
 //!
-//! Both paths converge on [`ProfileNode::from_parse_tree`] so the
+//! `.lua` is the one extension that is explicitly rejected (see
+//! [`FrontendError::LuaUnsupported`]): the legacy embedded-Lua authoring
+//! frontend has been removed, so a `.lua` file must fail loudly rather
+//! than fall through to the text grammar and be silently misparsed.
+//!
+//! Both parse paths converge on [`ProfileNode::from_parse_tree`] so the
 //! resulting AST is byte-identical to the one the JSON path would
 //! produce for the same logical profile, which is what makes
 //! [`crate::canonical::hash`] frontend-parity hold (see
@@ -47,6 +52,11 @@ pub enum FrontendError {
     /// The parse tree could not be built into a typed [`ProfileNode`].
     #[error("failed to build AST: {0}")]
     Build(String),
+    /// The profile file has a `.lua` extension. Lua profiles are no
+    /// longer supported; the input must be JSON or the canonical text
+    /// form.
+    #[error("Lua profiles are no longer supported; use JSON or the canonical text form")]
+    LuaUnsupported,
 }
 
 /// Read `path` and parse it into a [`ProfileNode`] AST.
@@ -57,23 +67,30 @@ pub enum FrontendError {
 /// therefore vary across invocations, but [`crate::canonical::hash`]
 /// excludes them and remains stable.
 pub fn load_profile(path: &Path) -> Result<ProfileNode, FrontendError> {
+    // Reject `.lua` up front, before any I/O: the embedded-Lua authoring
+    // frontend is gone, so a `.lua` file must fail loudly rather than be
+    // read and misparsed as canonical text.
+    if has_extension(path, "lua") {
+        return Err(FrontendError::LuaUnsupported);
+    }
+
     let text = std::fs::read_to_string(path).map_err(|source| FrontendError::Io {
         path: path.display().to_string(),
         source,
     })?;
 
-    if is_json_extension(path) {
+    if has_extension(path, "json") {
         parse_json(&text)
     } else {
         parse_text(&text)
     }
 }
 
-/// True when `path` has an extension of `json` (case-insensitive).
-fn is_json_extension(path: &Path) -> bool {
+/// True when `path`'s extension equals `ext` (case-insensitive).
+fn has_extension(path: &Path, ext: &str) -> bool {
     path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 fn parse_json(text: &str) -> Result<ProfileNode, FrontendError> {
@@ -257,6 +274,30 @@ mod tests {
         let path = write_temp("bad.txt", "This is not a Spec(...) expression");
         let err = load_profile(&path).expect_err("malformed text must fail");
         assert!(matches!(err, FrontendError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn lua_extension_is_rejected_before_any_io() {
+        // A `.lua` path is rejected purely on its extension — the file
+        // need not (and here does not) exist, proving the check precedes
+        // the read.
+        let path = std::env::temp_dir().join(format!(
+            "lm-provision-frontend-{}-never-read.lua",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&path);
+        let err = load_profile(&path).expect_err("a .lua profile must be rejected");
+        assert!(matches!(err, FrontendError::LuaUnsupported), "got {err:?}");
+        assert!(err
+            .to_string()
+            .contains("Lua profiles are no longer supported"));
+    }
+
+    #[test]
+    fn lua_extension_rejection_is_case_insensitive() {
+        let path = write_temp("Profile.LUA", "anything");
+        let err = load_profile(&path).expect_err("a .LUA profile must be rejected");
+        assert!(matches!(err, FrontendError::LuaUnsupported), "got {err:?}");
     }
 
     #[test]

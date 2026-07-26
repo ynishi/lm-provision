@@ -2,80 +2,56 @@
 //!
 //! ## Architecture
 //!
-//! Rust host / Lua domain 100% split: all provisioning domain logic
-//! (profile parsing, IR construction, validation, canonicalization,
-//! hashing, planning, dispatch, apply, reporting) lives in the `lm.*`
-//! Lua modules embedded via [`embed`] and resolved through the L1
-//! `require` allowlist ([`vm::require`]). The Rust host carries zero
-//! domain vocabulary; it implements exactly the sandbox layers
-//! (05-sandbox-layer-contract.md), the effectful bridge primitives
-//! (04-bridge.md, later milestones), and the CLI operator contract
-//! ([`cli`], 07-cli.md).
+//! A spec-first pod provisioner built entirely in Rust around a typed
+//! [`dsl_poc::ProfileNode`] AST. A profile is authored as JSON or the
+//! canonical text form, parsed into the AST by the [`frontend`], and then
+//! run through the read-only pipeline stages (validate / canonical / hash
+//! / plan) or the effectful [`exec`] engine (apply). There is no embedded
+//! scripting runtime: the earlier embedded-Lua authoring frontend and its
+//! VM / sandbox / bridge stack have been removed in favour of the single
+//! AST pipeline.
 //!
 //! ## Modules
 //!
-//! - [`vm`] — VM boot, stdlib strip, custom `require`, print redirect,
-//!   and the profile evaluation loop (registration steps 1-5 of
-//!   04-bridge.md §Registration order).
-//! - [`bridge`] — effectful bridge primitives (04-bridge.md). M1-3 ships
-//!   only the `env.ref` factory; `sh` / `net` / `fs` / `mount` land in M3.
-//! - [`secret`] — the `SecretRef` opacity contract
-//!   (06-secret-handling.md).
-//! - [`batteries`] — host-provided pure-function primitives outside the
-//!   declaration-gated `std.*` battery surface (04-bridge.md
-//!   §Registration order step 6, milestone M3); M2 ships only the
-//!   sha256 hash provider `lm.hash` calls into.
+//! - [`frontend`] — parse a profile file (`.json` → serde bridge,
+//!   canonical text → PEG grammar, `.lua` → explicit rejection) into a
+//!   [`dsl_poc::ProfileNode`] AST.
+//! - [`dsl_poc`] — the `ProfileNode` AST (spec + the 22 phase catalog
+//!   kinds) and the dsl-kit engine wiring that drives execution.
+//! - [`validate`] — the AST validate stage (03-pipeline-stage-artifacts.md
+//!   §validate).
 //! - [`canonical`] — deterministic byte encoder + SHA-256 profile hash
 //!   over the [`dsl_poc::ProfileNode`] AST
-//!   (03-pipeline-stage-artifacts.md §canonical / §hash respecified
-//!   onto the typed AST). Frontend-independent by construction:
-//!   `NodeId` is excluded, declared lists are sorted, phase order
-//!   preserved.
-//! - [`sandbox`] — the four-layer sandbox (05-sandbox-layer-contract.md):
-//!   L2 execution-control isolation, L3 declaration-derived policies,
-//!   L4 the capability gate, wired onto an [`vm::eval::ExtractedProfile`]
-//!   by [`sandbox::wire_sandboxed_profile`] (registration order steps
-//!   6-7, milestone M3-1).
+//!   (03-pipeline-stage-artifacts.md §canonical / §hash). Frontend-
+//!   independent by construction: `NodeId` is excluded, declared lists
+//!   are sorted, phase order preserved.
+//! - [`plan`] — the AST plan stage: expand a profile into the plan
+//!   artifact (03-pipeline-stage-artifacts.md §plan).
+//! - [`exec`] — the mlua-free execution layer: the capability gate, the
+//!   declaration-derived path / HTTP / secret policies, the pure-Rust
+//!   effect implementations, and the per-step report builder
+//!   (05-sandbox-layer-contract.md, 09-apply-report-and-ledger.md).
 //! - [`apply`] — host-side `plan → dispatch → apply → report` entry point
-//!   ([`apply::run_apply`], 09-apply-report-and-ledger.md; milestone
-//!   M4-1), wired onto the `apply` CLI subcommand in milestone M4-3.
-//! - [`audit`] — structured tracing + redaction for every bridge
-//!   invocation (09-apply-report-and-ledger.md §Audit log; milestone
-//!   M4-2).
-//! - [`embed`] — compile-time `include_str!` of the `lm.*` module set.
+//!   ([`apply::run_apply_ast`], 09-apply-report-and-ledger.md).
 //! - [`cli`] — subcommand / flag surface (07-cli.md).
-//! - [`codegen`] — `.d.lua` EmmyLua annotation emitter for the `codegen`
-//!   subcommand (07-cli.md), reading `lm.catalog_data`'s shared
-//!   vocabulary at codegen time rather than duplicating it in Rust.
 //!
 //! ## Static binary
 //!
-//! Build a musl static binary with the vendored Lua runtime baked in:
+//! Build a musl static binary requiring zero preinstalled dependencies on
+//! the target pod (08-push-driver-protocol.md §Inputs):
 //!
 //! ```text
 //! rustup target add x86_64-unknown-linux-musl
 //! cargo build --release --target x86_64-unknown-linux-musl
 //! ```
-//!
-//! The resulting binary embeds every `lm.*` module (`include_str!`) and
-//! requires zero preinstalled dependencies on the target pod
-//! (08-push-driver-protocol.md §Inputs).
 
 #![warn(missing_docs)]
 
 pub mod apply;
-pub mod audit;
-pub mod batteries;
-pub mod bridge;
 pub mod canonical;
 pub mod cli;
-pub mod codegen;
 pub mod dsl_poc;
-pub mod embed;
 pub mod exec;
 pub mod frontend;
 pub mod plan;
-pub mod sandbox;
-pub mod secret;
 pub mod validate;
-pub mod vm;

@@ -1,10 +1,13 @@
-//! End-to-end regression for the `hash` / `plan` subcommands' file-
-//! format routing (plan §CLI 配線): `.lua` files stay on the legacy
-//! Lua pipeline, everything else goes through the AST frontend
-//! ([`lm_provision::frontend::load_profile`]) and yields either a
+//! End-to-end regression for the `validate` / `hash` / `plan`
+//! subcommands' file-format routing (plan §CLI 配線): every profile goes
+//! through the AST frontend ([`lm_provision::frontend::load_profile`]),
+//! which parses `.json` via the serde bridge and everything else via the
+//! canonical text grammar, and **rejects `.lua`** outright now that the
+//! legacy embedded-Lua pipeline is gone. `hash` yields a
 //! frontend-agnostic 64-char hex digest via
-//! [`lm_provision::canonical::hash`] or the plan artifact via
-//! [`lm_provision::plan::expand`].
+//! [`lm_provision::canonical::hash`]; `plan` yields the plan artifact via
+//! [`lm_provision::plan::expand`]; `validate` yields the `{ ok, name }`
+//! envelope.
 
 use std::path::{Path, PathBuf};
 
@@ -74,15 +77,19 @@ fn json_and_text_frontends_hash_to_the_same_digest() {
 }
 
 #[test]
-fn hash_of_lua_profile_still_runs_the_legacy_pipeline_unchanged() {
-    // The existing `.lua` fixture already validates through
-    // `hash_pipeline`; re-run it here so a future routing regression
-    // that misroutes `.lua` files onto the AST path is caught at the
-    // CLI boundary rather than only inside `m2_cli.rs`.
-    let (code, stdout, stderr) = run_hash(&fixture("valid.lua"));
-    assert_eq!(code, 0, "stderr: {stderr}");
-    let hex = stdout.trim_end();
-    assert_hex64(hex);
+fn hash_of_lua_profile_is_rejected() {
+    // The legacy embedded-Lua pipeline is gone: a `.lua` profile must be
+    // rejected loudly (rather than silently misparsed as canonical text)
+    // at the CLI boundary. The extension check precedes any file I/O, so
+    // the path need not exist.
+    let (code, stdout, stderr) = run_hash(&fixture("legacy.lua"));
+    assert_eq!(code, 1, "a .lua profile must exit 1");
+    assert!(stdout.is_empty(), "nothing printed on failure: {stdout:?}");
+    assert!(
+        stderr.starts_with("hash failed: ")
+            && stderr.contains("Lua profiles are no longer supported"),
+        "stderr must carry the Lua-unsupported failure line: {stderr:?}",
+    );
 }
 
 #[test]
@@ -156,34 +163,17 @@ fn plan_of_text_profile_matches_the_plan_of_the_equivalent_json_profile() {
 }
 
 #[test]
-fn plan_of_lua_profile_still_runs_the_legacy_pipeline_unchanged() {
-    // valid.lua declares system.apt + comfyui.install; the legacy Lua
-    // plan inserts comfyui.restart / comfyui.health at the default
-    // port and carries `schema = "lm.profile/1"` (the AST plan omits
-    // that field). This asserts the legacy shape survives.
-    let (code, stdout, stderr) = run_plan(&fixture("valid.lua"));
-    assert_eq!(code, 0, "stderr: {stderr}");
-    let plan = parse_plan(&stdout);
-    assert_eq!(plan["profile_name"], serde_json::json!("demo-valid"));
-    assert_eq!(
-        plan["schema"],
-        serde_json::json!("lm.profile/1"),
-        "legacy Lua plan carries a schema field; a routing regression would drop it",
-    );
-    let ids: Vec<&str> = plan["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s["id"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        ids,
-        vec![
-            "1_system_apt",
-            "2_comfyui_install",
-            "9_comfyui_restart",
-            "10_comfyui_health",
-        ],
+fn plan_of_lua_profile_is_rejected() {
+    // Same rejection contract as `hash`, exercised through the `plan`
+    // subcommand so a routing regression is caught for either read-only
+    // subcommand.
+    let (code, stdout, stderr) = run_plan(&fixture("legacy.lua"));
+    assert_eq!(code, 1, "a .lua profile must exit 1");
+    assert!(stdout.is_empty(), "nothing printed on failure: {stdout:?}");
+    assert!(
+        stderr.starts_with("plan failed: ")
+            && stderr.contains("Lua profiles are no longer supported"),
+        "stderr must carry the Lua-unsupported failure line: {stderr:?}",
     );
 }
 
@@ -234,5 +224,71 @@ fn hash_of_malformed_json_reports_parse_error() {
     assert!(
         stderr.starts_with("hash failed: "),
         "parse failure must render through the standard failure line: {stderr:?}",
+    );
+}
+
+// ---------------------------------------------------------------------
+// validate subcommand routing (AST-frontend port of the m2_cli validate
+// CLI coverage: happy `{ ok, name }` envelope, a validate-stage
+// rejection, and a precondition load failure).
+// ---------------------------------------------------------------------
+
+fn run_validate(profile_path: &Path) -> (i32, String, String) {
+    let output = bin()
+        .args(["validate", profile_path.to_str().expect("utf8 path")])
+        .output()
+        .expect("process should run");
+    let status = output.status.code().expect("process should exit normally");
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    (status, stdout, stderr)
+}
+
+#[test]
+fn validate_of_json_profile_prints_ok_envelope_and_exits_zero() {
+    let (code, stdout, stderr) = run_validate(&fixture("valid.json"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("validate stdout should be JSON");
+    assert_eq!(envelope["ok"], serde_json::json!(true));
+    assert_eq!(envelope["name"], serde_json::json!("demo-valid"));
+}
+
+#[test]
+fn validate_of_a_rejected_profile_prints_nothing_and_an_error_on_stderr() {
+    // invalid.json declares a secret-shaped env key (`MY_TOKEN`), which
+    // the validate stage rejects (03 §validate check 3).
+    let (code, stdout, stderr) = run_validate(&fixture("invalid.json"));
+    assert_eq!(code, 1, "a rejected profile must exit 1");
+    assert!(
+        stdout.is_empty(),
+        "07 §Per-subcommand stdout: nothing printed on failure: {stdout:?}",
+    );
+    assert!(
+        stderr.starts_with("validate failed: "),
+        "07 §Error surface literal failure-line form: {stderr:?}",
+    );
+}
+
+#[test]
+fn validate_of_missing_profile_reports_io_error_on_stderr() {
+    let (code, stdout, stderr) = run_validate(&fixture("ast/does-not-exist.json"));
+    assert_eq!(code, 1, "missing profile must exit 1");
+    assert!(stdout.is_empty(), "nothing printed on failure: {stdout:?}");
+    assert!(
+        stderr.starts_with("validate failed: "),
+        "07 §Error surface literal failure-line form: {stderr:?}",
+    );
+}
+
+#[test]
+fn validate_of_lua_profile_is_rejected() {
+    let (code, stdout, stderr) = run_validate(&fixture("legacy.lua"));
+    assert_eq!(code, 1, "a .lua profile must exit 1");
+    assert!(stdout.is_empty(), "nothing printed on failure: {stdout:?}");
+    assert!(
+        stderr.starts_with("validate failed: ")
+            && stderr.contains("Lua profiles are no longer supported"),
+        "stderr must carry the Lua-unsupported failure line: {stderr:?}",
     );
 }

@@ -1,0 +1,8 @@
+{
+  "type": "Spec",
+  "name": "demo-driver-apply-failing",
+  "capabilities": [],
+  "phases": [
+    { "type": "ShExec", "argv": ["echo", "hi"] }
+  ]
+}

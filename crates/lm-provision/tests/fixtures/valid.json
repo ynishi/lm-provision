@@ -1,0 +1,13 @@
+{
+  "type": "Spec",
+  "name": "demo-valid",
+  "version": "1.0.0",
+  "capabilities": ["sh.exec", "fs.write"],
+  "env": ["LOG_LEVEL"],
+  "env_secrets": ["HF_TOKEN"],
+  "paths": ["/workspace"],
+  "phases": [
+    { "type": "SystemApt", "packages": ["curl"] },
+    { "type": "ShExec", "argv": ["echo", "ok"] }
+  ]
+}

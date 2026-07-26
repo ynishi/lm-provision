@@ -1,6 +1,6 @@
 [package]
 name = "lm-provision"
-description = "Spec-first pod provisioning: Rust host + embedded Lua profile DSL (static on-pod provisioner)"
+description = "Spec-first pod provisioning: Rust host + typed profile AST DSL (static on-pod provisioner)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -17,7 +17,6 @@ name = "lm-provision"
 path = "src/main.rs"
 
 [dependencies]
-mlua = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

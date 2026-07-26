@@ -58,17 +58,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::dsl_poc::ProfileNode;
 
-/// Secret-shaped-key substrings (check 3), a Rust-side mirror of
-/// `lm.catalog_data.SECRET_KEY_SUBSTRINGS` (06-secret-handling.md
-/// §Inputs "Profile declarations"; 02-phase-catalog.md §Shared
-/// vocabulary). The Lua host reads the list straight out of the embedded
-/// `lm.catalog_data` through a sandboxed VM
-/// ([`crate::sandbox::catalog::secret_key_substrings`]); the AST
-/// validate path has no VM, so the frozen eight-entry set is transcribed
-/// here. Kept `pub` so a later
-/// [`crate::sandbox::policy::EnvPolicy`]-side consolidation can consume
-/// this one accessor rather than growing a second copy. Consumers must
-/// match case-insensitively; the entries are already upper-case.
+/// Secret-shaped-key substrings (check 3), the frozen eight-entry set
+/// from 06-secret-handling.md §Inputs "Profile declarations" /
+/// 02-phase-catalog.md §Shared vocabulary, transcribed here for the AST
+/// validate path. Kept `pub` so any other consumer reuses this one
+/// accessor rather than growing a second copy. Consumers must match
+/// case-insensitively; the entries are already upper-case.
 pub const SECRET_KEY_SUBSTRINGS: &[&str] = &[
     "KEY", "SECRET", "TOKEN", "PASSWORD", "PWD", "AUTH", "CRED", "APIKEY",
 ];

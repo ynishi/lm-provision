@@ -23,9 +23,7 @@ use crate::dsl_poc::ProfileNode;
 
 /// Secret-injection policy derived from `profile.env_secrets`.
 ///
-/// Distinct from [`crate::sandbox::policy::EnvPolicy`], which is the
-/// Lua-facing *read* policy for `env.get`. This one is the *injection*
-/// policy: it resolves a phase's `env` keyed slot (name →
+/// The injection policy resolves a phase's `env` keyed slot (name →
 /// [`ProfileNode::EnvLiteral`] / [`ProfileNode::EnvSecret`]) into the
 /// concrete `name → value` map that flows into a child process env
 /// (spec 06 §Resolution). The plain non-secret `env` allowlist is *not*
@@ -38,8 +36,7 @@ use crate::dsl_poc::ProfileNode;
 /// - [`ProfileNode::EnvSecret`] `{ name }` is rejected with
 ///   [`ExecError::SecretUndeclared`] when `name ∉ env_secrets`
 ///   (defense-in-depth: `validate` also enforces this, but the `apply`
-///   pipeline never runs `validate`, mirroring
-///   [`crate::sandbox::policy::EnvPolicy`]'s own note).
+///   pipeline never runs `validate`).
 /// - A declared secret absent from the host process env is
 ///   [`ExecError::SecretMissingInHostEnv`] — fail-fast, no empty-string
 ///   substitution.

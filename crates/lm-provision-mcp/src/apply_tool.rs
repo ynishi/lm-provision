@@ -7,9 +7,9 @@
 //! LocalExecTransport を使う") — then appends the collected result to
 //! the append-only apply ledger (09 §Ledger).
 //!
-//! Unlike [`lm_provision::apply::run_apply`] (the *on-pod* binary's own
-//! `apply` subcommand, milestone M4), this function never runs `lm.*`
-//! Lua domain logic itself: it drives the already-built `lm-provision`
+//! Unlike [`lm_provision::apply::run_apply_ast`] (the *on-pod* binary's
+//! own `apply` subcommand), this function never runs the provisioning
+//! engine itself: it drives the already-built `lm-provision`
 //! binary as an external process through [`Transport`], exactly as an
 //! external pod manager would (08 §Purpose). `binary_path` is therefore
 //! a *different* artifact from this MCP server's own process — it is
@@ -20,7 +20,7 @@
 //!
 //! Before invoking the driver at all, every name the profile declares
 //! in `env_secrets` (chapter 01 declarations, extracted locally via
-//! [`evaluate_profile_file`] against the same `profile_path` the driver
+//! [`load_profile`] against the same `profile_path` the driver
 //! will later upload) must be present in *this server's own* process
 //! environment. A name missing here is reported as a precondition-class
 //! failure (10 §Error surface: "precondition (validate reject / missing
@@ -35,7 +35,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use lm_provision::vm::eval::evaluate_profile_file;
+use lm_provision::dsl_poc::ProfileNode;
+use lm_provision::frontend::load_profile;
 use lm_provision_driver::driver::{self, DriverError};
 use lm_provision_driver::ledger::{self, LedgerRow};
 use lm_provision_driver::local_exec::LocalExecTransport;
@@ -117,11 +118,16 @@ pub fn lm_apply(
     staging_dir: &Path,
     ledger_path: &Path,
 ) -> Result<ApplyOutput, ApplyToolError> {
-    let extracted = evaluate_profile_file(args.profile_path)
+    let root = load_profile(args.profile_path)
         .map_err(|err| ApplyToolError::ProfileEval(err.to_string()))?;
+    let declared_secrets = match &root {
+        ProfileNode::Spec { env_secrets, .. } => env_secrets.clone(),
+        // The frontend only ever produces a `Spec` root; keep total.
+        _ => Vec::new(),
+    };
 
     let mut env_secrets = BTreeMap::new();
-    for name in &extracted.declarations.env_secrets {
+    for name in &declared_secrets {
         let value =
             std::env::var(name).map_err(|_| ApplyToolError::MissingSecretEnv(name.clone()))?;
         env_secrets.insert(name.clone(), value);
@@ -216,7 +222,7 @@ mod tests {
 
         let output = lm_apply(
             ApplyArgs {
-                profile_path: &fixture("apply-sh-fs.lua"),
+                profile_path: &fixture("apply-sh-fs.json"),
                 pod_id: "test-pod-1",
                 dry_run: true,
             },
@@ -258,7 +264,7 @@ mod tests {
             let staging_dir = temp_dir(&format!("staging-repeat-{i}"));
             lm_apply(
                 ApplyArgs {
-                    profile_path: &fixture("apply-sh-fs.lua"),
+                    profile_path: &fixture("apply-sh-fs.json"),
                     pod_id: "test-pod-1",
                     dry_run: true,
                 },
@@ -288,18 +294,14 @@ mod tests {
     /// reusing a shared fixture's `HF_TOKEN` declaration, this does not
     /// depend on the ambient test environment happening to leave a
     /// well-known secret name unset.
-    const MISSING_SECRET_PROFILE: &str = r#"
-        local profile = require("lm.profile")
-        return profile({
-            name = "demo-missing-secret",
-            capabilities = {},
-            env_secrets = { "LM_PROVISION_MCP_TEST_DEFINITELY_UNSET_SECRET_XYZ" },
-            phases = {},
-        })
-    "#;
+    const MISSING_SECRET_PROFILE: &str = r#"{
+        "type": "Spec",
+        "name": "demo-missing-secret",
+        "env_secrets": ["LM_PROVISION_MCP_TEST_DEFINITELY_UNSET_SECRET_XYZ"]
+    }"#;
 
     fn write_missing_secret_profile() -> PathBuf {
-        let path = temp_dir("missing-secret-profile").with_extension("lua");
+        let path = temp_dir("missing-secret-profile").with_extension("json");
         std::fs::write(&path, MISSING_SECRET_PROFILE).expect("write temp profile");
         path
     }
@@ -353,7 +355,7 @@ mod tests {
 
         let err = lm_apply(
             ApplyArgs {
-                profile_path: Path::new("/nonexistent/lm-provision-profile.lua"),
+                profile_path: Path::new("/nonexistent/lm-provision-profile.json"),
                 pod_id: "test-pod-1",
                 dry_run: true,
             },

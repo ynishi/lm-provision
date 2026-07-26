@@ -1,14 +1,13 @@
-//! End-to-end regression for the `apply` subcommand's AST exec path
-//! (non-`.lua` profiles route to [`lm_provision::apply::run_apply_ast`],
-//! `.lua` profiles stay on the legacy pipeline — the latter is covered by
-//! `tests/m4_cli_apply.rs`).
+//! End-to-end regression for the `apply` subcommand's AST exec path: all
+//! profiles route to [`lm_provision::apply::run_apply_ast`], and a `.lua`
+//! profile is rejected at the frontend (the legacy embedded-Lua pipeline
+//! is gone).
 //!
 //! The report envelope (`{ ok, dry_run, profile_name, steps, error? }`)
-//! is field-name compatible with the legacy report (`lua/lm/report.lua`),
-//! but the `steps` array is the AST exec layer's own step structure — one
-//! entry per direct-op phase, one per lifecycle sub-step, with honest
-//! `note` steps instead of the legacy `dispatch_pending` skips (see
-//! `lm_provision::exec::report`).
+//! keeps the historical apply-report field names, with the `steps` array
+//! carrying the AST exec layer's own step structure — one entry per
+//! direct-op phase, one per lifecycle sub-step, with honest `note` steps
+//! (see `lm_provision::exec::report`).
 
 use std::path::PathBuf;
 
@@ -273,6 +272,44 @@ fn cli_apply_routes_a_json_profile_through_the_ast_path_exit_zero() {
     assert_eq!(report["profile_name"], json!("cli-ok"));
 
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn cli_apply_of_missing_profile_is_exit_one_with_nothing_on_stdout() {
+    let missing = temp_stem("cli-missing").with_extension("json");
+    let _ = std::fs::remove_file(&missing);
+    let output = bin()
+        .args(["apply", missing.to_str().unwrap(), "--dry-run"])
+        .output()
+        .expect("process runs");
+    assert_eq!(output.status.code(), Some(1), "missing profile must exit 1");
+    assert!(
+        output.stdout.is_empty(),
+        "nothing printed on a precondition failure: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("apply failed: "),
+        "stderr carries the failure line: {stderr}"
+    );
+}
+
+#[test]
+fn cli_apply_of_lua_profile_is_rejected() {
+    // The extension check precedes any I/O, so the path need not exist.
+    let output = bin()
+        .args(["apply", "/nonexistent/profile.lua", "--dry-run"])
+        .output()
+        .expect("process runs");
+    assert_eq!(output.status.code(), Some(1), "a .lua profile must exit 1");
+    assert!(output.stdout.is_empty(), "nothing printed on failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("apply failed: ")
+            && stderr.contains("Lua profiles are no longer supported"),
+        "stderr must carry the Lua-unsupported failure line: {stderr}"
+    );
 }
 
 #[test]

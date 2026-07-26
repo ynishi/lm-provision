@@ -1,0 +1,11 @@
+{
+  "type": "Spec",
+  "name": "demo-apply-sh-fs",
+  "capabilities": ["sh.exec", "fs.write"],
+  "paths": ["/workspace"],
+  "phases": [
+    { "type": "SystemApt", "packages": ["curl"] },
+    { "type": "FsWrite", "path": "/workspace/out.txt", "content": "hello" },
+    { "type": "ShExec", "argv": ["true"] }
+  ]
+}
