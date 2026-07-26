@@ -27,6 +27,7 @@ pub mod lifecycle;
 pub mod payload;
 pub mod policy;
 pub mod registry;
+pub mod report;
 
 /// Whether effects run for real or only render a dry-run trace.
 ///
@@ -150,8 +151,20 @@ pub struct ExecContext {
     /// `NodeId -> ProfileNode` payload lookup (dsl-kit does not pass leaf
     /// payloads into [`dsl_kit::Op::apply`]).
     pub payloads: Arc<HashMap<NodeId, ProfileNode>>,
-    /// Shared execution log (trace lines / result summaries).
+    /// Shared execution log (trace lines / result summaries). Preserved
+    /// verbatim — the AST apply report is built from [`reports`](Self::reports)
+    /// instead, so the trace log's shape is unchanged.
     pub log: Arc<Mutex<Vec<String>>>,
+    /// Structured per-step report entries, appended by each op handler in
+    /// execution order (the AST apply report's `steps`, spec 09 §Outputs).
+    /// Distinct from [`log`](Self::log): the log is a flat trace string
+    /// stream (one line per phase); this carries the typed per-step /
+    /// per-sub-step results the report envelope serializes.
+    pub reports: Arc<Mutex<Vec<report::StepReport>>>,
+    /// `NodeId -> (1-based phase index, kind string)` for every top-level
+    /// phase, used to label each report entry's `id` / `kind`. Built from
+    /// the `Spec` root's declaration-ordered `phases`.
+    phase_meta: Arc<HashMap<NodeId, (usize, String)>>,
 }
 
 impl ExecContext {
@@ -194,6 +207,21 @@ impl ExecContext {
         let http_policy = policy::HttpPolicy::new(&http_allowlist);
         let env_policy = policy::EnvPolicy::new(&env_secrets);
         let payloads = Arc::new(payload::build_payload_map(root));
+
+        // Label every top-level phase with its 1-based declaration index
+        // and kind string (reused from the plan stage to avoid a second
+        // variant→kind map). Non-`Spec` roots declare no phases.
+        let mut phase_meta = HashMap::new();
+        if let ProfileNode::Spec { phases, .. } = root {
+            use dsl_kit::DslNode as _;
+            for (index, phase) in phases.iter().enumerate() {
+                phase_meta.insert(
+                    phase.node_id(),
+                    (index + 1, crate::plan::kind_of(phase).to_string()),
+                );
+            }
+        }
+
         Ok(Self {
             mode,
             gate,
@@ -202,6 +230,26 @@ impl ExecContext {
             env_policy,
             payloads,
             log,
+            reports: Arc::new(Mutex::new(Vec::new())),
+            phase_meta: Arc::new(phase_meta),
         })
+    }
+
+    /// A handle to the shared per-step report collection, so a host can
+    /// read the accumulated [`report::StepReport`]s after driving the
+    /// engine (the AST apply entry point clones this before the context
+    /// is moved into the op registry).
+    pub fn reports_handle(&self) -> report::SharedReports {
+        Arc::clone(&self.reports)
+    }
+
+    /// The `(1-based phase index, kind)` recorded for `node`, or
+    /// `(0, "")` when `node` is not a top-level phase (never expected for
+    /// a registered op, which only ever fires on a phase node).
+    pub fn phase_meta_of(&self, node: NodeId) -> (usize, String) {
+        self.phase_meta
+            .get(&node)
+            .cloned()
+            .unwrap_or((0, String::new()))
     }
 }

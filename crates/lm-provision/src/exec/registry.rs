@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use dsl_kit::{EngineError, NodeContext, NodeId, Op, OpRegistry, Path};
 
-use super::{effects, lifecycle, ExecContext, ExecError, ExecMode};
+use super::{effects, lifecycle, report::StepReport, ExecContext, ExecError, ExecMode};
 use crate::dsl_poc::{ProfileNode, ProfileValue};
 
 /// The seven direct ops with real effect wiring.
@@ -118,19 +118,33 @@ impl Op<ProfileValue> for ProfileOp {
 
 impl ProfileOp {
     /// Common flow: payload lookup → capability check → mode branch.
+    ///
+    /// Every path that returns `Err` first appends a failing
+    /// [`StepReport`] for the node (via a runner or
+    /// [`record_phase_failure`](Self::record_phase_failure)), so the last
+    /// entry in [`ExecContext::reports`] is always the failing step —
+    /// the AST apply entry point reads it to build the fail-fast
+    /// envelope `error` line without re-deriving it from the engine's
+    /// error type.
     fn dispatch(&self, node: NodeId) -> Result<ProfileValue, ExecError> {
-        let payload = self
-            .ctx
-            .payloads
-            .get(&node)
-            .ok_or(ExecError::PayloadMissing(node.0))?;
+        let payload = match self.ctx.payloads.get(&node) {
+            Some(payload) => payload,
+            None => {
+                let err = ExecError::PayloadMissing(node.0);
+                self.record_phase_failure(node, &err);
+                return Err(err);
+            }
+        };
 
         if let Some(capability) = required_capability(self.name) {
-            self.ctx.gate.require(capability)?;
+            if let Err(err) = self.ctx.gate.require(capability) {
+                self.record_phase_failure(node, &err);
+                return Err(err);
+            }
         }
 
         if LIFECYCLE_OPS.contains(&self.name) {
-            return self.run_lifecycle(payload);
+            return self.run_lifecycle(node, payload);
         }
 
         match self.name {
@@ -141,10 +155,14 @@ impl ProfileOp {
             "net_transfer" => self.run_transfer(node, payload),
             "mount_bind" => self.run_mount_bind(node, payload),
             "mount_umount" => self.run_mount_umount(node, payload),
-            other => Err(ExecError::EffectFailed {
-                op: other.to_string(),
-                message: "op is not registered as direct or lifecycle".to_string(),
-            }),
+            other => {
+                let err = ExecError::EffectFailed {
+                    op: other.to_string(),
+                    message: "op is not registered as direct or lifecycle".to_string(),
+                };
+                self.record_phase_failure(node, &err);
+                Err(err)
+            }
         }
     }
 
@@ -154,29 +172,139 @@ impl ProfileOp {
         ProfileValue::Success(line)
     }
 
+    /// Whether this run is a dry run.
+    fn dry(&self) -> bool {
+        self.ctx.mode == ExecMode::DryRun
+    }
+
+    /// Append a structured step report entry.
+    fn push(&self, entry: StepReport) {
+        self.ctx.reports.lock().unwrap().push(entry);
+    }
+
+    /// The `(<phase_index>_<kind>, kind)` base for `node`'s report entry.
+    /// Falls back to a `n<node-id>` id for a node the phase map does not
+    /// know (never expected for a registered op).
+    fn base(&self, node: NodeId) -> (String, String) {
+        let (index, kind) = self.ctx.phase_meta_of(node);
+        if index == 0 {
+            (format!("n{}", node.0), kind)
+        } else {
+            (format!("{index}_{kind}"), kind)
+        }
+    }
+
+    /// Flip a report entry to the failed state, stamping the reason and
+    /// (under dry-run) the `dry_run` marker. `status` stays at its
+    /// default `-1` unless the caller already set a more specific code
+    /// (e.g. a non-zero process exit).
+    fn mark_fail(&self, entry: &mut StepReport, err: &ExecError) {
+        entry.ok = false;
+        if entry.status == 0 {
+            entry.status = -1;
+        }
+        entry.reason = Some(err.to_string());
+        if self.dry() {
+            entry.dry_run = Some(true);
+        }
+    }
+
+    /// Record a phase-level failure that happened before (or instead of)
+    /// any effect ran — a payload lookup miss, a capability denial, or an
+    /// unrouted op. The report entry carries the phase kind as its `op`
+    /// (no effect was reached to name a more specific one).
+    fn record_phase_failure(&self, node: NodeId, err: &ExecError) {
+        let (id, kind) = self.base(node);
+        let mut entry = StepReport::new(id, kind.clone(), kind);
+        self.mark_fail(&mut entry, err);
+        self.push(entry);
+    }
+
+    /// Build a failing report for a direct-op payload-variant mismatch,
+    /// pushing it and returning the error (an AST/host wiring bug, not a
+    /// profile-author error).
+    fn variant_fail(&self, node: NodeId, op: &str, expected: &'static str) -> ExecError {
+        let err = ExecError::PayloadVariant {
+            node: node.0,
+            expected,
+        };
+        let (id, kind) = self.base(node);
+        let mut entry = StepReport::new(id, kind, op);
+        self.mark_fail(&mut entry, &err);
+        self.push(entry);
+        err
+    }
+
     /// Compose a lifecycle op's steps, then render (dry-run) or execute
-    /// (real) each one and collapse the results into the single per-op
-    /// log line.
+    /// (real) each one. Each sub-step becomes its own report entry
+    /// (`<phase_index>_<kind>_<n>`, labelled with the effect it runs);
+    /// the per-op trace log line is still the joined summary, unchanged.
     ///
     /// The phase's `env` keyed slot (present on `sync.pull` /
     /// `staging.push`) is resolved once through the
     /// [`EnvPolicy`](super::policy::EnvPolicy) — in **both** modes
     /// (spec 06 §Resolution "dry-run resolves too"), so an undeclared or
     /// missing secret fails a dry run identically — and injected into the
-    /// composed [`lifecycle::Step::Sh`] steps.
-    fn run_lifecycle(&self, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
-        let env = self.resolve_phase_env(payload)?;
-        let steps = lifecycle::expand(payload)?;
-        let renders: Vec<String> = match self.ctx.mode {
-            ExecMode::DryRun => steps
-                .iter()
-                .map(|step| lifecycle::render_dry(step, &env))
-                .collect(),
-            ExecMode::Real => steps
-                .iter()
-                .map(|step| lifecycle::execute_step(step, self.name, &env))
-                .collect::<Result<Vec<_>, _>>()?,
+    /// composed [`lifecycle::Step::Sh`] steps. Fail-fast: a failing
+    /// sub-step is recorded and stops the phase, so its predecessors
+    /// remain in the report but no later sub-step is reached.
+    fn run_lifecycle(
+        &self,
+        node: NodeId,
+        payload: &ProfileNode,
+    ) -> Result<ProfileValue, ExecError> {
+        let (base_id, kind) = self.base(node);
+        let env = match self.resolve_phase_env(payload) {
+            Ok(env) => env,
+            Err(err) => {
+                self.record_phase_failure(node, &err);
+                return Err(err);
+            }
         };
+        let steps = match lifecycle::expand(payload) {
+            Ok(steps) => steps,
+            Err(err) => {
+                self.record_phase_failure(node, &err);
+                return Err(err);
+            }
+        };
+
+        let mut renders = Vec::with_capacity(steps.len());
+        for (index, step) in steps.iter().enumerate() {
+            let sub_id = format!("{base_id}_{}", index + 1);
+            let op = step_effect_op(step);
+            match self.ctx.mode {
+                ExecMode::DryRun => {
+                    renders.push(lifecycle::render_dry(step, &env));
+                    let mut entry = StepReport::new(sub_id, kind.clone(), op);
+                    apply_step_input_fields(&mut entry, step);
+                    // A `note` sub-step is inert in either mode, matching
+                    // the legacy `dispatch_pending` skip's lack of a
+                    // `dry_run` marker; effect-bearing sub-steps carry it.
+                    if !matches!(step, lifecycle::Step::Note(_)) {
+                        entry.dry_run = Some(true);
+                    }
+                    self.push(entry);
+                }
+                ExecMode::Real => match lifecycle::execute_step(step, self.name, &env) {
+                    Ok(summary) => {
+                        renders.push(summary);
+                        let mut entry = StepReport::new(sub_id, kind.clone(), op);
+                        apply_step_input_fields(&mut entry, step);
+                        self.push(entry);
+                    }
+                    Err(err) => {
+                        let mut entry = StepReport::new(sub_id, kind.clone(), op);
+                        apply_step_input_fields(&mut entry, step);
+                        entry.ok = false;
+                        entry.status = -1;
+                        entry.reason = Some(err.to_string());
+                        self.push(entry);
+                        return Err(err);
+                    }
+                },
+            }
+        }
         Ok(self.record(format!("{} {}", self.name, renders.join("; "))))
     }
 
@@ -195,21 +323,24 @@ impl ProfileOp {
         }
     }
 
-    fn variant_err(&self, node: NodeId, expected: &'static str) -> ExecError {
-        ExecError::PayloadVariant {
-            node: node.0,
-            expected,
-        }
-    }
-
     fn run_sh_exec(&self, node: NodeId, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
         let ProfileNode::ShExec { argv, env, .. } = payload else {
-            return Err(self.variant_err(node, "ShExec"));
+            return Err(self.variant_fail(node, "sh.exec", "ShExec"));
         };
+        let (id, kind) = self.base(node);
         // Resolve the env-injection map in both modes (spec 06
         // §Resolution "dry-run resolves too"): an undeclared or missing
         // secret fails a dry run identically to a real run.
-        let resolved_env = self.ctx.env_policy.resolve(env)?;
+        let resolved_env = match self.ctx.env_policy.resolve(env) {
+            Ok(resolved_env) => resolved_env,
+            Err(err) => {
+                let mut entry = StepReport::new(id, kind, "sh.exec");
+                entry.argv = Some(argv.clone());
+                self.mark_fail(&mut entry, &err);
+                self.push(entry);
+                return Err(err);
+            }
+        };
         match self.ctx.mode {
             ExecMode::DryRun => {
                 let line = if resolved_env.is_empty() {
@@ -220,54 +351,140 @@ impl ProfileOp {
                         resolved_env.keys().collect::<Vec<_>>()
                     )
                 };
-                Ok(self.record(line))
+                let value = self.record(line);
+                let mut entry = StepReport::new(id, kind, "sh.exec");
+                entry.argv = Some(argv.clone());
+                entry.dry_run = Some(true);
+                self.push(entry);
+                Ok(value)
             }
             ExecMode::Real => {
-                let outcome = effects::sh_exec(argv, &effects::ShOpts::new(resolved_env))?;
+                let outcome = match effects::sh_exec(argv, &effects::ShOpts::new(resolved_env)) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        let mut entry = StepReport::new(id, kind, "sh.exec");
+                        entry.argv = Some(argv.clone());
+                        self.mark_fail(&mut entry, &err);
+                        self.push(entry);
+                        return Err(err);
+                    }
+                };
                 if outcome.exit_code != 0 {
-                    return Err(ExecError::EffectFailed {
+                    let err = ExecError::EffectFailed {
                         op: "sh_exec".to_string(),
                         message: format!(
                             "exit {} stderr={:?}",
                             outcome.exit_code, outcome.stderr_tail
                         ),
-                    });
+                    };
+                    let mut entry = StepReport::new(id, kind, "sh.exec");
+                    entry.argv = Some(argv.clone());
+                    entry.status = i64::from(outcome.exit_code);
+                    entry.stdout = Some(outcome.stdout_tail.clone());
+                    entry.stderr = Some(outcome.stderr_tail.clone());
+                    entry.ok = false;
+                    entry.reason = Some(err.to_string());
+                    self.push(entry);
+                    return Err(err);
                 }
-                Ok(self.record(format!(
+                let value = self.record(format!(
                     "sh_exec exit={} stdout={:?}",
                     outcome.exit_code, outcome.stdout_tail
-                )))
+                ));
+                let mut entry = StepReport::new(id, kind, "sh.exec");
+                entry.argv = Some(argv.clone());
+                entry.status = i64::from(outcome.exit_code);
+                entry.stdout = Some(outcome.stdout_tail.clone());
+                entry.stderr = Some(outcome.stderr_tail.clone());
+                self.push(entry);
+                Ok(value)
             }
         }
     }
 
     fn run_fs_write(&self, node: NodeId, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
         let ProfileNode::FsWrite { path, content, .. } = payload else {
-            return Err(self.variant_err(node, "FsWrite"));
+            return Err(self.variant_fail(node, "fs.write", "FsWrite"));
         };
+        let (id, kind) = self.base(node);
         // Path policy runs in both modes (spec 07 "dry-run does policy").
-        self.ctx.path_policy.check(path)?;
+        if let Err(err) = self.ctx.path_policy.check(path) {
+            let mut entry = StepReport::new(id, kind, "fs.write");
+            entry.path = Some(path.clone());
+            self.mark_fail(&mut entry, &err);
+            self.push(entry);
+            return Err(err);
+        }
         match self.ctx.mode {
             ExecMode::DryRun => {
-                Ok(self.record(format!("fs_write path={path} bytes={}", content.len())))
+                let value = self.record(format!("fs_write path={path} bytes={}", content.len()));
+                let mut entry = StepReport::new(id, kind, "fs.write");
+                entry.path = Some(path.clone());
+                entry.bytes = Some(content.len() as u64);
+                entry.dry_run = Some(true);
+                self.push(entry);
+                Ok(value)
             }
             ExecMode::Real => {
-                let bytes = effects::fs_write(path, content.as_bytes())?;
-                Ok(self.record(format!("fs_write path={path} bytes={bytes}")))
+                let bytes = match effects::fs_write(path, content.as_bytes()) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        let mut entry = StepReport::new(id, kind, "fs.write");
+                        entry.path = Some(path.clone());
+                        self.mark_fail(&mut entry, &err);
+                        self.push(entry);
+                        return Err(err);
+                    }
+                };
+                let value = self.record(format!("fs_write path={path} bytes={bytes}"));
+                let mut entry = StepReport::new(id, kind, "fs.write");
+                entry.path = Some(path.clone());
+                entry.bytes = Some(bytes as u64);
+                self.push(entry);
+                Ok(value)
             }
         }
     }
 
     fn run_http_get(&self, node: NodeId, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
         let ProfileNode::NetHttpGet { url, .. } = payload else {
-            return Err(self.variant_err(node, "NetHttpGet"));
+            return Err(self.variant_fail(node, "net.http_get", "NetHttpGet"));
         };
-        self.ctx.http_policy.check(url)?;
+        let (id, kind) = self.base(node);
+        if let Err(err) = self.ctx.http_policy.check(url) {
+            let mut entry = StepReport::new(id, kind, "net.http_get");
+            entry.url = Some(url.clone());
+            self.mark_fail(&mut entry, &err);
+            self.push(entry);
+            return Err(err);
+        }
         match self.ctx.mode {
-            ExecMode::DryRun => Ok(self.record(format!("net_http_get url={url}"))),
+            ExecMode::DryRun => {
+                let value = self.record(format!("net_http_get url={url}"));
+                let mut entry = StepReport::new(id, kind, "net.http_get");
+                entry.url = Some(url.clone());
+                entry.dry_run = Some(true);
+                self.push(entry);
+                Ok(value)
+            }
             ExecMode::Real => {
-                let outcome = effects::http_get(url)?;
-                Ok(self.record(format!("net_http_get url={url} status={}", outcome.status)))
+                let outcome = match effects::http_get(url) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        let mut entry = StepReport::new(id, kind, "net.http_get");
+                        entry.url = Some(url.clone());
+                        self.mark_fail(&mut entry, &err);
+                        self.push(entry);
+                        return Err(err);
+                    }
+                };
+                let value =
+                    self.record(format!("net_http_get url={url} status={}", outcome.status));
+                let mut entry = StepReport::new(id, kind, "net.http_get");
+                entry.url = Some(url.clone());
+                entry.status = i64::from(outcome.status);
+                self.push(entry);
+                Ok(value)
             }
         }
     }
@@ -278,39 +495,104 @@ impl ProfileOp {
         payload: &ProfileNode,
     ) -> Result<ProfileValue, ExecError> {
         let ProfileNode::NetHttpPost { url, .. } = payload else {
-            return Err(self.variant_err(node, "NetHttpPost"));
+            return Err(self.variant_fail(node, "net.http_post", "NetHttpPost"));
         };
-        self.ctx.http_policy.check(url)?;
+        let (id, kind) = self.base(node);
+        if let Err(err) = self.ctx.http_policy.check(url) {
+            let mut entry = StepReport::new(id, kind, "net.http_post");
+            entry.url = Some(url.clone());
+            self.mark_fail(&mut entry, &err);
+            self.push(entry);
+            return Err(err);
+        }
         match self.ctx.mode {
-            ExecMode::DryRun => Ok(self.record(format!("net_http_post url={url}"))),
+            ExecMode::DryRun => {
+                let value = self.record(format!("net_http_post url={url}"));
+                let mut entry = StepReport::new(id, kind, "net.http_post");
+                entry.url = Some(url.clone());
+                entry.dry_run = Some(true);
+                self.push(entry);
+                Ok(value)
+            }
             ExecMode::Real => {
-                let outcome = effects::http_post(url, &[], "application/octet-stream")?;
-                Ok(self.record(format!("net_http_post url={url} status={}", outcome.status)))
+                let outcome = match effects::http_post(url, &[], "application/octet-stream") {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        let mut entry = StepReport::new(id, kind, "net.http_post");
+                        entry.url = Some(url.clone());
+                        self.mark_fail(&mut entry, &err);
+                        self.push(entry);
+                        return Err(err);
+                    }
+                };
+                let value =
+                    self.record(format!("net_http_post url={url} status={}", outcome.status));
+                let mut entry = StepReport::new(id, kind, "net.http_post");
+                entry.url = Some(url.clone());
+                entry.status = i64::from(outcome.status);
+                self.push(entry);
+                Ok(value)
             }
         }
     }
 
     fn run_transfer(&self, node: NodeId, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
         let ProfileNode::NetTransfer { src, dst, .. } = payload else {
-            return Err(self.variant_err(node, "NetTransfer"));
+            return Err(self.variant_fail(node, "net.transfer", "NetTransfer"));
         };
+        let (id, kind) = self.base(node);
         // Destination is always a local path; source is HTTP-checked
         // when it carries an `http(s)://` scheme (a download). Local
         // sources are left to the effect layer's own routing.
-        self.ctx.path_policy.check(dst)?;
-        if src.starts_with("http://") || src.starts_with("https://") {
-            self.ctx.http_policy.check(src)?;
+        if let Err(err) = self.ctx.path_policy.check(dst) {
+            self.push_transfer_failure(&id, &kind, src, dst, &err);
+            return Err(err);
         }
-        match self.ctx.mode {
-            ExecMode::DryRun => Ok(self.record(format!("net_transfer src={src} dst={dst}"))),
-            ExecMode::Real => {
-                let outcome = effects::transfer(src, dst)?;
-                Ok(self.record(format!(
-                    "net_transfer src={src} dst={} bytes={}",
-                    outcome.dst, outcome.bytes
-                )))
+        if src.starts_with("http://") || src.starts_with("https://") {
+            if let Err(err) = self.ctx.http_policy.check(src) {
+                self.push_transfer_failure(&id, &kind, src, dst, &err);
+                return Err(err);
             }
         }
+        match self.ctx.mode {
+            ExecMode::DryRun => {
+                let value = self.record(format!("net_transfer src={src} dst={dst}"));
+                let mut entry = StepReport::new(id, kind, "net.transfer");
+                entry.src = Some(src.clone());
+                entry.dst = Some(dst.clone());
+                entry.dry_run = Some(true);
+                self.push(entry);
+                Ok(value)
+            }
+            ExecMode::Real => {
+                let outcome = match effects::transfer(src, dst) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        self.push_transfer_failure(&id, &kind, src, dst, &err);
+                        return Err(err);
+                    }
+                };
+                let value = self.record(format!(
+                    "net_transfer src={src} dst={} bytes={}",
+                    outcome.dst, outcome.bytes
+                ));
+                let mut entry = StepReport::new(id, kind, "net.transfer");
+                entry.src = Some(src.clone());
+                entry.dst = Some(outcome.dst.clone());
+                entry.bytes = Some(outcome.bytes);
+                self.push(entry);
+                Ok(value)
+            }
+        }
+    }
+
+    /// Push a failed `net.transfer` report carrying the declared src/dst.
+    fn push_transfer_failure(&self, id: &str, kind: &str, src: &str, dst: &str, err: &ExecError) {
+        let mut entry = StepReport::new(id.to_string(), kind.to_string(), "net.transfer");
+        entry.src = Some(src.to_string());
+        entry.dst = Some(dst.to_string());
+        self.mark_fail(&mut entry, err);
+        self.push(entry);
     }
 
     fn run_mount_bind(
@@ -319,15 +601,44 @@ impl ProfileOp {
         payload: &ProfileNode,
     ) -> Result<ProfileValue, ExecError> {
         let ProfileNode::MountBind { src, dst, .. } = payload else {
-            return Err(self.variant_err(node, "MountBind"));
+            return Err(self.variant_fail(node, "mount.bind", "MountBind"));
         };
-        self.ctx.path_policy.check(src)?;
-        self.ctx.path_policy.check(dst)?;
+        let (id, kind) = self.base(node);
+        for target in [src, dst] {
+            if let Err(err) = self.ctx.path_policy.check(target) {
+                let mut entry = StepReport::new(id, kind, "mount.bind");
+                entry.src = Some(src.clone());
+                entry.dst = Some(dst.clone());
+                self.mark_fail(&mut entry, &err);
+                self.push(entry);
+                return Err(err);
+            }
+        }
         match self.ctx.mode {
-            ExecMode::DryRun => Ok(self.record(format!("mount_bind src={src} dst={dst}"))),
+            ExecMode::DryRun => {
+                let value = self.record(format!("mount_bind src={src} dst={dst}"));
+                let mut entry = StepReport::new(id, kind, "mount.bind");
+                entry.src = Some(src.clone());
+                entry.dst = Some(dst.clone());
+                entry.dry_run = Some(true);
+                self.push(entry);
+                Ok(value)
+            }
             ExecMode::Real => {
-                effects::mount_bind(src, dst)?;
-                Ok(self.record(format!("mount_bind src={src} dst={dst}")))
+                if let Err(err) = effects::mount_bind(src, dst) {
+                    let mut entry = StepReport::new(id, kind, "mount.bind");
+                    entry.src = Some(src.clone());
+                    entry.dst = Some(dst.clone());
+                    self.mark_fail(&mut entry, &err);
+                    self.push(entry);
+                    return Err(err);
+                }
+                let value = self.record(format!("mount_bind src={src} dst={dst}"));
+                let mut entry = StepReport::new(id, kind, "mount.bind");
+                entry.src = Some(src.clone());
+                entry.dst = Some(dst.clone());
+                self.push(entry);
+                Ok(value)
             }
         }
     }
@@ -338,16 +649,68 @@ impl ProfileOp {
         payload: &ProfileNode,
     ) -> Result<ProfileValue, ExecError> {
         let ProfileNode::MountUmount { path, .. } = payload else {
-            return Err(self.variant_err(node, "MountUmount"));
+            return Err(self.variant_fail(node, "mount.umount", "MountUmount"));
         };
-        self.ctx.path_policy.check(path)?;
+        let (id, kind) = self.base(node);
+        if let Err(err) = self.ctx.path_policy.check(path) {
+            let mut entry = StepReport::new(id, kind, "mount.umount");
+            entry.path = Some(path.clone());
+            self.mark_fail(&mut entry, &err);
+            self.push(entry);
+            return Err(err);
+        }
         match self.ctx.mode {
-            ExecMode::DryRun => Ok(self.record(format!("mount_umount path={path}"))),
+            ExecMode::DryRun => {
+                let value = self.record(format!("mount_umount path={path}"));
+                let mut entry = StepReport::new(id, kind, "mount.umount");
+                entry.path = Some(path.clone());
+                entry.dry_run = Some(true);
+                self.push(entry);
+                Ok(value)
+            }
             ExecMode::Real => {
-                effects::umount(path)?;
-                Ok(self.record(format!("mount_umount path={path}")))
+                if let Err(err) = effects::umount(path) {
+                    let mut entry = StepReport::new(id, kind, "mount.umount");
+                    entry.path = Some(path.clone());
+                    self.mark_fail(&mut entry, &err);
+                    self.push(entry);
+                    return Err(err);
+                }
+                let value = self.record(format!("mount_umount path={path}"));
+                let mut entry = StepReport::new(id, kind, "mount.umount");
+                entry.path = Some(path.clone());
+                self.push(entry);
+                Ok(value)
             }
         }
+    }
+}
+
+/// The effect op name a lifecycle sub-step runs (the report entry's `op`).
+/// A [`lifecycle::Step::Note`] has no effect, so it is reported honestly
+/// as `note` rather than the legacy `dispatch_pending` skip.
+fn step_effect_op(step: &lifecycle::Step) -> &'static str {
+    match step {
+        lifecycle::Step::Sh(_) => "sh.exec",
+        lifecycle::Step::Transfer { .. } => "net.transfer",
+        lifecycle::Step::HttpPoll { .. } => "net.http_get",
+        lifecycle::Step::Note(_) => "note",
+    }
+}
+
+/// Copy a lifecycle sub-step's declared input fields onto its report
+/// entry (the exec layer discards the effect outcome for lifecycle
+/// sub-steps — it survives only in the joined trace log line — so the
+/// entry carries the inputs, not the captured stdout/bytes).
+fn apply_step_input_fields(entry: &mut StepReport, step: &lifecycle::Step) {
+    match step {
+        lifecycle::Step::Sh(argv) => entry.argv = Some(argv.clone()),
+        lifecycle::Step::Transfer { src, dst } => {
+            entry.src = Some(src.clone());
+            entry.dst = Some(dst.clone());
+        }
+        lifecycle::Step::HttpPoll { url, .. } => entry.url = Some(url.clone()),
+        lifecycle::Step::Note(message) => entry.note = Some(message.clone()),
     }
 }
 

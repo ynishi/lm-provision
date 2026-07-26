@@ -392,40 +392,49 @@ fn run_codegen(profile: &Path) -> ExitCode {
 }
 
 /// `apply <profile> [--dry-run]` (07-cli.md §Invocation: load →
-/// declarations → gate → bridges → plan → dispatch → apply; milestone
-/// M4-3). Delegates the pipeline itself to
-/// [`crate::apply::run_apply`] (milestone M4-1) — the report JSON that
-/// function returns is already pretty-printed
-/// (09-apply-report-and-ledger.md §Outputs "Apply report" via
-/// `lm.canonical.encode`, see that function's own doc comment), so it is
-/// printed to stdout verbatim rather than re-serialized through
-/// [`print_json`].
+/// declarations → gate → bridges → plan → dispatch → apply). Routes on
+/// the profile file's extension, mirroring [`run_hash`] / [`run_plan`] /
+/// [`run_validate`]:
 ///
-/// Two distinct failure shapes map onto 07 §Exit codes' single "1 — any
-/// failure" bucket:
+/// - **`.lua`** → the legacy Lua pipeline ([`crate::apply::run_apply`],
+///   preserved bit-for-bit) — the report JSON it returns is already
+///   pretty-printed via `lm.canonical.encode`.
+/// - **anything else** (`.json` / canonical text) → the AST exec engine
+///   ([`crate::apply::run_apply_ast`]), whose report is envelope-compatible
+///   with the legacy one but reports the AST exec layer's own step
+///   structure (see that function's doc comment).
 ///
-/// - A precondition failure before the pipeline even produces a report
-///   (profile load / Lua eval / sandbox wiring error,
-///   [`crate::apply::ApplyError`]) — nothing is printed to stdout,
-///   matching every other subcommand's failure path
-///   ([`print_failure`]); 07 §Error surface "Precondition: ... nothing
-///   executed."
-/// - A report with `ok = false` (09 §Semantics: fail-fast, a bridge step
-///   failed) — the report is still printed to stdout (07 §Per-subcommand
-///   stdout `apply`: "printed on both success and step failure"), and
-///   the report's own `error` string is echoed to stderr as the "final
-///   error line" 07 §Error surface's literal form calls for elsewhere
-///   (`"apply failed: <message>"`).
+/// Both paths return a pretty-printed report JSON string, printed to
+/// stdout verbatim. Two distinct failure shapes map onto 07 §Exit codes'
+/// single "1 — any failure" bucket:
+///
+/// - A precondition failure before either pipeline produces a report
+///   (profile load / Lua eval / sandbox wiring / capability-gate build
+///   error) — nothing is printed to stdout, matching every other
+///   subcommand's failure path ([`print_failure`]); 07 §Error surface
+///   "Precondition: ... nothing executed."
+/// - A report with `ok = false` (fail-fast, a step failed) — the report
+///   is still printed to stdout (07 §Per-subcommand stdout `apply`:
+///   "printed on both success and step failure"), and the report's own
+///   `error` string is echoed to stderr as the "final error line" 07
+///   §Error surface's literal form calls for (`"apply failed: <message>"`).
 fn run_apply(profile: &Path, dry_run: bool) -> ExitCode {
-    let report_json = match crate::apply::run_apply(profile, dry_run) {
-        Ok(report_json) => report_json,
-        Err(err) => return print_failure("apply", err),
+    let report_json = if is_lua_profile(profile) {
+        match crate::apply::run_apply(profile, dry_run) {
+            Ok(report_json) => report_json,
+            Err(err) => return print_failure("apply", err),
+        }
+    } else {
+        match crate::apply::run_apply_ast(profile, dry_run) {
+            Ok(report_json) => report_json,
+            Err(err) => return print_failure("apply", err),
+        }
     };
 
     println!("{report_json}");
 
     let report: serde_json::Value = serde_json::from_str(&report_json)
-        .expect("crate::apply::run_apply always returns valid JSON (09 §Outputs)");
+        .expect("the apply report is always valid JSON (09 §Outputs)");
     let ok = report
         .get("ok")
         .and_then(serde_json::Value::as_bool)

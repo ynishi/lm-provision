@@ -297,7 +297,11 @@ fn port_from_payload(value: &Value) -> Option<u16> {
 
 /// The canonical kind string for `phase`
 /// (`02-phase-catalog.md` §Catalog kinds).
-fn kind_of(phase: &ProfileNode) -> &'static str {
+///
+/// `pub(crate)` so [`crate::exec`] can label each executed phase's report
+/// entry with the same kind string the plan artifact uses, rather than
+/// forking a second variant→kind map that could drift.
+pub(crate) fn kind_of(phase: &ProfileNode) -> &'static str {
     match phase {
         ProfileNode::Spec { .. } => "",
         ProfileNode::SystemApt { .. } => "system.apt",

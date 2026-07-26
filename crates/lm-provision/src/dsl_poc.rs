@@ -371,18 +371,34 @@ pub fn create_profile_engine(
     mode: crate::exec::ExecMode,
     executed_log: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> Result<Engine<ProfileAst>, crate::exec::ExecError> {
+    Ok(create_profile_engine_collecting(root, mode, executed_log)?.0)
+}
+
+/// Like [`create_profile_engine`], but also returns a handle to the
+/// shared structured per-step report collection
+/// ([`crate::exec::report::StepReport`]) the op handlers append to as
+/// they run. The AST `apply` subcommand ([`crate::apply::run_apply_ast`])
+/// drives the returned engine and then reads this handle to build the
+/// apply report; the plain [`create_profile_engine`] discards it for the
+/// trace-log-only call sites (integration tests, the POC path).
+pub fn create_profile_engine_collecting(
+    root: &ProfileNode,
+    mode: crate::exec::ExecMode,
+    executed_log: Arc<std::sync::Mutex<Vec<String>>>,
+) -> Result<(Engine<ProfileAst>, crate::exec::report::SharedReports), crate::exec::ExecError> {
     let ctx = Arc::new(crate::exec::ExecContext::from_root(
         root,
         mode,
         executed_log,
     )?);
+    let reports = ctx.reports_handle();
     let engine = Engine::new_with_ops(
         OwnedDerivedAst::new(root, ProfileSemantics),
         Arc::new(ReducerRegistry::new()),
-        crate::exec::registry::profile_op_registry(ctx),
+        crate::exec::registry::profile_op_registry(Arc::clone(&ctx)),
     )
     .expect("Engine initialization should succeed");
-    Ok(engine)
+    Ok((engine, reports))
 }
 
 #[cfg(test)]
