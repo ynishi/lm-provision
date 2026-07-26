@@ -24,8 +24,16 @@
 //! - Empty `Vec` encodes as `[]` (the typed AST removes the
 //!   array/object ambiguity that motivated the legacy
 //!   empty-table-as-`{}` rule).
-//! - No secret-marker rule: the current AST has no secret *value*
-//!   type; `env_secrets` carries only *names* (bare strings).
+//! - Secret-marker rule: an [`ProfileNode::EnvSecret`] `env`-map value
+//!   encodes as the `{"__secret":"NAME"}` marker (spec 03 / spec 06
+//!   §SecretRef); an [`ProfileNode::EnvLiteral`] value encodes as its
+//!   plain string. The `env_secrets` *declaration* list is unaffected —
+//!   it still carries only bare names.
+//! - The `env` keyed slot on `sync.pull` / `staging.push` / `sh.exec`
+//!   encodes as an object mapping each key to its (marker or string)
+//!   value; an empty `env` omits the key entirely, so a profile that
+//!   declares no env hashes byte-for-byte as it did before the field
+//!   was introduced. `revision` follows the `Option` omit rule above.
 //! - Object keys are the Rust field identifiers; variant tag is the
 //!   Rust variant name emitted under the `"type"` key (matching the
 //!   JSON serde bridge's `"type"` discriminator).
@@ -152,10 +160,18 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             CanonValue::Object(fields)
         }
 
-        ProfileNode::SyncPull { id: _, src, dst } => {
+        ProfileNode::SyncPull {
+            id: _,
+            src,
+            dst,
+            env,
+            revision,
+        } => {
             let mut fields = variant_object("SyncPull");
             fields.insert("src".into(), CanonValue::Str(src.clone()));
             fields.insert("dst".into(), CanonValue::Str(dst.clone()));
+            insert_env(&mut fields, env);
+            insert_optional_str(&mut fields, "revision", revision);
             CanonValue::Object(fields)
         }
 
@@ -166,10 +182,18 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             CanonValue::Object(fields)
         }
 
-        ProfileNode::StagingPush { id: _, src, dst } => {
+        ProfileNode::StagingPush {
+            id: _,
+            src,
+            dst,
+            env,
+            revision,
+        } => {
             let mut fields = variant_object("StagingPush");
             fields.insert("src".into(), CanonValue::Str(src.clone()));
             fields.insert("dst".into(), CanonValue::Str(dst.clone()));
+            insert_env(&mut fields, env);
+            insert_optional_str(&mut fields, "revision", revision);
             CanonValue::Object(fields)
         }
 
@@ -228,9 +252,10 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             CanonValue::Object(fields)
         }
 
-        ProfileNode::ShExec { id: _, argv } => {
+        ProfileNode::ShExec { id: _, argv, env } => {
             let mut fields = variant_object("ShExec");
             fields.insert("argv".into(), string_array(argv));
+            insert_env(&mut fields, env);
             CanonValue::Object(fields)
         }
 
@@ -276,7 +301,35 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             fields.insert("path".into(), CanonValue::Str(path.clone()));
             CanonValue::Object(fields)
         }
+
+        // Env value nodes: an `EnvLiteral` is its bare string; an
+        // `EnvSecret` is the `{"__secret":"NAME"}` marker. These arms
+        // are reached through [`insert_env`] (they never occur as
+        // top-level phases).
+        ProfileNode::EnvLiteral { id: _, value } => CanonValue::Str(value.clone()),
+        ProfileNode::EnvSecret { id: _, name } => {
+            let mut marker = BTreeMap::new();
+            marker.insert("__secret".into(), CanonValue::Str(name.clone()));
+            CanonValue::Object(marker)
+        }
     }
+}
+
+/// Insert the `env` key when `env` is non-empty, mapping each entry's
+/// key to its canonical value (a plain string for
+/// [`ProfileNode::EnvLiteral`], the `{"__secret":"NAME"}` marker for
+/// [`ProfileNode::EnvSecret`]). An empty `env` omits the key so a
+/// profile that declares no env hashes exactly as it did before the
+/// field existed. `BTreeMap` iteration is already lexicographic by key.
+fn insert_env(fields: &mut BTreeMap<String, CanonValue>, env: &BTreeMap<String, ProfileNode>) {
+    if env.is_empty() {
+        return;
+    }
+    let mut obj = BTreeMap::new();
+    for (key, value) in env {
+        obj.insert(key.clone(), to_canon(value));
+    }
+    fields.insert("env".into(), CanonValue::Object(obj));
 }
 
 fn variant_object(name: &str) -> BTreeMap<String, CanonValue> {
@@ -406,10 +459,12 @@ mod tests {
         let a = ProfileNode::ShExec {
             id: new_id(&gen),
             argv: vec!["ls".into(), "-la".into()],
+            env: BTreeMap::new(),
         };
         let b = ProfileNode::ShExec {
             id: new_id(&gen),
             argv: vec!["ls".into(), "-la".into()],
+            env: BTreeMap::new(),
         };
         assert_eq!(encode(&a), encode(&b));
     }
@@ -455,6 +510,7 @@ mod tests {
         let sh = || ProfileNode::ShExec {
             id: new_id(&gen),
             argv: vec!["ls".into()],
+            env: BTreeMap::new(),
         };
 
         let a = ProfileNode::Spec {
@@ -566,6 +622,7 @@ mod tests {
                 ProfileNode::ShExec {
                     id: new_id(&gen),
                     argv: vec!["ls".into(), "-la".into()],
+                    env: BTreeMap::new(),
                 },
             ],
         };
@@ -676,5 +733,99 @@ mod tests {
         };
         let bytes = encode(&node);
         assert_eq!(bytes, "{\"port\":8188,\"type\":\"ComfyUiRestart\"}");
+    }
+
+    // -----------------------------------------------------------------
+    // env value nodes + revision.
+    // -----------------------------------------------------------------
+
+    fn env_map(entries: &[(&str, ProfileNode)]) -> BTreeMap<String, ProfileNode> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn env_map_encodes_literals_and_secret_markers() {
+        let gen = IdGen::new();
+        let env = env_map(&[
+            (
+                "LOG_LEVEL",
+                ProfileNode::EnvLiteral {
+                    id: new_id(&gen),
+                    value: "debug".into(),
+                },
+            ),
+            (
+                "HF_TOKEN",
+                ProfileNode::EnvSecret {
+                    id: new_id(&gen),
+                    name: "HF_TOKEN".into(),
+                },
+            ),
+        ]);
+        let node = ProfileNode::SyncPull {
+            id: new_id(&gen),
+            src: "hf://owner/repo/model.bin".into(),
+            dst: "/workspace/model.bin".into(),
+            env,
+            revision: Some("abc123".into()),
+        };
+        let bytes = encode(&node);
+        // env object: keys lexicographic, EnvLiteral -> string,
+        // EnvSecret -> {"__secret":"NAME"}; revision emitted.
+        assert!(
+            bytes.contains(
+                "\"env\":{\"HF_TOKEN\":{\"__secret\":\"HF_TOKEN\"},\"LOG_LEVEL\":\"debug\"}"
+            ),
+            "bytes: {bytes}"
+        );
+        assert!(bytes.contains("\"revision\":\"abc123\""), "bytes: {bytes}");
+    }
+
+    #[test]
+    fn empty_env_and_none_revision_omit_their_keys_and_match_the_legacy_bytes() {
+        let gen = IdGen::new();
+        let node = ProfileNode::SyncPull {
+            id: new_id(&gen),
+            src: "b2://bucket/model.bin".into(),
+            dst: "/workspace/model.bin".into(),
+            env: BTreeMap::new(),
+            revision: None,
+        };
+        let bytes = encode(&node);
+        // Byte-for-byte the pre-field shape: only dst / src / type.
+        assert_eq!(
+            bytes,
+            "{\"dst\":\"/workspace/model.bin\",\"src\":\"b2://bucket/model.bin\",\"type\":\"SyncPull\"}"
+        );
+    }
+
+    #[test]
+    fn env_bearing_profiles_hash_deterministically() {
+        let gen = IdGen::new();
+        let make = || ProfileNode::ShExec {
+            id: new_id(&gen),
+            argv: vec!["echo".into()],
+            env: env_map(&[(
+                "TOKEN",
+                ProfileNode::EnvSecret {
+                    id: new_id(&gen),
+                    name: "TOKEN".into(),
+                },
+            )]),
+        };
+        assert_eq!(hash(&make()), hash(&make()));
+    }
+
+    #[test]
+    fn env_secret_marker_standalone_encoding() {
+        let gen = IdGen::new();
+        let node = ProfileNode::EnvSecret {
+            id: new_id(&gen),
+            name: "B2_KEY".into(),
+        };
+        assert_eq!(encode(&node), "{\"__secret\":\"B2_KEY\"}");
     }
 }

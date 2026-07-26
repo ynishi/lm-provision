@@ -5,6 +5,7 @@ use dsl_kit::{
     ReducerRegistry,
 };
 use dsl_kit_macros::{DslBuild, DslExec, DslNode, DslSchema};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Unified AST for provision profile declarations and 22 Phase catalog kinds (`02-phase-catalog.md`).
@@ -101,6 +102,13 @@ pub enum ProfileNode {
         src: String,
         /// Destination path.
         dst: String,
+        /// Env injection map (spec 02 `sync.pull`). A keyed slot whose
+        /// values are [`ProfileNode::EnvLiteral`] / [`ProfileNode::EnvSecret`]
+        /// value nodes (dsl-kit 0.5 `Multiplicity::Map`). Empty when the
+        /// author declared no env.
+        env: BTreeMap<String, ProfileNode>,
+        /// Optional hf revision (spec 02 `sync.pull` `revision`).
+        revision: Option<String>,
     },
 
     /// `sync.push`: Synchronize files/artifacts to remote storage (marker)
@@ -123,6 +131,11 @@ pub enum ProfileNode {
         src: String,
         /// Destination URI.
         dst: String,
+        /// Env injection map (spec 02 `staging.push`). Same keyed-slot
+        /// shape as [`ProfileNode::SyncPull`]'s `env`.
+        env: BTreeMap<String, ProfileNode>,
+        /// Optional hf revision (spec 02 `staging.push` `revision`).
+        revision: Option<String>,
     },
 
     /// `models`: Model downloads for ComfyUI
@@ -200,6 +213,9 @@ pub enum ProfileNode {
         id: NodeId,
         /// Argument vector.
         argv: Vec<String>,
+        /// Env injection map (spec 04 `sh.exec` `opts.env`). Same
+        /// keyed-slot shape as [`ProfileNode::SyncPull`]'s `env`.
+        env: BTreeMap<String, ProfileNode>,
     },
 
     /// `fs.write`: Write file content
@@ -261,6 +277,33 @@ pub enum ProfileNode {
         /// Target path.
         path: String,
     },
+
+    // --- Env value nodes (spec 06 §Inputs) ---
+    /// A literal (non-secret) `env` map value. Occurs only as a value in
+    /// an `env` keyed slot; never as a top-level phase. Canonicalizes to
+    /// its plain string (spec 03 §canonical). Executed as an inert literal
+    /// leaf — exec-time env injection is deferred (spec 02 §Dispatch
+    /// routing).
+    #[dsl_exec(value)]
+    EnvLiteral {
+        /// Stable node ID.
+        id: NodeId,
+        /// The literal env value.
+        value: String,
+    },
+
+    /// A secret `env` map value — the `env.ref(NAME)` form (spec 06
+    /// §`env.ref`). Occurs only as a value in an `env` keyed slot.
+    /// Canonicalizes to the `{"__secret":"NAME"}` marker (spec 03 /
+    /// spec 06 §SecretRef); `name` is the logical secret name, which
+    /// [`crate::validate`] cross-checks against `Spec.env_secrets`.
+    #[dsl_exec(value)]
+    EnvSecret {
+        /// Stable node ID.
+        id: NodeId,
+        /// Logical secret name (must appear in `Spec.env_secrets`).
+        name: String,
+    },
 }
 
 /// Execution value type for provision phases.
@@ -273,6 +316,17 @@ pub enum ProfileValue {
 impl From<()> for ProfileValue {
     fn from(_: ()) -> Self {
         ProfileValue::Success("ok".into())
+    }
+}
+
+/// Literal env value nodes ([`ProfileNode::EnvLiteral`] /
+/// [`ProfileNode::EnvSecret`]) carry a `String` `LitValue`; the engine
+/// converts it into a [`ProfileValue`] when it evaluates the leaf. The
+/// value is inert (exec-time env injection is deferred, spec 02
+/// §Dispatch routing), so the string is wrapped as a success marker.
+impl From<String> for ProfileValue {
+    fn from(value: String) -> Self {
+        ProfileValue::Success(value)
     }
 }
 

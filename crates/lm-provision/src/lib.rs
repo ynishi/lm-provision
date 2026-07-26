@@ -77,4 +77,5 @@ pub mod frontend;
 pub mod plan;
 pub mod sandbox;
 pub mod secret;
+pub mod validate;
 pub mod vm;

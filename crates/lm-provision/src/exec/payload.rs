@@ -59,6 +59,7 @@ mod tests {
                 ProfileNode::ShExec {
                     id: sh_id,
                     argv: vec!["ls".to_string()],
+                    env: Default::default(),
                 },
             ],
         };

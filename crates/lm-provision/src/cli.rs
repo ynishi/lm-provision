@@ -150,6 +150,12 @@ impl From<crate::frontend::FrontendError> for RunError {
     }
 }
 
+impl From<crate::validate::ValidateError> for RunError {
+    fn from(err: crate::validate::ValidateError) -> Self {
+        RunError(err.to_string())
+    }
+}
+
 /// The `Result` alias every read-only pipeline function below returns.
 /// `pub` for the same reason [`RunError`] is (milestone M6, see there).
 pub type PipelineResult<T> = std::result::Result<T, RunError>;
@@ -261,8 +267,36 @@ fn print_json(value: &serde_json::Value) {
     );
 }
 
+/// AST-path `validate` pipeline: load profile → run the AST validate
+/// checks → return the validated profile name.
+///
+/// Mirrors [`validate_pipeline`]'s "load → declarations → validate"
+/// shape (07-cli.md §Invocation) without the Lua VM hop:
+/// [`crate::frontend::load_profile`] produces the same
+/// [`crate::dsl_poc::ProfileNode`] AST both frontends converge on, and
+/// [`crate::validate::validate`] is the Rust port of the legacy
+/// `lm.validate.validate`. The name is read off the `Spec` node itself —
+/// a successful validate guarantees the root is a
+/// [`crate::dsl_poc::ProfileNode::Spec`].
+pub(crate) fn ast_validate(profile: &Path) -> PipelineResult<String> {
+    let node = crate::frontend::load_profile(profile)?;
+    crate::validate::validate(&node)?;
+    let name = match &node {
+        crate::dsl_poc::ProfileNode::Spec { name, .. } => name.clone(),
+        // Unreachable: `validate` returns `Err(NotSpec)` for any other
+        // root, so `?` above already returned. Kept total.
+        _ => String::new(),
+    };
+    Ok(name)
+}
+
 fn run_validate(profile: &Path) -> ExitCode {
-    match validate_pipeline(profile) {
+    let result = if is_lua_profile(profile) {
+        validate_pipeline(profile)
+    } else {
+        ast_validate(profile)
+    };
+    match result {
         Ok(name) => {
             print_json(&serde_json::json!({ "ok": true, "name": name }));
             ExitCode::from(0)

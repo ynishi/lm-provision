@@ -17,10 +17,12 @@
 //!
 //! ## Payload subset carried by the AST
 //!
-//! The current `ProfileNode` payload is a subset of the full spec-02
-//! payload (`SyncPull` has no `env` / `revision`, `ServiceStart` has no
-//! platform detail, `PythonDeps` has no `force_reinstall`, and so on).
-//! Extending the AST is out of scope here (backlog item), so:
+//! The `ProfileNode` payload is still a partial projection of the full
+//! spec-02 payload (`ServiceStart` has no platform detail, `PythonDeps`
+//! has no `force_reinstall`, and so on). `SyncPull` / `StagingPush` now
+//! carry an `env` keyed slot and a `revision` (step ②), but the
+//! exec-time consumption of those fields — env-routed CLI dispatch,
+//! spec 02 §Dispatch routing — is deferred to step ③. So:
 //!
 //! - Fields with a defensible built-in default are constant-substituted
 //!   (`PythonDeps.in_comfy_venv=false` → the system `pip` on `PATH`;
@@ -29,9 +31,11 @@
 //! - Ops whose invocation cannot be constructed from the AST fields
 //!   alone (`ComfyUiRestart`, `ServiceStart`) expand to a single
 //!   [`Step::Note`] recording that fact, rather than inventing an argv.
-//! - `SyncPull` with a `b2://` / `hf://` src and `StagingPush` return
-//!   [`ExecError::Unsupported`]: both need the env-routed CLI dispatch
-//!   documented in spec 02 §Dispatch routing.
+//! - `SyncPull` with a non-empty `env`, a `b2://` / `hf://` src, and
+//!   `StagingPush` (always) return [`ExecError::Unsupported`]: all need
+//!   the env-routed CLI dispatch documented in spec 02 §Dispatch
+//!   routing. A `SyncPull` whose `env` is empty keeps its prior
+//!   behaviour (an `https://` src maps to a plain download).
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -110,13 +114,13 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             ..
         } => Ok(expand_python_deps(deps, *in_comfy_venv)),
         ProfileNode::CustomNodes { nodes_json, .. } => expand_custom_nodes(nodes_json),
-        ProfileNode::SyncPull { src, dst, .. } => expand_sync_pull(src, dst),
+        ProfileNode::SyncPull { src, dst, env, .. } => expand_sync_pull(src, dst, env),
         ProfileNode::SyncPush { src, dst, .. } => Ok(vec![Step::Note(format!(
             "sync_push src={src} dst={dst}: marker only; not executed during apply"
         ))]),
         ProfileNode::StagingPush { src, dst, .. } => Err(ExecError::Unsupported(format!(
             "staging_push '{src}' -> '{dst}': requires env-routed CLI dispatch; \
-             pending AST env field extension"
+             pending exec env injection (spec 02 dispatch routing)"
         ))),
         ProfileNode::Models { models_json, .. } => expand_models(models_json),
         ProfileNode::LlmModels { models_json, .. } => expand_llm_models(models_json),
@@ -242,11 +246,24 @@ fn expand_custom_nodes(json: &str) -> Result<Vec<Step>, ExecError> {
     Ok(steps)
 }
 
-fn expand_sync_pull(src: &str, dst: &str) -> Result<Vec<Step>, ExecError> {
+fn expand_sync_pull(
+    src: &str,
+    dst: &str,
+    env: &std::collections::BTreeMap<String, ProfileNode>,
+) -> Result<Vec<Step>, ExecError> {
+    // A non-empty `env` needs env-routed CLI dispatch, which the exec
+    // layer does not yet implement (step ③). Fail loudly rather than
+    // silently dropping the injection.
+    if !env.is_empty() {
+        return Err(ExecError::Unsupported(format!(
+            "sync_pull '{src}': env injection not yet implemented; \
+             pending exec env injection (spec 02 dispatch routing)"
+        )));
+    }
     if src.starts_with("b2://") || src.starts_with("hf://") {
         return Err(ExecError::Unsupported(format!(
             "sync_pull '{src}': requires env-routed CLI dispatch; \
-             pending AST env field extension"
+             pending exec env injection (spec 02 dispatch routing)"
         )));
     }
     Ok(vec![Step::Transfer {
@@ -635,6 +652,8 @@ mod tests {
             id: node_id(&ids),
             src: "https://example.com/m.bin".to_string(),
             dst: "/workspace/m.bin".to_string(),
+            env: Default::default(),
+            revision: None,
         };
         let steps = expand(&payload).expect("sync_pull expands");
         assert_eq!(
@@ -653,11 +672,42 @@ mod tests {
             id: node_id(&ids),
             src: "b2://bucket/model.safetensors".to_string(),
             dst: "/workspace/model.safetensors".to_string(),
+            env: Default::default(),
+            revision: None,
         };
         let err = expand(&payload).expect_err("b2:// must be unsupported");
         match err {
             ExecError::Unsupported(msg) => {
-                assert!(msg.contains("pending AST env field extension"));
+                assert!(msg.contains("env-routed CLI dispatch"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_sync_pull_with_a_non_empty_env_is_unsupported() {
+        let ids = IdGen::new();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "B2_KEY".to_string(),
+            ProfileNode::EnvSecret {
+                id: node_id(&ids),
+                name: "B2_KEY".to_string(),
+            },
+        );
+        // Even an otherwise-downloadable https src must fail while exec
+        // env injection is pending (step ③).
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: "https://example.com/m.bin".to_string(),
+            dst: "/workspace/m.bin".to_string(),
+            env,
+            revision: None,
+        };
+        let err = expand(&payload).expect_err("non-empty env must be unsupported");
+        match err {
+            ExecError::Unsupported(msg) => {
+                assert!(msg.contains("env injection not yet implemented"), "{msg}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -689,6 +739,8 @@ mod tests {
             id: node_id(&ids),
             src: "/workspace/out.bin".to_string(),
             dst: "hf://owner/repo".to_string(),
+            env: Default::default(),
+            revision: None,
         };
         let err = expand(&payload).expect_err("staging_push must be unsupported");
         match err {
@@ -909,6 +961,7 @@ mod tests {
         let payload = ProfileNode::ShExec {
             id: node_id(&ids),
             argv: vec!["ls".to_string()],
+            env: Default::default(),
         };
         let err = expand(&payload).expect_err("ShExec is not a lifecycle payload");
         assert!(matches!(

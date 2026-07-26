@@ -47,6 +47,7 @@ fn an_undeclared_capability_fails_the_op_even_in_dry_run() {
         phases: vec![ProfileNode::ShExec {
             id: ids.node(),
             argv: vec!["echo".to_string(), "hi".to_string()],
+            env: Default::default(),
         }],
     };
 
@@ -104,6 +105,7 @@ fn dry_run_traces_every_direct_op() {
             ProfileNode::ShExec {
                 id: ids.node(),
                 argv: vec!["ls".to_string()],
+                env: Default::default(),
             },
             ProfileNode::FsWrite {
                 id: ids.node(),
@@ -185,6 +187,7 @@ fn real_mode_runs_sh_exec_and_summarises_the_result() {
         phases: vec![ProfileNode::ShExec {
             id: ids.node(),
             argv: vec!["echo".to_string(), "hello".to_string()],
+            env: Default::default(),
         }],
     };
 
@@ -269,6 +272,8 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
                 id: ids.node(),
                 src: "https://example.com/m.bin".to_string(),
                 dst: "/workspace/m.bin".to_string(),
+                env: Default::default(),
+                revision: None,
             },
             ProfileNode::SyncPush {
                 id: ids.node(),
@@ -377,6 +382,8 @@ fn staging_push_fails_in_dry_run_pending_ast_env_extension() {
             id: ids.node(),
             src: "/workspace/out.bin".to_string(),
             dst: "hf://owner/repo".to_string(),
+            env: Default::default(),
+            revision: None,
         }],
     };
 

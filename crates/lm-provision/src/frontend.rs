@@ -197,6 +197,55 @@ mod tests {
     }
 
     #[test]
+    fn json_env_keyed_slot_round_trips_into_env_value_nodes() {
+        // The serde bridge routes an `env` object (Multiplicity::Map)
+        // into keyed children, and DslBuild rebuilds each value as an
+        // EnvLiteral / EnvSecret node. Exercises the keyed-slot path
+        // end-to-end (JSON front-end → typed AST).
+        let value = serde_json::json!({
+            "type": "Spec",
+            "name": "env-demo",
+            "env_secrets": ["HF_TOKEN"],
+            "phases": [
+                {
+                    "type": "SyncPull",
+                    "src": "hf://owner/repo/m.bin",
+                    "dst": "/workspace/m.bin",
+                    "env": {
+                        "LOG_LEVEL": { "type": "EnvLiteral", "value": "debug" },
+                        "TOKEN": { "type": "EnvSecret", "name": "HF_TOKEN" }
+                    },
+                    "revision": "main"
+                }
+            ]
+        });
+        let path = write_temp("env.json", &value.to_string());
+        let ast = load_profile(&path).expect("env profile must load");
+
+        let ProfileNode::Spec { phases, .. } = &ast else {
+            panic!("expected Spec root");
+        };
+        let ProfileNode::SyncPull { env, revision, .. } = &phases[0] else {
+            panic!("expected SyncPull phase, got {:?}", phases[0]);
+        };
+        assert_eq!(revision.as_deref(), Some("main"));
+        assert_eq!(env.len(), 2);
+        match env.get("LOG_LEVEL") {
+            Some(ProfileNode::EnvLiteral { value, .. }) => assert_eq!(value, "debug"),
+            other => panic!("expected EnvLiteral for LOG_LEVEL, got {other:?}"),
+        }
+        match env.get("TOKEN") {
+            Some(ProfileNode::EnvSecret { name, .. }) => assert_eq!(name, "HF_TOKEN"),
+            other => panic!("expected EnvSecret for TOKEN, got {other:?}"),
+        }
+
+        // The rebuilt AST validates (HF_TOKEN is declared) and hashes
+        // deterministically.
+        assert!(crate::validate::validate(&ast).is_ok());
+        assert_eq!(canonical::hash(&ast), canonical::hash(&ast));
+    }
+
+    #[test]
     fn malformed_json_surfaces_as_parse_error() {
         let path = write_temp("bad.json", "{not: valid json,");
         let err = load_profile(&path).expect_err("malformed JSON must fail");

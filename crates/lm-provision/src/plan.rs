@@ -19,6 +19,8 @@
 //! The output has no `schema` field: the typed AST carries no schema
 //! marker, and downstream stages read `profile_name` / `steps` only.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Map, Value};
 
 use crate::dsl_poc::ProfileNode;
@@ -114,10 +116,13 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
             | ProfileNode::MountUmount { .. } => {
                 zz.push((kind_of(phase), payload_of(phase)));
             }
-            // A `Spec` variant nested inside `phases` is a malformed
-            // AST the frontend does not produce; skip rather than
-            // panic to keep [`expand`] total.
-            ProfileNode::Spec { .. } => {}
+            // A `Spec` variant nested inside `phases`, or an `Env*`
+            // value node appearing outside its `env` slot, is a
+            // malformed AST the frontend does not produce; skip rather
+            // than panic to keep [`expand`] total.
+            ProfileNode::Spec { .. }
+            | ProfileNode::EnvLiteral { .. }
+            | ProfileNode::EnvSecret { .. } => {}
         }
     }
 
@@ -310,6 +315,8 @@ fn kind_of(phase: &ProfileNode) -> &'static str {
         ProfileNode::ComfyUiHealth { .. } => "comfyui.health",
         ProfileNode::ServiceStart { .. } => "service.start",
         ProfileNode::ServiceReady { .. } => "service.ready",
+        ProfileNode::EnvLiteral { .. } => "env.literal",
+        ProfileNode::EnvSecret { .. } => "env.secret",
         ProfileNode::ShExec { .. } => "sh.exec",
         ProfileNode::FsWrite { .. } => "fs.write",
         ProfileNode::NetHttpGet { .. } => "net.http_get",
@@ -344,9 +351,21 @@ fn payload_of(phase: &ProfileNode) -> Value {
             ..
         } => json!({ "deps": deps, "in_comfy_venv": in_comfy_venv }),
         ProfileNode::CustomNodes { nodes_json, .. } => json!({ "nodes_json": nodes_json }),
-        ProfileNode::SyncPull { src, dst, .. } => json!({ "src": src, "dst": dst }),
+        ProfileNode::SyncPull {
+            src,
+            dst,
+            env,
+            revision,
+            ..
+        } => route_payload(src, dst, env, revision.as_deref()),
         ProfileNode::SyncPush { src, dst, .. } => json!({ "src": src, "dst": dst }),
-        ProfileNode::StagingPush { src, dst, .. } => json!({ "src": src, "dst": dst }),
+        ProfileNode::StagingPush {
+            src,
+            dst,
+            env,
+            revision,
+            ..
+        } => route_payload(src, dst, env, revision.as_deref()),
         ProfileNode::Models { models_json, .. } => json!({ "models_json": models_json }),
         ProfileNode::LlmModels { models_json, .. } => json!({ "models_json": models_json }),
         ProfileNode::PostInstall { script, .. } => json!({ "script": script }),
@@ -360,13 +379,67 @@ fn payload_of(phase: &ProfileNode) -> Value {
         ProfileNode::ServiceReady {
             name, check_url, ..
         } => json!({ "name": name, "check_url": check_url }),
-        ProfileNode::ShExec { argv, .. } => json!({ "argv": argv }),
+        ProfileNode::ShExec { argv, env, .. } => {
+            let mut m = Map::new();
+            m.insert("argv".into(), json!(argv));
+            if !env.is_empty() {
+                m.insert("env".into(), env_object(env));
+            }
+            Value::Object(m)
+        }
         ProfileNode::FsWrite { path, content, .. } => json!({ "path": path, "content": content }),
         ProfileNode::NetHttpGet { url, .. } => json!({ "url": url }),
         ProfileNode::NetHttpPost { url, .. } => json!({ "url": url }),
         ProfileNode::NetTransfer { src, dst, .. } => json!({ "src": src, "dst": dst }),
         ProfileNode::MountBind { src, dst, .. } => json!({ "src": src, "dst": dst }),
         ProfileNode::MountUmount { path, .. } => json!({ "path": path }),
+        // Env value nodes never occur as top-level phases; the arm keeps
+        // [`payload_of`] total. Rendered in their `env`-map value form.
+        ProfileNode::EnvLiteral { .. } | ProfileNode::EnvSecret { .. } => env_value(phase),
+    }
+}
+
+/// Payload for a `sync.pull` / `staging.push` route: `src` / `dst`,
+/// plus an `env` object (only when non-empty) and `revision` (only when
+/// present). Matches the legacy `lm.plan` bundle, whose `env` entries
+/// render each secret as its `{"__secret":"NAME"}` marker.
+fn route_payload(
+    src: &str,
+    dst: &str,
+    env: &BTreeMap<String, ProfileNode>,
+    revision: Option<&str>,
+) -> Value {
+    let mut m = Map::new();
+    m.insert("src".into(), Value::String(src.to_string()));
+    m.insert("dst".into(), Value::String(dst.to_string()));
+    if !env.is_empty() {
+        m.insert("env".into(), env_object(env));
+    }
+    if let Some(rev) = revision {
+        m.insert("revision".into(), Value::String(rev.to_string()));
+    }
+    Value::Object(m)
+}
+
+/// Render an `env` keyed slot as a JSON object mapping each key to its
+/// value node's plan form ([`env_value`]).
+fn env_object(env: &BTreeMap<String, ProfileNode>) -> Value {
+    let mut m = Map::new();
+    for (key, value) in env {
+        m.insert(key.clone(), env_value(value));
+    }
+    Value::Object(m)
+}
+
+/// Render one `env`-map value: an [`ProfileNode::EnvLiteral`] as its
+/// plain string, an [`ProfileNode::EnvSecret`] as the
+/// `{"__secret":"NAME"}` marker (mirroring [`crate::canonical`]). Any
+/// other node is a malformed AST the frontend never produces.
+fn env_value(node: &ProfileNode) -> Value {
+    match node {
+        ProfileNode::EnvLiteral { value, .. } => Value::String(value.clone()),
+        ProfileNode::EnvSecret { name, .. } => json!({ "__secret": name }),
+        _ => Value::Null,
     }
 }
 
@@ -443,6 +516,7 @@ mod tests {
                 ProfileNode::ShExec {
                     id: g.node(),
                     argv: vec!["echo".into(), "tail".into()],
+                    env: BTreeMap::new(),
                 },
                 ProfileNode::ServiceStart {
                     id: g.node(),
@@ -478,6 +552,8 @@ mod tests {
                     id: g.node(),
                     src: "b2://bucket/a.bin".into(),
                     dst: "/workspace/a.bin".into(),
+                    env: BTreeMap::new(),
+                    revision: None,
                 },
                 ProfileNode::CustomNodes {
                     id: g.node(),
@@ -810,6 +886,8 @@ mod tests {
                     id: g.node(),
                     src: "b2://bucket/a.bin".into(),
                     dst: "/workspace/a.bin".into(),
+                    env: BTreeMap::new(),
+                    revision: None,
                 },
                 ProfileNode::SyncPush {
                     id: g.node(),
@@ -820,6 +898,8 @@ mod tests {
                     id: g.node(),
                     src: "/workspace/stage.bin".into(),
                     dst: "hf://owner/repo/stage.bin".into(),
+                    env: BTreeMap::new(),
+                    revision: None,
                 },
             ],
         ));
@@ -837,6 +917,86 @@ mod tests {
         assert_eq!(
             payload["staging_push"][0]["src"],
             json!("/workspace/stage.bin")
+        );
+    }
+
+    #[test]
+    fn sync_pull_env_and_revision_appear_in_the_route_payload() {
+        let g = ids();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "LOG".to_string(),
+            ProfileNode::EnvLiteral {
+                id: g.node(),
+                value: "debug".into(),
+            },
+        );
+        env.insert(
+            "TOKEN".to_string(),
+            ProfileNode::EnvSecret {
+                id: g.node(),
+                name: "HF_TOKEN".into(),
+            },
+        );
+        let plan = expand(&spec(
+            "demo",
+            vec![ProfileNode::SyncPull {
+                id: g.node(),
+                src: "hf://owner/repo/m.bin".into(),
+                dst: "/workspace/m.bin".into(),
+                env,
+                revision: Some("main".into()),
+            }],
+        ));
+        let pull0 = &plan["steps"][0]["payload"]["pull"][0];
+        assert_eq!(pull0["env"]["LOG"], json!("debug"));
+        assert_eq!(pull0["env"]["TOKEN"], json!({ "__secret": "HF_TOKEN" }));
+        assert_eq!(pull0["revision"], json!("main"));
+    }
+
+    #[test]
+    fn sh_exec_env_appears_in_the_payload() {
+        let g = ids();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "API".to_string(),
+            ProfileNode::EnvSecret {
+                id: g.node(),
+                name: "API".into(),
+            },
+        );
+        let plan = expand(&spec(
+            "demo",
+            vec![ProfileNode::ShExec {
+                id: g.node(),
+                argv: vec!["run".into()],
+                env,
+            }],
+        ));
+        assert_eq!(
+            plan["steps"][0]["payload"]["env"]["API"],
+            json!({ "__secret": "API" })
+        );
+    }
+
+    #[test]
+    fn sync_pull_without_env_omits_the_env_and_revision_keys() {
+        let g = ids();
+        let plan = expand(&spec(
+            "demo",
+            vec![ProfileNode::SyncPull {
+                id: g.node(),
+                src: "b2://bucket/m.bin".into(),
+                dst: "/workspace/m.bin".into(),
+                env: BTreeMap::new(),
+                revision: None,
+            }],
+        ));
+        let pull0 = &plan["steps"][0]["payload"]["pull"][0];
+        assert!(pull0.get("env").is_none(), "env must be omitted: {pull0}");
+        assert!(
+            pull0.get("revision").is_none(),
+            "revision must be omitted: {pull0}"
         );
     }
 
@@ -866,6 +1026,7 @@ mod tests {
                 ProfileNode::ShExec {
                     id: g.node(),
                     argv: vec!["echo".into(), "a".into()],
+                    env: BTreeMap::new(),
                 },
                 ProfileNode::FsWrite {
                     id: g.node(),
@@ -914,6 +1075,7 @@ mod tests {
                 ProfileNode::ShExec {
                     id: g.node(),
                     argv: vec!["ls".into()],
+                    env: BTreeMap::new(),
                 },
             ],
         ));

@@ -177,9 +177,18 @@ impl ProfileOp {
     }
 
     fn run_sh_exec(&self, node: NodeId, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
-        let ProfileNode::ShExec { argv, .. } = payload else {
+        let ProfileNode::ShExec { argv, env, .. } = payload else {
             return Err(self.variant_err(node, "ShExec"));
         };
+        // A non-empty `env` needs exec-time env injection (step ③);
+        // fail loudly rather than running with the injection dropped.
+        if !env.is_empty() {
+            return Err(ExecError::Unsupported(
+                "sh_exec: env injection not yet implemented; \
+                 pending exec env injection (spec 02 dispatch routing)"
+                    .to_string(),
+            ));
+        }
         match self.ctx.mode {
             ExecMode::DryRun => Ok(self.record(format!("sh_exec argv={argv:?}"))),
             ExecMode::Real => {
