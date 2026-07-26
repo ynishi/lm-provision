@@ -172,6 +172,18 @@ pub enum ProfileNode {
         id: NodeId,
         /// Target port.
         port: u16,
+        /// Extra arguments appended to the restart invocation (spec 02
+        /// `comfyui.restart` `extra_args`, shell-safe). Declaration
+        /// order is preserved; an empty list is the common case and is
+        /// omitted from the canonical encoding so a profile that
+        /// declares none hashes as it did before the field existed.
+        ///
+        /// Carrying the field does not by itself make the phase
+        /// executable: spec 02 defines the payload but never the
+        /// restart command to append these to, so
+        /// [`crate::exec::lifecycle`] still expands the phase to a note
+        /// rather than inventing an argv.
+        extra_args: Vec<String>,
     },
 
     /// `comfyui.health`: Poll HTTP health check endpoint

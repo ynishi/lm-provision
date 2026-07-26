@@ -124,6 +124,13 @@ and therefore byte-identical canonical output.
   as the secret marker `{"__secret":"NAME"}` — the hash covers *which
   secret is referenced*, never a value, and the marker is the same
   convention the ledger and audit log use (chapters 06, 09).
+- **Payload lists added after the fact**: `comfyui.restart`'s
+  `extra_args` follows the same omit-when-empty rule as `env`, and for
+  the same reason — the field was introduced once profiles were
+  already being hashed, so the common case (no extra args) must keep
+  its existing bytes. When non-empty it encodes in **declaration
+  order**: the entries are argv positions, so the declared-list sort
+  above does not apply to them.
 
 Decode (canonical bytes → AST) is out of scope in the current
 revision: the ledger persists JSON Lines and does not require

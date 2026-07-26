@@ -25,10 +25,12 @@
 //!   (`PythonDeps.in_comfy_venv=false` → the system `pip` on `PATH`;
 //!   `ComfyUiInstall.repo=None` → `comfyanonymous/ComfyUI`; a `models`
 //!   entry with no `subdir`/`kind` → `checkpoints`).
-//! - Ops whose invocation cannot be constructed from the AST fields
-//!   alone (`ComfyUiRestart` lacks its restart command / `extra_args`;
-//!   `ServiceStart` lacks per-platform launch detail) expand to a single
-//!   [`Step::Note`] recording that fact, rather than inventing an argv.
+//! - Ops whose invocation no chapter specifies (`ComfyUiRestart` has a
+//!   payload but no restart command; `ServiceStart` has no per-platform
+//!   launch command, and the AST carries no platform detail either)
+//!   expand to a single [`Step::Note`] recording that fact, rather than
+//!   inventing an argv. See spec 02 §Kinds with no invocation
+//!   specified — closing these is a spec change, not an AST change.
 //!
 //! ## Env-routed CLI dispatch (spec 02 §Dispatch routing, step ③)
 //!
@@ -148,11 +150,28 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             "-c".to_string(),
             script.clone(),
         ])]),
-        ProfileNode::ComfyUiRestart { port, .. } => Ok(vec![Step::Note(format!(
-            "comfyui_restart port={port}: restart argv unsupported — the AST \
-             carries no restart command or extra_args (spec 02 comfyui.restart), \
-             out of scope for the env-injection work"
-        ))]),
+        ProfileNode::ComfyUiRestart {
+            port, extra_args, ..
+        } => {
+            // The AST now carries `extra_args` (spec 02 payload), but
+            // spec 02 defines only the payload — no chapter names the
+            // restart command those args would be appended to. The
+            // legacy Lua dispatcher reached the same conclusion
+            // ("comfyui.restart has no defined dispatch mapping"), so
+            // the phase still expands to a note rather than a guessed
+            // argv. The declared args are echoed so the operator can
+            // see what would be appended once the command is specified.
+            let declared = if extra_args.is_empty() {
+                String::new()
+            } else {
+                format!(" extra_args={extra_args:?}")
+            };
+            Ok(vec![Step::Note(format!(
+                "comfyui_restart port={port}{declared}: no argv — spec 02 \
+                 defines the comfyui.restart payload but never the restart \
+                 command to invoke"
+            ))])
+        }
         ProfileNode::ComfyUiHealth { port, .. } => Ok(vec![Step::HttpPoll {
             url: format!("http://127.0.0.1:{port}/"),
             timeout_sec: HTTP_POLL_TIMEOUT_SEC,
@@ -1184,13 +1203,40 @@ mod tests {
         let payload = ProfileNode::ComfyUiRestart {
             id: node_id(&ids),
             port: 8188,
+            extra_args: Vec::new(),
         };
         let steps = expand(&payload).expect("comfyui_restart expands");
         assert_eq!(steps.len(), 1);
         match &steps[0] {
             Step::Note(msg) => {
                 assert!(msg.contains("port=8188"));
-                assert!(msg.contains("extra_args") && msg.contains("out of scope"));
+                // The reason is the missing *command*, not a missing
+                // payload field: the AST carries `extra_args` now.
+                assert!(msg.contains("never the restart command"));
+                assert!(
+                    !msg.contains("extra_args"),
+                    "an undeclared extra_args must not be echoed: {msg}"
+                );
+            }
+            other => panic!("expected Note, got {other:?}"),
+        }
+    }
+
+    /// Declared `extra_args` are echoed into the note so the operator
+    /// can see what would be appended once a restart command exists.
+    #[test]
+    fn expand_comfyui_restart_echoes_declared_extra_args() {
+        let ids = IdGen::new();
+        let payload = ProfileNode::ComfyUiRestart {
+            id: node_id(&ids),
+            port: 8188,
+            extra_args: vec!["--listen".to_string(), "--highvram".to_string()],
+        };
+        let steps = expand(&payload).expect("comfyui_restart expands");
+        match &steps[0] {
+            Step::Note(msg) => {
+                assert!(msg.contains("--listen") && msg.contains("--highvram"));
+                assert!(msg.contains("never the restart command"));
             }
             other => panic!("expected Note, got {other:?}"),
         }

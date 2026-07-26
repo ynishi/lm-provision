@@ -123,6 +123,28 @@ Dispatch turns each planned step into one or more bridge invocations
   segment pins a revision; a URL-carried revision wins over
   `opts.revision`. `@` is rejected in the owner segment.
 
+#### Kinds with no invocation specified
+
+Some kinds have a payload defined above but no command in chapters
+00–10 to invoke it with:
+
+| kind | what is missing |
+|---|---|
+| `comfyui.restart` | the restart command itself. The payload (`port`, `extra_args`) says what to parameterise, never what to run — `extra_args` are argv positions on a command that is not specified |
+| `service.start` | the per-platform launch invocation for `vllm` / `ollama` / `llamacpp` |
+| `python.version_check` | the comparison. `python3 --version` is emitted, but nothing specifies what to do with its output against `want` — hence "advisory" |
+
+Dispatch expands the missing part to a **note** step naming it
+(chapter 03 §dispatch). It does not invent an argv: a guessed restart
+or launch command would run on the operator's pod with the profile's
+`sh.exec` capability behind it, and in the report a guess is
+indistinguishable from a specified command.
+
+Filling these in is a spec change, not an implementation change. Until
+then a profile that needs a specific restart / launch command expresses
+it through `hooks.post_install`, where the shell escape is sanctioned
+and visible (chapter 01 §Escape / Fragment Policy).
+
 ### Shared vocabulary (frozen literal sets)
 
 This chapter is the source of truth for three literal sets consumed

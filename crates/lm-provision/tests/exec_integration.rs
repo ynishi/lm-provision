@@ -295,6 +295,7 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
             ProfileNode::ComfyUiRestart {
                 id: ids.node(),
                 port: addr.port(),
+                extra_args: Vec::new(),
             },
             ProfileNode::ComfyUiHealth {
                 id: ids.node(),

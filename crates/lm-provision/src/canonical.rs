@@ -34,6 +34,13 @@
 //!   value; an empty `env` omits the key entirely, so a profile that
 //!   declares no env hashes byte-for-byte as it did before the field
 //!   was introduced. `revision` follows the `Option` omit rule above.
+//! - `comfyui.restart`'s `extra_args` follows the same omit-when-empty
+//!   rule for the same reason: it is a payload field added after
+//!   profiles were already being hashed, and the overwhelmingly common
+//!   case (no extra args) must keep its existing hash. When non-empty
+//!   it encodes as a declaration-ordered array — the entries are
+//!   argv positions, so unlike the `Spec` declared lists they are not
+//!   sorted.
 //! - Object keys are the Rust field identifiers; variant tag is the
 //!   Rust variant name emitted under the `"type"` key (matching the
 //!   JSON serde bridge's `"type"` discriminator).
@@ -215,9 +222,14 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             CanonValue::Object(fields)
         }
 
-        ProfileNode::ComfyUiRestart { id: _, port } => {
+        ProfileNode::ComfyUiRestart {
+            id: _,
+            port,
+            extra_args,
+        } => {
             let mut fields = variant_object("ComfyUiRestart");
             fields.insert("port".into(), CanonValue::Int(i64::from(*port)));
+            insert_when_non_empty(&mut fields, "extra_args", extra_args);
             CanonValue::Object(fields)
         }
 
@@ -346,6 +358,21 @@ fn insert_optional_str(
     if let Some(v) = value {
         fields.insert(key.into(), CanonValue::Str(v.clone()));
     }
+}
+
+/// Insert `key` only when `items` is non-empty, preserving declaration
+/// order.
+///
+/// Used for payload list fields introduced *after* profiles were already
+/// being hashed (`comfyui.restart` `extra_args`): omitting the key when
+/// empty keeps the canonical bytes — and therefore the profile hash —
+/// unchanged for every profile that does not use the field. The sibling
+/// rule for keyed slots is [`insert_env`].
+fn insert_when_non_empty(fields: &mut BTreeMap<String, CanonValue>, key: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    fields.insert(key.into(), string_array(items));
 }
 
 fn string_array(items: &[String]) -> CanonValue {
@@ -730,9 +757,65 @@ mod tests {
         let node = ProfileNode::ComfyUiRestart {
             id: new_id(&gen),
             port: 8188,
+            extra_args: Vec::new(),
         };
         let bytes = encode(&node);
         assert_eq!(bytes, "{\"port\":8188,\"type\":\"ComfyUiRestart\"}");
+    }
+
+    /// An empty `extra_args` must leave the canonical bytes — and so the
+    /// profile hash — exactly as they were before the field existed
+    /// (the expected string above is the pre-field encoding, verbatim).
+    #[test]
+    fn empty_extra_args_is_omitted_so_the_hash_is_unchanged() {
+        let gen = IdGen::new();
+        let without = ProfileNode::ComfyUiRestart {
+            id: new_id(&gen),
+            port: 8188,
+            extra_args: Vec::new(),
+        };
+        assert_eq!(
+            encode(&without),
+            "{\"port\":8188,\"type\":\"ComfyUiRestart\"}"
+        );
+    }
+
+    /// A non-empty `extra_args` encodes in declaration order — the
+    /// entries are argv positions, so (unlike the `Spec` declared lists)
+    /// they must not be sorted.
+    #[test]
+    fn extra_args_encodes_in_declaration_order() {
+        let gen = IdGen::new();
+        let node = ProfileNode::ComfyUiRestart {
+            id: new_id(&gen),
+            port: 8188,
+            // Deliberately not lexicographic: sorting would reorder
+            // these to ["--listen", "--port=9000"].
+            extra_args: vec!["--port=9000".to_string(), "--listen".to_string()],
+        };
+        assert_eq!(
+            encode(&node),
+            "{\"extra_args\":[\"--port=9000\",\"--listen\"],\"port\":8188,\"type\":\"ComfyUiRestart\"}"
+        );
+    }
+
+    /// Declaring extra args must change the hash — the field is part of
+    /// the invocation, so two profiles differing in it are not the same
+    /// profile.
+    #[test]
+    fn extra_args_participates_in_the_hash() {
+        let gen = IdGen::new();
+        let bare = ProfileNode::ComfyUiRestart {
+            id: new_id(&gen),
+            port: 8188,
+            extra_args: Vec::new(),
+        };
+        let with_args = ProfileNode::ComfyUiRestart {
+            id: new_id(&gen),
+            port: 8188,
+            extra_args: vec!["--listen".to_string()],
+        };
+        assert_ne!(hash(&bare), hash(&with_args));
     }
 
     // -----------------------------------------------------------------

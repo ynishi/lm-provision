@@ -373,7 +373,18 @@ fn payload_of(phase: &ProfileNode) -> Value {
         ProfileNode::Models { models_json, .. } => json!({ "models_json": models_json }),
         ProfileNode::LlmModels { models_json, .. } => json!({ "models_json": models_json }),
         ProfileNode::PostInstall { script, .. } => json!({ "script": script }),
-        ProfileNode::ComfyUiRestart { port, .. } => json!({ "port": port }),
+        // `extra_args` is omitted when empty, mirroring the canonical
+        // encoder: the plan renders what the author declared, and an
+        // absent list is not the same statement as an empty one.
+        ProfileNode::ComfyUiRestart {
+            port, extra_args, ..
+        } => {
+            if extra_args.is_empty() {
+                json!({ "port": port })
+            } else {
+                json!({ "port": port, "extra_args": extra_args })
+            }
+        }
         ProfileNode::ComfyUiHealth { port, .. } => json!({ "port": port }),
         ProfileNode::ServiceStart {
             name,
@@ -507,6 +518,48 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // comfyui.restart payload (02 §Catalog kinds `extra_args`).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn restart_payload_omits_extra_args_when_undeclared() {
+        let g = ids();
+        let plan = expand(&spec(
+            "demo",
+            vec![ProfileNode::ComfyUiRestart {
+                id: g.node(),
+                port: 8188,
+                extra_args: Vec::new(),
+            }],
+        ));
+        let payload = &plan["steps"][0]["payload"];
+        assert_eq!(payload["port"].as_u64(), Some(8188));
+        assert!(
+            payload.get("extra_args").is_none(),
+            "an undeclared extra_args must not appear as an empty list: {payload}"
+        );
+    }
+
+    #[test]
+    fn restart_payload_carries_declared_extra_args_in_order() {
+        let g = ids();
+        let plan = expand(&spec(
+            "demo",
+            vec![ProfileNode::ComfyUiRestart {
+                id: g.node(),
+                port: 8188,
+                extra_args: vec!["--port=9000".into(), "--listen".into()],
+            }],
+        ));
+        let payload = &plan["steps"][0]["payload"];
+        assert_eq!(
+            payload["extra_args"],
+            serde_json::json!(["--port=9000", "--listen"]),
+            "plan preserves declaration order (it does not sort payload lists)"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Canonical bucket order (02 §Canonical phase ordering).
     // -----------------------------------------------------------------
 
@@ -535,6 +588,7 @@ mod tests {
                 ProfileNode::ComfyUiRestart {
                     id: g.node(),
                     port: 9000,
+                    extra_args: Vec::new(),
                 },
                 ProfileNode::ComfyUiHealth {
                     id: g.node(),
@@ -671,6 +725,7 @@ mod tests {
                 ProfileNode::ComfyUiRestart {
                     id: g.node(),
                     port: 9001,
+                    extra_args: Vec::new(),
                 },
             ],
         ));
@@ -737,6 +792,7 @@ mod tests {
                 ProfileNode::ComfyUiRestart {
                     id: g.node(),
                     port: 1111,
+                    extra_args: Vec::new(),
                 },
                 ProfileNode::ComfyUiHealth {
                     id: g.node(),

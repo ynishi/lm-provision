@@ -450,6 +450,13 @@ fn check_phase(
         ProfileNode::ServiceStart { name, .. } => {
             check_str_shell_safe(name, index, "name", PodId::Forbidden)
         }
+        // `comfyui.restart` `extra_args` is marked shell-safe by
+        // 02-phase-catalog.md §Catalog kinds: the entries become argv
+        // positions on the (still unspecified) restart invocation, so
+        // they are checked exactly like `system.apt.packages`.
+        ProfileNode::ComfyUiRestart { extra_args, .. } => {
+            check_list_shell_safe(extra_args, index, "extra_args")
+        }
         ProfileNode::ShExec { env, .. } => check_env_map(env, env_secrets, index),
         // Every remaining variant carries no `shell_safe`-marked field,
         // no route shape, and no `env` slot (`hooks.post_install.script`
@@ -821,6 +828,39 @@ mod tests {
                 "phases[1].ref_name: is not shell-safe".into()
             ))
         );
+    }
+
+    #[test]
+    fn comfyui_restart_extra_args_are_shell_safety_checked() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![ProfileNode::ComfyUiRestart {
+                id: g.node(),
+                port: 8188,
+                extra_args: vec!["--listen".into(), "; rm -rf /".into()],
+            }],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].extra_args[2]: is not shell-safe".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn comfyui_restart_accepts_shell_safe_extra_args() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![ProfileNode::ComfyUiRestart {
+                id: g.node(),
+                port: 8188,
+                extra_args: vec!["--listen".into(), "--port=9000".into()],
+            }],
+        );
+        assert!(validate(&node).is_ok());
     }
 
     #[test]
