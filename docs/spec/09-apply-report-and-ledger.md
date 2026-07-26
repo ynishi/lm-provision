@@ -62,10 +62,17 @@ Per-op additional fields:
 | `mount.umount` | `path` |
 | `note` | `note` — a visible skip; `ok = true`, `status = 0` |
 
-A lifecycle sub-step's entry carries the step's *inputs* (`argv` /
-`src` + `dst` / `url`), not its captured output: the composed-step
-outcome is summarised into the trace line rather than the report
-(chapter 04 §Trace output).
+A lifecycle sub-step's entry carries the same fields as a direct op's:
+its declared inputs (`argv` / `src` + `dst` / `url`) always, plus the
+observations from running it (`status`, `stdout` / `stderr`, `bytes`,
+the destination actually written) in real mode. Under `--dry-run` the
+inputs are present and the observations are absent — nothing ran, so a
+status or captured output there would be fabricated.
+
+One gap remains: a step that *fails* carries `status = -1` and its
+`reason`, not the partial observation that accompanied the failure
+(the captured stderr behind a non-zero exit, say). The failure text
+quotes it, but it is not in a structured field.
 
 Semantics:
 

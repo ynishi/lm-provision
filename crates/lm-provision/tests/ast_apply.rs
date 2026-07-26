@@ -198,6 +198,91 @@ fn real_mode_runs_sh_exec_and_fs_write_for_real() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A real-mode **lifecycle** sub-step must carry what it observed —
+/// exit status and captured output — not just the argv it was composed
+/// from. The exec layer used to keep only the joined trace summary, so
+/// these entries were strictly less informative than a direct op's
+/// (spec 09 §Apply report: the per-op field table applies to lifecycle
+/// sub-steps too).
+#[test]
+fn real_mode_lifecycle_substeps_carry_their_observations() {
+    // `hooks.post_install` composes exactly one `sh.exec` sub-step out
+    // of the script, so the assertion targets a lifecycle entry rather
+    // than a direct op.
+    let profile = json!({
+        "type": "Spec",
+        "name": "lifecycle-observations",
+        "capabilities": ["sh.exec"],
+        "phases": [
+            { "type": "PostInstall", "script": "echo observed-stdout" }
+        ]
+    });
+    let path = write_json_profile("lifecycle-observations", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .expect("a post_install echo should apply cleanly");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+    assert_eq!(report["ok"], json!(true));
+
+    let steps = report["steps"].as_array().unwrap();
+    assert_eq!(
+        steps.len(),
+        1,
+        "post_install composes one sub-step: {steps:?}"
+    );
+    let step = &steps[0];
+
+    // Lifecycle sub-step id shape, and the effect it actually ran.
+    assert_eq!(step["kind"], json!("hooks.post_install"));
+    assert_eq!(step["op"], json!("sh.exec"));
+    assert_eq!(step["id"], json!("1_hooks.post_install_1"));
+
+    // The declared input is still there …
+    assert_eq!(step["argv"], json!(["sh", "-c", "echo observed-stdout"]));
+    // … and now so are the observations.
+    assert_eq!(step["status"], json!(0), "exit status: {step}");
+    assert!(
+        step["stdout"]
+            .as_str()
+            .expect("stdout tail is recorded")
+            .contains("observed-stdout"),
+        "captured stdout must reach the report: {step}"
+    );
+    assert!(step.get("stderr").is_some(), "stderr tail present: {step}");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// The same entries under `--dry-run` carry inputs but **no**
+/// observations — nothing ran, so a status/stdout there would be
+/// fabricated.
+#[test]
+fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
+    let profile = json!({
+        "type": "Spec",
+        "name": "lifecycle-dry",
+        "capabilities": ["sh.exec"],
+        "phases": [
+            { "type": "PostInstall", "script": "echo not-executed" }
+        ]
+    });
+    let path = write_json_profile("lifecycle-dry", &profile);
+
+    let report_json =
+        lm_provision::apply::run_apply_ast(&path, true).expect("dry-run apply succeeds");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    let step = &report["steps"].as_array().unwrap()[0];
+    assert_eq!(step["argv"], json!(["sh", "-c", "echo not-executed"]));
+    assert_eq!(step["dry_run"], json!(true));
+    assert!(
+        step.get("stdout").is_none() && step.get("stderr").is_none(),
+        "a dry run observed nothing: {step}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 // ---------------------------------------------------------------------
 // Fail-fast step collection + the legacy error form.
 // ---------------------------------------------------------------------

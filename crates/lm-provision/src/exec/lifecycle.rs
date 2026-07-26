@@ -601,8 +601,49 @@ pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
     }
 }
 
-/// Execute one step for real, returning its result summary fragment
-/// (the registry joins them per op).
+/// What executing one [`Step`] observed.
+///
+/// The `summary` fragment is the trace-log text the registry joins per
+/// op (unchanged from when this was the whole return value); the
+/// remaining fields are the observations the apply report's per-sub-step
+/// entry carries (spec 09 §Apply report). Before this type existed the
+/// exec layer discarded them, so a lifecycle sub-step's report entry
+/// showed only its declared inputs even in real mode — a regression
+/// against the predecessor Lua report, which carried
+/// `status` / `stdout` / `stderr` / `bytes` per executed op.
+///
+/// Failure observations are **not** carried here: a failing step still
+/// surfaces as [`ExecError`] with `status = -1` on its entry. Attaching
+/// the partial observation (a non-zero exit's captured stderr, say) to
+/// the failing entry needs a fallible-with-payload return and is left
+/// as a separate change.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StepResult {
+    /// Trace-log summary fragment.
+    pub summary: String,
+    /// Process exit code / HTTP status / `0` for an effectless step.
+    pub status: i64,
+    /// Captured stdout tail (`sh` steps).
+    pub stdout: Option<String>,
+    /// Captured stderr tail (`sh` steps).
+    pub stderr: Option<String>,
+    /// Bytes transferred (`transfer` steps).
+    pub bytes: Option<u64>,
+    /// Destination actually written (`transfer` steps).
+    pub dst: Option<String>,
+}
+
+impl StepResult {
+    /// A result carrying only a trace summary (effectless steps).
+    fn summary_only(summary: String) -> Self {
+        Self {
+            summary,
+            ..Self::default()
+        }
+    }
+}
+
+/// Execute one step for real, returning what it observed.
 ///
 /// `op` is the registry op name — used only to label the
 /// [`ExecError::EffectFailed`] surface, so the engine's node-located
@@ -612,18 +653,23 @@ pub fn execute_step(
     step: &Step,
     op: &str,
     env: &BTreeMap<String, String>,
-) -> Result<String, ExecError> {
+) -> Result<StepResult, ExecError> {
     match step {
         Step::Sh(argv) => execute_sh(argv, op, env),
         Step::Transfer { src, dst } => {
             let outcome = effects::transfer(src, dst)?;
-            Ok(format!(
-                "transfer src={src} dst={} bytes={}",
-                outcome.dst, outcome.bytes
-            ))
+            Ok(StepResult {
+                summary: format!(
+                    "transfer src={src} dst={} bytes={}",
+                    outcome.dst, outcome.bytes
+                ),
+                bytes: Some(outcome.bytes),
+                dst: Some(outcome.dst),
+                ..StepResult::default()
+            })
         }
         Step::HttpPoll { url, timeout_sec } => execute_http_poll(url, *timeout_sec, op),
-        Step::Note(message) => Ok(format!("note \"{message}\"")),
+        Step::Note(message) => Ok(StepResult::summary_only(format!("note \"{message}\""))),
     }
 }
 
@@ -631,7 +677,7 @@ fn execute_sh(
     argv: &[String],
     op: &str,
     env: &BTreeMap<String, String>,
-) -> Result<String, ExecError> {
+) -> Result<StepResult, ExecError> {
     let outcome = effects::sh_exec(argv, &effects::ShOpts::new(env.clone()))?;
     if outcome.exit_code != 0 {
         return Err(ExecError::EffectFailed {
@@ -642,13 +688,19 @@ fn execute_sh(
             ),
         });
     }
-    Ok(format!(
-        "sh exit={} stdout={:?}",
-        outcome.exit_code, outcome.stdout_tail
-    ))
+    Ok(StepResult {
+        summary: format!(
+            "sh exit={} stdout={:?}",
+            outcome.exit_code, outcome.stdout_tail
+        ),
+        status: i64::from(outcome.exit_code),
+        stdout: Some(outcome.stdout_tail),
+        stderr: Some(outcome.stderr_tail),
+        ..StepResult::default()
+    })
 }
 
-fn execute_http_poll(url: &str, timeout_sec: u64, op: &str) -> Result<String, ExecError> {
+fn execute_http_poll(url: &str, timeout_sec: u64, op: &str) -> Result<StepResult, ExecError> {
     let deadline = Instant::now() + Duration::from_secs(timeout_sec);
     let mut last_status: Option<u16> = None;
     let mut last_err: Option<String> = None;
@@ -656,7 +708,11 @@ fn execute_http_poll(url: &str, timeout_sec: u64, op: &str) -> Result<String, Ex
         match effects::http_get(url) {
             Ok(outcome) => {
                 if (200..300).contains(&outcome.status) {
-                    return Ok(format!("http_poll url={url} status={}", outcome.status));
+                    return Ok(StepResult {
+                        summary: format!("http_poll url={url} status={}", outcome.status),
+                        status: i64::from(outcome.status),
+                        ..StepResult::default()
+                    });
                 }
                 last_status = Some(outcome.status);
             }

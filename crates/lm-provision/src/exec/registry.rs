@@ -287,11 +287,12 @@ impl ProfileOp {
                     self.push(entry);
                 }
                 ExecMode::Real => match lifecycle::execute_step(step, self.name, &env) {
-                    Ok(summary) => {
-                        renders.push(summary);
+                    Ok(result) => {
                         let mut entry = StepReport::new(sub_id, kind.clone(), op);
                         apply_step_input_fields(&mut entry, step);
+                        apply_step_result_fields(&mut entry, &result);
                         self.push(entry);
+                        renders.push(result.summary);
                     }
                     Err(err) => {
                         let mut entry = StepReport::new(sub_id, kind.clone(), op);
@@ -698,10 +699,10 @@ fn step_effect_op(step: &lifecycle::Step) -> &'static str {
     }
 }
 
-/// Copy a lifecycle sub-step's declared input fields onto its report
-/// entry (the exec layer discards the effect outcome for lifecycle
-/// sub-steps — it survives only in the joined trace log line — so the
-/// entry carries the inputs, not the captured stdout/bytes).
+/// Copy a lifecycle sub-step's *declared inputs* onto its report entry.
+/// The observations from actually running it are applied separately by
+/// [`apply_step_result_fields`] (dry-run has inputs but no
+/// observations).
 fn apply_step_input_fields(entry: &mut StepReport, step: &lifecycle::Step) {
     match step {
         lifecycle::Step::Sh(argv) => entry.argv = Some(argv.clone()),
@@ -711,6 +712,31 @@ fn apply_step_input_fields(entry: &mut StepReport, step: &lifecycle::Step) {
         }
         lifecycle::Step::HttpPoll { url, .. } => entry.url = Some(url.clone()),
         lifecycle::Step::Note(message) => entry.note = Some(message.clone()),
+    }
+}
+
+/// Copy what a lifecycle sub-step observed while running onto its
+/// report entry (real mode only).
+///
+/// This is what makes a lifecycle sub-step's entry as informative as a
+/// direct op's: before [`lifecycle::StepResult`] existed the exec layer
+/// kept only the trace summary, so a real-mode `system.apt` step
+/// reported its argv but never its exit status or output. `dst` is
+/// overwritten with the destination actually written, which can differ
+/// from the declared one.
+fn apply_step_result_fields(entry: &mut StepReport, result: &lifecycle::StepResult) {
+    entry.status = result.status;
+    if result.stdout.is_some() {
+        entry.stdout = result.stdout.clone();
+    }
+    if result.stderr.is_some() {
+        entry.stderr = result.stderr.clone();
+    }
+    if result.bytes.is_some() {
+        entry.bytes = result.bytes;
+    }
+    if result.dst.is_some() {
+        entry.dst = result.dst.clone();
     }
 }
 
