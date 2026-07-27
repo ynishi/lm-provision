@@ -294,14 +294,17 @@ impl ProfileOp {
                         self.push(entry);
                         renders.push(result.summary);
                     }
-                    Err(err) => {
+                    Err(failure) => {
                         let mut entry = StepReport::new(sub_id, kind.clone(), op);
                         apply_step_input_fields(&mut entry, step);
-                        entry.ok = false;
-                        entry.status = -1;
-                        entry.reason = Some(err.to_string());
+                        // The partial observation lands *before*
+                        // `mark_fail`, which only substitutes `-1` when
+                        // no more specific status is already there — so
+                        // a non-zero exit code survives.
+                        apply_step_result_fields(&mut entry, &failure.observed);
+                        self.mark_fail(&mut entry, &failure.error);
                         self.push(entry);
-                        return Err(err);
+                        return Err(failure.error);
                     }
                 },
             }
@@ -724,6 +727,12 @@ fn apply_step_input_fields(entry: &mut StepReport, step: &lifecycle::Step) {
 /// reported its argv but never its exit status or output. `dst` is
 /// overwritten with the destination actually written, which can differ
 /// from the declared one.
+///
+/// A *failing* sub-step goes through here too, with the partial
+/// observation from [`lifecycle::StepFailure::observed`] — so a
+/// non-zero exit reports its real code rather than the generic `-1`
+/// [`mark_fail`](ProfileOp::mark_fail) substitutes when nothing was
+/// observed.
 fn apply_step_result_fields(entry: &mut StepReport, result: &lifecycle::StepResult) {
     entry.status = result.status;
     if result.stdout.is_some() {

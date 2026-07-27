@@ -324,6 +324,57 @@ fn a_failing_step_is_collected_and_stops_the_run() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A *failing* lifecycle sub-step must be as informative as a failing
+/// direct op: the exit code and the captured output that accompanied the
+/// failure belong in structured fields, not only quoted inside the
+/// `reason` text (spec 09 §Apply report).
+#[test]
+fn a_failing_lifecycle_substep_carries_its_partial_observation() {
+    let profile = json!({
+        "type": "Spec",
+        "name": "lifecycle-fail-observations",
+        "capabilities": ["sh.exec"],
+        "phases": [
+            { "type": "PostInstall",
+              "script": "echo out-before-failing; echo err-before-failing 1>&2; exit 7" }
+        ]
+    });
+    let path = write_json_profile("lifecycle-fail-observations", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .expect("a step failure is captured in-report, not returned as Err");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    assert_eq!(report["ok"], json!(false));
+    let steps = report["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "fail-fast: {steps:?}");
+    let step = &steps[0];
+
+    assert_eq!(step["ok"], json!(false));
+    assert_eq!(step["op"], json!("sh.exec"));
+    assert_eq!(
+        step["status"],
+        json!(7),
+        "the real exit code survives instead of the pre-effect -1: {step}"
+    );
+    assert!(
+        step["stdout"]
+            .as_str()
+            .expect("stdout observed before the failure")
+            .contains("out-before-failing"),
+        "{step}"
+    );
+    assert!(
+        step["stderr"]
+            .as_str()
+            .expect("stderr observed before the failure")
+            .contains("err-before-failing"),
+        "{step}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 // ---------------------------------------------------------------------
 // CLI wiring: exit codes + stdout/stderr contract through the binary.
 // ---------------------------------------------------------------------

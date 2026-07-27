@@ -69,10 +69,13 @@ the destination actually written) in real mode. Under `--dry-run` the
 inputs are present and the observations are absent — nothing ran, so a
 status or captured output there would be fabricated.
 
-One gap remains: a step that *fails* carries `status = -1` and its
-`reason`, not the partial observation that accompanied the failure
-(the captured stderr behind a non-zero exit, say). The failure text
-quotes it, but it is not in a structured field.
+A step that *fails* carries the same observations when it made any
+before failing: a non-zero `sh` exit reports that exit code in
+`status` and its captured `stdout` / `stderr`, alongside `reason`.
+`status = -1` is therefore reserved for a failure that observed
+nothing — one raised before the effect ran (an undeclared capability,
+a policy rejection, an unresolvable secret) or by an effect that
+produced no output to report.
 
 Semantics:
 

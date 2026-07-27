@@ -612,11 +612,10 @@ pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
 /// against the predecessor Lua report, which carried
 /// `status` / `stdout` / `stderr` / `bytes` per executed op.
 ///
-/// Failure observations are **not** carried here: a failing step still
-/// surfaces as [`ExecError`] with `status = -1` on its entry. Attaching
-/// the partial observation (a non-zero exit's captured stderr, say) to
-/// the failing entry needs a fallible-with-payload return and is left
-/// as a separate change.
+/// A *failing* step carries the same observations, through
+/// [`StepFailure::observed`] — the error and what was seen before it
+/// travel together rather than the observation collapsing into the
+/// error's message text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StepResult {
     /// Trace-log summary fragment.
@@ -643,17 +642,67 @@ impl StepResult {
     }
 }
 
+/// A step that failed, plus whatever it managed to observe first.
+///
+/// A non-zero `sh` exit is the motivating case: the exit code and the
+/// captured stdout / stderr are real observations, but they used to
+/// reach the caller only quoted inside [`ExecError::EffectFailed`]'s
+/// message. The registry copies [`observed`](Self::observed) onto the
+/// failing report entry before marking it failed, so a failing
+/// lifecycle sub-step is as informative as a failing direct op
+/// (spec 09 §Apply report).
+///
+/// A failure with nothing to report (a payload error, a transfer the
+/// effect layer rejected outright) converts from its [`ExecError`] and
+/// leaves `observed` at its default — the registry's `status = -1`
+/// then stands.
+#[derive(Debug)]
+pub struct StepFailure {
+    /// The error to surface to the engine.
+    pub error: ExecError,
+    /// What was observed up to the point of failure. Default when the
+    /// failure happened before anything could be observed.
+    ///
+    /// Boxed so the `Err` variant of every `execute_*` signature stays
+    /// small (`clippy::result_large_err`); a failure is the rare path,
+    /// so the allocation costs nothing on the hot one.
+    pub observed: Box<StepResult>,
+}
+
+impl StepFailure {
+    /// A failure that observed something before it happened.
+    fn observing(error: ExecError, observed: StepResult) -> Self {
+        Self {
+            error,
+            observed: Box::new(observed),
+        }
+    }
+}
+
+impl From<ExecError> for StepFailure {
+    fn from(error: ExecError) -> Self {
+        Self {
+            error,
+            observed: Box::default(),
+        }
+    }
+}
+
 /// Execute one step for real, returning what it observed.
 ///
 /// `op` is the registry op name — used only to label the
 /// [`ExecError::EffectFailed`] surface, so the engine's node-located
 /// error carries the op that ran. `env` is the phase's resolved
 /// env-injection map, injected into a [`Step::Sh`] child process.
+///
+/// On failure the error travels with whatever the step observed first
+/// ([`StepFailure`]); callers that only need the error take
+/// [`StepFailure::error`].
 pub fn execute_step(
     step: &Step,
     op: &str,
     env: &BTreeMap<String, String>,
-) -> Result<StepResult, ExecError> {
+) -> Result<StepResult, StepFailure> {
     match step {
         Step::Sh(argv) => execute_sh(argv, op, env),
         Step::Transfer { src, dst } => {
@@ -677,16 +726,30 @@ fn execute_sh(
     argv: &[String],
     op: &str,
     env: &BTreeMap<String, String>,
-) -> Result<StepResult, ExecError> {
+) -> Result<StepResult, StepFailure> {
     let outcome = effects::sh_exec(argv, &effects::ShOpts::new(env.clone()))?;
     if outcome.exit_code != 0 {
-        return Err(ExecError::EffectFailed {
+        let error = ExecError::EffectFailed {
             op: op.to_string(),
             message: format!(
                 "sh {argv:?} failed: exit {} stderr={:?}",
                 outcome.exit_code, outcome.stderr_tail
             ),
-        });
+        };
+        // The exit code and captured tails are genuine observations —
+        // they ride along instead of surviving only as quoted text
+        // inside the error message.
+        let observed = StepResult {
+            summary: format!(
+                "sh exit={} stdout={:?}",
+                outcome.exit_code, outcome.stdout_tail
+            ),
+            status: i64::from(outcome.exit_code),
+            stdout: Some(outcome.stdout_tail),
+            stderr: Some(outcome.stderr_tail),
+            ..StepResult::default()
+        };
+        return Err(StepFailure::observing(error, observed));
     }
     Ok(StepResult {
         summary: format!(
@@ -700,7 +763,7 @@ fn execute_sh(
     })
 }
 
-fn execute_http_poll(url: &str, timeout_sec: u64, op: &str) -> Result<StepResult, ExecError> {
+fn execute_http_poll(url: &str, timeout_sec: u64, op: &str) -> Result<StepResult, StepFailure> {
     let deadline = Instant::now() + Duration::from_secs(timeout_sec);
     let mut last_status: Option<u16> = None;
     let mut last_err: Option<String> = None;
@@ -728,7 +791,8 @@ fn execute_http_poll(url: &str, timeout_sec: u64, op: &str) -> Result<StepResult
             return Err(ExecError::EffectFailed {
                 op: op.to_string(),
                 message: format!("HTTP poll of {url} timed out after {timeout_sec}s ({detail})"),
-            });
+            }
+            .into());
         }
         sleep(Duration::from_secs(HTTP_POLL_INTERVAL_SEC));
     }
@@ -1536,5 +1600,58 @@ mod tests {
             !rendered.contains("super-secret"),
             "values must be redacted: {rendered}"
         );
+    }
+
+    // -------------------------------------------------------------
+    // execute_step: a failing step carries its partial observation.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn a_non_zero_sh_exit_carries_its_exit_code_and_captured_output() {
+        let step = Step::Sh(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo out-before-failing; echo err-before-failing 1>&2; exit 7".into(),
+        ]);
+        let failure = execute_step(&step, "post_install", &BTreeMap::new())
+            .expect_err("a non-zero exit is a step failure");
+
+        // The error still names the op, as before.
+        match &failure.error {
+            ExecError::EffectFailed { op, .. } => assert_eq!(op, "post_install"),
+            other => panic!("expected EffectFailed, got {other:?}"),
+        }
+        // …and the observation now rides along in structured form
+        // instead of surviving only inside the error message.
+        assert_eq!(failure.observed.status, 7);
+        assert!(
+            failure
+                .observed
+                .stdout
+                .as_deref()
+                .is_some_and(|s| s.contains("out-before-failing")),
+            "stdout observed before the failure: {:?}",
+            failure.observed.stdout
+        );
+        assert!(
+            failure
+                .observed
+                .stderr
+                .as_deref()
+                .is_some_and(|s| s.contains("err-before-failing")),
+            "stderr observed before the failure: {:?}",
+            failure.observed.stderr
+        );
+    }
+
+    #[test]
+    fn a_failure_with_nothing_observed_keeps_the_default_result() {
+        let failure: StepFailure = ExecError::EffectFailed {
+            op: "models".to_string(),
+            message: "malformed payload".to_string(),
+        }
+        .into();
+        assert_eq!(*failure.observed, StepResult::default());
+        assert_eq!(failure.observed.status, 0, "the registry substitutes -1");
     }
 }
