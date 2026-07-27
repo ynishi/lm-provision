@@ -447,8 +447,27 @@ fn check_phase(
             check_route(dst, RouteShape::UriRoute, index, "dst")?;
             check_env_map(env, env_secrets, index)
         }
-        ProfileNode::ServiceStart { name, .. } => {
-            check_str_shell_safe(name, index, "name", PodId::Forbidden)
+        // `service.start`'s `name` has always been shell-safe-checked;
+        // `model` and `extra_args` join it now that they reach argv
+        // positions on the launch invocation (spec 02 §Kinds with a
+        // spawn-and-poll invocation). `port` / `dtype` /
+        // `tensor_parallel_size` do not: the numeric pair cannot carry
+        // a metacharacter, and `dtype` is checked as a string below.
+        ProfileNode::ServiceStart {
+            name,
+            model,
+            dtype,
+            extra_args,
+            ..
+        } => {
+            check_str_shell_safe(name, index, "name", PodId::Forbidden)?;
+            if let Some(model) = model {
+                check_str_shell_safe(model, index, "model", PodId::Forbidden)?;
+            }
+            if let Some(dtype) = dtype {
+                check_str_shell_safe(dtype, index, "dtype", PodId::Forbidden)?;
+            }
+            check_list_shell_safe(extra_args, index, "extra_args")
         }
         // `comfyui.restart` `extra_args` is marked shell-safe by
         // 02-phase-catalog.md §Catalog kinds: the entries become argv
@@ -1104,11 +1123,17 @@ mod tests {
                     id: g.node(),
                     name: "svc".into(),
                     platform_kind: "vllm".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
                 ProfileNode::ServiceStart {
                     id: g.node(),
                     name: "svc".into(),
                     platform_kind: "ollama".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
             ],
         );
@@ -1131,11 +1156,17 @@ mod tests {
                     id: g.node(),
                     name: "svc-a".into(),
                     platform_kind: "vllm".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
                 ProfileNode::ServiceStart {
                     id: g.node(),
                     name: "svc-b".into(),
                     platform_kind: "ollama".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
             ],
         );
@@ -1343,6 +1374,9 @@ mod tests {
                     id: g.node(),
                     name: "vllm-svc".into(),
                     platform_kind: "vllm".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
                 ProfileNode::ShExec {
                     id: g.node(),

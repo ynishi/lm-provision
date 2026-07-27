@@ -375,6 +375,46 @@ fn a_failing_lifecycle_substep_carries_its_partial_observation() {
     std::fs::remove_file(&path).ok();
 }
 
+/// `python.version_check` must actually check. Emitting `python3
+/// --version` and calling itself advisory let a mismatch pass silently;
+/// the assert script fails the step, and the interpreter's real version
+/// reaches the report through the captured stderr.
+#[test]
+fn python_version_check_fails_the_run_on_a_mismatch() {
+    let profile = json!({
+        "type": "Spec",
+        "name": "version-mismatch",
+        "capabilities": ["sh.exec"],
+        "phases": [
+            // No interpreter reports 99.99, so this mismatches anywhere.
+            { "type": "PythonVersionCheck", "want": "99.99" }
+        ]
+    });
+    let path = write_json_profile("version-mismatch", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .expect("a step failure is captured in-report");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    assert_eq!(report["ok"], json!(false), "{report}");
+    let step = &report["steps"].as_array().unwrap()[0];
+    assert_eq!(step["ok"], json!(false));
+    assert_ne!(
+        step["status"],
+        json!(0),
+        "a mismatch exits non-zero: {step}"
+    );
+    assert!(
+        step["stderr"]
+            .as_str()
+            .expect("stderr reaches the report")
+            .contains("python version mismatch"),
+        "the assert message names the mismatch: {step}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 // ---------------------------------------------------------------------
 // CLI wiring: exit codes + stdout/stderr contract through the binary.
 // ---------------------------------------------------------------------

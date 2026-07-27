@@ -34,8 +34,8 @@ The catalog below is exhaustive: **22 user-facing phase variants**.
 | `llm_models` | `models` list of `{ src = "hf://<owner>/<repo>[@<rev>]", dst_dir? (default "/tmp/"), revision? }` — repo snapshot download | `sh.exec` (huggingface-cli) |
 | `hooks.post_install` | `script` string — raw shell, inner escape (chapter 01) | `sh.exec` |
 | `comfyui.restart` | `port` number (default 8188); `extra_args` list\<string\> (shell-safe) | `sh.exec` |
-| `comfyui.health` | `port` number (default 8188) — 60 s HTTP poll loop | `sh.exec` |
-| `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind = "vllm"\|"ollama"\|"llamacpp", model?, port?, dtype?, tensor_parallel_size?, extra_args? }` | `sh.exec` |
+| `comfyui.health` | `port` number (default 8188) — 60 s poll of `/object_info` | `net.http_get` |
+| `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind = "vllm"\|"ollama"\|"llamacpp", model? (shell-safe), port?, dtype? (shell-safe), tensor_parallel_size?, extra_args? (shell-safe) }`. `port` / `tensor_parallel_size` are not carried by the AST — §Payload fields not carried by the AST | `sh.exec` |
 | `service.ready` | `name` string; `check` = `{ http = "<url>", timeout_sec? (default 60) }` | `sh.exec` |
 
 ### Catalog kinds (direct operations)
@@ -92,7 +92,7 @@ Rules:
   inserted with the default port (or the port carried by whichever of
   the two the user did declare).
 - `python.version_check` with `want == "3.12"` (the default) is
-  suppressed — the advisory has no effect.
+  suppressed — asserting the default against itself cannot fail.
 - Direct-operation kinds and any unknown kind land in the trailing
   `zz_unknown` bucket in declaration order (§Unknown kinds).
 
@@ -140,27 +140,79 @@ Dispatch turns each planned step into one or more bridge invocations
   segment pins a revision; a URL-carried revision wins over
   `opts.revision`. `@` is rejected in the owner segment.
 
-#### Kinds with no invocation specified
+#### Spawn-and-poll invocations
 
-Some kinds have a payload defined above but no command in chapters
-00–10 to invoke it with:
+`comfyui.restart` and `service.start` background their server and
+return immediately; readiness is the following phase's job
+(`comfyui.health` / `service.ready`, which canonical ordering places
+directly after them).
 
-| kind | what is missing |
+**Why the split.** Apply is normally driven over SSH, where holding a
+connection open for the lifetime of a server process is the thing most
+likely to fail. Spawning detached and asking again over a fresh call
+survives a dropped connection; a foreground launch does not. This
+holds even when the host is expected to stay up — the failure mode
+being avoided is the transport's, not the server's. Do not "fix" these
+into blocking launches.
+
+Two consequences follow, and are intended:
+
+- the launch step reports only whether the *spawn* was accepted;
+  whether the server came up is the poll step's verdict
+- a crash *after* the poll succeeded is not detected, and nothing
+  guards against a double start. Process supervision (pid files, a
+  restart policy) would be a new concept in this spec, not a fix to
+  these kinds.
+
+The redirect in each command is load-bearing: the host reads the
+child's stdout / stderr to EOF, so a backgrounded process still
+holding those pipes would block apply for as long as it runs. Sending
+its output to a log file closes them.
+
+| kind | invocation |
 |---|---|
-| `comfyui.restart` | the restart command itself. The payload (`port`, `extra_args`) says what to parameterise, never what to run — `extra_args` are argv positions on a command that is not specified |
-| `service.start` | the per-platform launch invocation for `vllm` / `ollama` / `llamacpp` |
-| `python.version_check` | the comparison. `python3 --version` is emitted, but nothing specifies what to do with its output against `want` — hence "advisory" |
+| `comfyui.restart` | `sh -c "cd /workspace/ComfyUI && nohup /workspace/ComfyUI/venv/bin/python /workspace/ComfyUI/main.py --port <port> <extra_args…> > /tmp/comfyui.log 2>&1 &"` |
+| `service.start` `vllm` | `sh -c "nohup python -m vllm.entrypoints.openai.api_server --model <model> [--dtype <dtype>] <extra_args…> > /tmp/<name>.log 2>&1 &"` |
+| `service.start` `ollama` | `sh -c "nohup ollama serve > /tmp/<name>.log 2>&1 &"` — binds 11434 and takes its address from `OLLAMA_HOST`, so neither model nor port appears on the command line |
+| `service.start` `llamacpp` | `sh -c "nohup llama-server --model <model> <extra_args…> > /tmp/<name>.log 2>&1 &"` |
 
-Dispatch expands the missing part to a **note** step naming it
-(chapter 03 §dispatch). It does not invent an argv: a guessed restart
-or launch command would run on the operator's pod with the profile's
-`sh.exec` capability behind it, and in the report a guess is
-indistinguishable from a specified command.
+`--port` is **not** synthesized for `service.start`. The AST carries no
+`port` / `tensor_parallel_size` (see §Payload fields not carried by the
+AST), and the values that would be substituted — 8000 for `vllm`, 8080
+for `llamacpp` — are each platform's own default, so omitting the flag
+lands on the same port. A profile that wants another one declares it in
+`extra_args`, where it appears exactly once rather than overriding a
+flag the launch already emitted.
 
-Filling these in is a spec change, not an implementation change. Until
-then a profile that needs a specific restart / launch command expresses
-it through `hooks.post_install`, where the shell escape is sanctioned
-and visible (chapter 01 §Escape / Fragment Policy).
+`service.start` expands to a **note** step instead of a command when
+the platform is not one of the three above, or when `vllm` / `llamacpp`
+is declared without a `model`. Neither case has an argv to run:
+`--model` with nothing after it consumes the next token as the model,
+launching something the profile did not ask for. A profile that needs a
+launch this catalog does not cover expresses it through
+`hooks.post_install`, where the shell escape is sanctioned and visible
+(chapter 01 §Escape / Fragment Policy).
+
+`comfyui.health` polls `/object_info`, not `/`. The root path serves
+the UI's HTML and answers 200 before the backend can take an API call,
+so polling it reports ready too early.
+
+`python.version_check` runs the comparison rather than describing it:
+`python3 -c 'import sys; assert sys.version.startswith("<want>"),
+"python version mismatch: want <want>, got " + sys.version'`. A
+mismatch exits non-zero and fails the step, with the interpreter's real
+version in the captured stderr.
+
+#### Payload fields not carried by the AST
+
+`service.start`'s `platform.port` and `platform.tensor_parallel_size`
+are defined above but have no AST field. The AST's canonical text
+grammar maps `Option<String>` but not `Option<u16>`, so an optional
+integer cannot currently be spelled. Both are expressed through
+`extra_args` (`["--port", "9000"]`) at no cost to the invocation, per
+the note above. Carrying them as named fields is an upstream
+dependency, alongside the `env` keyed slot and `fs.write` content
+coercion (chapters 05, 06).
 
 ### Shared vocabulary (frozen literal sets)
 

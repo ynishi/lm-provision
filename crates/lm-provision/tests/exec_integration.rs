@@ -305,6 +305,9 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
                 id: ids.node(),
                 name: "llm".to_string(),
                 platform_kind: "vllm".to_string(),
+                model: None,
+                dtype: None,
+                extra_args: vec![],
             },
             ProfileNode::ServiceReady {
                 id: ids.node(),

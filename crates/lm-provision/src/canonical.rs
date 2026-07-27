@@ -243,6 +243,9 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             id: _,
             name,
             platform_kind,
+            model,
+            dtype,
+            extra_args,
         } => {
             let mut fields = variant_object("ServiceStart");
             fields.insert("name".into(), CanonValue::Str(name.clone()));
@@ -250,6 +253,12 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
                 "platform_kind".into(),
                 CanonValue::Str(platform_kind.clone()),
             );
+            // Every platform-detail field is omitted when unset, so a
+            // profile that declares only `kind` keeps the bytes (and
+            // therefore the hash) it had before the fields existed.
+            insert_optional_str(&mut fields, "model", model);
+            insert_optional_str(&mut fields, "dtype", dtype);
+            insert_when_non_empty(&mut fields, "extra_args", extra_args);
             CanonValue::Object(fields)
         }
 
@@ -797,6 +806,59 @@ mod tests {
             encode(&node),
             "{\"extra_args\":[\"--port=9000\",\"--listen\"],\"port\":8188,\"type\":\"ComfyUiRestart\"}"
         );
+    }
+
+    /// A `service.start` that declares no platform detail must encode
+    /// exactly as it did before `model` / `dtype` / `extra_args`
+    /// existed (the expected string is the pre-field encoding,
+    /// verbatim), so adding them left every existing profile's hash
+    /// alone.
+    #[test]
+    fn service_start_without_platform_detail_keeps_its_pre_field_bytes() {
+        let gen = IdGen::new();
+        let node = ProfileNode::ServiceStart {
+            id: new_id(&gen),
+            name: "llm".to_string(),
+            platform_kind: "vllm".to_string(),
+            model: None,
+            dtype: None,
+            extra_args: Vec::new(),
+        };
+        assert_eq!(
+            encode(&node),
+            "{\"name\":\"llm\",\"platform_kind\":\"vllm\",\"type\":\"ServiceStart\"}"
+        );
+    }
+
+    /// Declared platform detail encodes, and changes the hash: two
+    /// services differing in the model they serve are not the same
+    /// service.
+    #[test]
+    fn service_start_platform_detail_encodes_and_changes_the_hash() {
+        let gen = IdGen::new();
+        let bare = ProfileNode::ServiceStart {
+            id: new_id(&gen),
+            name: "llm".to_string(),
+            platform_kind: "vllm".to_string(),
+            model: None,
+            dtype: None,
+            extra_args: Vec::new(),
+        };
+        let detailed = ProfileNode::ServiceStart {
+            id: new_id(&gen),
+            name: "llm".to_string(),
+            platform_kind: "vllm".to_string(),
+            model: Some("meta-llama/Llama-3-8B".to_string()),
+            dtype: Some("bfloat16".to_string()),
+            extra_args: vec!["--port".to_string(), "9000".to_string()],
+        };
+        assert_eq!(
+            encode(&detailed),
+            "{\"dtype\":\"bfloat16\",\"extra_args\":[\"--port\",\"9000\"],\
+             \"model\":\"meta-llama/Llama-3-8B\",\"name\":\"llm\",\
+             \"platform_kind\":\"vllm\",\"type\":\"ServiceStart\"}"
+        );
+        assert_ne!(hash(&bare), hash(&detailed));
     }
 
     /// Declaring extra args must change the hash — the field is part of

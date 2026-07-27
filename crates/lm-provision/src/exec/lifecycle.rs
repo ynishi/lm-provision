@@ -18,19 +18,21 @@
 //! ## Payload subset carried by the AST
 //!
 //! The `ProfileNode` payload is still a partial projection of the full
-//! spec-02 payload (`ServiceStart` has no platform detail, `PythonDeps`
-//! has no `force_reinstall`, and so on). So:
+//! spec-02 payload (`PythonDeps` has no `force_reinstall`,
+//! `ServiceStart` carries no `port` / `tensor_parallel_size`, and so
+//! on). So:
 //!
 //! - Fields with a defensible built-in default are constant-substituted
 //!   (`PythonDeps.in_comfy_venv=false` → the system `pip` on `PATH`;
 //!   `ComfyUiInstall.repo=None` → `comfyanonymous/ComfyUI`; a `models`
 //!   entry with no `subdir`/`kind` → `checkpoints`).
-//! - Ops whose invocation no chapter specifies (`ComfyUiRestart` has a
-//!   payload but no restart command; `ServiceStart` has no per-platform
-//!   launch command, and the AST carries no platform detail either)
-//!   expand to a single [`Step::Note`] recording that fact, rather than
-//!   inventing an argv. See spec 02 §Kinds with no invocation
-//!   specified — closing these is a spec change, not an AST change.
+//! - An op the profile has under-specified expands to a single
+//!   [`Step::Note`] recording that fact rather than an invented argv —
+//!   a `service.start` on an unrecognised platform, or on `vllm` /
+//!   `llamacpp` with no `model`. A guessed command would run on the
+//!   operator's pod with the profile's `sh.exec` capability behind it,
+//!   and in the report a guess is indistinguishable from a specified
+//!   one.
 //!
 //! ## Env-routed CLI dispatch (spec 02 §Dispatch routing, step ③)
 //!
@@ -82,6 +84,13 @@ const DEFAULT_MODEL_SUBDIR: &str = "checkpoints";
 /// `llm_models` entry default destination directory
 /// (`huggingface-cli download --local-dir` target).
 const DEFAULT_LLM_MODELS_DST_DIR: &str = "/tmp/";
+/// Venv-relative python binary, the ComfyUI launch interpreter
+/// (spec 02 §Built-in path constants).
+const COMFYUI_VENV_PY: &str = "/workspace/ComfyUI/venv/bin/python";
+/// ComfyUI entry point (spec 02 §Built-in path constants).
+const COMFYUI_MAIN_PY: &str = "/workspace/ComfyUI/main.py";
+/// ComfyUI launch log (spec 02 §Built-in path constants).
+const COMFYUI_LOG_PATH: &str = "/tmp/comfyui.log";
 /// `comfyui.install` default repo when the payload omits `repo`.
 const DEFAULT_COMFYUI_REPO: &str = "comfyanonymous/ComfyUI";
 /// Health-poll deadline (spec 02: 60 s HTTP poll loop).
@@ -160,38 +169,28 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
         ])]),
         ProfileNode::ComfyUiRestart {
             port, extra_args, ..
-        } => {
-            // The AST now carries `extra_args` (spec 02 payload), but
-            // spec 02 defines only the payload — no chapter names the
-            // restart command those args would be appended to. The
-            // legacy Lua dispatcher reached the same conclusion
-            // ("comfyui.restart has no defined dispatch mapping"), so
-            // the phase still expands to a note rather than a guessed
-            // argv. The declared args are echoed so the operator can
-            // see what would be appended once the command is specified.
-            let declared = if extra_args.is_empty() {
-                String::new()
-            } else {
-                format!(" extra_args={extra_args:?}")
-            };
-            Ok(vec![Step::Note(format!(
-                "comfyui_restart port={port}{declared}: no argv — spec 02 \
-                 defines the comfyui.restart payload but never the restart \
-                 command to invoke"
-            ))])
-        }
+        } => Ok(expand_comfyui_restart(*port, extra_args)),
         ProfileNode::ComfyUiHealth { port, .. } => Ok(vec![Step::HttpPoll {
-            url: format!("http://127.0.0.1:{port}/"),
+            // `/object_info` is the API readiness endpoint. `/` serves
+            // the UI's HTML and answers 200 before the backend can take
+            // an API call, so polling it reports ready too early.
+            url: format!("http://127.0.0.1:{port}/object_info"),
             timeout_sec: HTTP_POLL_TIMEOUT_SEC,
         }]),
         ProfileNode::ServiceStart {
             name,
             platform_kind,
+            model,
+            dtype,
+            extra_args,
             ..
-        } => Ok(vec![Step::Note(format!(
-            "service_start name={name} platform_kind={platform_kind}: \
-             per-platform argv unsupported pending AST extension"
-        ))]),
+        } => Ok(expand_service_start(
+            name,
+            platform_kind,
+            model.as_deref(),
+            dtype.as_deref(),
+            extra_args,
+        )),
         ProfileNode::ServiceReady { check_url, .. } => Ok(vec![Step::HttpPoll {
             url: check_url.clone(),
             timeout_sec: HTTP_POLL_TIMEOUT_SEC,
@@ -226,14 +225,24 @@ fn expand_comfyui_install(ref_name: &str, repo: Option<&str>) -> Vec<Step> {
     vec![Step::Sh(vec!["sh".to_string(), "-c".to_string(), script])]
 }
 
+/// `python3 -c '<assert>'` — exits non-zero when the running
+/// interpreter's version does not start with `want`, printing the
+/// actual `sys.version` so the mismatch is visible in the report's
+/// captured stderr.
+///
+/// Emitting `python3 --version` and letting the operator compare was
+/// the earlier shape; it called itself advisory while checking nothing,
+/// so a version mismatch passed silently.
 fn expand_python_version_check(want: &str) -> Vec<Step> {
-    vec![
-        Step::Sh(vec!["python3".to_string(), "--version".to_string()]),
-        Step::Note(format!(
-            "python_version_check want={want}: advisory only; \
-             concrete check command pending AST extension"
-        )),
-    ]
+    let script = format!(
+        "import sys; assert sys.version.startswith(\"{want}\"), \
+         \"python version mismatch: want {want}, got \" + sys.version"
+    );
+    vec![Step::Sh(vec![
+        "python3".to_string(),
+        "-c".to_string(),
+        script,
+    ])]
 }
 
 fn expand_python_deps(deps: &[String], in_comfy_venv: bool) -> Vec<Step> {
@@ -579,6 +588,136 @@ fn expand_llm_models(json: &str) -> Result<Vec<Step>, ExecError> {
     Ok(steps)
 }
 
+// ---------------------------------------------------------------------
+// Spawn-and-poll launches (`comfyui.restart` / `service.start`).
+//
+// Both background the server with `nohup … &` and return immediately,
+// leaving readiness to the poll phase that canonical ordering places
+// right after them (`comfyui.health` / `service.ready`). That split is
+// deliberate, not an omission: apply is normally driven over SSH, where
+// a connection held open for the life of a server process is the thing
+// most likely to break. Spawning detached and asking again over a fresh
+// call survives a dropped connection; a foreground launch does not.
+//
+// Consequence to keep in mind when reading a report: the launch step
+// only reports whether the *spawn* was accepted. Whether the server
+// came up is the poll step's verdict.
+// ---------------------------------------------------------------------
+
+/// The `nohup <argv…> > <log> 2>&1 &` command text shared by both
+/// launch kinds. Returned as text (not a [`Step`]) so a caller can
+/// prefix it — `comfyui.restart` needs a `cd` in the same shell.
+///
+/// The redirect is load-bearing, not cosmetic. [`effects::sh_exec`]
+/// uses `Command::output()`, which reads the child's stdout / stderr
+/// pipes until EOF; a backgrounded grandchild that inherited those
+/// pipes would hold them open and hang apply for as long as the server
+/// runs. Sending its output to a file closes the inherited ends, so
+/// `sh` exits and `output()` returns at once. Do not "tidy away" the
+/// redirect.
+fn spawn_detached_command(argv: &[String], log_path: &str) -> String {
+    format!("nohup {} > {log_path} 2>&1 &", argv.join(" "))
+}
+
+/// Wrap a command line in `sh -c` so the shell — not `Command` —
+/// parses the redirect and the `&`.
+fn sh_c(command: String) -> Step {
+    Step::Sh(vec!["sh".to_string(), "-c".to_string(), command])
+}
+
+fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<Step> {
+    let mut argv = vec![
+        COMFYUI_VENV_PY.to_string(),
+        COMFYUI_MAIN_PY.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    argv.extend(extra_args.iter().cloned());
+    // `cd` first: ComfyUI resolves `models/` / `custom_nodes/` relative
+    // to its working directory.
+    vec![sh_c(format!(
+        "cd {COMFYUI_INSTALL_DIR} && {}",
+        spawn_detached_command(&argv, COMFYUI_LOG_PATH)
+    ))]
+}
+
+/// Per-platform launch invocation. An unrecognised platform expands to
+/// a note rather than a guessed argv — running an invented command on
+/// the operator's pod under the profile's `sh.exec` capability is worse
+/// than reporting that nothing was launched.
+///
+/// `vllm` / `llamacpp` also note-out when no `model` is declared: both
+/// take the model as a required `--model` value, and emitting the flag
+/// with an empty value makes the *next* token the model, launching
+/// something other than what the profile asked for.
+///
+/// No `--port` / `--tensor-parallel-size` is synthesized. The AST does
+/// not carry them (see [`ProfileNode::ServiceStart`] on the dsl-kit
+/// `Option<u16>` gap), and the values the predecessor passed by default
+/// — 8000 for `vllm`, 8080 for `llamacpp` — are each platform's own
+/// default, so omitting the flag lands on the same port. A profile that
+/// wants another one declares it in `extra_args`, where it appears
+/// exactly once instead of overriding a flag this function already
+/// emitted.
+fn expand_service_start(
+    name: &str,
+    platform_kind: &str,
+    model: Option<&str>,
+    dtype: Option<&str>,
+    extra_args: &[String],
+) -> Vec<Step> {
+    let log_path = format!("/tmp/{name}.log");
+    let argv = match platform_kind {
+        "vllm" => {
+            let Some(model) = model else {
+                return vec![missing_model_note(name, platform_kind)];
+            };
+            let mut argv = vec![
+                "python".to_string(),
+                "-m".to_string(),
+                "vllm.entrypoints.openai.api_server".to_string(),
+                "--model".to_string(),
+                model.to_string(),
+            ];
+            if let Some(dtype) = dtype {
+                argv.push("--dtype".to_string());
+                argv.push(dtype.to_string());
+            }
+            argv.extend(extra_args.iter().cloned());
+            argv
+        }
+        // Ollama serves on 11434 and takes its bind address from
+        // `OLLAMA_HOST`, so it has no port / model flag to pass.
+        "ollama" => vec!["ollama".to_string(), "serve".to_string()],
+        "llamacpp" => {
+            let Some(model) = model else {
+                return vec![missing_model_note(name, platform_kind)];
+            };
+            let mut argv = vec![
+                "llama-server".to_string(),
+                "--model".to_string(),
+                model.to_string(),
+            ];
+            argv.extend(extra_args.iter().cloned());
+            argv
+        }
+        other => {
+            return vec![Step::Note(format!(
+                "service_start name={name} platform_kind={other}: no launch \
+                 invocation — spec 02 specifies vllm / ollama / llamacpp"
+            ))]
+        }
+    };
+    vec![sh_c(spawn_detached_command(&argv, &log_path))]
+}
+
+fn missing_model_note(name: &str, platform_kind: &str) -> Step {
+    Step::Note(format!(
+        "service_start name={name} platform_kind={platform_kind}: no launch \
+         invocation — the platform requires `model` and the profile declares none"
+    ))
+}
+
 /// Render one step for the dry-run trace log.
 ///
 /// Used by the registry to build a single per-op log line
@@ -870,26 +1009,26 @@ mod tests {
         }
     }
 
+    /// The check must *fail* on a mismatch, not print a version and
+    /// leave the comparison to the reader.
     #[test]
-    fn expand_python_version_check_emits_probe_plus_advisory_note() {
+    fn expand_python_version_check_asserts_the_wanted_version() {
         let ids = IdGen::new();
         let payload = ProfileNode::PythonVersionCheck {
             id: node_id(&ids),
             want: "3.12".to_string(),
         };
         let steps = expand(&payload).expect("python_version_check expands");
-        assert_eq!(steps.len(), 2);
         assert_eq!(
-            steps[0],
-            Step::Sh(vec!["python3".to_string(), "--version".to_string()])
+            steps,
+            vec![Step::Sh(vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "import sys; assert sys.version.startswith(\"3.12\"), \
+             \"python version mismatch: want 3.12, got \" + sys.version"
+                    .to_string(),
+            ])]
         );
-        match &steps[1] {
-            Step::Note(msg) => {
-                assert!(msg.contains("want=3.12"));
-                assert!(msg.contains("pending AST extension"));
-            }
-            other => panic!("expected Note, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1443,8 +1582,26 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------
+    // Spawn-and-poll launches. The expected argv are the predecessor's
+    // literals (`pod-setup/dispatch.lua`), which the
+    // production pod-setup script uses verbatim — they are the
+    // specification here, so the tests pin them exactly rather than
+    // asserting on fragments.
+    // -------------------------------------------------------------
+
+    fn sh_command(step: &Step) -> &str {
+        match step {
+            Step::Sh(argv) => {
+                assert_eq!(argv[..2], ["sh".to_string(), "-c".to_string()]);
+                &argv[2]
+            }
+            other => panic!("expected Sh, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn expand_comfyui_restart_emits_a_pending_note() {
+    fn expand_comfyui_restart_backgrounds_the_launch_from_the_install_dir() {
         let ids = IdGen::new();
         let payload = ProfileNode::ComfyUiRestart {
             id: node_id(&ids),
@@ -1453,25 +1610,16 @@ mod tests {
         };
         let steps = expand(&payload).expect("comfyui_restart expands");
         assert_eq!(steps.len(), 1);
-        match &steps[0] {
-            Step::Note(msg) => {
-                assert!(msg.contains("port=8188"));
-                // The reason is the missing *command*, not a missing
-                // payload field: the AST carries `extra_args` now.
-                assert!(msg.contains("never the restart command"));
-                assert!(
-                    !msg.contains("extra_args"),
-                    "an undeclared extra_args must not be echoed: {msg}"
-                );
-            }
-            other => panic!("expected Note, got {other:?}"),
-        }
+        assert_eq!(
+            sh_command(&steps[0]),
+            "cd /workspace/ComfyUI && nohup /workspace/ComfyUI/venv/bin/python \
+             /workspace/ComfyUI/main.py --port 8188 > /tmp/comfyui.log 2>&1 &"
+        );
     }
 
-    /// Declared `extra_args` are echoed into the note so the operator
-    /// can see what would be appended once a restart command exists.
+    /// Declared `extra_args` land as argv positions after `--port`.
     #[test]
-    fn expand_comfyui_restart_echoes_declared_extra_args() {
+    fn expand_comfyui_restart_appends_declared_extra_args() {
         let ids = IdGen::new();
         let payload = ProfileNode::ComfyUiRestart {
             id: node_id(&ids),
@@ -1479,17 +1627,46 @@ mod tests {
             extra_args: vec!["--listen".to_string(), "--highvram".to_string()],
         };
         let steps = expand(&payload).expect("comfyui_restart expands");
-        match &steps[0] {
-            Step::Note(msg) => {
-                assert!(msg.contains("--listen") && msg.contains("--highvram"));
-                assert!(msg.contains("never the restart command"));
-            }
-            other => panic!("expected Note, got {other:?}"),
+        assert_eq!(
+            sh_command(&steps[0]),
+            "cd /workspace/ComfyUI && nohup /workspace/ComfyUI/venv/bin/python \
+             /workspace/ComfyUI/main.py --port 8188 --listen --highvram \
+             > /tmp/comfyui.log 2>&1 &"
+        );
+    }
+
+    /// The redirect keeps `Command::output()` from blocking on pipes the
+    /// backgrounded server would otherwise hold open for its lifetime.
+    #[test]
+    fn a_backgrounded_launch_always_redirects_its_output_to_a_file() {
+        let ids = IdGen::new();
+        let restart = expand(&ProfileNode::ComfyUiRestart {
+            id: node_id(&ids),
+            port: 8188,
+            extra_args: Vec::new(),
+        })
+        .expect("comfyui_restart expands");
+        let start = expand(&ProfileNode::ServiceStart {
+            id: node_id(&ids),
+            name: "llm".to_string(),
+            platform_kind: "ollama".to_string(),
+            model: None,
+            dtype: None,
+            extra_args: Vec::new(),
+        })
+        .expect("service_start expands");
+
+        for step in [&restart[0], &start[0]] {
+            let command = sh_command(step);
+            assert!(
+                command.contains("2>&1 &") && command.contains("> /tmp/"),
+                "a detached launch must redirect to a file: {command}"
+            );
         }
     }
 
     #[test]
-    fn expand_comfyui_health_polls_the_local_port() {
+    fn expand_comfyui_health_polls_the_api_endpoint_not_the_ui_root() {
         let ids = IdGen::new();
         let payload = ProfileNode::ComfyUiHealth {
             id: node_id(&ids),
@@ -1499,27 +1676,111 @@ mod tests {
         assert_eq!(
             steps,
             vec![Step::HttpPoll {
-                url: "http://127.0.0.1:8188/".to_string(),
+                // `/` answers 200 from the UI before the API is usable.
+                url: "http://127.0.0.1:8188/object_info".to_string(),
                 timeout_sec: HTTP_POLL_TIMEOUT_SEC,
             }]
         );
     }
 
-    #[test]
-    fn expand_service_start_emits_a_pending_note() {
-        let ids = IdGen::new();
+    fn service_start(
+        ids: &IdGen,
+        platform_kind: &str,
+        model: Option<&str>,
+        dtype: Option<&str>,
+        extra_args: &[&str],
+    ) -> Vec<Step> {
         let payload = ProfileNode::ServiceStart {
-            id: node_id(&ids),
+            id: node_id(ids),
             name: "llm".to_string(),
-            platform_kind: "vllm".to_string(),
+            platform_kind: platform_kind.to_string(),
+            model: model.map(str::to_string),
+            dtype: dtype.map(str::to_string),
+            extra_args: extra_args.iter().map(|s| s.to_string()).collect(),
         };
-        let steps = expand(&payload).expect("service_start expands");
-        assert_eq!(steps.len(), 1);
+        expand(&payload).expect("service_start expands")
+    }
+
+    #[test]
+    fn expand_service_start_vllm_uses_the_openai_api_server_entry_point() {
+        let ids = IdGen::new();
+        let steps = service_start(&ids, "vllm", Some("meta-llama/Llama-3-8B"), None, &[]);
+        assert_eq!(
+            sh_command(&steps[0]),
+            "nohup python -m vllm.entrypoints.openai.api_server \
+             --model meta-llama/Llama-3-8B > /tmp/llm.log 2>&1 &"
+        );
+    }
+
+    /// `--port` / `--tensor-parallel-size` are the author's to place in
+    /// `extra_args`; nothing synthesizes them, so they appear exactly
+    /// once and after the flags this function does emit.
+    #[test]
+    fn expand_service_start_vllm_appends_declared_knobs_after_dtype() {
+        let ids = IdGen::new();
+        let steps = service_start(
+            &ids,
+            "vllm",
+            Some("m"),
+            Some("bfloat16"),
+            &["--port", "9000", "--tensor-parallel-size", "4"],
+        );
+        assert_eq!(
+            sh_command(&steps[0]),
+            "nohup python -m vllm.entrypoints.openai.api_server --model m \
+             --dtype bfloat16 --port 9000 --tensor-parallel-size 4 \
+             > /tmp/llm.log 2>&1 &"
+        );
+    }
+
+    /// Ollama binds 11434 and reads `OLLAMA_HOST`, so it takes neither
+    /// a model nor a port on the command line.
+    #[test]
+    fn expand_service_start_ollama_just_serves() {
+        let ids = IdGen::new();
+        let steps = service_start(&ids, "ollama", None, None, &[]);
+        assert_eq!(
+            sh_command(&steps[0]),
+            "nohup ollama serve > /tmp/llm.log 2>&1 &"
+        );
+    }
+
+    #[test]
+    fn expand_service_start_llamacpp_uses_llama_server() {
+        let ids = IdGen::new();
+        let steps = service_start(&ids, "llamacpp", Some("/models/q4.gguf"), None, &[]);
+        assert_eq!(
+            sh_command(&steps[0]),
+            "nohup llama-server --model /models/q4.gguf > /tmp/llm.log 2>&1 &"
+        );
+    }
+
+    /// Emitting `--model` with nothing after it would make the next
+    /// token the model, launching something the profile never asked
+    /// for — so a missing model is reported, not papered over.
+    #[test]
+    fn expand_service_start_notes_out_when_a_required_model_is_absent() {
+        let ids = IdGen::new();
+        for platform in ["vllm", "llamacpp"] {
+            let steps = service_start(&ids, platform, None, None, &[]);
+            match &steps[0] {
+                Step::Note(msg) => {
+                    assert!(msg.contains("name=llm"), "{msg}");
+                    assert!(msg.contains("requires `model`"), "{msg}");
+                }
+                other => panic!("expected Note for {platform}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn expand_service_start_notes_out_an_unspecified_platform() {
+        let ids = IdGen::new();
+        let steps = service_start(&ids, "tgi", Some("m"), None, &[]);
         match &steps[0] {
             Step::Note(msg) => {
-                assert!(msg.contains("name=llm"));
-                assert!(msg.contains("platform_kind=vllm"));
-                assert!(msg.contains("pending AST extension"));
+                assert!(msg.contains("platform_kind=tgi"), "{msg}");
+                assert!(msg.contains("vllm / ollama / llamacpp"), "{msg}");
             }
             other => panic!("expected Note, got {other:?}"),
         }

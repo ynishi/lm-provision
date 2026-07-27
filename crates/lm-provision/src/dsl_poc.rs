@@ -178,11 +178,8 @@ pub enum ProfileNode {
         /// omitted from the canonical encoding so a profile that
         /// declares none hashes as it did before the field existed.
         ///
-        /// Carrying the field does not by itself make the phase
-        /// executable: spec 02 defines the payload but never the
-        /// restart command to append these to, so
-        /// [`crate::exec::lifecycle`] still expands the phase to a note
-        /// rather than inventing an argv.
+        /// These land as argv positions after `--port` on the launch
+        /// command (spec 02 §Kinds with a spawn-and-poll invocation).
         extra_args: Vec<String>,
     },
 
@@ -196,6 +193,25 @@ pub enum ProfileNode {
     },
 
     /// `service.start`: Start background service
+    ///
+    /// Spec 02 defines the payload as `platform = { kind, model?,
+    /// port?, dtype?, tensor_parallel_size?, extra_args? }`; the AST
+    /// flattens it, since the field count is fixed and small (unlike
+    /// `custom_nodes` / `models`, whose variable-length entry lists are
+    /// carried as JSON strings). Every flattened field is omitted from
+    /// the canonical encoding when unset, so a profile that declares
+    /// only `kind` hashes as it did before they existed.
+    ///
+    /// `port` and `tensor_parallel_size` are **not** flattened fields:
+    /// dsl-kit's grammar generator maps `Option<String>` but not
+    /// `Option<u16>` (`dsl-kit-parse` `schema_gen::field_value_peg`), so
+    /// there is no way to spell an optional integer in the canonical
+    /// text today. Both are expressed through `extra_args`
+    /// (`["--port", "9000"]`) instead, which costs nothing at the
+    /// invocation because the per-platform defaults the launch would
+    /// otherwise pass are the platforms' own defaults — see
+    /// [`crate::exec::lifecycle`]. Same upstream bucket as the `env`
+    /// keyed slot and `fs.write` content coercion.
     #[dsl_exec(apply = "service_start")]
     ServiceStart {
         /// Stable node ID.
@@ -204,6 +220,17 @@ pub enum ProfileNode {
         name: String,
         /// Platform kind (vllm, ollama, llamacpp).
         platform_kind: String,
+        /// Model to serve (`--model`). Required in practice by `vllm`
+        /// and `llamacpp`; ignored by `ollama`, which resolves models
+        /// at request time.
+        model: Option<String>,
+        /// `vllm` `--dtype`.
+        dtype: Option<String>,
+        /// Extra arguments appended to the launch invocation
+        /// (shell-safe, declaration order preserved). Also the route
+        /// for `--port` / `--tensor-parallel-size`, per the type note
+        /// above.
+        extra_args: Vec<String>,
     },
 
     /// `service.ready`: Wait for service readiness

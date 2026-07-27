@@ -60,10 +60,14 @@ Checks, in order:
 7. `service.start` names are unique across the profile.
 
 Because the AST payload is still a projection of the full spec-02
-catalog (`service.start` flattens `platform.kind`; `custom_nodes` /
-`models` / `llm_models` carry an opaque JSON string), the field-level
-checks for those payloads land when the fields are promoted onto the
-AST. `hooks.post_install.script` is deliberately exempt from
+catalog (`service.start` flattens `platform` and omits its two numeric
+fields — chapter 02 §Payload fields not carried by the AST;
+`custom_nodes` / `models` / `llm_models` carry an opaque JSON string),
+the field-level checks for those payloads land when the fields are
+promoted onto the AST. `service.start`'s flattened `model` / `dtype` /
+`extra_args` are shell-safety-checked today, since they reach argv
+positions on the launch invocation.
+`hooks.post_install.script` is deliberately exempt from
 shell-safety (chapter 01 §Escape / Fragment Policy).
 
 Shell-safety contract: a string is shell-safe iff non-empty and
@@ -124,13 +128,14 @@ and therefore byte-identical canonical output.
   as the secret marker `{"__secret":"NAME"}` — the hash covers *which
   secret is referenced*, never a value, and the marker is the same
   convention the ledger and audit log use (chapters 06, 09).
-- **Payload lists added after the fact**: `comfyui.restart`'s
-  `extra_args` follows the same omit-when-empty rule as `env`, and for
-  the same reason — the field was introduced once profiles were
-  already being hashed, so the common case (no extra args) must keep
-  its existing bytes. When non-empty it encodes in **declaration
-  order**: the entries are argv positions, so the declared-list sort
-  above does not apply to them.
+- **Payload fields added after the fact**: `comfyui.restart`'s
+  `extra_args` and `service.start`'s `model` / `dtype` / `extra_args`
+  follow the same omit-when-unset rule as `env`, and for the same
+  reason — they were introduced once profiles were already being
+  hashed, so the common case (none declared) must keep its existing
+  bytes. A non-empty `extra_args` encodes in **declaration order**:
+  the entries are argv positions, so the declared-list sort above does
+  not apply to them.
 
 Decode (canonical bytes → AST) is out of scope in the current
 revision: the ledger persists JSON Lines and does not require

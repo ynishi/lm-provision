@@ -386,11 +386,31 @@ fn payload_of(phase: &ProfileNode) -> Value {
             }
         }
         ProfileNode::ComfyUiHealth { port, .. } => json!({ "port": port }),
+        // Platform detail follows the same omit-when-unset rule as the
+        // canonical encoder: the plan renders what the author declared,
+        // and an absent field is not the same statement as a zero one.
         ProfileNode::ServiceStart {
             name,
             platform_kind,
+            model,
+            dtype,
+            extra_args,
             ..
-        } => json!({ "name": name, "platform_kind": platform_kind }),
+        } => {
+            let mut m = Map::new();
+            m.insert("name".into(), json!(name));
+            m.insert("platform_kind".into(), json!(platform_kind));
+            if let Some(model) = model {
+                m.insert("model".into(), json!(model));
+            }
+            if let Some(dtype) = dtype {
+                m.insert("dtype".into(), json!(dtype));
+            }
+            if !extra_args.is_empty() {
+                m.insert("extra_args".into(), json!(extra_args));
+            }
+            Value::Object(m)
+        }
         ProfileNode::ServiceReady {
             name, check_url, ..
         } => json!({ "name": name, "check_url": check_url }),
@@ -579,6 +599,9 @@ mod tests {
                     id: g.node(),
                     name: "svc".into(),
                     platform_kind: "vllm".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
                 ProfileNode::ServiceReady {
                     id: g.node(),
@@ -838,6 +861,9 @@ mod tests {
                     id: g.node(),
                     name: "svc-a".into(),
                     platform_kind: "vllm".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
                 ProfileNode::ServiceReady {
                     id: g.node(),
@@ -848,6 +874,9 @@ mod tests {
                     id: g.node(),
                     name: "svc-b".into(),
                     platform_kind: "ollama".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
                 ProfileNode::ServiceReady {
                     id: g.node(),
@@ -877,11 +906,17 @@ mod tests {
                     id: g.node(),
                     name: "svc-a".into(),
                     platform_kind: "vllm".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
                 ProfileNode::ServiceStart {
                     id: g.node(),
                     name: "svc-b".into(),
                     platform_kind: "ollama".into(),
+                    model: None,
+                    dtype: None,
+                    extra_args: vec![],
                 },
                 ProfileNode::ServiceReady {
                     id: g.node(),
