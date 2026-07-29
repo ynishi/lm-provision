@@ -100,17 +100,20 @@ Semantics:
 
 ### Audit log (stderr transcript)
 
-**Status: specified, not yet implemented.** The binary installs a
-stderr tracing subscriber honouring `--log-level` / `RUST_LOG`
-(chapter 07 §Global flags), but no effect currently emits a tracing
-event: stderr carries only the final error line. The exec layer does
-build a per-phase trace line, and wiring it to this transcript under
-the rules below is the outstanding work (chapter 04 §Trace output).
-The rules are frozen here so the wiring has a contract to satisfy
-rather than being invented at implementation time.
+The binary installs a stderr tracing subscriber honouring
+`--log-level` / `RUST_LOG` (chapter 07 §Global flags) and emits one
+structured `info` event per effect invocation, before the effect
+runs. ANSI colour is suppressed when stderr is not a terminal so a
+spec-08 driver that captures the pipe reads plain text.
 
-Every effect invocation emits one structured tracing line before the
-effect. Redaction rules:
+Every event carries `op` (the catalog op name, e.g. `sh.exec`),
+`kind` (the phase kind), and `mode` (`"dry-run"` / `"real"`) so a
+consumer can partition the stream. Emission runs in both modes,
+mirroring the "dry-run does policy / resolves secrets too" rule
+(spec 06 / 07) — a dry-run trace is what the profile *would* run,
+a real trace is what it *did*.
+
+Redaction rules:
 
 - Env keys: key **names** are logged; a name matching the
   sensitive-key set is logged as `<KEY> [REDACTED]`. Values are
@@ -204,7 +207,6 @@ driver.
 The report shape, the fail-fast semantics, and `note` entries ship
 binary-side in Phase F; Phase G consumes them unchanged.
 
-The stderr audit transcript and its redaction rules are specified but
-not yet emitted (see §Audit log). This does not weaken the report
-contract — the report never carried secret values in the first place —
-but an operator watching stderr today sees only the final error line.
+The stderr audit transcript ships with the report (see §Audit log): one
+structured `info` event per effect invocation, redacted by the rules
+above and captured by the driver alongside the report.

@@ -194,12 +194,11 @@ in it: an `env` map renders as its **key list** only. There is no
 profile-controlled print surface, so stdout stays reserved for the
 machine-readable artifact.
 
-The trace currently accumulates in an in-process buffer that no
-subcommand emits: `apply` builds its report from the structured step
-entries instead, and stderr carries only the final error line
-(chapter 07 §Error surface). Wiring the trace to the stderr audit
-transcript chapter 09 specifies is outstanding — see chapter 09
-§Audit log.
+The per-phase summary is separate from the stderr audit transcript
+that lands one structured `info` event per effect invocation (chapter
+09 §Audit log). The trace buffer stays in-process for downstream
+tooling that wants the joined per-phase view; the audit transcript is
+the pipe the spec-08 driver collects.
 
 ## Error surface
 

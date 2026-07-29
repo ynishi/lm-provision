@@ -20,6 +20,7 @@ use dsl_kit::NodeId;
 
 use crate::dsl_poc::ProfileNode;
 
+pub mod audit;
 pub mod capgate;
 pub mod effects;
 pub mod lifecycle;

@@ -24,7 +24,14 @@ fn main() -> ExitCode {
 /// Initialize the stderr tracing subscriber from the resolved filter
 /// string (07-cli.md §Global flags: `RUST_LOG` precedence is already
 /// applied by [`cli::resolve_log_filter`]).
+///
+/// ANSI escapes are suppressed when stderr is not a terminal — the
+/// driver in spec 08 captures stderr into the ledger, and a plain-text
+/// audit transcript (spec 09 §Audit log) is what downstream analysis
+/// consumes. A human running `apply` in a TTY keeps the coloured
+/// output.
 fn init_tracing(filter: &str) -> anyhow::Result<()> {
+    use std::io::IsTerminal as _;
     use tracing_subscriber::EnvFilter;
 
     let env_filter =
@@ -32,6 +39,7 @@ fn init_tracing(filter: &str) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .try_init()
         .map_err(|err| anyhow::anyhow!("tracing subscriber already initialized: {err}"))?;
     Ok(())

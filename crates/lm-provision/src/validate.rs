@@ -278,7 +278,15 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
 /// (03 §validate check 3; the entries are upper-case, so the name is
 /// upper-cased for the comparison — mirroring `lm.validate`'s
 /// `name:upper()`).
-fn is_secret_shaped_key(name: &str) -> bool {
+///
+/// The same match is what spec 09 §Audit log calls the "sensitive-key"
+/// check — the two literal sets spec 02 §Shared vocabulary lists
+/// separately (`KEY` / `SECRET` / … in upper case for validate rejection,
+/// `key` / `secret` / … in lower case for audit redaction) are the same
+/// eight words under case-insensitive substring match. `pub` so the
+/// audit path reuses this one function rather than growing a parallel
+/// definition that could drift.
+pub fn is_secret_shaped_key(name: &str) -> bool {
     let upper = name.to_uppercase();
     SECRET_KEY_SUBSTRINGS
         .iter()

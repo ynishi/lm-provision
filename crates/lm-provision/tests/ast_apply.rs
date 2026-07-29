@@ -515,3 +515,103 @@ fn cli_apply_ast_step_failure_is_exit_one_with_the_error_on_stderr() {
 
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------
+// Audit transcript on stderr (spec 09 §Audit log).
+// ---------------------------------------------------------------------
+
+/// Every effect invocation must emit one structured audit event on
+/// stderr, and the event must never carry a secret value even when
+/// the phase's env-injection map resolves one.
+#[test]
+fn apply_emits_a_stderr_audit_event_per_effect_and_never_a_secret_value() {
+    let dir = temp_stem("audit-emit");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let target = dir.join("out.txt");
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "audit-demo",
+        "capabilities": ["sh.exec", "fs.write"],
+        "paths": [dir_str],
+        "env_secrets": ["AUDIT_SECRET_TOKEN"],
+        "phases": [
+            // The `AUDIT_SECRET_TOKEN` name matches the sensitive-key
+            // set, so it must be logged as `[REDACTED]`.
+            { "type": "ShExec", "argv": ["true"],
+              "env": {
+                  "AUDIT_SECRET_TOKEN": { "type": "EnvSecret", "name": "AUDIT_SECRET_TOKEN" },
+                  "MODE": { "type": "EnvLiteral", "value": "audit-mode-value" }
+              } },
+            { "type": "FsWrite", "path": target.to_string_lossy(), "content": "written" }
+        ]
+    });
+    let path = write_json_profile("audit-emit", &profile);
+
+    let output = bin()
+        .args(["apply", path.to_str().unwrap()])
+        // The secret value must never appear on stderr. Set it to a
+        // literal the test can grep for so a leak is unambiguous.
+        .env(
+            "AUDIT_SECRET_TOKEN",
+            "super-secret-value-that-must-not-leak",
+        )
+        .output()
+        .expect("process runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // (a) One audit event per effect.
+    let audit_events: Vec<_> = stderr.lines().filter(|l| l.contains("audit")).collect();
+    assert!(
+        audit_events.len() >= 2,
+        "expected at least one audit event per effect (sh.exec + fs.write), got: {stderr}"
+    );
+    assert!(
+        stderr.contains("op=\"sh.exec\"") || stderr.contains("op=sh.exec"),
+        "sh.exec event present: {stderr}"
+    );
+    assert!(
+        stderr.contains("op=\"fs.write\"") || stderr.contains("op=fs.write"),
+        "fs.write event present: {stderr}"
+    );
+
+    // (b) The secret value must never appear anywhere on stderr.
+    assert!(
+        !stderr.contains("super-secret-value-that-must-not-leak"),
+        "secret value must never reach the audit transcript: {stderr}"
+    );
+    // Non-sensitive env *values* are redacted too (values are never
+    // logged, sensitive or not).
+    assert!(
+        !stderr.contains("audit-mode-value"),
+        "no env value ever reaches the transcript, sensitive or not: {stderr}"
+    );
+
+    // (c) Sensitive-named env keys are marked `[REDACTED]`; non-
+    // sensitive names appear verbatim.
+    assert!(
+        stderr.contains("AUDIT_SECRET_TOKEN [REDACTED]"),
+        "the sensitive-key marker labels a key whose value was withheld: {stderr}"
+    );
+    assert!(
+        stderr.contains("MODE"),
+        "a non-sensitive key name is logged: {stderr}"
+    );
+
+    // (d) `fs.write` carries the content_source contract (spec 09).
+    assert!(
+        stderr.contains("content_source=\"string\"") || stderr.contains("content_source=string"),
+        "fs.write event carries content_source: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+}

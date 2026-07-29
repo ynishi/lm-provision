@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use dsl_kit::{EngineError, NodeContext, NodeId, Op, OpRegistry, Path};
 
-use super::{effects, lifecycle, report::StepReport, ExecContext, ExecError, ExecMode};
+use super::{audit, effects, lifecycle, report::StepReport, ExecContext, ExecError, ExecMode};
 use crate::dsl_poc::{ProfileNode, ProfileValue};
 
 /// The seven direct ops with real effect wiring.
@@ -273,6 +273,10 @@ impl ProfileOp {
         for (index, step) in steps.iter().enumerate() {
             let sub_id = format!("{base_id}_{}", index + 1);
             let op = step_effect_op(step);
+            // Audit before the sub-step runs. Env keys go through the
+            // redaction helper (spec 09 §Audit log); the resolved
+            // values from the phase's `env` map never reach the event.
+            audit_lifecycle_step(self.ctx.mode, &kind, step, &env);
             match self.ctx.mode {
                 ExecMode::DryRun => {
                     renders.push(lifecycle::render_dry(step, &env));
@@ -345,6 +349,10 @@ impl ProfileOp {
                 return Err(err);
             }
         };
+        // Audit before the effect (spec 09 §Audit log). Env keys go
+        // through the redaction helper; the resolved values never enter
+        // the event.
+        audit::sh_exec(self.ctx.mode, &kind, argv, &resolved_env);
         match self.ctx.mode {
             ExecMode::DryRun => {
                 let line = if resolved_env.is_empty() {
@@ -419,6 +427,11 @@ impl ProfileOp {
             self.push(entry);
             return Err(err);
         }
+        // `content_source = "string"` while `content` is a literal
+        // `String`; the `"secret:<name>"` form lands once the AST
+        // carries a `SecretRef` value (spec 04 §`fs.write`, spec 06
+        // consumption point 3, currently blocked on dsl-kit #14).
+        audit::fs_write(self.ctx.mode, &kind, path, content.len() as u64, "string");
         match self.ctx.mode {
             ExecMode::DryRun => {
                 let value = self.record(format!("fs_write path={path} bytes={}", content.len()));
@@ -462,6 +475,7 @@ impl ProfileOp {
             self.push(entry);
             return Err(err);
         }
+        audit::http_get(self.ctx.mode, &kind, url);
         match self.ctx.mode {
             ExecMode::DryRun => {
                 let value = self.record(format!("net_http_get url={url}"));
@@ -509,6 +523,7 @@ impl ProfileOp {
             self.push(entry);
             return Err(err);
         }
+        audit::http_post(self.ctx.mode, &kind, url);
         match self.ctx.mode {
             ExecMode::DryRun => {
                 let value = self.record(format!("net_http_post url={url}"));
@@ -558,6 +573,7 @@ impl ProfileOp {
                 return Err(err);
             }
         }
+        audit::transfer(self.ctx.mode, &kind, src, dst);
         match self.ctx.mode {
             ExecMode::DryRun => {
                 let value = self.record(format!("net_transfer src={src} dst={dst}"));
@@ -618,6 +634,7 @@ impl ProfileOp {
                 return Err(err);
             }
         }
+        audit::mount_bind(self.ctx.mode, &kind, src, dst);
         match self.ctx.mode {
             ExecMode::DryRun => {
                 let value = self.record(format!("mount_bind src={src} dst={dst}"));
@@ -663,6 +680,7 @@ impl ProfileOp {
             self.push(entry);
             return Err(err);
         }
+        audit::mount_umount(self.ctx.mode, &kind, path);
         match self.ctx.mode {
             ExecMode::DryRun => {
                 let value = self.record(format!("mount_umount path={path}"));
@@ -687,6 +705,28 @@ impl ProfileOp {
                 Ok(value)
             }
         }
+    }
+}
+
+/// Emit one audit event for a lifecycle sub-step, dispatched by its
+/// [`lifecycle::Step`] variant. Placed here (not in `audit`) because
+/// it depends on `lifecycle`'s step type, which `audit` deliberately
+/// does not import — audit's helpers stay effect-shaped, not
+/// lifecycle-shaped, so a caller from `registry`'s direct-op branches
+/// pays the same shape.
+fn audit_lifecycle_step(
+    mode: ExecMode,
+    kind: &str,
+    step: &lifecycle::Step,
+    env: &std::collections::BTreeMap<String, String>,
+) {
+    match step {
+        lifecycle::Step::Sh(argv) => audit::sh_exec(mode, kind, argv, env),
+        lifecycle::Step::Transfer { src, dst } => audit::transfer(mode, kind, src, dst),
+        lifecycle::Step::HttpPoll { url, timeout_sec } => {
+            audit::http_poll(mode, kind, url, *timeout_sec)
+        }
+        lifecycle::Step::Note(message) => audit::note(mode, kind, message),
     }
 }
 
