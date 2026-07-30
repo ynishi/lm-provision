@@ -306,7 +306,9 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
                 name: "llm".to_string(),
                 platform_kind: "vllm".to_string(),
                 model: None,
+                port: None,
                 dtype: None,
+                tensor_parallel_size: None,
                 extra_args: vec![],
             },
             ProfileNode::ServiceReady {

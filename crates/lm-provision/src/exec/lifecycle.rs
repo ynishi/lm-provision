@@ -181,14 +181,18 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             name,
             platform_kind,
             model,
+            port,
             dtype,
+            tensor_parallel_size,
             extra_args,
             ..
         } => Ok(expand_service_start(
             name,
             platform_kind,
             model.as_deref(),
+            *port,
             dtype.as_deref(),
+            *tensor_parallel_size,
             extra_args,
         )),
         ProfileNode::ServiceReady { check_url, .. } => Ok(vec![Step::HttpPoll {
@@ -651,19 +655,21 @@ fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<Step> {
 /// with an empty value makes the *next* token the model, launching
 /// something other than what the profile asked for.
 ///
-/// No `--port` / `--tensor-parallel-size` is synthesized. The AST does
-/// not carry them (see [`ProfileNode::ServiceStart`] on the dsl-kit
-/// `Option<u16>` gap), and the values the predecessor passed by default
-/// — 8000 for `vllm`, 8080 for `llamacpp` — are each platform's own
-/// default, so omitting the flag lands on the same port. A profile that
-/// wants another one declares it in `extra_args`, where it appears
-/// exactly once instead of overriding a flag this function already
-/// emitted.
+/// `port` / `tensor_parallel_size` become `--port` / `--tensor-parallel-size`
+/// when set; when `None`, the flag is omitted and each platform's own
+/// default takes over (`vllm` 8000, `llamacpp` 8080, `ollama` reads
+/// `OLLAMA_HOST`). `extra_args` is still appended verbatim after the
+/// declared flags, so an author who prefers to write `["--port", "9000"]`
+/// there directly stays in control; if both are declared the argv
+/// carries both, which the platform CLI will normally reject as
+/// duplicate — validate does not police that overlap yet.
 fn expand_service_start(
     name: &str,
     platform_kind: &str,
     model: Option<&str>,
+    port: Option<u16>,
     dtype: Option<&str>,
+    tensor_parallel_size: Option<u16>,
     extra_args: &[String],
 ) -> Vec<Step> {
     let log_path = format!("/tmp/{name}.log");
@@ -679,9 +685,17 @@ fn expand_service_start(
                 "--model".to_string(),
                 model.to_string(),
             ];
+            if let Some(port) = port {
+                argv.push("--port".to_string());
+                argv.push(port.to_string());
+            }
             if let Some(dtype) = dtype {
                 argv.push("--dtype".to_string());
                 argv.push(dtype.to_string());
+            }
+            if let Some(size) = tensor_parallel_size {
+                argv.push("--tensor-parallel-size".to_string());
+                argv.push(size.to_string());
             }
             argv.extend(extra_args.iter().cloned());
             argv
@@ -698,6 +712,10 @@ fn expand_service_start(
                 "--model".to_string(),
                 model.to_string(),
             ];
+            if let Some(port) = port {
+                argv.push("--port".to_string());
+                argv.push(port.to_string());
+            }
             argv.extend(extra_args.iter().cloned());
             argv
         }
@@ -1651,7 +1669,9 @@ mod tests {
             name: "llm".to_string(),
             platform_kind: "ollama".to_string(),
             model: None,
+            port: None,
             dtype: None,
+            tensor_parallel_size: None,
             extra_args: Vec::new(),
         })
         .expect("service_start expands");
@@ -1687,7 +1707,9 @@ mod tests {
         ids: &IdGen,
         platform_kind: &str,
         model: Option<&str>,
+        port: Option<u16>,
         dtype: Option<&str>,
+        tensor_parallel_size: Option<u16>,
         extra_args: &[&str],
     ) -> Vec<Step> {
         let payload = ProfileNode::ServiceStart {
@@ -1695,7 +1717,9 @@ mod tests {
             name: "llm".to_string(),
             platform_kind: platform_kind.to_string(),
             model: model.map(str::to_string),
+            port,
             dtype: dtype.map(str::to_string),
+            tensor_parallel_size,
             extra_args: extra_args.iter().map(|s| s.to_string()).collect(),
         };
         expand(&payload).expect("service_start expands")
@@ -1704,7 +1728,15 @@ mod tests {
     #[test]
     fn expand_service_start_vllm_uses_the_openai_api_server_entry_point() {
         let ids = IdGen::new();
-        let steps = service_start(&ids, "vllm", Some("meta-llama/Llama-3-8B"), None, &[]);
+        let steps = service_start(
+            &ids,
+            "vllm",
+            Some("meta-llama/Llama-3-8B"),
+            None,
+            None,
+            None,
+            &[],
+        );
         assert_eq!(
             sh_command(&steps[0]),
             "nohup python -m vllm.entrypoints.openai.api_server \
@@ -1712,9 +1744,10 @@ mod tests {
         );
     }
 
-    /// `--port` / `--tensor-parallel-size` are the author's to place in
-    /// `extra_args`; nothing synthesizes them, so they appear exactly
-    /// once and after the flags this function does emit.
+    /// Named `port` / `dtype` / `tensor_parallel_size` become their own
+    /// `--flag` / value pairs in declaration order; `extra_args` still
+    /// trails them verbatim for anything the named surface does not
+    /// cover.
     #[test]
     fn expand_service_start_vllm_appends_declared_knobs_after_dtype() {
         let ids = IdGen::new();
@@ -1722,23 +1755,27 @@ mod tests {
             &ids,
             "vllm",
             Some("m"),
+            Some(9000),
             Some("bfloat16"),
-            &["--port", "9000", "--tensor-parallel-size", "4"],
+            Some(4),
+            &["--max-model-len=8192"],
         );
         assert_eq!(
             sh_command(&steps[0]),
             "nohup python -m vllm.entrypoints.openai.api_server --model m \
-             --dtype bfloat16 --port 9000 --tensor-parallel-size 4 \
-             > /tmp/llm.log 2>&1 &"
+             --port 9000 --dtype bfloat16 --tensor-parallel-size 4 \
+             --max-model-len=8192 > /tmp/llm.log 2>&1 &"
         );
     }
 
     /// Ollama binds 11434 and reads `OLLAMA_HOST`, so it takes neither
-    /// a model nor a port on the command line.
+    /// a model nor a port on the command line — a declared `port`
+    /// here is ignored (spec 02 §Kinds with a spawn-and-poll invocation
+    /// documents this asymmetry).
     #[test]
     fn expand_service_start_ollama_just_serves() {
         let ids = IdGen::new();
-        let steps = service_start(&ids, "ollama", None, None, &[]);
+        let steps = service_start(&ids, "ollama", None, Some(9999), None, None, &[]);
         assert_eq!(
             sh_command(&steps[0]),
             "nohup ollama serve > /tmp/llm.log 2>&1 &"
@@ -1748,7 +1785,15 @@ mod tests {
     #[test]
     fn expand_service_start_llamacpp_uses_llama_server() {
         let ids = IdGen::new();
-        let steps = service_start(&ids, "llamacpp", Some("/models/q4.gguf"), None, &[]);
+        let steps = service_start(
+            &ids,
+            "llamacpp",
+            Some("/models/q4.gguf"),
+            None,
+            None,
+            None,
+            &[],
+        );
         assert_eq!(
             sh_command(&steps[0]),
             "nohup llama-server --model /models/q4.gguf > /tmp/llm.log 2>&1 &"
@@ -1762,7 +1807,7 @@ mod tests {
     fn expand_service_start_notes_out_when_a_required_model_is_absent() {
         let ids = IdGen::new();
         for platform in ["vllm", "llamacpp"] {
-            let steps = service_start(&ids, platform, None, None, &[]);
+            let steps = service_start(&ids, platform, None, None, None, None, &[]);
             match &steps[0] {
                 Step::Note(msg) => {
                     assert!(msg.contains("name=llm"), "{msg}");
@@ -1776,7 +1821,7 @@ mod tests {
     #[test]
     fn expand_service_start_notes_out_an_unspecified_platform() {
         let ids = IdGen::new();
-        let steps = service_start(&ids, "tgi", Some("m"), None, &[]);
+        let steps = service_start(&ids, "tgi", Some("m"), None, None, None, &[]);
         match &steps[0] {
             Step::Note(msg) => {
                 assert!(msg.contains("platform_kind=tgi"), "{msg}");

@@ -35,7 +35,7 @@ The catalog below is exhaustive: **22 user-facing phase variants**.
 | `hooks.post_install` | `script` string — raw shell, inner escape (chapter 01) | `sh.exec` |
 | `comfyui.restart` | `port` number (default 8188); `extra_args` list\<string\> (shell-safe) | `sh.exec` |
 | `comfyui.health` | `port` number (default 8188) — 60 s poll of `/object_info` | `net.http_get` |
-| `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind = "vllm"\|"ollama"\|"llamacpp", model? (shell-safe), port?, dtype? (shell-safe), tensor_parallel_size?, extra_args? (shell-safe) }`. `port` / `tensor_parallel_size` are not carried by the AST — §Payload fields not carried by the AST | `sh.exec` |
+| `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind = "vllm"\|"ollama"\|"llamacpp", model? (shell-safe), port?, dtype? (shell-safe), tensor_parallel_size?, extra_args? (shell-safe) }` | `sh.exec` |
 | `service.ready` | `name` string; `check` = `{ http = "<url>", timeout_sec? (default 60) }` | `sh.exec` |
 
 ### Catalog kinds (direct operations)
@@ -202,17 +202,6 @@ so polling it reports ready too early.
 "python version mismatch: want <want>, got " + sys.version'`. A
 mismatch exits non-zero and fails the step, with the interpreter's real
 version in the captured stderr.
-
-#### Payload fields not carried by the AST
-
-`service.start`'s `platform.port` and `platform.tensor_parallel_size`
-are defined above but have no AST field. The AST's canonical text
-grammar maps `Option<String>` but not `Option<u16>`, so an optional
-integer cannot currently be spelled. Both are expressed through
-`extra_args` (`["--port", "9000"]`) at no cost to the invocation, per
-the note above. Carrying them as named fields is an upstream
-dependency, alongside the `env` keyed slot and `fs.write` content
-coercion (chapters 05, 06).
 
 ### Shared vocabulary (frozen literal sets)
 

@@ -8,10 +8,25 @@
 //! `NodeId` sequences.
 
 use dsl_kit::{IdGen, NodeId};
-use dsl_kit_parse::{peg::Grammar, serde_bridge::from_json_value, DslBuild as _};
+use dsl_kit_parse::{
+    peg::{choice, token},
+    schema_gen::{checked_grammar_from_schema_with, SyntaxOverrides},
+    serde_bridge::from_json_value,
+    DslBuild as _,
+};
 use dsl_kit_schema::DslSchema as _;
 use lm_provision::canonical;
 use lm_provision::profile_ast::ProfileNode;
+
+/// Same override wiring the frontend crate ships (spec 01 §Profile-scoped
+/// env table's numeric-side sibling: `Option<u16>` needs a
+/// `SyntaxOverrides::for_type` value production since it is outside
+/// dsl-kit's built-in type table).
+fn overrides() -> SyntaxOverrides {
+    SyntaxOverrides::new().for_type("Option<u16>", |ids| {
+        choice(ids, vec![token(ids, "%kw:none"), token(ids, "%int")])
+    })
+}
 
 /// Same logical profile, but the two frontends declare the sortable
 /// lists in different order — the canonical encoder normalises both,
@@ -82,8 +97,8 @@ fn json_profile() -> serde_json::Value {
 fn build_from_text(text: &str) -> ProfileNode {
     let ids = IdGen::new();
     let schema = ProfileNode::schema();
-    let grammar =
-        Grammar::from_schema(&schema, &ids).expect("grammar must build from ProfileNode schema");
+    let grammar = checked_grammar_from_schema_with(&schema, &ids, &overrides())
+        .expect("grammar must build from ProfileNode schema with Option<u16> override");
     let tree = grammar
         .parse(text)
         .expect("canonical text must parse against the generated grammar");

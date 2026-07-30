@@ -23,10 +23,46 @@
 use std::path::Path;
 
 use dsl_kit::IdGen;
-use dsl_kit_parse::{peg::Grammar, serde_bridge::from_json_value, DslBuild as _};
+use dsl_kit_parse::{
+    peg::{choice, token},
+    schema_gen::{grammar_from_schema_with, SyntaxOverrides},
+    serde_bridge::from_json_value,
+    DslBuild as _,
+};
 use dsl_kit_schema::DslSchema as _;
 
 use crate::profile_ast::ProfileNode;
+
+/// Custom canonical-text syntax productions for payload types that
+/// dsl-kit's built-in mapping table does not cover.
+///
+/// dsl-kit's `field_value_peg` maps `String` / integer types / `bool` /
+/// `Option<String>` / `Vec<String>` out of the box; `Option<u16>` falls
+/// outside that table, so `service.start`'s `port` /
+/// `tensor_parallel_size` need an explicit value production (spec 01
+/// §Profile-scoped env table's sibling gap on the numeric side).
+///
+/// The production mirrors the built-in `Option<String>` shape —
+/// `none` for `None`, the corresponding scalar token for `Some` — so a
+/// profile author writes `port: 9000` or `port: none` uniformly with
+/// every other optional field. The JSON front-end needs no adapter
+/// because [`dsl_kit_parse::build_field_optional::<T>`] is generic
+/// over `T: DeserializeOwned + FromStr`, so `u16` deserialises through
+/// the same code path `Option<String>` does.
+fn profile_syntax_overrides() -> SyntaxOverrides {
+    SyntaxOverrides::new().for_type("Option<u16>", |ids| {
+        choice(ids, vec![token(ids, "%kw:none"), token(ids, "%int")])
+    })
+}
+
+/// Same overrides as [`profile_syntax_overrides`], exposed for the
+/// `profile_ast` schema-generation test so the two paths agree on the
+/// grammar shape. Not a public API — `pub(crate)` and prefixed
+/// `_for_test` to signal that.
+#[cfg(test)]
+pub(crate) fn profile_syntax_overrides_for_test() -> SyntaxOverrides {
+    profile_syntax_overrides()
+}
 
 /// Errors returned by [`load_profile`].
 ///
@@ -106,8 +142,9 @@ fn parse_json(text: &str) -> Result<ProfileNode, FrontendError> {
 fn parse_text(text: &str) -> Result<ProfileNode, FrontendError> {
     let ids = IdGen::new();
     let schema = ProfileNode::schema();
-    let grammar =
-        Grammar::from_schema(&schema, &ids).map_err(|err| FrontendError::Parse(err.to_string()))?;
+    let overrides = profile_syntax_overrides();
+    let grammar = grammar_from_schema_with(&schema, &ids, &overrides)
+        .map_err(|err| FrontendError::Parse(err.to_string()))?;
     let tree = grammar
         .parse(text)
         .map_err(|err| FrontendError::Parse(err.to_string()))?;

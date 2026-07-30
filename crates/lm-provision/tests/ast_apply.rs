@@ -450,6 +450,65 @@ fn cli_apply_routes_a_json_profile_through_the_ast_path_exit_zero() {
     std::fs::remove_file(&path).ok();
 }
 
+/// `service.start` carries `port` / `tensor_parallel_size` as named
+/// `Option<u16>` fields (dsl-kit #1 Layer 2 landed in 0.3.0; the
+/// frontend registers a `SyntaxOverrides` value production for
+/// `Option<u16>` so the canonical text and JSON front-ends both accept
+/// them). `expand_service_start` synthesises `--port` / `--tensor-parallel-size`
+/// from the named fields — this test proves the JSON front-end round
+/// trip end-to-end (parse → validate → dry-run report carries `port`
+/// as an integer in the plan payload).
+#[test]
+fn cli_apply_named_port_field_synthesises_flag_in_launch_argv() {
+    let profile = json!({
+        "type": "Spec",
+        "name": "cli-named-port",
+        "capabilities": ["sh.exec"],
+        "phases": [
+            {
+                "type": "ServiceStart",
+                "name": "llm",
+                "platform_kind": "vllm",
+                "model": "meta-llama/Llama-3-8B",
+                "port": 9000,
+                "tensor_parallel_size": 4
+            }
+        ]
+    });
+    let path = write_json_profile("cli-named-port", &profile);
+
+    let output = bin()
+        .args(["apply", path.to_str().unwrap(), "--dry-run"])
+        .output()
+        .expect("process runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("stdout is the report JSON");
+    let step = &report["steps"].as_array().unwrap()[0];
+    let argv = step["argv"].as_array().expect("argv is an array");
+    let joined = argv
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The named fields land as their own `--port` / `--tensor-parallel-size`
+    // flags in the synthesised launch line.
+    assert!(
+        joined.contains("--port 9000"),
+        "named port must synthesise --port flag: {joined}"
+    );
+    assert!(
+        joined.contains("--tensor-parallel-size 4"),
+        "named tensor_parallel_size must synthesise its flag: {joined}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 #[test]
 fn cli_apply_of_missing_profile_is_exit_one_with_nothing_on_stdout() {
     let missing = temp_stem("cli-missing").with_extension("json");

@@ -231,16 +231,18 @@ pub enum ProfileNode {
     /// the canonical encoding when unset, so a profile that declares
     /// only `kind` hashes as it did before they existed.
     ///
-    /// `port` and `tensor_parallel_size` are **not** flattened fields:
-    /// dsl-kit's grammar generator maps `Option<String>` but not
-    /// `Option<u16>` (`dsl-kit-parse` `schema_gen::field_value_peg`), so
-    /// there is no way to spell an optional integer in the canonical
-    /// text today. Both are expressed through `extra_args`
-    /// (`["--port", "9000"]`) instead, which costs nothing at the
-    /// invocation because the per-platform defaults the launch would
-    /// otherwise pass are the platforms' own defaults — see
-    /// [`crate::exec::lifecycle`]. Same upstream bucket as the `env`
-    /// keyed slot and `fs.write` content coercion.
+    /// `port` and `tensor_parallel_size` are named `Option<u16>` fields.
+    /// dsl-kit's grammar generator does not map `Option<u16>` in its
+    /// built-in type table, so the frontend registers a
+    /// [`SyntaxOverrides`](dsl_kit_parse::schema_gen::SyntaxOverrides)
+    /// `for_type("Option<u16>", …)` value production (`none` / `%int`,
+    /// mirroring the built-in `Option<String>` shape) and builds the
+    /// grammar through
+    /// [`grammar_from_schema_with`](dsl_kit_parse::schema_gen::grammar_from_schema_with).
+    /// The JSON front-end needs no adapter — [`dsl_kit_parse::build_field_optional::<T>`]
+    /// is generic over `T: DeserializeOwned + FromStr`, and canonical
+    /// encodes each as an `Int` when set / omits the key when `None`.
+    /// See [`crate::frontend`] for the override registration site.
     #[dsl_exec(apply = "service_start")]
     ServiceStart {
         /// Stable node ID.
@@ -253,12 +255,16 @@ pub enum ProfileNode {
         /// and `llamacpp`; ignored by `ollama`, which resolves models
         /// at request time.
         model: Option<String>,
+        /// Listen port (`--port`). Defaults per platform when unset
+        /// (`vllm` 8000, `llamacpp` 8080); `ollama` reads its port
+        /// from `OLLAMA_HOST` and ignores this field.
+        port: Option<u16>,
         /// `vllm` `--dtype`.
         dtype: Option<String>,
+        /// `vllm` `--tensor-parallel-size`.
+        tensor_parallel_size: Option<u16>,
         /// Extra arguments appended to the launch invocation
-        /// (shell-safe, declaration order preserved). Also the route
-        /// for `--port` / `--tensor-parallel-size`, per the type note
-        /// above.
+        /// (shell-safe, declaration order preserved).
         extra_args: Vec<String>,
     },
 
@@ -414,7 +420,15 @@ mod tests {
         let schema = ProfileNode::schema();
         assert_eq!(schema.name, "ProfileNode");
 
-        let grammar = schema_gen::checked_grammar_from_schema(&schema, &id_gen)
+        // The `Option<u16>` payload fields (`ServiceStart.port` /
+        // `ServiceStart.tensor_parallel_size`) fall outside dsl-kit's
+        // built-in canonical-syntax mapping table, so the frontend
+        // ships a `SyntaxOverrides::for_type("Option<u16>", …)`
+        // production (see [`crate::frontend`]); the schema test uses
+        // the same override so it exercises the same grammar the
+        // frontend actually parses against.
+        let overrides = crate::frontend::profile_syntax_overrides_for_test();
+        let grammar = schema_gen::checked_grammar_from_schema_with(&schema, &id_gen, &overrides)
             .expect("grammar generation failed");
 
         let examples =
@@ -527,11 +541,12 @@ mod tests {
     /// the serde bridge).
     #[test]
     fn canonical_text_parses_into_the_typed_ast() {
-        use dsl_kit_parse::peg::Grammar;
-
         let ids = IdGen::new();
         let schema = ProfileNode::schema();
-        let grammar = Grammar::from_schema(&schema, &ids)
+        // Same override wiring as the frontend uses (see
+        // `test_schema_and_grammar_generation` above for the rationale).
+        let overrides = crate::frontend::profile_syntax_overrides_for_test();
+        let grammar = schema_gen::checked_grammar_from_schema_with(&schema, &ids, &overrides)
             .expect("grammar generation must succeed for the ProfileNode schema");
 
         // A minimal Spec: one lifecycle phase, one direct phase, so the

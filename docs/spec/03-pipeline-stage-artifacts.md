@@ -60,13 +60,13 @@ Checks, in order:
 7. `service.start` names are unique across the profile.
 
 Because the AST payload is still a projection of the full spec-02
-catalog (`service.start` flattens `platform` and omits its two numeric
-fields — chapter 02 §Payload fields not carried by the AST;
-`custom_nodes` / `models` / `llm_models` carry an opaque JSON string),
-the field-level checks for those payloads land when the fields are
-promoted onto the AST. `service.start`'s flattened `model` / `dtype` /
-`extra_args` are shell-safety-checked today, since they reach argv
-positions on the launch invocation.
+catalog (`custom_nodes` / `models` / `llm_models` carry an opaque JSON
+string), the field-level checks for those payloads land when the
+fields are promoted onto the AST. `service.start` flattens `platform`
+into named fields (`model?` / `port?` / `dtype?` /
+`tensor_parallel_size?` / `extra_args?`); the string-valued three
+(`model` / `dtype` / `extra_args`) are shell-safety-checked, since
+they reach argv positions on the launch invocation.
 `hooks.post_install.script` is deliberately exempt from
 shell-safety (chapter 01 §Escape / Fragment Policy).
 

@@ -252,7 +252,9 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             name,
             platform_kind,
             model,
+            port,
             dtype,
+            tensor_parallel_size,
             extra_args,
         } => {
             let mut fields = variant_object("ServiceStart");
@@ -265,7 +267,9 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             // profile that declares only `kind` keeps the bytes (and
             // therefore the hash) it had before the fields existed.
             insert_optional_str(&mut fields, "model", model);
+            insert_optional_u16(&mut fields, "port", port);
             insert_optional_str(&mut fields, "dtype", dtype);
+            insert_optional_u16(&mut fields, "tensor_parallel_size", tensor_parallel_size);
             insert_when_non_empty(&mut fields, "extra_args", extra_args);
             CanonValue::Object(fields)
         }
@@ -382,6 +386,16 @@ fn insert_optional_str(
 ) {
     if let Some(v) = value {
         fields.insert(key.into(), CanonValue::Str(v.clone()));
+    }
+}
+
+/// The `Option<u16>` counterpart to [`insert_optional_str`]: emit an
+/// `Int` when set, omit the key entirely otherwise. Matches the same
+/// omit-when-`None` rule so a `service.start` that declares no
+/// `port` / `tensor_parallel_size` keeps its pre-migration hash.
+fn insert_optional_u16(fields: &mut BTreeMap<String, CanonValue>, key: &str, value: &Option<u16>) {
+    if let Some(v) = value {
+        fields.insert(key.into(), CanonValue::Int(i64::from(*v)));
     }
 }
 
@@ -880,7 +894,7 @@ mod tests {
     }
 
     /// A `service.start` that declares no platform detail must encode
-    /// exactly as it did before `model` / `dtype` / `extra_args`
+    /// exactly as it did before the five optional platform fields
     /// existed (the expected string is the pre-field encoding,
     /// verbatim), so adding them left every existing profile's hash
     /// alone.
@@ -892,7 +906,9 @@ mod tests {
             name: "llm".to_string(),
             platform_kind: "vllm".to_string(),
             model: None,
+            port: None,
             dtype: None,
+            tensor_parallel_size: None,
             extra_args: Vec::new(),
         };
         assert_eq!(
@@ -902,8 +918,7 @@ mod tests {
     }
 
     /// Declared platform detail encodes, and changes the hash: two
-    /// services differing in the model they serve are not the same
-    /// service.
+    /// services differing in a numeric knob are not the same service.
     #[test]
     fn service_start_platform_detail_encodes_and_changes_the_hash() {
         let gen = IdGen::new();
@@ -912,7 +927,9 @@ mod tests {
             name: "llm".to_string(),
             platform_kind: "vllm".to_string(),
             model: None,
+            port: None,
             dtype: None,
+            tensor_parallel_size: None,
             extra_args: Vec::new(),
         };
         let detailed = ProfileNode::ServiceStart {
@@ -920,14 +937,16 @@ mod tests {
             name: "llm".to_string(),
             platform_kind: "vllm".to_string(),
             model: Some("meta-llama/Llama-3-8B".to_string()),
+            port: Some(9000),
             dtype: Some("bfloat16".to_string()),
-            extra_args: vec!["--port".to_string(), "9000".to_string()],
+            tensor_parallel_size: Some(4),
+            extra_args: Vec::new(),
         };
         assert_eq!(
             encode(&detailed),
-            "{\"dtype\":\"bfloat16\",\"extra_args\":[\"--port\",\"9000\"],\
-             \"model\":\"meta-llama/Llama-3-8B\",\"name\":\"llm\",\
-             \"platform_kind\":\"vllm\",\"type\":\"ServiceStart\"}"
+            "{\"dtype\":\"bfloat16\",\"model\":\"meta-llama/Llama-3-8B\",\
+             \"name\":\"llm\",\"platform_kind\":\"vllm\",\"port\":9000,\
+             \"tensor_parallel_size\":4,\"type\":\"ServiceStart\"}"
         );
         assert_ne!(hash(&bare), hash(&detailed));
     }

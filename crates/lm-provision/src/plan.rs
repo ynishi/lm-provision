@@ -395,7 +395,9 @@ fn payload_of(phase: &ProfileNode) -> Value {
             name,
             platform_kind,
             model,
+            port,
             dtype,
+            tensor_parallel_size,
             extra_args,
             ..
         } => {
@@ -405,8 +407,14 @@ fn payload_of(phase: &ProfileNode) -> Value {
             if let Some(model) = model {
                 m.insert("model".into(), json!(model));
             }
+            if let Some(port) = port {
+                m.insert("port".into(), json!(port));
+            }
             if let Some(dtype) = dtype {
                 m.insert("dtype".into(), json!(dtype));
+            }
+            if let Some(size) = tensor_parallel_size {
+                m.insert("tensor_parallel_size".into(), json!(size));
             }
             if !extra_args.is_empty() {
                 m.insert("extra_args".into(), json!(extra_args));
@@ -606,7 +614,9 @@ mod tests {
                     name: "svc".into(),
                     platform_kind: "vllm".into(),
                     model: None,
+                    port: None,
                     dtype: None,
+                    tensor_parallel_size: None,
                     extra_args: vec![],
                 },
                 ProfileNode::ServiceReady {
@@ -868,7 +878,9 @@ mod tests {
                     name: "svc-a".into(),
                     platform_kind: "vllm".into(),
                     model: None,
+                    port: None,
                     dtype: None,
+                    tensor_parallel_size: None,
                     extra_args: vec![],
                 },
                 ProfileNode::ServiceReady {
@@ -881,7 +893,9 @@ mod tests {
                     name: "svc-b".into(),
                     platform_kind: "ollama".into(),
                     model: None,
+                    port: None,
                     dtype: None,
+                    tensor_parallel_size: None,
                     extra_args: vec![],
                 },
                 ProfileNode::ServiceReady {
@@ -913,7 +927,9 @@ mod tests {
                     name: "svc-a".into(),
                     platform_kind: "vllm".into(),
                     model: None,
+                    port: None,
                     dtype: None,
+                    tensor_parallel_size: None,
                     extra_args: vec![],
                 },
                 ProfileNode::ServiceStart {
@@ -921,7 +937,9 @@ mod tests {
                     name: "svc-b".into(),
                     platform_kind: "ollama".into(),
                     model: None,
+                    port: None,
                     dtype: None,
+                    tensor_parallel_size: None,
                     extra_args: vec![],
                 },
                 ProfileNode::ServiceReady {
