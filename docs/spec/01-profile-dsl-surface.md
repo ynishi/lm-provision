@@ -22,7 +22,7 @@ pub enum ProfileNode {
         version: Option<String>,
         description: Option<String>,
         capabilities: Vec<String>,
-        env: Vec<String>,
+        env: BTreeMap<String, ProfileNode>,     // keyed slot, values are EnvLiteral / EnvSecret
         env_secrets: Vec<String>,
         paths: Vec<String>,
         http_allowlist: Vec<String>,
@@ -177,6 +177,49 @@ encodes it as the `{"__secret":"NAME"}` marker. `dsl-kit`'s
 `Multiplicity::Map` supports self-recursive node values, which is
 exactly this shape; a map of *scalar* values is not yet supported
 upstream, which is why the value side is a node rather than a string.
+
+### Profile-scoped env table (`Spec.env`)
+
+`Spec.env` is the same keyed slot shape, one level up: a table of
+name → value node declared once at the profile root and shared across
+phases. Values are `EnvLiteral` (a hardcoded string) or `EnvSecret` (a
+host-env-resolved secret whose `name` must appear in `env_secrets`).
+A phase's own `env` slot may then reference an entry by name through
+the `EnvRef` value node, and the exec layer resolves it back to the
+declared value:
+
+```text
+Spec(
+    name: "demo",
+    env_secrets: ["HF_TOKEN"],
+    env: {
+        LOG_LEVEL: EnvLiteral(value: "info"),
+        HF_TOKEN:  EnvSecret(name: "HF_TOKEN")
+    },
+    phases: [
+        ShExec(
+            argv: ["python", "train.py"],
+            env: {
+                LOG_LEVEL: EnvRef(name: "LOG_LEVEL"),
+                HF_TOKEN:  EnvRef(name: "HF_TOKEN")
+            }
+        )
+    ]
+)
+```
+
+Validate rejects an `EnvRef` whose `name` is not a key in `Spec.env`
+(check 6, `UndeclaredEnvRef`); the exec layer's resolution then reads
+the declared value node and applies the same rule that would apply to
+an inline value at the reference site — a literal is injected verbatim,
+a secret goes through the `env_secrets` / host-env pipe. Canonical
+encodes an `EnvRef` as `{"__env_ref":"NAME"}`, symmetric with the
+`{"__secret":"NAME"}` marker: the hash covers *which entry is
+referenced*, never the resolved value.
+
+An empty `Spec.env` is omitted from canonical, so a profile that
+declares no entries here hashes exactly as it did while `env` was a
+bare allowlist `Vec<String>`.
 
 ## Escape / Fragment Policy
 

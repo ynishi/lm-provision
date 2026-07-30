@@ -136,7 +136,8 @@ mod tests {
         "version: \"1.0.0\", ",
         "description: none, ",
         "capabilities: [\"sh.exec\"], ",
-        "env: [\"HOME\"], ",
+        // `Spec.env` is a keyed slot: `{name: value_node}`.
+        "env: {HOME: EnvLiteral(value: \"/root\")}, ",
         "env_secrets: [], ",
         "phases: [",
         "SystemApt(packages: [\"git\", \"curl\"]), ",
@@ -150,7 +151,7 @@ mod tests {
             "name": "demo-frontend",
             "version": "1.0.0",
             "capabilities": ["sh.exec"],
-            "env": ["HOME"],
+            "env": { "HOME": { "type": "EnvLiteral", "value": "/root" } },
             "phases": [
                 { "type": "SystemApt", "packages": ["git", "curl"] },
                 { "type": "ShExec", "argv": ["echo", "ok"] },

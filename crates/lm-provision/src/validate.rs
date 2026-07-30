@@ -161,11 +161,43 @@ pub enum ValidateError {
     /// guard enabled by the typed `EnvSecret` value node.
     #[error("phases[{index}].env[{key}]: secret {name:?} is not declared in env_secrets")]
     UndeclaredEnvSecret {
-        /// 1-based position of the phase carrying the `env` slot.
+        /// 1-based position of the phase carrying the `env` slot (or
+        /// 0 when the offending slot is `Spec.env` itself).
         index: usize,
         /// The `env` map key whose value is the offending secret.
         key: String,
         /// The undeclared secret name.
+        name: String,
+    },
+
+    /// A `Spec.env` value is neither [`ProfileNode::EnvLiteral`] nor
+    /// [`ProfileNode::EnvSecret`] (check 4b). An `EnvRef` value would
+    /// loop back into `Spec.env`; any other variant means the author
+    /// wrote a phase where a value belongs.
+    #[error(
+        "Spec.env[{key}]: value must be EnvLiteral or EnvSecret \
+         (declaration slot #{index})"
+    )]
+    SpecEnvValueShape {
+        /// 1-based position of the offending declaration (lexicographic
+        /// key order, matching the deterministic first-violation
+        /// convention).
+        index: usize,
+        /// The `Spec.env` key whose value is malformed.
+        key: String,
+    },
+
+    /// A phase-`env` [`ProfileNode::EnvRef`] value names an entry
+    /// that does not exist in `Spec.env` (check 6). The resolution
+    /// would fail at execution time; catching it here keeps the
+    /// validate stage self-contained.
+    #[error("phases[{index}].env[{key}]: reference {name:?} not declared in Spec.env")]
+    UndeclaredEnvRef {
+        /// 1-based position of the phase carrying the `env` slot.
+        index: usize,
+        /// The `env` map key whose value is the offending reference.
+        key: String,
+        /// The undeclared reference name.
         name: String,
     },
 }
@@ -199,9 +231,17 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // the `Vec<String>` typing; the Lua check imposes no content
     // condition beyond that, so nothing remains to port.
 
-    // Check 3: no `env` key is secret-shaped.
-    for (idx, key) in env.iter().enumerate() {
-        if is_secret_shaped_key(key) {
+    // Check 3: a secret-shaped key in `Spec.env` must carry an
+    // `EnvSecret` value, not an `EnvLiteral`. A literal under a
+    // secret-shaped name is the shape a "secret pasted as a plain
+    // string" mistake takes — under the old `Vec<String>` shape it was
+    // outright rejected because every entry was inherently a plain
+    // declaration. Now that `Spec.env` can carry either kind of value,
+    // the check refines to the case the original rule actually cared
+    // about. BTreeMap iteration is lexicographic so the first
+    // violation is deterministic.
+    for (idx, (key, value)) in env.iter().enumerate() {
+        if is_secret_shaped_key(key) && matches!(value, ProfileNode::EnvLiteral { .. }) {
             return Err(ValidateError::SecretShapedEnvKey {
                 index: idx + 1,
                 name: key.clone(),
@@ -209,8 +249,8 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         }
     }
 
-    // Check 4: every `env` / `env_secrets` name is shell-safe.
-    for (idx, key) in env.iter().enumerate() {
+    // Check 4: every `Spec.env` key / `env_secrets` name is shell-safe.
+    for (idx, key) in env.keys().enumerate() {
         if !is_shell_safe(key) {
             return Err(ValidateError::EnvNameNotShellSafe {
                 field: "env",
@@ -226,6 +266,35 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
                 index: idx + 1,
                 name: key.clone(),
             });
+        }
+    }
+
+    // Check 4b: each `Spec.env` value is a value node — `EnvLiteral`
+    // or `EnvSecret`. `EnvRef` in `Spec.env` would loop (a reference
+    // resolves *into* `Spec.env`); a phase-only variant would mean
+    // the profile author declared a phase where a value belongs.
+    // An `EnvSecret` value's `name` must appear in `env_secrets`
+    // (the same allowlist a phase-inline secret already goes
+    // through). We build the set once and reuse it for check 6.
+    let declared_secrets: HashSet<&str> = env_secrets.iter().map(String::as_str).collect();
+    for (idx, (key, value)) in env.iter().enumerate() {
+        match value {
+            ProfileNode::EnvLiteral { .. } => {}
+            ProfileNode::EnvSecret { name, .. } => {
+                if !declared_secrets.contains(name.as_str()) {
+                    return Err(ValidateError::UndeclaredEnvSecret {
+                        index: idx + 1,
+                        key: key.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            _ => {
+                return Err(ValidateError::SpecEnvValueShape {
+                    index: idx + 1,
+                    key: key.clone(),
+                });
+            }
         }
     }
 
@@ -248,10 +317,11 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     }
 
     // Check 6: per-phase payload shell-safety + sync/staging route shape
-    // + `env` keyed-slot checks (keys shell-safe, EnvSecret cross-ref).
-    let declared_secrets: HashSet<&str> = env_secrets.iter().map(String::as_str).collect();
+    // + `env` keyed-slot checks (keys shell-safe, EnvSecret cross-ref,
+    // EnvRef name resolvable against `Spec.env`).
+    let declared_env_keys: HashSet<&str> = env.keys().map(String::as_str).collect();
     for (idx, phase) in phases.iter().enumerate() {
-        check_phase(phase, idx + 1, &declared_secrets)?;
+        check_phase(phase, idx + 1, &declared_secrets, &declared_env_keys)?;
     }
 
     // Check 7: service.start names are unique across the profile.
@@ -426,6 +496,7 @@ fn check_phase(
     phase: &ProfileNode,
     index: usize,
     env_secrets: &HashSet<&str>,
+    declared_env_keys: &HashSet<&str>,
 ) -> Result<(), ValidateError> {
     match phase {
         ProfileNode::SystemApt { packages, .. } => {
@@ -440,7 +511,7 @@ fn check_phase(
             check_str_shell_safe(dst, index, "dst", PodId::Forbidden)?;
             check_route(src, RouteShape::UriRoute, index, "src")?;
             check_route(dst, RouteShape::LocalPath, index, "dst")?;
-            check_env_map(env, env_secrets, index)
+            check_env_map(env, env_secrets, declared_env_keys, index)
         }
         ProfileNode::SyncPush { src, dst, .. } => {
             check_str_shell_safe(src, index, "src", PodId::Forbidden)?;
@@ -453,7 +524,7 @@ fn check_phase(
             check_str_shell_safe(dst, index, "dst", PodId::Allowed)?;
             check_route(src, RouteShape::LocalPath, index, "src")?;
             check_route(dst, RouteShape::UriRoute, index, "dst")?;
-            check_env_map(env, env_secrets, index)
+            check_env_map(env, env_secrets, declared_env_keys, index)
         }
         // `service.start`'s `name` has always been shell-safe-checked;
         // `model` and `extra_args` join it now that they reach argv
@@ -484,7 +555,9 @@ fn check_phase(
         ProfileNode::ComfyUiRestart { extra_args, .. } => {
             check_list_shell_safe(extra_args, index, "extra_args")
         }
-        ProfileNode::ShExec { env, .. } => check_env_map(env, env_secrets, index),
+        ProfileNode::ShExec { env, .. } => {
+            check_env_map(env, env_secrets, declared_env_keys, index)
+        }
         // Every remaining variant carries no `shell_safe`-marked field,
         // no route shape, and no `env` slot (`hooks.post_install.script`
         // is the escape exemption; ports / JSON-string payloads /
@@ -508,6 +581,7 @@ fn check_phase(
 fn check_env_map(
     env: &BTreeMap<String, ProfileNode>,
     env_secrets: &HashSet<&str>,
+    declared_env_keys: &HashSet<&str>,
     index: usize,
 ) -> Result<(), ValidateError> {
     for key in env.keys() {
@@ -518,13 +592,30 @@ fn check_env_map(
         }
     }
     for (key, value) in env {
-        if let ProfileNode::EnvSecret { name, .. } = value {
-            if !env_secrets.contains(name.as_str()) {
-                return Err(ValidateError::UndeclaredEnvSecret {
-                    index,
-                    key: key.clone(),
-                    name: name.clone(),
-                });
+        match value {
+            ProfileNode::EnvLiteral { .. } => {}
+            ProfileNode::EnvSecret { name, .. } => {
+                if !env_secrets.contains(name.as_str()) {
+                    return Err(ValidateError::UndeclaredEnvSecret {
+                        index,
+                        key: key.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            ProfileNode::EnvRef { name, .. } => {
+                if !declared_env_keys.contains(name.as_str()) {
+                    return Err(ValidateError::UndeclaredEnvRef {
+                        index,
+                        key: key.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            _ => {
+                return Err(ValidateError::PhaseShape(format!(
+                    "phases[{index}].env[{key}]: value must be EnvLiteral, EnvSecret, or EnvRef"
+                )));
             }
         }
     }
@@ -600,7 +691,11 @@ mod tests {
         spec_full(name, &[], &[], &[], phases)
     }
 
-    /// Build a `Spec` root with explicit declared lists.
+    /// Build a `Spec` root with explicit declared lists. `env` names
+    /// bind to placeholder [`ProfileNode::EnvLiteral`] values —
+    /// validate check 3 / 4 look only at keys, so the values are
+    /// inert for those tests. Cross-check tests that need a specific
+    /// value node build the `Spec` inline.
     fn spec_full(
         name: &str,
         env: &[&str],
@@ -609,13 +704,25 @@ mod tests {
         phases: Vec<ProfileNode>,
     ) -> ProfileNode {
         let ids = IdGen::new();
+        let env_map: BTreeMap<String, ProfileNode> = env
+            .iter()
+            .map(|s| {
+                (
+                    (*s).to_string(),
+                    ProfileNode::EnvLiteral {
+                        id: ids.node(),
+                        value: String::new(),
+                    },
+                )
+            })
+            .collect();
         ProfileNode::Spec {
             id: ids.node(),
             name: name.into(),
             version: None,
             description: None,
             capabilities: Vec::new(),
-            env: env.iter().map(|s| (*s).to_string()).collect(),
+            env: env_map,
             env_secrets: env_secrets.iter().map(|s| (*s).to_string()).collect(),
             paths: paths.iter().map(|s| (*s).to_string()).collect(),
             http_allowlist: Vec::new(),

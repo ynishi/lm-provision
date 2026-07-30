@@ -24,7 +24,8 @@ const TEXT_PROFILE: &str = concat!(
     "description: \"cross-frontend parity fixture\", ",
     // Text frontend declares capabilities in one order …
     "capabilities: [\"sh.exec\", \"fs.write\", \"net.transfer\"], ",
-    "env: [\"HOME\", \"PATH\"], ",
+    // `Spec.env` is a keyed slot now; entries in one key order …
+    "env: {HOME: EnvLiteral(value: \"/root\"), PATH: EnvLiteral(value: \"/usr/local/bin\")}, ",
     "env_secrets: [\"HF_TOKEN\"], ",
     // … and declares paths / http_allowlist in one order …
     "paths: [\"/workspace\", \"/tmp\"], ",
@@ -51,7 +52,13 @@ fn json_profile() -> serde_json::Value {
         "version": "1.2.3",
         "description": "cross-frontend parity fixture",
         "capabilities": ["net.transfer", "sh.exec", "fs.write"],
-        "env": ["PATH", "HOME"],
+        // … and the JSON frontend writes the same entries in reverse
+        // key order, proving Spec.env's keyed slot is normalised
+        // (BTreeMap iteration) the same way the sortable lists are.
+        "env": {
+            "PATH": { "type": "EnvLiteral", "value": "/usr/local/bin" },
+            "HOME": { "type": "EnvLiteral", "value": "/root" }
+        },
         "env_secrets": ["HF_TOKEN"],
         // … and the JSON frontend declares paths / http_allowlist in
         // the reverse order to prove canonical sorts them too.

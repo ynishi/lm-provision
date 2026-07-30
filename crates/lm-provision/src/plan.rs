@@ -122,7 +122,8 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
             // than panic to keep [`expand`] total.
             ProfileNode::Spec { .. }
             | ProfileNode::EnvLiteral { .. }
-            | ProfileNode::EnvSecret { .. } => {}
+            | ProfileNode::EnvSecret { .. }
+            | ProfileNode::EnvRef { .. } => {}
         }
     }
 
@@ -321,6 +322,7 @@ pub(crate) fn kind_of(phase: &ProfileNode) -> &'static str {
         ProfileNode::ServiceReady { .. } => "service.ready",
         ProfileNode::EnvLiteral { .. } => "env.literal",
         ProfileNode::EnvSecret { .. } => "env.secret",
+        ProfileNode::EnvRef { .. } => "env.ref",
         ProfileNode::ShExec { .. } => "sh.exec",
         ProfileNode::FsWrite { .. } => "fs.write",
         ProfileNode::NetHttpGet { .. } => "net.http_get",
@@ -430,7 +432,9 @@ fn payload_of(phase: &ProfileNode) -> Value {
         ProfileNode::MountUmount { path, .. } => json!({ "path": path }),
         // Env value nodes never occur as top-level phases; the arm keeps
         // [`payload_of`] total. Rendered in their `env`-map value form.
-        ProfileNode::EnvLiteral { .. } | ProfileNode::EnvSecret { .. } => env_value(phase),
+        ProfileNode::EnvLiteral { .. }
+        | ProfileNode::EnvSecret { .. }
+        | ProfileNode::EnvRef { .. } => env_value(phase),
     }
 }
 
@@ -468,12 +472,14 @@ fn env_object(env: &BTreeMap<String, ProfileNode>) -> Value {
 
 /// Render one `env`-map value: an [`ProfileNode::EnvLiteral`] as its
 /// plain string, an [`ProfileNode::EnvSecret`] as the
-/// `{"__secret":"NAME"}` marker (mirroring [`crate::canonical`]). Any
-/// other node is a malformed AST the frontend never produces.
+/// `{"__secret":"NAME"}` marker, an [`ProfileNode::EnvRef`] as the
+/// `{"__env_ref":"NAME"}` marker (mirroring [`crate::canonical`]).
+/// Any other node is a malformed AST the frontend never produces.
 fn env_value(node: &ProfileNode) -> Value {
     match node {
         ProfileNode::EnvLiteral { value, .. } => Value::String(value.clone()),
         ProfileNode::EnvSecret { name, .. } => json!({ "__secret": name }),
+        ProfileNode::EnvRef { name, .. } => json!({ "__env_ref": name }),
         _ => Value::Null,
     }
 }
@@ -498,7 +504,7 @@ mod tests {
             version: None,
             description: None,
             capabilities: Vec::new(),
-            env: Vec::new(),
+            env: std::collections::BTreeMap::new(),
             env_secrets: Vec::new(),
             paths: Vec::new(),
             http_allowlist: Vec::new(),

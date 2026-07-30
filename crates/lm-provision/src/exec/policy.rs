@@ -50,44 +50,105 @@ use crate::profile_ast::ProfileNode;
 #[derive(Debug, Clone)]
 pub struct EnvPolicy {
     env_secrets: HashSet<String>,
+    /// Snapshot of the profile-scoped [`ProfileNode::Spec::env`] table:
+    /// name → declared value node. [`ProfileNode::EnvRef`] entries in
+    /// a phase's `env` slot resolve by looking their `name` up here.
+    /// The stored value is the value node the profile declared (an
+    /// [`ProfileNode::EnvLiteral`] carrying its literal string, or an
+    /// [`ProfileNode::EnvSecret`] carrying its logical name), so the
+    /// same resolution semantics apply to an `EnvRef` as would apply
+    /// to an inline value node — the reference does not bypass the
+    /// secret pipe.
+    spec_env: BTreeMap<String, ProfileNode>,
 }
 
 impl EnvPolicy {
-    /// Build a policy from the profile's declared `env_secrets` list.
-    pub fn new(env_secrets: &[String]) -> Self {
+    /// Build a policy from the profile's declared `env_secrets` list
+    /// and the profile-scoped `Spec.env` table.
+    pub fn new(env_secrets: &[String], spec_env: &BTreeMap<String, ProfileNode>) -> Self {
         Self {
             env_secrets: env_secrets.iter().cloned().collect(),
+            spec_env: spec_env.clone(),
         }
     }
 
     /// Resolve a phase `env` keyed slot into a concrete `name → value`
     /// map. Always resolves (spec 06 §Resolution: the caller invokes
     /// this in both modes). Fail-fast on the first offending entry.
+    ///
+    /// An [`ProfileNode::EnvRef`] resolves to the value node stored
+    /// under its `name` in `Spec.env` — an [`ProfileNode::EnvLiteral`]
+    /// yields its literal string, an [`ProfileNode::EnvSecret`] goes
+    /// through the same host-env / `env_secrets` gate an inline
+    /// secret would. Validate already checks
+    /// `EnvRef.name ∈ Spec.env.keys()`, so a lookup miss here is an
+    /// internal error rather than an author mistake.
     pub fn resolve(
         &self,
         env: &BTreeMap<String, ProfileNode>,
     ) -> Result<BTreeMap<String, String>, ExecError> {
         let mut resolved = BTreeMap::new();
         for (key, node) in env {
-            let value = match node {
-                ProfileNode::EnvLiteral { value, .. } => value.clone(),
-                ProfileNode::EnvSecret { name, .. } => {
-                    if !self.env_secrets.contains(name) {
-                        return Err(ExecError::SecretUndeclared { name: name.clone() });
-                    }
-                    std::env::var(name)
-                        .map_err(|_| ExecError::SecretMissingInHostEnv { name: name.clone() })?
-                }
-                other => {
-                    return Err(ExecError::PayloadVariant {
-                        node: other.node_id().0,
-                        expected: "EnvLiteral or EnvSecret",
-                    })
-                }
-            };
+            let value = self.resolve_value(node)?;
             resolved.insert(key.clone(), value);
         }
         Ok(resolved)
+    }
+
+    /// Resolve one value node to its concrete `String`. Shared by the
+    /// keyed-slot walker above and (indirectly, via one hop) an
+    /// [`ProfileNode::EnvRef`] whose target is itself another value
+    /// node — but *not* another [`ProfileNode::EnvRef`]: `Spec.env`
+    /// validate rejects nested references (check 4b), so the recursion
+    /// depth here is bounded at 1.
+    fn resolve_value(&self, node: &ProfileNode) -> Result<String, ExecError> {
+        match node {
+            ProfileNode::EnvLiteral { value, .. } => Ok(value.clone()),
+            ProfileNode::EnvSecret { name, .. } => {
+                if !self.env_secrets.contains(name) {
+                    return Err(ExecError::SecretUndeclared { name: name.clone() });
+                }
+                std::env::var(name)
+                    .map_err(|_| ExecError::SecretMissingInHostEnv { name: name.clone() })
+            }
+            ProfileNode::EnvRef { name, .. } => {
+                let target = self.spec_env.get(name).ok_or_else(|| {
+                    // Validate rejects an unresolvable ref before exec
+                    // ever runs (check 6 UndeclaredEnvRef). Reaching
+                    // here means the AST was built past validate with
+                    // a stale `Spec.env`; treat as an internal wiring
+                    // bug rather than an author-facing secret error.
+                    ExecError::EffectFailed {
+                        op: "env_ref".to_string(),
+                        message: format!(
+                            "env_ref {name:?}: name not present in Spec.env (validate should have rejected)"
+                        ),
+                    }
+                })?;
+                // A nested EnvRef would loop; validate check 4b rules
+                // it out so `resolve_value` here only sees Literal or
+                // Secret. Match explicitly to keep the "recursion
+                // depth is 1" invariant a compile-time property.
+                match target {
+                    ProfileNode::EnvLiteral { value, .. } => Ok(value.clone()),
+                    ProfileNode::EnvSecret { name, .. } => {
+                        if !self.env_secrets.contains(name) {
+                            return Err(ExecError::SecretUndeclared { name: name.clone() });
+                        }
+                        std::env::var(name)
+                            .map_err(|_| ExecError::SecretMissingInHostEnv { name: name.clone() })
+                    }
+                    other => Err(ExecError::PayloadVariant {
+                        node: other.node_id().0,
+                        expected: "EnvLiteral or EnvSecret (in Spec.env)",
+                    }),
+                }
+            }
+            other => Err(ExecError::PayloadVariant {
+                node: other.node_id().0,
+                expected: "EnvLiteral, EnvSecret, or EnvRef",
+            }),
+        }
     }
 }
 
@@ -254,7 +315,7 @@ mod tests {
         let ids = IdGen::new();
         let mut env = BTreeMap::new();
         env.insert("REGION".to_string(), literal(&ids, "us-west"));
-        let policy = EnvPolicy::new(&[]);
+        let policy = EnvPolicy::new(&[], &BTreeMap::new());
 
         let resolved = policy.resolve(&env).expect("literal resolves");
         assert_eq!(resolved.get("REGION").map(String::as_str), Some("us-west"));
@@ -267,7 +328,7 @@ mod tests {
         let ids = IdGen::new();
         let mut env = BTreeMap::new();
         env.insert("SLOT".to_string(), secret(&ids, &var));
-        let policy = EnvPolicy::new(std::slice::from_ref(&var));
+        let policy = EnvPolicy::new(std::slice::from_ref(&var), &BTreeMap::new());
 
         let resolved = policy
             .resolve(&env)
@@ -289,7 +350,7 @@ mod tests {
         let ids = IdGen::new();
         let mut env = BTreeMap::new();
         env.insert("SLOT".to_string(), secret(&ids, &var));
-        let policy = EnvPolicy::new(&[]);
+        let policy = EnvPolicy::new(&[], &BTreeMap::new());
 
         let err = policy
             .resolve(&env)
@@ -312,7 +373,7 @@ mod tests {
         let ids = IdGen::new();
         let mut env = BTreeMap::new();
         env.insert("SLOT".to_string(), secret(&ids, &var));
-        let policy = EnvPolicy::new(std::slice::from_ref(&var));
+        let policy = EnvPolicy::new(std::slice::from_ref(&var), &BTreeMap::new());
 
         let err = policy
             .resolve(&env)
@@ -328,7 +389,7 @@ mod tests {
         let ids = IdGen::new();
         let mut env = BTreeMap::new();
         env.insert("SLOT".to_string(), secret(&ids, "NEVER_SET_SECRET"));
-        let policy = EnvPolicy::new(&["NEVER_SET_SECRET".to_string()]);
+        let policy = EnvPolicy::new(&["NEVER_SET_SECRET".to_string()], &BTreeMap::new());
 
         let err = policy.resolve(&env).expect_err("absent secret fails");
         assert_eq!(
@@ -339,7 +400,7 @@ mod tests {
 
     #[test]
     fn env_empty_map_resolves_to_an_empty_map() {
-        let policy = EnvPolicy::new(&["ANY".to_string()]);
+        let policy = EnvPolicy::new(&["ANY".to_string()], &BTreeMap::new());
         let resolved = policy
             .resolve(&BTreeMap::new())
             .expect("an empty env is a valid no-op");

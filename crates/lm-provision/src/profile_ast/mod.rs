@@ -41,9 +41,21 @@ pub enum ProfileNode {
         description: Option<String>,
         /// Allowed capabilities.
         capabilities: Vec<String>,
-        /// Non-secret env allowlist.
-        env: Vec<String>,
-        /// Secret env allowlist.
+        /// Profile-scoped env / config table: `name → value node`. Every
+        /// value is a [`ProfileNode::EnvLiteral`] (bare literal string)
+        /// or a [`ProfileNode::EnvSecret`] (host-env-resolved secret,
+        /// whose `name` must appear in `env_secrets` below). Phases
+        /// reference an entry by name through [`ProfileNode::EnvRef`]
+        /// in their own `env` keyed slot; validate rejects an
+        /// [`ProfileNode::EnvRef`] whose name is not a key here (spec 03
+        /// §validate check 3'). Empty maps carry no canonical bytes so
+        /// a profile that declares nothing here hashes exactly as it
+        /// did while `env` was a bare allowlist `Vec<String>`.
+        env: BTreeMap<String, ProfileNode>,
+        /// Secret env allowlist (host-env-resolved). A [`ProfileNode::EnvSecret`]
+        /// value — whether stored in [`Spec::env`] above or written
+        /// inline in a phase's `env` — carries a `name` this list must
+        /// contain.
         env_secrets: Vec<String>,
         /// Allowed filesystem path roots. `fs.write` / `mount.*` /
         /// `net.transfer` destinations are rejected when the target
@@ -360,6 +372,29 @@ pub enum ProfileNode {
         /// Logical secret name (must appear in `Spec.env_secrets`).
         name: String,
     },
+
+    /// A reference to an entry in the profile-scoped [`ProfileNode::Spec::env`]
+    /// table. Occurs only as a value in a phase's `env` keyed slot; the
+    /// exec layer resolves it to the value node stored under `name` in
+    /// [`ProfileNode::Spec::env`] (an [`ProfileNode::EnvLiteral`] or an
+    /// [`ProfileNode::EnvSecret`]), preserving that value's resolution
+    /// semantics — a literal is injected verbatim, a secret goes through
+    /// the same host-env / `env_secrets` pipe as an inline
+    /// [`ProfileNode::EnvSecret`] would.
+    ///
+    /// Canonicalizes to `{"__env_ref":"NAME"}`, symmetric with the
+    /// `{"__secret":"NAME"}` marker: the hash covers *which entry is
+    /// referenced*, never the resolved value. [`crate::validate`]
+    /// rejects a reference whose `name` is not a key in
+    /// [`ProfileNode::Spec::env`] (unresolvable at execution time
+    /// otherwise — spec 03 §validate check 3').
+    #[dsl_exec(value)]
+    EnvRef {
+        /// Stable node ID.
+        id: NodeId,
+        /// Entry name in [`ProfileNode::Spec::env`] (must exist there).
+        name: String,
+    },
 }
 
 #[cfg(test)]
@@ -508,7 +543,10 @@ mod tests {
             "version: none, ",
             "description: none, ",
             "capabilities: [\"sh.exec\"], ",
-            "env: [], ",
+            // `Spec.env` is a keyed slot (Multiplicity::Map) now, so
+            // the canonical text spelling is `{}` (empty map), not
+            // `[]` (empty list).
+            "env: {}, ",
             "env_secrets: [], ",
             "paths: [], ",
             "http_allowlist: [], ",

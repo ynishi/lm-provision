@@ -47,7 +47,7 @@ mod tests {
             version: None,
             description: None,
             capabilities: vec!["sh.exec".to_string()],
-            env: Vec::new(),
+            env: std::collections::BTreeMap::new(),
             env_secrets: Vec::new(),
             paths: Vec::new(),
             http_allowlist: Vec::new(),

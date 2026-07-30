@@ -41,7 +41,7 @@ impl ProfileHost {
             version: Some("0.0.0".to_string()),
             description: None,
             capabilities: vec!["sh.exec".to_string(), "net.transfer".to_string()],
-            env: Vec::new(),
+            env: std::collections::BTreeMap::new(),
             env_secrets: Vec::new(),
             // The demo profile only wires lifecycle ops (SystemApt /
             // PythonDeps / PostInstall). Lifecycle ops do not run

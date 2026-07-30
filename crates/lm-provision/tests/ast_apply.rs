@@ -516,6 +516,122 @@ fn cli_apply_ast_step_failure_is_exit_one_with_the_error_on_stderr() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A phase-`env` `EnvRef` must resolve to the value node the profile
+/// declared in `Spec.env` — a literal to its string, a secret through
+/// the same host-env / `env_secrets` pipe an inline reference would go
+/// through. The audit transcript still redacts what the corresponding
+/// inline node would redact (spec 09).
+#[test]
+fn env_ref_resolves_through_spec_env_and_redacts_correctly() {
+    let dir = temp_stem("env-ref");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let target = dir.join("out.txt");
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "env-ref-demo",
+        "capabilities": ["sh.exec", "fs.write"],
+        "paths": [dir_str],
+        "env_secrets": ["ENV_REF_SECRET_TOKEN"],
+        "env": {
+            // A non-sensitive literal shared across phases.
+            "SHARED_MODE": { "type": "EnvLiteral", "value": "must-not-appear-anywhere" },
+            // A secret whose logical name is sensitive-shaped, so the
+            // audit event redacts *and* the resolved value never leaks.
+            "SHARED_TOKEN": { "type": "EnvSecret", "name": "ENV_REF_SECRET_TOKEN" }
+        },
+        "phases": [
+            {
+                "type": "ShExec",
+                "argv": ["true"],
+                "env": {
+                    "MODE": { "type": "EnvRef", "name": "SHARED_MODE" },
+                    "TOKEN": { "type": "EnvRef", "name": "SHARED_TOKEN" }
+                }
+            },
+            { "type": "FsWrite", "path": target.to_string_lossy(), "content": "written" }
+        ]
+    });
+    let path = write_json_profile("env-ref", &profile);
+
+    let output = bin()
+        .args(["apply", path.to_str().unwrap()])
+        .env(
+            "ENV_REF_SECRET_TOKEN",
+            "super-secret-token-value-that-must-not-leak",
+        )
+        .output()
+        .expect("process runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Value on either side of the reference must never leak.
+    assert!(
+        !stderr.contains("super-secret-token-value-that-must-not-leak"),
+        "resolved secret must never appear on the audit transcript: {stderr}"
+    );
+    assert!(
+        !stderr.contains("must-not-appear-anywhere"),
+        "no env value ever reaches the transcript, sensitive or not: {stderr}"
+    );
+    // The redaction marker applies to the *slot* key name in the
+    // phase's env: `TOKEN` is sensitive-shaped, `MODE` is not.
+    assert!(
+        stderr.contains("TOKEN [REDACTED]"),
+        "sensitive slot name still marks [REDACTED] even when the value is a reference: {stderr}"
+    );
+    assert!(
+        stderr.contains("MODE"),
+        "non-sensitive slot name appears verbatim: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+/// Validate rejects a phase `EnvRef` whose `name` is not declared in
+/// `Spec.env` — the CLI surfaces the rejection before any effect runs.
+#[test]
+fn env_ref_to_an_undeclared_spec_env_key_is_rejected_at_validate() {
+    let profile = json!({
+        "type": "Spec",
+        "name": "env-ref-bad",
+        "capabilities": ["sh.exec"],
+        "env": {
+            "KNOWN": { "type": "EnvLiteral", "value": "yes" }
+        },
+        "phases": [
+            {
+                "type": "ShExec",
+                "argv": ["true"],
+                "env": {
+                    "SLOT": { "type": "EnvRef", "name": "UNKNOWN" }
+                }
+            }
+        ]
+    });
+    let path = write_json_profile("env-ref-bad", &profile);
+
+    let output = bin()
+        .args(["validate", path.to_str().unwrap()])
+        .output()
+        .expect("process runs");
+    assert_ne!(output.status.code(), Some(0), "validate must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("UNKNOWN") && stderr.contains("Spec.env"),
+        "validate error names the undeclared reference and its intended lookup surface: {stderr}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 // ---------------------------------------------------------------------
 // Audit transcript on stderr (spec 09 §Audit log).
 // ---------------------------------------------------------------------

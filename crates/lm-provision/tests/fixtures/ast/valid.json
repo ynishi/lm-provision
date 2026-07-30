@@ -4,7 +4,10 @@
   "version": "1.0.0",
   "description": "AST frontend fixture (JSON form)",
   "capabilities": ["sh.exec", "fs.write"],
-  "env": ["HOME", "PATH"],
+  "env": {
+    "HOME": { "type": "EnvLiteral", "value": "/root" },
+    "PATH": { "type": "EnvLiteral", "value": "/usr/local/bin:/usr/bin" }
+  },
   "env_secrets": ["HF_TOKEN"],
   "phases": [
     { "type": "SystemApt", "packages": ["git", "curl"] },

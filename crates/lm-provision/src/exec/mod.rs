@@ -182,30 +182,51 @@ impl ExecContext {
         mode: ExecMode,
         log: Arc<Mutex<Vec<String>>>,
     ) -> Result<Self, ExecError> {
-        let (declared, paths, http_allowlist, env_secrets): (
-            Vec<String>,
-            Vec<String>,
-            Vec<String>,
-            Vec<String>,
-        ) = match root {
+        // Extract the five `Spec`-scoped declarations the context
+        // needs, or empty defaults when `root` is not a `Spec` (the
+        // frontend never produces such a root today, but the exec
+        // context stays total).
+        struct SpecDecls {
+            capabilities: Vec<String>,
+            paths: Vec<String>,
+            http_allowlist: Vec<String>,
+            env_secrets: Vec<String>,
+            env: std::collections::BTreeMap<String, ProfileNode>,
+        }
+        let decls = match root {
             ProfileNode::Spec {
                 capabilities,
                 paths,
                 http_allowlist,
                 env_secrets,
+                env,
                 ..
-            } => (
-                capabilities.clone(),
-                paths.clone(),
-                http_allowlist.clone(),
-                env_secrets.clone(),
-            ),
-            _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            } => SpecDecls {
+                capabilities: capabilities.clone(),
+                paths: paths.clone(),
+                http_allowlist: http_allowlist.clone(),
+                env_secrets: env_secrets.clone(),
+                env: env.clone(),
+            },
+            _ => SpecDecls {
+                capabilities: Vec::new(),
+                paths: Vec::new(),
+                http_allowlist: Vec::new(),
+                env_secrets: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+            },
         };
+        let SpecDecls {
+            capabilities: declared,
+            paths,
+            http_allowlist,
+            env_secrets,
+            env: spec_env,
+        } = decls;
         let gate = capgate::CapabilityGate::build(&declared)?;
         let path_policy = policy::PathPolicy::new(&paths);
         let http_policy = policy::HttpPolicy::new(&http_allowlist);
-        let env_policy = policy::EnvPolicy::new(&env_secrets);
+        let env_policy = policy::EnvPolicy::new(&env_secrets, &spec_env);
         let payloads = Arc::new(payload::build_payload_map(root));
 
         // Label every top-level phase with its 1-based declaration index

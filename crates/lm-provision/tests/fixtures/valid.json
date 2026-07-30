@@ -3,7 +3,9 @@
   "name": "demo-valid",
   "version": "1.0.0",
   "capabilities": ["sh.exec", "fs.write"],
-  "env": ["LOG_LEVEL"],
+  "env": {
+    "LOG_LEVEL": { "type": "EnvLiteral", "value": "info" }
+  },
   "env_secrets": ["HF_TOKEN"],
   "paths": ["/workspace"],
   "phases": [

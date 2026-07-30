@@ -1,5 +1,5 @@
 {
   "type": "Spec",
   "name": "demo-invalid",
-  "env": ["MY_TOKEN"]
+  "env": { "MY_TOKEN": { "type": "EnvLiteral", "value": "x" } }
 }

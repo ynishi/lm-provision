@@ -116,7 +116,15 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             insert_optional_str(&mut fields, "version", version);
             insert_optional_str(&mut fields, "description", description);
             fields.insert("capabilities".into(), sorted_string_array(capabilities));
-            fields.insert("env".into(), sorted_string_array(env));
+            // Spec.env: keyed slot of `EnvLiteral` / `EnvSecret` value
+            // nodes. Empty maps are omitted so a profile that declares
+            // no entries here hashes exactly as it did while `env` was
+            // a bare allowlist `Vec<String>` — the old declaration form
+            // hashed as `"env":[]` which the omit-when-empty rule
+            // matches for empty maps too (a profile that carried names
+            // in the old `Vec` will re-hash under this shape, which is
+            // the intended shape change; the field had no consumer).
+            insert_env(&mut fields, env);
             fields.insert("env_secrets".into(), sorted_string_array(env_secrets));
             fields.insert("http_allowlist".into(), sorted_string_array(http_allowlist));
             fields.insert("paths".into(), sorted_string_array(paths));
@@ -324,13 +332,21 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
         }
 
         // Env value nodes: an `EnvLiteral` is its bare string; an
-        // `EnvSecret` is the `{"__secret":"NAME"}` marker. These arms
-        // are reached through [`insert_env`] (they never occur as
-        // top-level phases).
+        // `EnvSecret` is the `{"__secret":"NAME"}` marker; an
+        // `EnvRef` is the `{"__env_ref":"NAME"}` marker (symmetric
+        // with `__secret` so a consumer can spot references without
+        // resolving them). These arms are reached through
+        // [`insert_env`] and the [`Spec::env`] slot — they never
+        // occur as top-level phases.
         ProfileNode::EnvLiteral { id: _, value } => CanonValue::Str(value.clone()),
         ProfileNode::EnvSecret { id: _, name } => {
             let mut marker = BTreeMap::new();
             marker.insert("__secret".into(), CanonValue::Str(name.clone()));
+            CanonValue::Object(marker)
+        }
+        ProfileNode::EnvRef { id: _, name } => {
+            let mut marker = BTreeMap::new();
+            marker.insert("__env_ref".into(), CanonValue::Str(name.clone()));
             CanonValue::Object(marker)
         }
     }
@@ -481,7 +497,7 @@ mod tests {
             version: None,
             description: None,
             capabilities: vec![],
-            env: vec![],
+            env: BTreeMap::new(),
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
@@ -509,13 +525,18 @@ mod tests {
     fn declared_lists_are_sorted_lexicographically() {
         let gen = IdGen::new();
 
+        // `Spec.env` is now a keyed map (BTreeMap iteration is already
+        // lexicographic by key), so its ordering guarantee is inherent
+        // rather than sort-on-encode. The other four declared lists
+        // are still Vec<String> and the encoder sorts them before
+        // emission, so the parity check runs over those.
         let a = ProfileNode::Spec {
             id: new_id(&gen),
             name: "p".into(),
             version: None,
             description: None,
             capabilities: vec!["net.transfer".into(), "sh.exec".into()],
-            env: vec!["FOO".into(), "BAR".into()],
+            env: BTreeMap::new(),
             env_secrets: vec!["S2".into(), "S1".into()],
             paths: vec!["/workspace".into(), "/tmp".into()],
             http_allowlist: vec!["https://b.example/".into(), "https://a.example/".into()],
@@ -527,7 +548,7 @@ mod tests {
             version: None,
             description: None,
             capabilities: vec!["sh.exec".into(), "net.transfer".into()],
-            env: vec!["BAR".into(), "FOO".into()],
+            env: BTreeMap::new(),
             env_secrets: vec!["S1".into(), "S2".into()],
             paths: vec!["/tmp".into(), "/workspace".into()],
             http_allowlist: vec!["https://a.example/".into(), "https://b.example/".into()],
@@ -555,7 +576,7 @@ mod tests {
             version: None,
             description: None,
             capabilities: vec![],
-            env: vec![],
+            env: BTreeMap::new(),
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
@@ -567,7 +588,7 @@ mod tests {
             version: None,
             description: None,
             capabilities: vec![],
-            env: vec![],
+            env: BTreeMap::new(),
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
@@ -593,7 +614,7 @@ mod tests {
             version: Some("1.0.0".into()),
             description: Some("d".into()),
             capabilities: vec![],
-            env: vec![],
+            env: BTreeMap::new(),
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
@@ -609,11 +630,61 @@ mod tests {
         let gen = IdGen::new();
         let bytes = encode(&empty_spec(&gen, "p"));
         assert!(bytes.contains("\"capabilities\":[]"), "bytes: {bytes}");
-        assert!(bytes.contains("\"env\":[]"), "bytes: {bytes}");
         assert!(bytes.contains("\"env_secrets\":[]"), "bytes: {bytes}");
         assert!(bytes.contains("\"http_allowlist\":[]"), "bytes: {bytes}");
         assert!(bytes.contains("\"paths\":[]"), "bytes: {bytes}");
         assert!(bytes.contains("\"phases\":[]"), "bytes: {bytes}");
+        // `Spec.env` is a keyed map now, not a Vec — empty maps are
+        // omitted from the canonical so a profile that declares no
+        // env-table entries keeps the pre-migration hash.
+        assert!(
+            !bytes.contains("\"env\":"),
+            "empty Spec.env must be omitted from canonical: {bytes}"
+        );
+    }
+
+    /// A populated `Spec.env` encodes as a keyed object whose values
+    /// follow the same `EnvLiteral` / `EnvSecret` / `EnvRef` shape as
+    /// the per-phase env slots (marker for the reference / secret
+    /// nodes, bare string for the literal).
+    #[test]
+    fn populated_spec_env_encodes_as_a_keyed_object() {
+        let gen = IdGen::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "LOG_LEVEL".to_string(),
+            ProfileNode::EnvLiteral {
+                id: new_id(&gen),
+                value: "info".into(),
+            },
+        );
+        env.insert(
+            "HF_TOKEN".to_string(),
+            ProfileNode::EnvSecret {
+                id: new_id(&gen),
+                name: "HF_TOKEN".into(),
+            },
+        );
+        let node = ProfileNode::Spec {
+            id: new_id(&gen),
+            name: "p".into(),
+            version: None,
+            description: None,
+            capabilities: vec![],
+            env,
+            env_secrets: vec!["HF_TOKEN".into()],
+            paths: vec![],
+            http_allowlist: vec![],
+            phases: vec![],
+        };
+        let bytes = encode(&node);
+        // BTreeMap key iteration is lexicographic; HF_TOKEN < LOG_LEVEL.
+        assert!(
+            bytes.contains(
+                "\"env\":{\"HF_TOKEN\":{\"__secret\":\"HF_TOKEN\"},\"LOG_LEVEL\":\"info\"}"
+            ),
+            "bytes: {bytes}"
+        );
     }
 
     #[test]
@@ -646,7 +717,7 @@ mod tests {
             version: None,
             description: None,
             capabilities: vec!["sh.exec".into()],
-            env: vec![],
+            env: BTreeMap::new(),
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
@@ -669,7 +740,7 @@ mod tests {
         let expected = concat!(
             "{",
             "\"capabilities\":[\"sh.exec\"],",
-            "\"env\":[],",
+            // `Spec.env` omitted: empty keyed map, so no key emitted.
             "\"env_secrets\":[],",
             "\"http_allowlist\":[],",
             "\"name\":\"demo\",",
@@ -707,7 +778,7 @@ mod tests {
         let expected_bytes = concat!(
             "{",
             "\"capabilities\":[],",
-            "\"env\":[],",
+            // `Spec.env` omitted (empty keyed map).
             "\"env_secrets\":[],",
             "\"http_allowlist\":[],",
             "\"name\":\"p\",",
@@ -738,7 +809,7 @@ mod tests {
             version: None,
             description: None,
             capabilities: vec![],
-            env: vec![],
+            env: BTreeMap::new(),
             env_secrets: vec![],
             paths: vec!["/workspace".into(), "/tmp".into()],
             http_allowlist: vec![

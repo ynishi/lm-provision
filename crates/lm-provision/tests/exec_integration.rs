@@ -37,7 +37,7 @@ fn an_undeclared_capability_fails_the_op_even_in_dry_run() {
         version: None,
         description: None,
         capabilities: Vec::new(),
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // sh_exec does not consult path / http policy, so the empty
         // allowlists are fine for this fixture — the point is that the
@@ -91,7 +91,7 @@ fn dry_run_traces_every_direct_op() {
             "mount.bind".to_string(),
             "mount.umount".to_string(),
         ],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // Declared roots cover every filesystem target the phases
         // touch (FsWrite path, NetTransfer dst, MountBind src / dst,
@@ -178,7 +178,7 @@ fn real_mode_runs_sh_exec_and_summarises_the_result() {
         version: None,
         description: None,
         capabilities: vec!["sh.exec".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // sh_exec has no path / URL surface, so the empty allowlists
         // are inert here.
@@ -237,7 +237,7 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
         version: None,
         description: None,
         capabilities: vec!["sh.exec".to_string(), "net.transfer".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // Lifecycle ops do not run through the direct-op path / URL
         // policy check (spec 07 §"lifecycle op internal steps" is
@@ -373,7 +373,7 @@ fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
         version: None,
         description: None,
         capabilities: vec!["net.transfer".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         paths: Vec::new(),
         http_allowlist: Vec::new(),
@@ -429,7 +429,7 @@ fn sh_exec_undeclared_secret_fails_in_dry_run() {
         version: None,
         description: None,
         capabilities: vec!["sh.exec".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         // env_secrets is EMPTY: HF_TOKEN is referenced but not declared.
         env_secrets: Vec::new(),
         paths: Vec::new(),
@@ -479,7 +479,7 @@ fn sh_exec_injects_a_declared_secret_into_the_child_in_real_mode() {
         version: None,
         description: None,
         capabilities: vec!["sh.exec".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: vec![var.clone()],
         paths: Vec::new(),
         http_allowlist: Vec::new(),
@@ -544,7 +544,7 @@ fn comfyui_health_polls_a_local_server_when_executing_effects() {
         version: None,
         description: None,
         capabilities: vec!["sh.exec".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // ComfyUiHealth is a lifecycle op; the direct-op HTTP policy
         // does not gate its internal poll (see the lifecycle carry
@@ -587,7 +587,7 @@ fn fs_write_to_an_undeclared_path_root_fails_in_dry_run() {
         version: None,
         description: None,
         capabilities: vec!["fs.write".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // Capability is declared but the path allowlist is empty:
         // policy denies even before the dry-run trace is recorded.
@@ -631,7 +631,7 @@ fn fs_write_under_a_declared_path_root_traces_in_dry_run() {
         version: None,
         description: None,
         capabilities: vec!["fs.write".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         paths: vec!["/tmp".to_string()],
         http_allowlist: Vec::new(),
@@ -664,7 +664,7 @@ fn http_get_to_an_undeclared_url_fails_in_dry_run() {
         version: None,
         description: None,
         capabilities: vec!["net.http_get".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         paths: Vec::new(),
         http_allowlist: Vec::new(),
@@ -702,7 +702,7 @@ fn net_transfer_denies_when_the_http_source_is_not_allowlisted() {
         version: None,
         description: None,
         capabilities: vec!["net.transfer".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // Path is declared but HTTP source is not.
         paths: vec!["/tmp".to_string()],
@@ -740,7 +740,7 @@ fn mount_bind_denies_when_only_the_source_is_declared() {
         version: None,
         description: None,
         capabilities: vec!["mount.bind".to_string()],
-        env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         paths: vec!["/src".to_string()],
         http_allowlist: Vec::new(),
