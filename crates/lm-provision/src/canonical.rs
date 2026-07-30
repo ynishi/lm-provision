@@ -52,7 +52,7 @@
 //! Decode is out of scope: the current ledger persists JSON Lines and
 //! does not require canonical→AST reconstruction.
 
-use crate::dsl_poc::ProfileNode;
+use crate::profile_ast::ProfileNode;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 

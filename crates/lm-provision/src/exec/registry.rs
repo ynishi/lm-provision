@@ -26,7 +26,7 @@ use std::sync::Arc;
 use dsl_kit::{EngineError, NodeContext, NodeId, Op, OpRegistry, Path};
 
 use super::{audit, effects, lifecycle, report::StepReport, ExecContext, ExecError, ExecMode};
-use crate::dsl_poc::{ProfileNode, ProfileValue};
+use crate::profile_ast::{ProfileNode, ProfileValue};
 
 /// The seven direct ops with real effect wiring.
 const DIRECT_OPS: [&str; 7] = [

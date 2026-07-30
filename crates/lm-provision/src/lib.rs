@@ -3,7 +3,7 @@
 //! ## Architecture
 //!
 //! A spec-first pod provisioner built entirely in Rust around a typed
-//! [`dsl_poc::ProfileNode`] AST. A profile is authored as JSON or the
+//! [`profile_ast::ProfileNode`] AST. A profile is authored as JSON or the
 //! canonical text form, parsed into the AST by the [`frontend`], and then
 //! run through the read-only pipeline stages (validate / canonical / hash
 //! / plan) or the effectful [`exec`] engine (apply). There is no embedded
@@ -15,13 +15,14 @@
 //!
 //! - [`frontend`] — parse a profile file (`.json` → serde bridge,
 //!   canonical text → PEG grammar, `.lua` → explicit rejection) into a
-//!   [`dsl_poc::ProfileNode`] AST.
-//! - [`dsl_poc`] — the `ProfileNode` AST (spec + the 22 phase catalog
-//!   kinds) and the dsl-kit engine wiring that drives execution.
+//!   [`profile_ast::ProfileNode`] AST.
+//! - [`profile_ast`] — the `ProfileNode` AST (spec + the 22 phase catalog
+//!   kinds), the semantics adapter (`ProfileSemantics` / `ProfileValue`),
+//!   and the dsl-kit engine wiring that drives execution.
 //! - [`validate`] — the AST validate stage (03-pipeline-stage-artifacts.md
 //!   §validate).
 //! - [`canonical`] — deterministic byte encoder + SHA-256 profile hash
-//!   over the [`dsl_poc::ProfileNode`] AST
+//!   over the [`profile_ast::ProfileNode`] AST
 //!   (03-pipeline-stage-artifacts.md §canonical / §hash). Frontend-
 //!   independent by construction: `NodeId` is excluded, declared lists
 //!   are sorted, phase order preserved.
@@ -50,8 +51,8 @@
 pub mod apply;
 pub mod canonical;
 pub mod cli;
-pub mod dsl_poc;
 pub mod exec;
 pub mod frontend;
 pub mod plan;
+pub mod profile_ast;
 pub mod validate;

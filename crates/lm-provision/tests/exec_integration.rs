@@ -6,8 +6,8 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 
 use dsl_kit::{Engine, EngineError, ExecError, IdGen, StepOutcome, Stepper};
-use lm_provision::dsl_poc::{create_profile_engine, ProfileAst, ProfileNode};
 use lm_provision::exec::ExecMode;
+use lm_provision::profile_ast::{create_profile_engine, ProfileAst, ProfileNode};
 
 /// Drive the engine to `Done`, surfacing the first step error.
 ///

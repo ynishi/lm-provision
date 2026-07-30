@@ -56,7 +56,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::dsl_poc::ProfileNode;
+use crate::profile_ast::ProfileNode;
 
 /// Secret-shaped-key substrings (check 3), the frozen eight-entry set
 /// from 06-secret-handling.md §Inputs "Profile declarations" /

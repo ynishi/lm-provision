@@ -23,15 +23,15 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
-use crate::dsl_poc::ProfileNode;
+use crate::profile_ast::ProfileNode;
 
-/// Default port used when [`crate::dsl_poc::ProfileNode::ComfyUiRestart`]
-/// or [`crate::dsl_poc::ProfileNode::ComfyUiHealth`] is implicitly
+/// Default port used when [`crate::profile_ast::ProfileNode::ComfyUiRestart`]
+/// or [`crate::profile_ast::ProfileNode::ComfyUiHealth`] is implicitly
 /// inserted (`02-phase-catalog.md` §Canonical phase ordering).
 const DEFAULT_COMFYUI_PORT: u16 = 8188;
 
 /// Default `want` value that suppresses the
-/// [`crate::dsl_poc::ProfileNode::PythonVersionCheck`] step
+/// [`crate::profile_ast::ProfileNode::PythonVersionCheck`] step
 /// (`02-phase-catalog.md` §Catalog kinds `python.version_check`).
 const DEFAULT_PYTHON_VERSION_WANT: &str = "3.12";
 

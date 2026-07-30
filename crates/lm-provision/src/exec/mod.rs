@@ -1,6 +1,6 @@
 //! mlua-free execution layer for the `ProfileNode` DSL (backlog D).
 //!
-//! Replaces the `dsl_poc` mock `OpRegistry` (which only pushed the op
+//! Replaces the `profile_ast` mock `OpRegistry` (which only pushed the op
 //! name onto a log) with a real bridge: [`capgate`] enforces the
 //! declared-capability contract, [`payload`] recovers each node's
 //! payload from the AST (dsl-kit does not pass leaf payloads into
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use dsl_kit::NodeId;
 
-use crate::dsl_poc::ProfileNode;
+use crate::profile_ast::ProfileNode;
 
 pub mod audit;
 pub mod capgate;

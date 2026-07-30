@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use super::{effects, ExecError};
-use crate::dsl_poc::ProfileNode;
+use crate::profile_ast::ProfileNode;
 
 /// ComfyUI clone target (spec 02 §Built-in path constants).
 const COMFYUI_INSTALL_DIR: &str = "/workspace/ComfyUI";

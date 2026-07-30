@@ -1,12 +1,29 @@
-//! Provisioning Profile DSL defined using dsl-kit with dsl-kit-core Engine Integration.
+//! The `ProfileNode` AST: the top-level `Spec` and the 22 phase catalog
+//! kinds (spec 02).
+//!
+//! Sibling modules:
+//!
+//! - [`semantics`] — the [`ProfileValue`] result type, the
+//!   [`ProfileSemantics`] dsl-kit-core adapter, and the [`ProfileAst`]
+//!   type alias.
+//! - [`engine`] — the two [`create_profile_engine`] / [`create_profile_engine_collecting`]
+//!   constructors that wire an AST + [`ProfileSemantics`] onto the
+//!   [`crate::exec`] bridge.
+//!
+//! The enum stays here (not `node.rs`) because it is the module's
+//! defining shape: `mod.rs` = `ProfileNode`, the two neighbours =
+//! everything downstream of it.
 
-use dsl_kit::{
-    DslExec as DslExecTrait, DslSemantics, Engine, LoopDecision, NodeId, OwnedDerivedAst,
-    ReducerRegistry,
-};
-use dsl_kit_macros::{DslBuild, DslExec, DslNode, DslSchema};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+
+use dsl_kit::NodeId;
+use dsl_kit_macros::{DslBuild, DslExec, DslNode, DslSchema};
+
+pub mod engine;
+pub mod semantics;
+
+pub use engine::{create_profile_engine, create_profile_engine_collecting};
+pub use semantics::{ProfileAst, ProfileSemantics, ProfileValue};
 
 /// Unified AST for provision profile declarations and 22 Phase catalog kinds (`02-phase-catalog.md`).
 #[derive(Debug, Clone, PartialEq, Eq, DslNode, DslSchema, DslBuild, DslExec)]
@@ -345,103 +362,10 @@ pub enum ProfileNode {
     },
 }
 
-/// Execution value type for provision phases.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProfileValue {
-    /// Unit result indicating successful execution of a phase step.
-    Success(String),
-}
-
-impl From<()> for ProfileValue {
-    fn from(_: ()) -> Self {
-        ProfileValue::Success("ok".into())
-    }
-}
-
-/// Literal env value nodes ([`ProfileNode::EnvLiteral`] /
-/// [`ProfileNode::EnvSecret`]) carry a `String` `LitValue`; the engine
-/// converts it into a [`ProfileValue`] when it evaluates the leaf. The
-/// value is inert (exec-time env injection is deferred, spec 02
-/// §Dispatch routing), so the string is wrapped as a success marker.
-impl From<String> for ProfileValue {
-    fn from(value: String) -> Self {
-        ProfileValue::Success(value)
-    }
-}
-
-/// Semantics adapter for provisioning AST execution under dsl-kit-core.
-#[derive(Debug, Clone, Copy)]
-pub struct ProfileSemantics;
-
-impl DslSemantics for ProfileSemantics {
-    type Value = ProfileValue;
-    type Delta = ();
-    type EffectError = std::convert::Infallible;
-    type Cursor = ();
-
-    fn unit_value(&self) -> ProfileValue {
-        ProfileValue::Success("ok".into())
-    }
-
-    fn continue_loop(
-        &self,
-        _node: NodeId,
-        _last: &ProfileValue,
-        _iteration: usize,
-    ) -> LoopDecision {
-        LoopDecision::Break
-    }
-}
-
-/// Owned AST projection: the engine borrows nothing, so hosts can hold
-/// program and engine together without `Box::leak`.
-pub type ProfileAst = OwnedDerivedAst<<ProfileNode as DslExecTrait>::LitValue, ProfileSemantics>;
-
-/// Instantiates a dsl-kit-core Engine driving real execution of a
-/// `ProfileNode` AST through the [`crate::exec`] bridge.
-///
-/// `mode` selects dry-run tracing vs real effects; `executed_log`
-/// collects each op's trace line / result summary. Construction fails
-/// with [`crate::exec::ExecError`] only when the profile declares a
-/// capability outside [`crate::exec::capgate::KNOWN_CAPABILITIES`]; the
-/// engine wiring itself is a host invariant and is asserted.
-pub fn create_profile_engine(
-    root: &ProfileNode,
-    mode: crate::exec::ExecMode,
-    executed_log: Arc<std::sync::Mutex<Vec<String>>>,
-) -> Result<Engine<ProfileAst>, crate::exec::ExecError> {
-    Ok(create_profile_engine_collecting(root, mode, executed_log)?.0)
-}
-
-/// Like [`create_profile_engine`], but also returns a handle to the
-/// shared structured per-step report collection
-/// ([`crate::exec::report::StepReport`]) the op handlers append to as
-/// they run. The AST `apply` subcommand ([`crate::apply::run_apply_ast`])
-/// drives the returned engine and then reads this handle to build the
-/// apply report; the plain [`create_profile_engine`] discards it for the
-/// trace-log-only call sites (integration tests, the POC path).
-pub fn create_profile_engine_collecting(
-    root: &ProfileNode,
-    mode: crate::exec::ExecMode,
-    executed_log: Arc<std::sync::Mutex<Vec<String>>>,
-) -> Result<(Engine<ProfileAst>, crate::exec::report::SharedReports), crate::exec::ExecError> {
-    let ctx = Arc::new(crate::exec::ExecContext::from_root(
-        root,
-        mode,
-        executed_log,
-    )?);
-    let reports = ctx.reports_handle();
-    let engine = Engine::new_with_ops(
-        OwnedDerivedAst::new(root, ProfileSemantics),
-        Arc::new(ReducerRegistry::new()),
-        crate::exec::registry::profile_op_registry(Arc::clone(&ctx)),
-    )
-    .expect("Engine initialization should succeed");
-    Ok((engine, reports))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::exec::ExecMode;
     use dsl_kit::{IdGen, StepOutcome, Stepper};

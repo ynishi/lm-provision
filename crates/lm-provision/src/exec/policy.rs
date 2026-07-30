@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use dsl_kit::DslNode as _;
 
 use super::ExecError;
-use crate::dsl_poc::ProfileNode;
+use crate::profile_ast::ProfileNode;
 
 /// Secret-injection policy derived from `profile.env_secrets`.
 ///

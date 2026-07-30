@@ -11,7 +11,7 @@ use dsl_kit::{IdGen, NodeId};
 use dsl_kit_parse::{peg::Grammar, serde_bridge::from_json_value, DslBuild as _};
 use dsl_kit_schema::DslSchema as _;
 use lm_provision::canonical;
-use lm_provision::dsl_poc::ProfileNode;
+use lm_provision::profile_ast::ProfileNode;
 
 /// Same logical profile, but the two frontends declare the sortable
 /// lists in different order — the canonical encoder normalises both,

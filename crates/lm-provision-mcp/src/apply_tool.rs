@@ -35,8 +35,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use lm_provision::dsl_poc::ProfileNode;
 use lm_provision::frontend::load_profile;
+use lm_provision::profile_ast::ProfileNode;
 use lm_provision_driver::driver::{self, DriverError};
 use lm_provision_driver::ledger::{self, LedgerRow};
 use lm_provision_driver::local_exec::LocalExecTransport;

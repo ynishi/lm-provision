@@ -2,7 +2,7 @@
 //!
 //! `validate` / `hash` / `plan` each run the read-only pipeline stages
 //! 07-cli.md §Invocation names for that subcommand over the
-//! [`crate::dsl_poc::ProfileNode`] AST produced by
+//! [`crate::profile_ast::ProfileNode`] AST produced by
 //! [`crate::frontend::load_profile`] — no effect is run for these three
 //! subcommands, matching their "none (read-only)" effects column in 07
 //! §Invocation. `apply` (07 §Invocation: "load → declarations → gate →
@@ -149,11 +149,11 @@ fn print_json(value: &serde_json::Value) {
 
 /// `validate <profile>` pipeline (07-cli.md §Invocation: load →
 /// declarations → validate). Load the profile into a
-/// [`crate::dsl_poc::ProfileNode`] AST, run the AST validate checks
+/// [`crate::profile_ast::ProfileNode`] AST, run the AST validate checks
 /// ([`crate::validate::validate`], the port of the legacy
 /// `lm.validate.validate`), and return the validated profile name read
 /// off the `Spec` node. A successful validate guarantees the root is a
-/// [`crate::dsl_poc::ProfileNode::Spec`].
+/// [`crate::profile_ast::ProfileNode::Spec`].
 ///
 /// `pub` so [`lm-provision-mcp`'s `lm_validate` tool][../../lm-provision-mcp]
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
@@ -161,7 +161,7 @@ pub fn ast_validate(profile: &Path) -> PipelineResult<String> {
     let node = crate::frontend::load_profile(profile)?;
     crate::validate::validate(&node)?;
     let name = match &node {
-        crate::dsl_poc::ProfileNode::Spec { name, .. } => name.clone(),
+        crate::profile_ast::ProfileNode::Spec { name, .. } => name.clone(),
         // Unreachable: `validate` returns `Err(NotSpec)` for any other
         // root, so `?` above already returned. Kept total.
         _ => String::new(),

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use dsl_kit::{DslNode, NodeId, Walk};
 
-use crate::dsl_poc::ProfileNode;
+use crate::profile_ast::ProfileNode;
 
 /// Walk `root` depth-first and return a `NodeId -> ProfileNode` map
 /// containing every node (root included), each cloned by value.

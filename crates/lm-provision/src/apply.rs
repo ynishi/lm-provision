@@ -2,7 +2,7 @@
 //! (09-apply-report-and-ledger.md).
 //!
 //! [`run_apply_ast`] loads a profile file into a
-//! [`crate::dsl_poc::ProfileNode`] AST ([`crate::frontend::load_profile`])
+//! [`crate::profile_ast::ProfileNode`] AST ([`crate::frontend::load_profile`])
 //! and drives the pure-Rust [`crate::exec`] engine over it, collecting
 //! one structured [`crate::exec::report::StepReport`] per executed op into
 //! the apply report artifact (09 §Outputs "Apply report"), returned as a
@@ -69,12 +69,13 @@ pub fn run_apply_ast(profile: &Path, dry_run: bool) -> Result<String, AstApplyEr
     };
 
     let log = Arc::new(Mutex::new(Vec::new()));
-    let (mut engine, reports) = crate::dsl_poc::create_profile_engine_collecting(&root, mode, log)?;
+    let (mut engine, reports) =
+        crate::profile_ast::create_profile_engine_collecting(&root, mode, log)?;
     let run_result = drive(&mut engine);
 
     let steps = reports.lock().unwrap().clone();
     let profile_name = match &root {
-        crate::dsl_poc::ProfileNode::Spec { name, .. } => name.clone(),
+        crate::profile_ast::ProfileNode::Spec { name, .. } => name.clone(),
         // The frontend only ever produces a `Spec` root; keep total.
         _ => String::new(),
     };
@@ -103,7 +104,7 @@ pub fn run_apply_ast(profile: &Path, dry_run: bool) -> Result<String, AstApplyEr
 /// Drive the engine to completion, returning `Ok(())` on `Done` or the
 /// rendered engine error on the first failing step (the per-step report
 /// already carries the machine-readable detail).
-fn drive(engine: &mut dsl_kit::Engine<crate::dsl_poc::ProfileAst>) -> Result<(), String> {
+fn drive(engine: &mut dsl_kit::Engine<crate::profile_ast::ProfileAst>) -> Result<(), String> {
     use dsl_kit::{StepOutcome, Stepper};
 
     let mut steps = 0u32;

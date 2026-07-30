@@ -5,8 +5,8 @@ use dsl_kit_mcp::host::{
     DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, PendingProjection,
 };
 use dsl_kit_mcp::resources::ResourceEntry;
-use lm_provision::dsl_poc::{create_profile_engine, ProfileAst, ProfileNode, ProfileValue};
 use lm_provision::exec::ExecMode;
+use lm_provision::profile_ast::{create_profile_engine, ProfileAst, ProfileNode, ProfileValue};
 use std::sync::Arc;
 
 /// `DslHost` adapter for profile AST execution and MCP debugging.

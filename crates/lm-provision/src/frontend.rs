@@ -26,7 +26,7 @@ use dsl_kit::IdGen;
 use dsl_kit_parse::{peg::Grammar, serde_bridge::from_json_value, DslBuild as _};
 use dsl_kit_schema::DslSchema as _;
 
-use crate::dsl_poc::ProfileNode;
+use crate::profile_ast::ProfileNode;
 
 /// Errors returned by [`load_profile`].
 ///
