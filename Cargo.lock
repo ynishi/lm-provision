@@ -350,9 +350,9 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit"
-version = "0.5.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9210c2f154078737d9565ad8166bf7d2f274d2b0bb65eba6d3e71deb0624c706"
+checksum = "54e29e907433189c6312d860394dbe9aa3634e0b8c2ae0ff8fd863b76273e79e"
 dependencies = [
  "dsl-kit-core",
  "dsl-kit-macros",
@@ -360,9 +360,9 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-core"
-version = "0.5.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab8f8913564057600524f8c4cf40ec383e6ec4382d5b872e73f510ec6c9d59a8"
+checksum = "608cb31a0ca9166e2e02374b585d36e90ed2ccf651950d6e8634d91c76b5e278"
 dependencies = [
  "miette",
  "serde",
@@ -373,9 +373,9 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-lint"
-version = "0.5.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3639304a2c7a82f854e24c9359e9cf1d6113bbd5541272c4d11c17c2f97a897e"
+checksum = "1f5c5b9d2a759dea2a0915569b483687eeb8ad7c7753503b7e9e9ebd3f2eaf22"
 dependencies = [
  "dsl-kit-core",
  "dsl-kit-schema",
@@ -383,9 +383,9 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-macros"
-version = "0.5.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "367f49887ff49d20146d023fbf2c3f22a4c508be3806925d41a2e910688e4f42"
+checksum = "f98923568b6966b662aa4f266d6c7c0e5b956099da17ac6c4d0841cb54ca3701"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -394,9 +394,9 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-mcp"
-version = "0.5.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c30cd92561d79b296da6e88c86240193158b35d2b8890aa36355c7e11c8809"
+checksum = "c5db992bb9ae4bbf51512899449063fb1a4ecfc8fc2bc5fbf0ae20faef41836f"
 dependencies = [
  "async-trait",
  "dsl-kit",
@@ -411,9 +411,9 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-parse"
-version = "0.5.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d0dc69c1930afca785a4cf04685844e0af5745f1503c357967a779b2b4fb96b"
+checksum = "7eea0266f38656adc194f6c78f0778015650374ce68353da59cb49b43e0fb298"
 dependencies = [
  "dsl-kit-core",
  "dsl-kit-macros",
@@ -424,9 +424,9 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-schema"
-version = "0.5.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57ee6f8dfb63fdb92bc30f897a9c9694f06cfba564ebcf4cd5ada658e6d4c8fc"
+checksum = "e8d74f2d8902f300ce5ee45d3e0e71a202f97101c05d54e456e7f5d60996f80b"
 dependencies = [
  "serde_json",
 ]
