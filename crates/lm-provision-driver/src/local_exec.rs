@@ -37,17 +37,36 @@ impl LocalExecTransport {
 }
 
 impl Transport for LocalExecTransport {
-    fn upload(&self, binary: &Path, profile: &Path) -> Result<PodPaths, TransportError> {
+    fn dest_binary(&self, local_binary: &Path) -> Result<PathBuf, TransportError> {
+        Ok(self.staging_dir.join(file_name(local_binary)?))
+    }
+
+    fn dest_profile(&self, local_profile: &Path) -> Result<PathBuf, TransportError> {
+        Ok(self.staging_dir.join(file_name(local_profile)?))
+    }
+
+    fn ensure_binary(&self, local_binary: &Path) -> Result<PathBuf, TransportError> {
         std::fs::create_dir_all(&self.staging_dir)?;
-        let staged_binary = self.staging_dir.join(file_name(binary)?);
-        let staged_profile = self.staging_dir.join(file_name(profile)?);
-        std::fs::copy(binary, &staged_binary)?;
-        std::fs::copy(profile, &staged_profile)?;
+        let staged_binary = self.dest_binary(local_binary)?;
+        // Idempotent by content (08 §Session steps "ensure-binary"):
+        // an already-identical destination skips the copy, so a
+        // re-run converges without re-transfer.
+        let already_identical = match std::fs::read(&staged_binary) {
+            Ok(existing) => existing == std::fs::read(local_binary)?,
+            Err(_) => false,
+        };
+        if !already_identical {
+            std::fs::copy(local_binary, &staged_binary)?;
+        }
         mark_executable(&staged_binary)?;
-        Ok(PodPaths {
-            binary: staged_binary,
-            profile: staged_profile,
-        })
+        Ok(staged_binary)
+    }
+
+    fn place_profile(&self, local_profile: &Path) -> Result<PathBuf, TransportError> {
+        std::fs::create_dir_all(&self.staging_dir)?;
+        let staged_profile = self.dest_profile(local_profile)?;
+        std::fs::copy(local_profile, &staged_profile)?;
+        Ok(staged_profile)
     }
 
     fn exec(

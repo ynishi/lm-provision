@@ -204,11 +204,20 @@ mod tests {
     }
 
     impl Transport for MockTransport {
-        fn upload(&self, _binary: &Path, _profile: &Path) -> Result<PodPaths, TransportError> {
-            Ok(PodPaths {
-                binary: PathBuf::from("/pod/lm-provision"),
-                profile: PathBuf::from("/pod/profile.lua"),
-            })
+        fn dest_binary(&self, _local_binary: &Path) -> Result<PathBuf, TransportError> {
+            Ok(PathBuf::from("/pod/lm-provision"))
+        }
+
+        fn dest_profile(&self, _local_profile: &Path) -> Result<PathBuf, TransportError> {
+            Ok(PathBuf::from("/pod/profile.lua"))
+        }
+
+        fn ensure_binary(&self, local_binary: &Path) -> Result<PathBuf, TransportError> {
+            self.dest_binary(local_binary)
+        }
+
+        fn place_profile(&self, local_profile: &Path) -> Result<PathBuf, TransportError> {
+            self.dest_profile(local_profile)
         }
 
         fn exec(

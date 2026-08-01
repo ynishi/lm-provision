@@ -35,10 +35,18 @@
 //!   first".
 //! - [`ledger`] — the append-only ledger (09-apply-report-and-ledger.md
 //!   §Ledger): [`ledger::append`] / [`ledger::list`] / [`ledger::get`].
+//! - [`ssh`] — [`ssh::SshTransport`], the SSH realization of the seam
+//!   (08 §Session contract `ConnectionSpec`): scp upload, explicit
+//!   identity file, secrets over stdin (08 §Secret delivery).
+//! - [`session`] — [`session::run`], the session contract's steps 0-5
+//!   with per-step gates ([`session::StepPlan`]); the shape the
+//!   `lm-provision-driver` binary exposes as a one-shot CLI.
 
 #![warn(missing_docs)]
 
 pub mod driver;
 pub mod ledger;
 pub mod local_exec;
+pub mod session;
+pub mod ssh;
 pub mod transport;

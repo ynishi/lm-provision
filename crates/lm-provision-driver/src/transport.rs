@@ -57,21 +57,60 @@ pub enum TransportError {
     NonUtf8Output(#[from] std::string::FromUtf8Error),
 }
 
-/// The transport-agnostic upload / exec seam (08 §Driver steps): "any
-/// byte-transport (SSH, provider exec API, `docker exec`) satisfies
-/// it" — implementations own how bytes and commands actually reach the
-/// pod; [`crate::driver::run`] only ever calls through this trait.
+/// The transport-agnostic seam of the session contract (08 §Session
+/// steps): "any byte-transport (SSH, provider exec API, `docker exec`)
+/// satisfies it" — implementations own how bytes and commands actually
+/// reach the pod; [`crate::driver::run`] and [`crate::session::run`]
+/// only ever call through this trait.
+///
+/// The finer `dest_*` / `ensure_binary` / `place_profile` seams exist
+/// so the session layer can gate the ensure-binary step off
+/// (`skip-install`, 08 §Session steps) while still knowing where the
+/// binary is expected to live; [`Transport::upload`] is the composed
+/// form the pre-session [`crate::driver::run`] flow keeps using.
 pub trait Transport {
-    /// Step 1 (08 §Driver steps): place `binary` and `profile` on the
-    /// pod, returning the pod-local paths this transport chose.
-    fn upload(&self, binary: &Path, profile: &Path) -> Result<PodPaths, TransportError>;
+    /// The pod-local path where `ensure_binary` would (or did) place
+    /// the binary — deterministic, callable without any transfer, so a
+    /// gated-off install still yields the invoke path (08 §Session
+    /// steps: a skipped step is "never an implicit promise that the
+    /// work happened elsewhere" — the exec against this path is what
+    /// surfaces the missing postcondition).
+    fn dest_binary(&self, local_binary: &Path) -> Result<PathBuf, TransportError>;
+
+    /// The pod-local path where `place_profile` would (or did) place
+    /// the profile.
+    fn dest_profile(&self, local_profile: &Path) -> Result<PathBuf, TransportError>;
+
+    /// Session step 0 (08 §Session steps "ensure-binary",
+    /// push-local-artifact strategy): make the binary exist at
+    /// [`Self::dest_binary`] and be executable. Idempotent by content:
+    /// when the destination already carries byte-identical content the
+    /// transfer is skipped, so re-running a session is re-convergence,
+    /// not re-transfer.
+    fn ensure_binary(&self, local_binary: &Path) -> Result<PathBuf, TransportError>;
+
+    /// Session step 1 (08 §Session steps "place-profile"): put the
+    /// profile at [`Self::dest_profile`], overwriting (it is small and
+    /// the hash-verify step vouches for its content).
+    fn place_profile(&self, local_profile: &Path) -> Result<PathBuf, TransportError>;
+
+    /// The composed steps 0+1 (the 2026-07 contract's "upload"):
+    /// ensure the binary, place the profile, return both pod paths.
+    fn upload(&self, binary: &Path, profile: &Path) -> Result<PodPaths, TransportError> {
+        Ok(PodPaths {
+            binary: self.ensure_binary(binary)?,
+            profile: self.place_profile(profile)?,
+        })
+    }
 
     /// Run `<paths.binary> <args...>` with `env` exported into the
-    /// invocation's process environment (08 §Driver steps step 2's
+    /// invocation's process environment (08 §Session steps step 3's
     /// env-injection contract, generalized to any subcommand so the
     /// same primitive drives both the `hash` profile-integrity check
     /// and the `apply` invocation proper), then capture stdout /
-    /// stderr / exit code (step 3).
+    /// stderr / exit code (step 4). Implementations must honor 08
+    /// §Secret delivery: an `env` value never appears on a command
+    /// line (the SSH transport feeds values over stdin).
     fn exec(
         &self,
         paths: &PodPaths,

@@ -1,17 +1,55 @@
 # 08. Push driver protocol (on-pod agent model)
 
-Status: specified (the driver side is the Phase G build target).
+Status: specified (the session contract below is the Phase G build
+target; revised 2026-08-01 from first real-pod usage feedback).
 Layer 4. Upstream deps: 07, 04, 06.
 MVP: Phase G.
 
 ## Purpose
 
-The protocol between the outer driver (operator machine, an external
-pod manager, or CI) and the on-pod `lm-provision` binary: what gets
-uploaded, how the
-binary is invoked, and how the report is collected. The protocol is
-defined at the command + stdio level so it is transport-agnostic
-(SSH, provider exec API, `docker exec` all satisfy it).
+The contract between a caller (operator machine, an external pod
+manager, or CI) and a pod that provisioning should land on. It is a
+**session contract**: the caller supplies connectivity, a profile,
+and secret values — the driver session owns everything from there
+(binary delivery included) through to a collected report and a ledger
+row. Individual session steps can be gated on or off, but the base
+shape is declarative one-shot apply: given a reachable pod, one
+driver invocation converges it (the Terraform / K8s `apply` posture).
+
+Pod lifecycle (create / start / stop / delete) stays outside — see
+§Stability.
+
+### Session contract
+
+```
+Input  (everything the caller must know)
+  ConnectionSpec  = ssh { host, port, user (default root), key_path }
+                    (a provider exec-API variant is additive, later)
+  profile         = local path (canonical text or JSON, chapter 01)
+  artifact        = local path to the musl binary (used by the
+                    ensure-binary step's push strategy)
+  secrets         = present in the driver host environment; the name
+                    list is derived from the profile's `env_secrets`,
+                    a missing name fails before any connection
+  StepPlan        = per-step gates + strategies (§Session steps)
+       │
+       ▼   driver session
+  0. ensure-binary → 1. place-profile → 2. hash-verify → 3. invoke
+       → 4. collect → 5. ledger
+       │
+       ▼
+Output = collected apply (report JSON, stderr transcript, exit code,
+         profile_hash, collected_at) + a ledger row (chapter 09)
+```
+
+The 2026-07 revision of this chapter defined only steps 1-4's middle
+(upload / invoke / collect) and left binary acquisition, placement
+paths, key material, secret transport, and report retrieval to "the
+driver's choice". First real-pod usage (2026-08-01) executed that
+contract manually and every one of those choices became by-hand work;
+this revision pulls them inside the contract. The old three-step
+definitions are not discarded — they survive verbatim as the middle
+of §Session steps.
 
 ## Inputs
 
@@ -34,26 +72,67 @@ defined at the command + stdio level so it is transport-agnostic
   the corresponding step at apply time with the exec error in the
   report.
 
-### Driver steps
+## Session steps
+
+Every step defaults to **on**; a gate turns a step off explicitly.
+Gating a step off is a declaration that its work is not wanted — it
+is never an implicit promise that the work happened elsewhere. When a
+skipped step's postcondition is actually needed later (e.g.
+`--skip-install` but no binary at the pod path), the session fails
+fast as an invoke-time precondition error (§Error surface), before
+any effect runs.
 
 ```
-1. upload   — place the binary and the profile file on the pod
-              (any byte-transport; paths are the driver's choice)
-2. invoke   — run:  <bin> apply <profile-path> [--dry-run]
-              with every consumed env_secrets name exported into the
-              process environment (chapter 06)
-3. collect  — capture stdout (the apply report JSON), stderr (the
-              audit/progress transcript), and the exit code
+0. ensure-binary  — make <bin> exist at the pod path
+                    strategy: push-local-artifact (default)
+                              fetch-release  (additive, later)
+                              cargo-install  (additive, later)
+                    idempotent: the pod-side sha256 is compared to
+                    the local artifact's; identical → no-op, so
+                    re-running a session is re-convergence, not
+                    re-transfer   gate: skip-install
+1. place-profile  — put the profile file at the pod path (always
+                    overwritten; it is small and step 2 verifies it)
+2. hash-verify    — run `<bin> hash <profile>` on the pod, compare
+                    with the locally computed hash (the
+                    profile-integrity check)   gate: skip-verify
+3. invoke         — run:  <bin> apply <profile-path> [--dry-run]
+                    with every consumed env_secrets name exported
+                    into the process environment (chapter 06)
+                    gate: dry-run / validate-only select the
+                    subcommand form; `plan`-like preview = dry-run
+4. collect        — capture stdout (the apply report JSON), stderr
+                    (the audit/progress transcript), and the exit
+                    code (follows invoke)
+5. ledger         — append (pod_id, profile_hash, report,
+                    collected_at) to the ledger (chapter 09)
+                    gate: no-ledger
 ```
 
 - The driver may run `validate` / `hash` / `plan` remotely or
   locally first — the binary is the same and the artifacts are
   identical (chapter 07); `hash` before and after upload doubles as
-  a profile-integrity check.
-- Secret delivery is env-only: the driver injects secrets into the
-  invocation environment (provider secret store, SSH `env`,
-  exec-API env field). Secrets never appear in the command line, in
-  the profile file, or on stdout/stderr (chapter 09 redaction).
+  a profile-integrity check (that is step 2's whole job).
+- Steps 1-4's middle is the 2026-07 three-step contract verbatim
+  (upload / invoke / collect); nothing about the invoke command
+  form, the stdio contract, or the exit mapping changed.
+
+### Secret delivery
+
+Secret delivery is env-only: the driver injects secrets into the
+invocation environment. Secrets never appear in the command line, in
+the profile file, or on stdout/stderr (chapter 09 redaction).
+
+Per-transport realization:
+
+- **provider exec API**: the API's env field.
+- **SSH**: values travel on the **ssh channel's stdin**, and a
+  pod-side wrapper reads them into the environment before exec'ing
+  the binary. Embedding `NAME=value` in the remote command string is
+  **not** a conforming delivery: the value lands in the driver
+  host's process list and shell history. (First real-pod usage did
+  exactly this by hand — the leak surface is why the spelling is now
+  pinned.)
 
 ## Outputs
 
@@ -64,7 +143,8 @@ defined at the command + stdio level so it is transport-agnostic
   failure of any class; 2 = usage).
 - The driver derives `(pod_id, profile_hash, report)` — `pod_id`
   from its own provisioning context, `profile_hash` via the `hash`
-  subcommand — and appends it to the ledger (chapter 09).
+  subcommand — and appends it to the ledger (chapter 09, session
+  step 5).
 
 ## Error surface
 
@@ -73,8 +153,9 @@ defined at the command + stdio level so it is transport-agnostic
   partially provisioned state — re-invoking apply re-runs from the
   first step (chapter 07 runtime class).
 - Invoke-time precondition failures (missing secret env, validate
-  reject): exit 1 with a stderr line and (for apply) no effects run
-  on the pod.
+  reject, a gated-off step's missing postcondition such as
+  `skip-install` with no binary on the pod): exit 1 / session error
+  with a stderr line and (for apply) no effects run on the pod.
 - Pod-side apply failures: exit 1 **with** the structured report on
   stdout — the driver must treat "exit 1 + parseable report" as a
   richer signal than the exit code alone (the failing step, its
@@ -86,19 +167,30 @@ defined at the command + stdio level so it is transport-agnostic
 
 ## Stability
 
-- The three-step protocol shape and the stdio/exit-code contract:
-  **stable once frozen** — frozen here.
+- The invoke command form, the stdio/exit-code contract, and env-only
+  secret delivery: **stable** (unchanged from the 2026-07 freeze).
+- The session-step list and gate names: **provisional** — step
+  strategies (`fetch-release`, `cargo-install`, an exec-API
+  ConnectionSpec) are additive.
 - Provisioning boundary: pod lifecycle (create / start / stop /
   delete) stays with the external pod manager; only provisioning is
   owned by `lm-provision`. The pod-provider API client is **not**
-  pulled into this repo. **Stable.**
+  pulled into this repo. **Stable** (re-affirmed by the 2026-08-01
+  revision: real-pod usage worked cleanly with lifecycle outside).
 - Static-binary embeddability constraint (musl, no language runtime,
   no runtime file dependencies): **stable**.
 - Binary target set (musl x86_64 as the baseline): **provisional**
   (additive).
-- Driver implementation home (standalone CLI wrapper vs an external
+- ~~Driver implementation home (standalone CLI wrapper vs an external
   pod manager calling the protocol directly): **internal** — the
-  protocol, not the caller, is the contract.
+  protocol, not the caller, is the contract.~~ Superseded
+  (2026-08-01): with no in-repo driver, every caller re-implemented
+  the session by hand (first real-pod usage was scp + ssh + manual
+  env assembly + manual report retrieval). The in-repo
+  `lm-provision-driver` binary is now the **reference
+  implementation** of the session contract; an external pod manager
+  may still drive the protocol directly — the session contract, not
+  the reference binary, remains the normative surface.
 
 ## Upstream references
 
@@ -110,10 +202,17 @@ defined at the command + stdio level so it is transport-agnostic
 
 ## MVP scope
 
-Ships in Phase G: upload / invoke / collect against the Phase F
-binary, ledger append (chapter 09), and the call path that lets an
-external pod manager delegate provisioning to this protocol.
+Ships in Phase G: the session steps 0-5 against the Phase F binary
+(SSH ConnectionSpec, push-local-artifact strategy, per-step gates),
+ledger append (chapter 09), and the call path that lets an external
+pod manager delegate provisioning to this protocol.
 
 The binary half of this contract ships in Phase F (subcommands,
 report-on-stdout, exit codes, env-secret injection);
 Phase G adds the driver half without modifying the binary contract.
+
+Deferred with one-line reasons: `fetch-release` / `cargo-install`
+ensure-binary strategies (distribution surface not published yet);
+exec-API ConnectionSpec (no concrete provider client in scope —
+lifecycle boundary keeps provider SDKs out, an exec adapter would
+re-open that question deliberately).
