@@ -427,23 +427,45 @@ impl ProfileOp {
             self.push(entry);
             return Err(err);
         }
-        // `content_source = "string"` while `content` is a literal
-        // `String`; the `"secret:<name>"` form lands once the AST
-        // carries a `SecretRef` value (spec 04 §`fs.write`, spec 06
-        // consumption point 3, currently blocked on dsl-kit #14).
-        audit::fs_write(self.ctx.mode, &kind, path, content.len() as u64, "string");
-        match self.ctx.mode {
-            ExecMode::DryRun => {
-                let value = self.record(format!("fs_write path={path} bytes={}", content.len()));
+        // Resolve the content value node in both modes (spec 06
+        // §Resolution "dry-run resolves too"): an undeclared or missing
+        // secret fails a dry run identically to a real run. The label
+        // names the source (spec 09 names-not-values) — the resolved
+        // value itself never reaches the event or the report.
+        let content_source = match &**content {
+            ProfileNode::EnvSecret { name, .. } => format!("secret:{name}"),
+            ProfileNode::EnvRef { name, .. } => format!("env_ref:{name}"),
+            _ => "string".to_string(),
+        };
+        let resolved = match self.ctx.env_policy.resolve_one(content) {
+            Ok(resolved) => resolved,
+            Err(err) => {
                 let mut entry = StepReport::new(id, kind, "fs.write");
                 entry.path = Some(path.clone());
-                entry.bytes = Some(content.len() as u64);
+                self.mark_fail(&mut entry, &err);
+                self.push(entry);
+                return Err(err);
+            }
+        };
+        audit::fs_write(
+            self.ctx.mode,
+            &kind,
+            path,
+            resolved.len() as u64,
+            &content_source,
+        );
+        match self.ctx.mode {
+            ExecMode::DryRun => {
+                let value = self.record(format!("fs_write path={path} bytes={}", resolved.len()));
+                let mut entry = StepReport::new(id, kind, "fs.write");
+                entry.path = Some(path.clone());
+                entry.bytes = Some(resolved.len() as u64);
                 entry.dry_run = Some(true);
                 self.push(entry);
                 Ok(value)
             }
             ExecMode::Real => {
-                let bytes = match effects::fs_write(path, content.as_bytes()) {
+                let bytes = match effects::fs_write(path, resolved.as_bytes()) {
                     Ok(bytes) => bytes,
                     Err(err) => {
                         let mut entry = StepReport::new(id, kind, "fs.write");

@@ -153,10 +153,15 @@ those options are deferred, not withdrawn.
 
 - `path` must be absolute and under a declared `paths` root
   (chapter 05 L3), checked in both modes.
-- `content`: string. The SecretRef form (write resolved secret bytes,
-  the third acceptance point of chapter 06) is deferred — the AST
-  cannot yet express a node-valued `content` (dsl-kit's `One` child
-  slot requires a typed object and does not coerce a scalar).
+- `content`: a value node — `EnvLiteral` (verbatim bytes), `EnvSecret`
+  (host-env-resolved secret bytes, the third acceptance point of
+  chapter 06), or `EnvRef` (a `Spec.env` entry, resolved with that
+  entry's own semantics). A bare string spelling
+  (`content: "text"`) lowers to an `EnvLiteral` via the declared
+  scalar shorthand (dsl-kit 0.8, issue #14), so the pre-node form
+  parses — and hashes — unchanged. Resolution runs in both modes
+  (chapter 06 §Resolution "dry-run resolves too"); an undeclared or
+  host-absent secret fails a dry run identically.
 - Effect: create / truncate and write. The parent directory is **not**
   created; a missing parent is a step failure. The report carries the
   byte count.
@@ -272,8 +277,10 @@ Deferred with one-line reasons:
   PUT upload — the credential-carrying paths already work through the
   CLI dispatch route, so the public bridge is not on the critical
   path.
-- `fs.write` `content` as a secret — blocked on a dsl-kit scalar
-  coercion for the `One` child slot.
+- ~~`fs.write` `content` as a secret — blocked on a dsl-kit scalar
+  coercion for the `One` child slot.~~ Landed: dsl-kit 0.8 shipped the
+  scalar shorthand (issue #14) and `content` is a value node now
+  (§`fs.write` above).
 - `mount.volume_attach` has a reserved capability key and no
   primitive (provider-API territory behind the provisioning boundary,
   chapter 08).

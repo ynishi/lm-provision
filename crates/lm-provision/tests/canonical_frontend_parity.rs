@@ -137,6 +137,54 @@ fn text_and_json_frontends_yield_byte_identical_canonical() {
     );
 }
 
+/// `fs.write` `content` accepts two spellings per front-end — the bare
+/// scalar shorthand (`content: "hello"`, pre-migration form) and the
+/// explicit value node (`content: EnvLiteral(value: "hello")`) — and
+/// all four land on the same canonical bytes, which are also the exact
+/// bytes the slot produced while it was a plain `String` payload
+/// (hash neutrality, spec 04 §`fs.write` / dsl-kit #14).
+#[test]
+fn fs_write_content_spellings_share_canonical_bytes_across_frontends() {
+    let text_bare = r#"FsWrite(path: "/tmp/x", content: "hello")"#;
+    let text_explicit = r#"FsWrite(path: "/tmp/x", content: EnvLiteral(value: "hello"))"#;
+    let json_bare = serde_json::json!({ "type": "FsWrite", "path": "/tmp/x", "content": "hello" });
+    let json_explicit = serde_json::json!({
+        "type": "FsWrite",
+        "path": "/tmp/x",
+        "content": { "type": "EnvLiteral", "value": "hello" },
+    });
+
+    let baseline = canonical::encode(&build_from_text(text_bare));
+    // Pre-migration byte shape: content is a bare JSON string.
+    assert_eq!(
+        baseline,
+        r#"{"content":"hello","path":"/tmp/x","type":"FsWrite"}"#
+    );
+    for (label, ast) in [
+        ("text explicit", build_from_text(text_explicit)),
+        ("json bare", build_from_json(&json_bare)),
+        ("json explicit", build_from_json(&json_explicit)),
+    ] {
+        assert_eq!(
+            canonical::encode(&ast),
+            baseline,
+            "{label} spelling must share the bare-string canonical bytes",
+        );
+    }
+
+    // The secret form is the reason the slot became a value node: it
+    // canonicalizes to the same marker an `env`-map secret uses.
+    let json_secret = serde_json::json!({
+        "type": "FsWrite",
+        "path": "/tmp/x",
+        "content": { "type": "EnvSecret", "name": "HF_TOKEN" },
+    });
+    assert_eq!(
+        canonical::encode(&build_from_json(&json_secret)),
+        r#"{"content":{"__secret":"HF_TOKEN"},"path":"/tmp/x","type":"FsWrite"}"#
+    );
+}
+
 #[test]
 fn frontend_parity_holds_despite_distinct_node_ids() {
     let ast_text = build_from_text(TEXT_PROFILE);

@@ -558,6 +558,14 @@ fn check_phase(
         ProfileNode::ShExec { env, .. } => {
             check_env_map(env, env_secrets, declared_env_keys, index)
         }
+        // `fs.write` `content` is a value node (spec 04 §`fs.write`,
+        // spec 06 consumption point 3): the same admissible-variant /
+        // cross-reference rules as one `env`-map value, minus the key
+        // shell-safety (there is no key). The content itself stays
+        // free-form — a literal is never shell-safety-checked.
+        ProfileNode::FsWrite { content, .. } => {
+            check_content_value(content, env_secrets, declared_env_keys, index)
+        }
         // Every remaining variant carries no `shell_safe`-marked field,
         // no route shape, and no `env` slot (`hooks.post_install.script`
         // is the escape exemption; ports / JSON-string payloads /
@@ -620,6 +628,43 @@ fn check_env_map(
         }
     }
     Ok(())
+}
+
+/// Check the `fs.write` `content` value node: the admissible variants
+/// and cross-references mirror one [`check_env_map`] value —
+/// [`ProfileNode::EnvSecret`] must name a declared secret,
+/// [`ProfileNode::EnvRef`] must name a `Spec.env` entry — reported
+/// under the `content` field path rather than an `env[key]` path.
+fn check_content_value(
+    content: &ProfileNode,
+    env_secrets: &HashSet<&str>,
+    declared_env_keys: &HashSet<&str>,
+    index: usize,
+) -> Result<(), ValidateError> {
+    match content {
+        ProfileNode::EnvLiteral { .. } => Ok(()),
+        ProfileNode::EnvSecret { name, .. } => {
+            if env_secrets.contains(name.as_str()) {
+                Ok(())
+            } else {
+                Err(ValidateError::PhaseShape(format!(
+                    "phases[{index}].content: secret {name:?} is not declared in env_secrets"
+                )))
+            }
+        }
+        ProfileNode::EnvRef { name, .. } => {
+            if declared_env_keys.contains(name.as_str()) {
+                Ok(())
+            } else {
+                Err(ValidateError::PhaseShape(format!(
+                    "phases[{index}].content: reference {name:?} not declared in Spec.env"
+                )))
+            }
+        }
+        _ => Err(ValidateError::PhaseShape(format!(
+            "phases[{index}].content: value must be EnvLiteral, EnvSecret, or EnvRef"
+        ))),
+    }
 }
 
 /// Shell-safety of one string field, honoring the `{pod_id}` exemption
@@ -1363,6 +1408,112 @@ mod tests {
                 key: "TOKEN".into(),
                 name: "UNDECLARED".into(),
             })
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Check 6: `fs.write` content value node (spec 06 consumption
+    // point 3 — same admissible variants / cross-refs as an env value).
+    // -----------------------------------------------------------------
+
+    fn fs_write_with(content: ProfileNode, g: &IdGen) -> ProfileNode {
+        ProfileNode::FsWrite {
+            id: g.node(),
+            path: "/workspace/x".into(),
+            content: Box::new(content),
+        }
+    }
+
+    #[test]
+    fn fs_write_literal_and_declared_secret_and_ref_content_pass() {
+        let g = ids();
+        let node = spec_full(
+            "demo",
+            &["MODEL_DIR"],
+            &["HF_TOKEN"],
+            &[],
+            vec![
+                fs_write_with(
+                    ProfileNode::EnvLiteral {
+                        id: g.node(),
+                        value: "free-form; not shell-checked $(ok)".into(),
+                    },
+                    &g,
+                ),
+                fs_write_with(
+                    ProfileNode::EnvSecret {
+                        id: g.node(),
+                        name: "HF_TOKEN".into(),
+                    },
+                    &g,
+                ),
+                fs_write_with(
+                    ProfileNode::EnvRef {
+                        id: g.node(),
+                        name: "MODEL_DIR".into(),
+                    },
+                    &g,
+                ),
+            ],
+        );
+        assert!(validate(&node).is_ok(), "{:?}", validate(&node));
+    }
+
+    #[test]
+    fn fs_write_undeclared_secret_content_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![fs_write_with(
+                ProfileNode::EnvSecret {
+                    id: g.node(),
+                    name: "UNDECLARED".into(),
+                },
+                &g,
+            )],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].content: secret \"UNDECLARED\" is not declared in env_secrets".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn fs_write_ref_content_to_an_undeclared_spec_env_key_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![fs_write_with(
+                ProfileNode::EnvRef {
+                    id: g.node(),
+                    name: "MISSING".into(),
+                },
+                &g,
+            )],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].content: reference \"MISSING\" not declared in Spec.env".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn fs_write_non_value_node_content_is_rejected() {
+        let g = ids();
+        let inner = ProfileNode::MountUmount {
+            id: g.node(),
+            path: "/x".into(),
+        };
+        let node = spec("demo", vec![fs_write_with(inner, &g)]);
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].content: value must be EnvLiteral, EnvSecret, or EnvRef".into()
+            ))
         );
     }
 

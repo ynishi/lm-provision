@@ -299,8 +299,17 @@ pub enum ProfileNode {
         id: NodeId,
         /// Path to target file.
         path: String,
-        /// File content.
-        content: String,
+        /// File content — a value node (spec 04 §`fs.write`, spec 06
+        /// consumption point 3): an [`ProfileNode::EnvLiteral`] carries
+        /// the content verbatim, an [`ProfileNode::EnvSecret`] resolves
+        /// from the host env through the same `env_secrets` gate as an
+        /// `env`-slot secret, an [`ProfileNode::EnvRef`] points at a
+        /// [`ProfileNode::Spec::env`] entry. A bare string spelling
+        /// (`"content": "text"`) lowers to an `EnvLiteral` via the
+        /// declared scalar shorthand (dsl-kit #14), so pre-migration
+        /// profiles parse — and hash — unchanged.
+        #[dsl_schema(scalar(string = EnvLiteral::value))]
+        content: Box<ProfileNode>,
     },
 
     /// `net.http_get`: Perform HTTP GET request

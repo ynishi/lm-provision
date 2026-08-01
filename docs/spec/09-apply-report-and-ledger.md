@@ -121,9 +121,10 @@ Redaction rules:
 - Secret markers: an `EnvSecret` reference renders as
   `[secret:NAME]` in every audit field.
 - `fs.write`: logs path + byte count + `content_source` — the
-  string `"string"` for literal content or `"secret:<name>"` once the
-  secret-content form lands (chapter 04 §`fs.write`). Content bytes
-  are never logged.
+  string `"string"` for literal content, `"secret:<name>"` for an
+  `EnvSecret` content node, `"env_ref:<name>"` for an `EnvRef`
+  pointing at a `Spec.env` entry (chapter 04 §`fs.write`). Content
+  bytes are never logged, whatever the source.
 - HTTP: URL, status, and body byte counts are logged; header
   **names** are logged, header values never (headers may carry
   tokens); bodies never.

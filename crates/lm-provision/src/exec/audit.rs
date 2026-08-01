@@ -79,10 +79,13 @@ pub fn sh_exec(mode: super::ExecMode, kind: &str, argv: &[String], env: &BTreeMa
     );
 }
 
-/// `fs.write` audit event. `content_source` is the string
-/// `"string"` for a literal content payload; when the secret-content
-/// form lands (spec 04 §`fs.write`) it will be `"secret:<name>"`.
-/// Content bytes never enter the event.
+/// `fs.write` audit event. `content_source` names where the content
+/// came from without carrying it (spec 09 names-not-values):
+/// `"string"` for a literal payload, `"secret:<name>"` for an
+/// [`EnvSecret`](crate::profile_ast::ProfileNode::EnvSecret) content
+/// node, `"env_ref:<name>"` for an
+/// [`EnvRef`](crate::profile_ast::ProfileNode::EnvRef) pointing at a
+/// `Spec.env` entry. Content bytes never enter the event.
 pub fn fs_write(mode: super::ExecMode, kind: &str, path: &str, bytes: u64, content_source: &str) {
     tracing::info!(
         mode = mode_label(mode),

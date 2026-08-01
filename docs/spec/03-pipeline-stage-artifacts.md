@@ -128,6 +128,11 @@ and therefore byte-identical canonical output.
   as the secret marker `{"__secret":"NAME"}` — the hash covers *which
   secret is referenced*, never a value, and the marker is the same
   convention the ledger and audit log use (chapters 06, 09).
+- **`fs.write` `content`**: the content slot holds a value node and
+  encodes by the env-value rules above — a literal content is its
+  bare string, byte-identical to the pre-node `content: String`
+  encoding (so literal-content profiles keep their hash), a secret /
+  ref is its marker object (chapter 04 §`fs.write`).
 - **Payload fields added after the fact**: `comfyui.restart`'s
   `extra_args` and `service.start`'s `model` / `dtype` / `extra_args`
   follow the same omit-when-unset rule as `env`, and for the same

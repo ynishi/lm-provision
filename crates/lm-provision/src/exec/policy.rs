@@ -95,6 +95,15 @@ impl EnvPolicy {
         Ok(resolved)
     }
 
+    /// Resolve a single value node outside a keyed slot — the
+    /// `fs.write` `content` position (spec 06 consumption point 3).
+    /// Same admissible variants and same secret pipe as one `env`-map
+    /// value; validate has already vetted the node, so a failure here
+    /// carries the same fail-fast semantics as [`Self::resolve`].
+    pub fn resolve_one(&self, node: &ProfileNode) -> Result<String, ExecError> {
+        self.resolve_value(node)
+    }
+
     /// Resolve one value node to its concrete `String`. Shared by the
     /// keyed-slot walker above and (indirectly, via one hop) an
     /// [`ProfileNode::EnvRef`] whose target is itself another value

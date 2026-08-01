@@ -790,3 +790,136 @@ fn apply_emits_a_stderr_audit_event_per_effect_and_never_a_secret_value() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_file(&path).ok();
 }
+
+/// `fs.write` `content` as a value node (spec 06 consumption point 3):
+/// an `EnvSecret` content resolves from the host env and lands on
+/// disk, an `EnvRef` content resolves through `Spec.env` — and the
+/// audit transcript names the source (`content_source=secret:<name>` /
+/// `env_ref:<name>`) without ever carrying the resolved value.
+#[test]
+fn fs_write_secret_and_ref_content_resolve_and_never_leak_on_the_transcript() {
+    let dir = temp_stem("fs-content");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let secret_target = dir.join("token.txt");
+    let ref_target = dir.join("conf.txt");
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "fs-content-demo",
+        "capabilities": ["fs.write"],
+        "paths": [dir_str],
+        "env_secrets": ["FS_CONTENT_SECRET_TOKEN"],
+        "env": {
+            "SHARED_CONF": { "type": "EnvLiteral", "value": "conf-value-not-logged" }
+        },
+        "phases": [
+            {
+                "type": "FsWrite",
+                "path": secret_target.to_string_lossy(),
+                "content": { "type": "EnvSecret", "name": "FS_CONTENT_SECRET_TOKEN" }
+            },
+            {
+                "type": "FsWrite",
+                "path": ref_target.to_string_lossy(),
+                "content": { "type": "EnvRef", "name": "SHARED_CONF" }
+            }
+        ]
+    });
+    let path = write_json_profile("fs-content", &profile);
+
+    let output = bin()
+        .args(["apply", path.to_str().unwrap()])
+        .env(
+            "FS_CONTENT_SECRET_TOKEN",
+            "fs-secret-value-that-must-not-leak",
+        )
+        .output()
+        .expect("process runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The effects ran with the *resolved* content.
+    assert_eq!(
+        std::fs::read_to_string(&secret_target).expect("secret-content target was written"),
+        "fs-secret-value-that-must-not-leak"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ref_target).expect("ref-content target was written"),
+        "conf-value-not-logged"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The audit event names the source, never the value.
+    assert!(
+        stderr.contains("content_source=\"secret:FS_CONTENT_SECRET_TOKEN\"")
+            || stderr.contains("content_source=secret:FS_CONTENT_SECRET_TOKEN"),
+        "secret-content event names its source: {stderr}"
+    );
+    assert!(
+        stderr.contains("content_source=\"env_ref:SHARED_CONF\"")
+            || stderr.contains("content_source=env_ref:SHARED_CONF"),
+        "ref-content event names its source: {stderr}"
+    );
+    assert!(
+        !stderr.contains("fs-secret-value-that-must-not-leak"),
+        "resolved secret content must never reach the transcript: {stderr}"
+    );
+    assert!(
+        !stderr.contains("conf-value-not-logged"),
+        "resolved literal content must never reach the transcript either: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+/// Content resolution follows spec 06 §Resolution "dry-run resolves
+/// too": a secret content whose host env var is absent fails the dry
+/// run identically to a real run — a passing dry run proves the
+/// content plumbing.
+#[test]
+fn fs_write_secret_content_missing_from_the_host_env_fails_the_dry_run() {
+    let dir = temp_stem("fs-content-missing");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "fs-content-missing-demo",
+        "capabilities": ["fs.write"],
+        "paths": [dir_str],
+        "env_secrets": ["FS_CONTENT_NEVER_SET_SECRET"],
+        "phases": [
+            {
+                "type": "FsWrite",
+                "path": dir.join("out.txt").to_string_lossy(),
+                "content": { "type": "EnvSecret", "name": "FS_CONTENT_NEVER_SET_SECRET" }
+            }
+        ]
+    });
+    let path = write_json_profile("fs-content-missing", &profile);
+
+    let output = bin()
+        .args(["apply", "--dry-run", path.to_str().unwrap()])
+        .env_remove("FS_CONTENT_NEVER_SET_SECRET")
+        .output()
+        .expect("process runs");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a dry run must fail on an unresolvable secret content"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("FS_CONTENT_NEVER_SET_SECRET"),
+        "the failure names the logical secret, nothing else: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+}

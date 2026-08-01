@@ -110,7 +110,10 @@ fn dry_run_traces_every_direct_op() {
             ProfileNode::FsWrite {
                 id: ids.node(),
                 path: "/tmp/should-not-be-written".to_string(),
-                content: "x".to_string(),
+                content: Box::new(ProfileNode::EnvLiteral {
+                    id: ids.node(),
+                    value: "x".to_string(),
+                }),
             },
             ProfileNode::NetHttpGet {
                 id: ids.node(),
@@ -598,7 +601,10 @@ fn fs_write_to_an_undeclared_path_root_fails_in_dry_run() {
         phases: vec![ProfileNode::FsWrite {
             id: ids.node(),
             path: "/tmp/blocked".to_string(),
-            content: "x".to_string(),
+            content: Box::new(ProfileNode::EnvLiteral {
+                id: ids.node(),
+                value: "x".to_string(),
+            }),
         }],
     };
 
@@ -640,7 +646,10 @@ fn fs_write_under_a_declared_path_root_traces_in_dry_run() {
         phases: vec![ProfileNode::FsWrite {
             id: ids.node(),
             path: "/tmp/allowed".to_string(),
-            content: "x".to_string(),
+            content: Box::new(ProfileNode::EnvLiteral {
+                id: ids.node(),
+                value: "x".to_string(),
+            }),
         }],
     };
 

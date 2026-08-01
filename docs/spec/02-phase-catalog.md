@@ -47,7 +47,7 @@ mirror the bridge signatures, with non-core fields forwarded as
 | kind | payload | required capability |
 |---|---|---|
 | `sh.exec` | `argv` list\<string\> (non-empty); `opts` table (chapter 04 §sh.exec) | `sh.exec` |
-| `fs.write` | `path` string; `content` string \| SecretRef; other fields → opts | `fs.write` |
+| `fs.write` | `path` string; `content` value node (bare string \| `EnvSecret` \| `EnvRef`, chapter 04 §`fs.write`); other fields → opts | `fs.write` |
 | `net.http_get` | `url` string; other fields → opts | `net.http_get` |
 | `net.http_post` | `url` string; `body` \| `body_json` \| `body_form`, `headers`, ... → opts | `net.http_post` |
 | `net.transfer` | `src`, `dst` strings; other fields → opts | `net.transfer`, or `sh.exec` when routed (§Dispatch routing) |

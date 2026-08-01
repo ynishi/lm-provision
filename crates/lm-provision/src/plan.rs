@@ -432,7 +432,13 @@ fn payload_of(phase: &ProfileNode) -> Value {
             }
             Value::Object(m)
         }
-        ProfileNode::FsWrite { path, content, .. } => json!({ "path": path, "content": content }),
+        // `content` renders in its `env`-map value form: a literal is
+        // its bare string (matching the pre-node plan output), a secret
+        // / ref is its marker object — the resolved value never enters
+        // a plan.
+        ProfileNode::FsWrite { path, content, .. } => {
+            json!({ "path": path, "content": env_value(content) })
+        }
         ProfileNode::NetHttpGet { url, .. } => json!({ "url": url }),
         ProfileNode::NetHttpPost { url, .. } => json!({ "url": url }),
         ProfileNode::NetTransfer { src, dst, .. } => json!({ "src": src, "dst": dst }),
@@ -1150,7 +1156,10 @@ mod tests {
                 ProfileNode::FsWrite {
                     id: g.node(),
                     path: "/workspace/x".into(),
-                    content: "y".into(),
+                    content: Box::new(ProfileNode::EnvLiteral {
+                        id: g.node(),
+                        value: "y".into(),
+                    }),
                 },
                 ProfileNode::NetHttpGet {
                     id: g.node(),

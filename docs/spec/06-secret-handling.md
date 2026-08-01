@@ -105,12 +105,14 @@ expresses can mutate the host process environment.
   the consuming step — and is never stored, returned, or logged.
 - Consumption points currently implemented: the `env` keyed slot of
   `sh.exec` (`ShExec`), `sync.pull` (`SyncPull`), and `staging.push`
-  (`StagingPush`). The latter two are what make the credential-carrying
-  CLI dispatch route work (chapter 02 §Dispatch routing).
-- Consumption points specified but deferred (chapter 04): a
-  `net.transfer` `auth_bearer` (→ an `Authorization: Bearer` header)
-  and an `fs.write` `content` (→ file bytes). Each will adopt the
-  identical check-then-resolve protocol.
+  (`StagingPush`) — the latter two are what make the
+  credential-carrying CLI dispatch route work (chapter 02 §Dispatch
+  routing) — and the `fs.write` `content` value node (→ file bytes,
+  chapter 04 §`fs.write`), which follows the identical
+  check-then-resolve protocol.
+- Consumption point specified but deferred (chapter 04): a
+  `net.transfer` `auth_bearer` (→ an `Authorization: Bearer` header).
+  It will adopt the identical check-then-resolve protocol.
 - Missing host env is fail-fast: a declared, consumed secret absent
   from the host environment aborts the step with
   `secret 'NAME' missing in host env` — no silent fallback, no
@@ -170,6 +172,7 @@ implemented consumption points, and fail-fast missing-env behaviour
 including under dry-run — with negative fixtures for undeclared
 references, secret-shaped `env` keys, and a missing host env.
 
-Deferred: the `net.transfer` `auth_bearer` and `fs.write` `content`
-consumption points, each blocked on the corresponding AST field
-(chapter 04 §MVP scope).
+Deferred: the `net.transfer` `auth_bearer` consumption point, blocked
+on the corresponding AST field (chapter 04 §MVP scope). The `fs.write`
+`content` point landed with dsl-kit 0.8's scalar shorthand (chapter 04
+§`fs.write`).

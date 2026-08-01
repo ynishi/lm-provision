@@ -299,7 +299,12 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
         } => {
             let mut fields = variant_object("FsWrite");
             fields.insert("path".into(), CanonValue::Str(path.clone()));
-            fields.insert("content".into(), CanonValue::Str(content.clone()));
+            // The content value node canonicalizes exactly like an
+            // `env`-map value: an `EnvLiteral` is its bare string —
+            // byte-identical to the pre-node `content: String` encoding,
+            // so literal-content profiles keep their hash — a secret /
+            // ref is its marker object.
+            fields.insert("content".into(), to_canon(content));
             CanonValue::Object(fields)
         }
 
@@ -706,10 +711,17 @@ mod tests {
         let gen = IdGen::new();
         // Mix: quote, backslash, LF, tab, control byte 0x01, non-ASCII UTF-8.
         let content = "a\"b\\c\nd\te\x01\u{3042}";
+        // A literal content node encodes as its bare string — the
+        // byte-identical shape `content: String` produced before the
+        // slot became a value node (hash neutrality for pre-migration
+        // profiles).
         let node = ProfileNode::FsWrite {
             id: new_id(&gen),
             path: "/tmp/x".into(),
-            content: content.into(),
+            content: Box::new(ProfileNode::EnvLiteral {
+                id: new_id(&gen),
+                value: content.into(),
+            }),
         };
         let bytes = encode(&node);
         // Expected canonical form:
