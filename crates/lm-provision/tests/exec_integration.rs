@@ -359,6 +359,30 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
             "lifecycle wiring is live now; placeholder text must not appear: {line}"
         );
     }
+    // The launch records a pid and the poll that follows watches it, so
+    // a server that dies during the readiness wait fails at once rather
+    // than at the deadline (spec 02 §Spawn-and-poll invocations). The
+    // trace is where an operator sees that pairing.
+    let line_for = |op: &str| {
+        log.iter()
+            .find(|line| line.starts_with(op))
+            .unwrap_or_else(|| panic!("no trace line for {op}"))
+    };
+    let restart = line_for("comfyui_restart");
+    assert!(
+        restart.contains("echo $pid > /tmp/comfyui.pid") && restart.contains("kill -0 $pid"),
+        "the launch should record and settle-check its pid: {restart}"
+    );
+    assert!(
+        line_for("comfyui_health").contains("pid_file=/tmp/comfyui.pid"),
+        "the health poll should watch the launch's pid file: {}",
+        line_for("comfyui_health")
+    );
+    assert!(
+        line_for("service_ready").contains("pid_file=/tmp/llm.pid"),
+        "the readiness poll should watch its service's pid file: {}",
+        line_for("service_ready")
+    );
     // The dry-run must not touch the filesystem or network — the
     // custom_nodes / models / llm_models targets stay absent.
     assert!(

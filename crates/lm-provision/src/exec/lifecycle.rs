@@ -65,6 +65,8 @@
 //!   [`ExecError::Unsupported`].
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -93,6 +95,9 @@ const COMFYUI_VENV_PY: &str = "/workspace/ComfyUI/venv/bin/python";
 const COMFYUI_MAIN_PY: &str = "/workspace/ComfyUI/main.py";
 /// ComfyUI launch log (spec 02 §Built-in path constants).
 const COMFYUI_LOG_PATH: &str = "/tmp/comfyui.log";
+/// ComfyUI launch pid file, written by `comfyui.restart` and read by
+/// `comfyui.health`'s poll (spec 02 §Built-in path constants).
+const COMFYUI_PID_PATH: &str = "/tmp/comfyui.pid";
 /// `comfyui.install` default repo when the payload omits `repo`.
 const DEFAULT_COMFYUI_REPO: &str = "comfyanonymous/ComfyUI";
 /// `comfyui.health` poll deadline when the payload declares no
@@ -116,6 +121,13 @@ const COMFYUI_HEALTH_TIMEOUT_SEC: u64 = 180;
 const SERVICE_READY_TIMEOUT_SEC: u64 = 300;
 /// Poll interval between GETs while waiting for a 2xx.
 const HTTP_POLL_INTERVAL_SEC: u64 = 2;
+/// Linux procfs root. A running process has a `/proc/<pid>` directory,
+/// which is how a poll step decides whether the launch it is waiting
+/// for is still alive (§Died-during-wait detection).
+const PROC_ROOT: &str = "/proc";
+/// Lines of the launch log a died-during-wait / died-immediately
+/// failure carries, matching the predecessor's `tail -100`.
+const DIED_LOG_TAIL_LINES: usize = 100;
 
 /// One executable step a lifecycle op expands into.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +149,14 @@ pub enum Step {
         url: String,
         /// Overall poll deadline, in seconds.
         timeout_sec: u64,
+        /// Pid file the preceding launch step wrote, when the poll is
+        /// waiting on a spawn-and-poll launch. Each iteration re-reads
+        /// it to notice a process that died during the wait
+        /// (§Died-during-wait detection); `None` disables the check.
+        pid_file: Option<String>,
+        /// Launch log tailed into a died-during-wait failure, so the
+        /// report carries the crash instead of only the pid.
+        log_path: Option<String>,
     },
     /// No effect; `message` is preserved in the log so the operator can
     /// tell that an op ran and what it decided.
@@ -197,6 +217,10 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             // an API call, so polling it reports ready too early.
             url: format!("http://127.0.0.1:{port}/object_info"),
             timeout_sec: poll_timeout(*timeout_sec, COMFYUI_HEALTH_TIMEOUT_SEC),
+            // Paired with `comfyui.restart`'s launch, which canonical
+            // ordering places directly before this poll.
+            pid_file: Some(COMFYUI_PID_PATH.to_string()),
+            log_path: Some(COMFYUI_LOG_PATH.to_string()),
         }]),
         ProfileNode::ServiceStart {
             name,
@@ -217,12 +241,17 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             extra_args,
         )),
         ProfileNode::ServiceReady {
+            name,
             check_url,
             timeout_sec,
             ..
         } => Ok(vec![Step::HttpPoll {
             url: check_url.clone(),
             timeout_sec: poll_timeout(*timeout_sec, SERVICE_READY_TIMEOUT_SEC),
+            // Paired with the `service.start` of the same `name`, whose
+            // launch wrote these two paths.
+            pid_file: Some(service_pid_path(name)),
+            log_path: Some(service_log_path(name)),
         }]),
         other => {
             use dsl_kit::DslNode as _;
@@ -641,11 +670,56 @@ fn expand_llm_models(json: &str) -> Result<Vec<Step>, ExecError> {
 // Consequence to keep in mind when reading a report: the launch step
 // only reports whether the *spawn* was accepted. Whether the server
 // came up is the poll step's verdict.
+//
+// ## Died-during-wait detection
+//
+// The launch writes `$!` to a pid file next to its log, so the poll
+// that follows can tell "not up yet" from "gone". Two checks use it:
+//
+// - the launch itself sleeps 1 s and `kill -0`s the pid, which catches
+//   the fastest failures (missing binary, argument parse error);
+// - every poll iteration re-reads the pid file and checks the process
+//   still exists, failing at once when a pid it saw running is gone.
+//
+// The second check is the one that matters in practice: an inference
+// engine crashes tens of seconds in — after its import phase, on
+// `bind()` — which is long past any settle sleep. Without it the poll
+// spends its whole deadline (300 s by default) asking a socket nobody
+// is listening on, and reports a timeout for what was a crash. The
+// launch log's tail travels with the failure so the crash itself is in
+// the report.
+//
+// The poll only treats a dead pid as fatal after it has seen that pid
+// alive — a resume profile polls without launching anything, and a
+// leftover pid file at the well-known path must not turn into a death
+// verdict (the arming rule on `execute_http_poll_in`).
+//
+// This is *not* process supervision: nothing restarts, nothing keeps
+// watching. The pid file is read only inside the readiness window, so
+// a crash after the poll succeeded is still undetected (spec 02
+// §Spawn-and-poll invocations).
 // ---------------------------------------------------------------------
 
-/// The `nohup <argv…> > <log> 2>&1 &` command text shared by both
-/// launch kinds. Returned as text (not a [`Step`]) so a caller can
+/// `service.start` / `service.ready` launch log for a service `name`
+/// (spec 02 §Built-in path constants).
+fn service_log_path(name: &str) -> String {
+    format!("/tmp/{name}.log")
+}
+
+/// `service.start` / `service.ready` pid file for a service `name`
+/// (spec 02 §Built-in path constants).
+fn service_pid_path(name: &str) -> String {
+    format!("/tmp/{name}.pid")
+}
+
+/// The detached-launch command text shared by both launch kinds:
+/// background `argv`, record its pid, and fail the step if it is gone
+/// a second later. Returned as text (not a [`Step`]) so a caller can
 /// prefix it — `comfyui.restart` needs a `cd` in the same shell.
+///
+/// `label` names the launch in the died-immediately message
+/// (`comfyui` / `service <name>`); it reaches the shell inside single
+/// quotes and is validate-stage shell-safe.
 ///
 /// The redirect is load-bearing, not cosmetic. [`effects::sh_exec`]
 /// uses `Command::output()`, which reads the child's stdout / stderr
@@ -654,8 +728,31 @@ fn expand_llm_models(json: &str) -> Result<Vec<Step>, ExecError> {
 /// runs. Sending its output to a file closes the inherited ends, so
 /// `sh` exits and `output()` returns at once. Do not "tidy away" the
 /// redirect.
-fn spawn_detached_command(argv: &[String], log_path: &str) -> String {
-    format!("nohup {} > {log_path} 2>&1 &", argv.join(" "))
+///
+/// `pid=$!` must be the *server's* pid, so only the `nohup` is
+/// backgrounded here — a caller that prefixes a `cd` has to group this
+/// text (see [`expand_comfyui_restart`]), otherwise `&` would
+/// background the whole `cd … && nohup …` list and `$!` would name the
+/// subshell instead.
+fn spawn_detached_command(argv: &[String], log_path: &str, pid_path: &str, label: &str) -> String {
+    format!(
+        "nohup {argv} > {log_path} 2>&1 & pid=$!; echo $pid > {pid_path}; sleep 1; \
+         kill -0 $pid 2>/dev/null || {{ echo '{label} died immediately' >&2; \
+         tail -{DIED_LOG_TAIL_LINES} {log_path} >&2; exit 1; }}",
+        argv = argv.join(" ")
+    )
+}
+
+/// Brace-group a launch command so a caller can put something in front
+/// of it with `&&`.
+///
+/// Without the group, `cd dir && nohup … &` backgrounds the *whole*
+/// `&&` list, and `$!` then names the subshell running it rather than
+/// the server — the recorded pid would belong to a process that exits
+/// as soon as the launch is spawned, and the readiness poll would read
+/// every wait as a death.
+fn grouped(command: String) -> String {
+    format!("{{ {command}; }}")
 }
 
 /// Wrap a command line in `sh -c` so the shell — not `Command` —
@@ -673,10 +770,18 @@ fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<Step> {
     ];
     argv.extend(extra_args.iter().cloned());
     // `cd` first: ComfyUI resolves `models/` / `custom_nodes/` relative
-    // to its working directory.
+    // to its working directory. The launch is braced so `&` backgrounds
+    // only the `nohup` — `cd … && nohup … &` would background the whole
+    // list and leave `$!` naming the subshell, not the server. A failing
+    // `cd` short-circuits the group and fails the step.
     vec![sh_c(format!(
         "cd {COMFYUI_INSTALL_DIR} && {}",
-        spawn_detached_command(&argv, COMFYUI_LOG_PATH)
+        grouped(spawn_detached_command(
+            &argv,
+            COMFYUI_LOG_PATH,
+            COMFYUI_PID_PATH,
+            "comfyui"
+        ))
     ))]
 }
 
@@ -707,7 +812,8 @@ fn expand_service_start(
     tensor_parallel_size: Option<u16>,
     extra_args: &[String],
 ) -> Vec<Step> {
-    let log_path = format!("/tmp/{name}.log");
+    let log_path = service_log_path(name);
+    let pid_path = service_pid_path(name);
     let argv = match platform_kind {
         "vllm" => {
             let Some(model) = model else {
@@ -761,7 +867,12 @@ fn expand_service_start(
             ))]
         }
     };
-    vec![sh_c(spawn_detached_command(&argv, &log_path))]
+    vec![sh_c(spawn_detached_command(
+        &argv,
+        &log_path,
+        &pid_path,
+        &format!("service {name}"),
+    ))]
 }
 
 fn missing_model_note(name: &str, platform_kind: &str) -> Step {
@@ -786,8 +897,21 @@ pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
             env.keys().collect::<Vec<_>>()
         ),
         Step::Transfer { src, dst } => format!("transfer src={src} dst={dst}"),
-        Step::HttpPoll { url, timeout_sec } => {
-            format!("http_poll url={url} timeout={timeout_sec}s")
+        Step::HttpPoll {
+            url,
+            timeout_sec,
+            pid_file,
+            ..
+        } => {
+            // The pid file is shown because it changes what the step
+            // can fail *for*: with one, a launch that dies during the
+            // wait fails the poll immediately instead of at the
+            // deadline.
+            let liveness = pid_file
+                .as_deref()
+                .map(|path| format!(" pid_file={path}"))
+                .unwrap_or_default();
+            format!("http_poll url={url} timeout={timeout_sec}s{liveness}")
         }
         Step::Note(message) => format!("note \"{message}\""),
     }
@@ -909,7 +1033,18 @@ pub fn execute_step(
                 ..StepResult::default()
             })
         }
-        Step::HttpPoll { url, timeout_sec } => execute_http_poll(url, *timeout_sec, op),
+        Step::HttpPoll {
+            url,
+            timeout_sec,
+            pid_file,
+            log_path,
+        } => execute_http_poll(
+            url,
+            *timeout_sec,
+            pid_file.as_deref(),
+            log_path.as_deref(),
+            op,
+        ),
         Step::Note(message) => Ok(StepResult::summary_only(format!("note \"{message}\""))),
     }
 }
@@ -955,10 +1090,114 @@ fn execute_sh(
     })
 }
 
-fn execute_http_poll(url: &str, timeout_sec: u64, op: &str) -> Result<StepResult, StepFailure> {
+/// What one liveness probe of a launch's pid file concluded.
+///
+/// A verdict on its own is never enough to fail a poll — see the
+/// arming rule in [`execute_http_poll_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// The pid file names a process that still exists.
+    Alive,
+    /// The pid file names a process that is gone.
+    Dead(u32),
+    /// Nothing to conclude — the pid file is absent, unreadable, or
+    /// does not (yet) hold a number. Deliberately *not* a death: the
+    /// launch writes the file a moment after backgrounding the server,
+    /// and losing that race must not fail a poll that would otherwise
+    /// have succeeded.
+    Unknown,
+}
+
+/// Read `pid_file` and decide whether the process it names is still
+/// running, looking under `proc_root` (`/proc` in production).
+///
+/// `proc_root` is a parameter so the decision can be tested without a
+/// procfs — on a host without `/proc` every pid would otherwise read as
+/// dead.
+fn probe_liveness(pid_file: &str, proc_root: &Path) -> Liveness {
+    let Ok(text) = fs::read_to_string(pid_file) else {
+        return Liveness::Unknown;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return Liveness::Unknown;
+    };
+    if proc_root.join(pid.to_string()).exists() {
+        Liveness::Alive
+    } else {
+        Liveness::Dead(pid)
+    }
+}
+
+/// Last `DIED_LOG_TAIL_LINES` lines of `log_path`, rendered for a
+/// failure message. An unreadable log yields a note saying so rather
+/// than silently dropping the section — "the log is missing" is itself
+/// worth reporting when a launch has just died.
+fn log_tail(log_path: &str) -> String {
+    match fs::read_to_string(log_path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.len().saturating_sub(DIED_LOG_TAIL_LINES);
+            format!(
+                "\n--- {log_path} (last {} lines) ---\n{}",
+                lines.len() - start,
+                lines[start..].join("\n")
+            )
+        }
+        Err(err) => format!("\n--- {log_path} unreadable: {err} ---"),
+    }
+}
+
+fn execute_http_poll(
+    url: &str,
+    timeout_sec: u64,
+    pid_file: Option<&str>,
+    log_path: Option<&str>,
+    op: &str,
+) -> Result<StepResult, StepFailure> {
+    execute_http_poll_in(
+        url,
+        timeout_sec,
+        pid_file,
+        log_path,
+        op,
+        Path::new(PROC_ROOT),
+    )
+}
+
+/// [`execute_http_poll`] with the procfs root injected (tests supply a
+/// directory they control; production supplies [`PROC_ROOT`]).
+///
+/// ## Arming rule
+///
+/// A `Dead` verdict only fails the poll once this call has *itself*
+/// seen the pid alive. A pid file that reads dead from the very first
+/// probe is not this poll's launch dying — it is almost always a stale
+/// file left at the well-known path by an earlier apply, and a resume
+/// profile (a `comfyui.health` / `service.ready` declared without the
+/// launch that pairs with it) is a first-class shape here. Failing
+/// those on a leftover file would be a wrong verdict; falling through
+/// to the deadline is merely the old behaviour.
+///
+/// The cost is a small blind spot: a launch that dies between its own
+/// settle check and this poll's first probe is never observed alive,
+/// so it surfaces as a timeout rather than as a death. That window is
+/// a couple of seconds wide, while the crash this exists for (an
+/// engine failing to `bind()` after its import phase) happens tens of
+/// seconds in, comfortably inside the armed window.
+fn execute_http_poll_in(
+    url: &str,
+    timeout_sec: u64,
+    pid_file: Option<&str>,
+    log_path: Option<&str>,
+    op: &str,
+    proc_root: &Path,
+) -> Result<StepResult, StepFailure> {
     let deadline = Instant::now() + Duration::from_secs(timeout_sec);
     let mut last_status: Option<u16> = None;
     let mut last_err: Option<String> = None;
+    // Set once the launch has been seen running; until then a death
+    // verdict is not this poll's to report (§Arming rule).
+    let mut armed = false;
     loop {
         match effects::http_get(url) {
             Ok(outcome) => {
@@ -973,6 +1212,32 @@ fn execute_http_poll(url: &str, timeout_sec: u64, op: &str) -> Result<StepResult
             }
             Err(err) => {
                 last_err = Some(err.to_string());
+            }
+        }
+        // The server did not answer this round. Before waiting again,
+        // ask whether it is still there at all: a launch that crashed
+        // during the wait must fail now, not after the full deadline
+        // (§Died-during-wait detection).
+        if let Some(pid_file) = pid_file {
+            match probe_liveness(pid_file, proc_root) {
+                // From here on, this pid disappearing is a death this
+                // poll witnessed (§Arming rule).
+                Liveness::Alive => armed = true,
+                Liveness::Dead(pid) if armed => {
+                    let tail = log_path.map(log_tail).unwrap_or_default();
+                    return Err(ExecError::EffectFailed {
+                        op: op.to_string(),
+                        message: format!(
+                            "process died during readiness wait (pid {pid}); \
+                             {url} never answered{tail}"
+                        ),
+                    }
+                    .into());
+                }
+                // Dead before ever being seen alive (a stale pid file,
+                // or a poll declared without its launch), or nothing
+                // readable yet: keep waiting on the URL alone.
+                Liveness::Dead(_) | Liveness::Unknown => {}
             }
         }
         if Instant::now() >= deadline {
@@ -1665,8 +1930,11 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(
             sh_command(&steps[0]),
-            "cd /workspace/ComfyUI && nohup /workspace/ComfyUI/venv/bin/python \
-             /workspace/ComfyUI/main.py --port 8188 > /tmp/comfyui.log 2>&1 &"
+            "cd /workspace/ComfyUI && { nohup /workspace/ComfyUI/venv/bin/python \
+             /workspace/ComfyUI/main.py --port 8188 > /tmp/comfyui.log 2>&1 & \
+             pid=$!; echo $pid > /tmp/comfyui.pid; sleep 1; \
+             kill -0 $pid 2>/dev/null || { echo 'comfyui died immediately' >&2; \
+             tail -100 /tmp/comfyui.log >&2; exit 1; }; }"
         );
     }
 
@@ -1682,9 +1950,11 @@ mod tests {
         let steps = expand(&payload).expect("comfyui_restart expands");
         assert_eq!(
             sh_command(&steps[0]),
-            "cd /workspace/ComfyUI && nohup /workspace/ComfyUI/venv/bin/python \
+            "cd /workspace/ComfyUI && { nohup /workspace/ComfyUI/venv/bin/python \
              /workspace/ComfyUI/main.py --port 8188 --listen --highvram \
-             > /tmp/comfyui.log 2>&1 &"
+             > /tmp/comfyui.log 2>&1 & pid=$!; echo $pid > /tmp/comfyui.pid; sleep 1; \
+             kill -0 $pid 2>/dev/null || { echo 'comfyui died immediately' >&2; \
+             tail -100 /tmp/comfyui.log >&2; exit 1; }; }"
         );
     }
 
@@ -1720,6 +1990,122 @@ mod tests {
         }
     }
 
+    /// Every detached launch records the *server's* pid and settles for
+    /// a second before returning, so a binary that is missing or
+    /// rejects its arguments fails the launch step instead of the poll
+    /// that follows.
+    #[test]
+    fn a_backgrounded_launch_records_its_pid_and_checks_it_survived() {
+        let ids = IdGen::new();
+        let restart = expand(&ProfileNode::ComfyUiRestart {
+            id: node_id(&ids),
+            port: 8188,
+            extra_args: Vec::new(),
+        })
+        .expect("comfyui_restart expands");
+        let start = expand(&ProfileNode::ServiceStart {
+            id: node_id(&ids),
+            name: "llm".to_string(),
+            platform_kind: "ollama".to_string(),
+            model: None,
+            port: None,
+            dtype: None,
+            tensor_parallel_size: None,
+            extra_args: Vec::new(),
+        })
+        .expect("service_start expands");
+
+        for (step, pid_path) in [
+            (&restart[0], "/tmp/comfyui.pid"),
+            (&start[0], "/tmp/llm.pid"),
+        ] {
+            let command = sh_command(step);
+            assert!(
+                command.contains(&format!("pid=$!; echo $pid > {pid_path}")),
+                "the launch must record the backgrounded pid: {command}"
+            );
+            assert!(
+                command.contains("sleep 1; kill -0 $pid 2>/dev/null || {"),
+                "the launch must settle-check the pid it recorded: {command}"
+            );
+            assert!(
+                command.contains("died immediately") && command.contains("tail -100 /tmp/"),
+                "a died-immediately launch must fail with its log tail: {command}"
+            );
+            assert!(
+                command.contains("exit 1"),
+                "a died-immediately launch must fail the step: {command}"
+            );
+        }
+    }
+
+    /// The pid file a launch writes is the one its poll reads. The two
+    /// halves are composed by different `expand` arms, so nothing but a
+    /// test keeps the paths in step — and a mismatch would silently
+    /// disable died-during-wait detection rather than break anything
+    /// visible.
+    #[test]
+    fn each_launch_pid_path_is_the_one_its_poll_watches() {
+        let ids = IdGen::new();
+        let pairs = [
+            (
+                expand(&ProfileNode::ComfyUiRestart {
+                    id: node_id(&ids),
+                    port: 8188,
+                    extra_args: Vec::new(),
+                })
+                .expect("comfyui_restart expands"),
+                expand(&ProfileNode::ComfyUiHealth {
+                    id: node_id(&ids),
+                    port: 8188,
+                    timeout_sec: None,
+                })
+                .expect("comfyui_health expands"),
+            ),
+            (
+                expand(&ProfileNode::ServiceStart {
+                    id: node_id(&ids),
+                    name: "engine".to_string(),
+                    platform_kind: "ollama".to_string(),
+                    model: None,
+                    port: None,
+                    dtype: None,
+                    tensor_parallel_size: None,
+                    extra_args: Vec::new(),
+                })
+                .expect("service_start expands"),
+                expand(&ProfileNode::ServiceReady {
+                    id: node_id(&ids),
+                    name: "engine".to_string(),
+                    check_url: "http://127.0.0.1:11434/".to_string(),
+                    timeout_sec: None,
+                })
+                .expect("service_ready expands"),
+            ),
+        ];
+
+        for (launch, poll) in pairs {
+            let command = sh_command(&launch[0]);
+            match &poll[0] {
+                Step::HttpPoll {
+                    pid_file: Some(pid_file),
+                    log_path: Some(log_path),
+                    ..
+                } => {
+                    assert!(
+                        command.contains(&format!("echo $pid > {pid_file}")),
+                        "poll watches {pid_file}, launch writes elsewhere: {command}"
+                    );
+                    assert!(
+                        command.contains(&format!("> {log_path} 2>&1 &")),
+                        "poll tails {log_path}, launch logs elsewhere: {command}"
+                    );
+                }
+                other => panic!("expected a poll with liveness paths, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn expand_comfyui_health_polls_the_api_endpoint_not_the_ui_root() {
         let ids = IdGen::new();
@@ -1738,6 +2124,10 @@ mod tests {
                 // which is sized for a cold boot rather than for an HTTP
                 // round trip.
                 timeout_sec: COMFYUI_HEALTH_TIMEOUT_SEC,
+                // Wired to `comfyui.restart`'s launch so a ComfyUI that
+                // dies during the wait fails the poll at once.
+                pid_file: Some("/tmp/comfyui.pid".to_string()),
+                log_path: Some("/tmp/comfyui.log".to_string()),
             }]
         );
         assert_eq!(COMFYUI_HEALTH_TIMEOUT_SEC, 180);
@@ -1760,6 +2150,8 @@ mod tests {
                 vec![Step::HttpPoll {
                     url: "http://127.0.0.1:8188/object_info".to_string(),
                     timeout_sec: u64::from(declared),
+                    pid_file: Some("/tmp/comfyui.pid".to_string()),
+                    log_path: Some("/tmp/comfyui.log".to_string()),
                 }]
             );
         }
@@ -1802,7 +2194,10 @@ mod tests {
         assert_eq!(
             sh_command(&steps[0]),
             "nohup python -m vllm.entrypoints.openai.api_server \
-             --model meta-llama/Llama-3-8B > /tmp/llm.log 2>&1 &"
+             --model meta-llama/Llama-3-8B > /tmp/llm.log 2>&1 & \
+             pid=$!; echo $pid > /tmp/llm.pid; sleep 1; \
+             kill -0 $pid 2>/dev/null || { echo 'service llm died immediately' >&2; \
+             tail -100 /tmp/llm.log >&2; exit 1; }"
         );
     }
 
@@ -1826,7 +2221,10 @@ mod tests {
             sh_command(&steps[0]),
             "nohup python -m vllm.entrypoints.openai.api_server --model m \
              --port 9000 --dtype bfloat16 --tensor-parallel-size 4 \
-             --max-model-len=8192 > /tmp/llm.log 2>&1 &"
+             --max-model-len=8192 > /tmp/llm.log 2>&1 & \
+             pid=$!; echo $pid > /tmp/llm.pid; sleep 1; \
+             kill -0 $pid 2>/dev/null || { echo 'service llm died immediately' >&2; \
+             tail -100 /tmp/llm.log >&2; exit 1; }"
         );
     }
 
@@ -1840,7 +2238,10 @@ mod tests {
         let steps = service_start(&ids, "ollama", None, Some(9999), None, None, &[]);
         assert_eq!(
             sh_command(&steps[0]),
-            "nohup ollama serve > /tmp/llm.log 2>&1 &"
+            "nohup ollama serve > /tmp/llm.log 2>&1 & \
+             pid=$!; echo $pid > /tmp/llm.pid; sleep 1; \
+             kill -0 $pid 2>/dev/null || { echo 'service llm died immediately' >&2; \
+             tail -100 /tmp/llm.log >&2; exit 1; }"
         );
     }
 
@@ -1858,7 +2259,10 @@ mod tests {
         );
         assert_eq!(
             sh_command(&steps[0]),
-            "nohup llama-server --model /models/q4.gguf > /tmp/llm.log 2>&1 &"
+            "nohup llama-server --model /models/q4.gguf > /tmp/llm.log 2>&1 & \
+             pid=$!; echo $pid > /tmp/llm.pid; sleep 1; \
+             kill -0 $pid 2>/dev/null || { echo 'service llm died immediately' >&2; \
+             tail -100 /tmp/llm.log >&2; exit 1; }"
         );
     }
 
@@ -1910,6 +2314,10 @@ mod tests {
                 // Engine start-up, not an HTTP round trip, sets this
                 // default.
                 timeout_sec: SERVICE_READY_TIMEOUT_SEC,
+                // The paths `service.start name=llm` wrote — the poll
+                // watches the process it is waiting for.
+                pid_file: Some("/tmp/llm.pid".to_string()),
+                log_path: Some("/tmp/llm.log".to_string()),
             }]
         );
         assert_eq!(SERVICE_READY_TIMEOUT_SEC, 300);
@@ -1933,6 +2341,8 @@ mod tests {
                 vec![Step::HttpPoll {
                     url: "http://127.0.0.1:9000/health".to_string(),
                     timeout_sec: u64::from(declared),
+                    pid_file: Some("/tmp/llm.pid".to_string()),
+                    log_path: Some("/tmp/llm.log".to_string()),
                 }]
             );
         }
@@ -1998,14 +2408,18 @@ mod tests {
             &no_env
         )
         .starts_with("transfer src=s dst=d"));
-        assert!(render_dry(
-            &Step::HttpPoll {
-                url: "u".into(),
-                timeout_sec: 5
-            },
-            &no_env
-        )
-        .starts_with("http_poll url=u timeout=5s"));
+        assert_eq!(
+            render_dry(
+                &Step::HttpPoll {
+                    url: "u".into(),
+                    timeout_sec: 5,
+                    pid_file: None,
+                    log_path: None,
+                },
+                &no_env
+            ),
+            "http_poll url=u timeout=5s"
+        );
         assert!(render_dry(&Step::Note("n".into()), &no_env).starts_with("note "));
     }
 
@@ -2022,6 +2436,464 @@ mod tests {
             !rendered.contains("super-secret"),
             "values must be redacted: {rendered}"
         );
+    }
+
+    /// A poll wired to a launch shows the pid file it watches: with one
+    /// the step can fail for a reason ("the process is gone") that a
+    /// bare poll cannot.
+    #[test]
+    fn render_dry_shows_the_pid_file_a_poll_watches() {
+        let no_env = BTreeMap::new();
+        let rendered = render_dry(
+            &Step::HttpPoll {
+                url: "http://127.0.0.1:8188/object_info".into(),
+                timeout_sec: 180,
+                pid_file: Some("/tmp/comfyui.pid".into()),
+                log_path: Some("/tmp/comfyui.log".into()),
+            },
+            &no_env,
+        );
+        assert_eq!(
+            rendered,
+            "http_poll url=http://127.0.0.1:8188/object_info timeout=180s \
+             pid_file=/tmp/comfyui.pid"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // The launch script, run by a real `sh`. The composed text is what
+    // reaches the pod, so its two load-bearing properties — the pid it
+    // records is the server's, and a launch that dies fails the step —
+    // are asserted against an actual shell rather than by reading.
+    // -------------------------------------------------------------
+
+    /// Write an executable script that records its own pid and then
+    /// lingers, standing in for a server that started successfully.
+    #[cfg(unix)]
+    fn write_server_stub(dir: &std::path::Path, self_pid_path: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("server-stub.sh");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nsleep 3\n",
+                self_pid_path.to_string_lossy()
+            ),
+        )
+        .expect("write server stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// `$!` must name the server, not a shell that wrapped it — in both
+    /// launch shapes, including the `cd … && …` one `comfyui.restart`
+    /// composes. A pid belonging to a wrapper exits with the spawn, so
+    /// the readiness poll would call every wait a death.
+    #[cfg(unix)]
+    #[test]
+    fn the_launch_script_records_the_pid_of_the_server_itself() {
+        for grouping in ["plain", "cd-prefixed"] {
+            let dir = scratch_dir("launch-pid");
+            let self_pid_path = dir.join("self.pid");
+            let stub = write_server_stub(&dir, &self_pid_path);
+            let log = dir.join("stub.log");
+            let pid_file = dir.join("stub.pid");
+
+            let launch = spawn_detached_command(
+                &[stub],
+                &log.to_string_lossy(),
+                &pid_file.to_string_lossy(),
+                "svc",
+            );
+            let command = match grouping {
+                "plain" => launch,
+                // What `comfyui.restart` emits around the same text.
+                _ => format!("cd {} && {}", dir.to_string_lossy(), grouped(launch)),
+            };
+
+            let outcome = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+                .expect("run the launch command");
+            assert!(
+                outcome.status.success(),
+                "{grouping} launch failed: {command}\nstderr={}",
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+
+            let recorded = fs::read_to_string(&pid_file).expect("launch wrote a pid file");
+            let reported = fs::read_to_string(&self_pid_path).expect("the server wrote its pid");
+            assert_eq!(
+                recorded.trim(),
+                reported.trim(),
+                "{grouping} launch recorded a pid that is not the server's"
+            );
+
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The settle check is what turns "the spawn was accepted" into
+    /// "the process survived a second": a command that cannot run at
+    /// all fails the launch step, with its log tail on stderr.
+    #[cfg(unix)]
+    #[test]
+    fn the_launch_script_fails_when_the_process_dies_immediately() {
+        let dir = scratch_dir("launch-died");
+        let log = dir.join("stub.log");
+        let pid_file = dir.join("stub.pid");
+        let missing = dir.join("no-such-binary").to_string_lossy().into_owned();
+
+        let command = spawn_detached_command(
+            &[missing],
+            &log.to_string_lossy(),
+            &pid_file.to_string_lossy(),
+            "svc",
+        );
+        let outcome = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("run the launch command");
+
+        assert_eq!(
+            outcome.status.code(),
+            Some(1),
+            "a launch that cannot start must fail the step"
+        );
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        assert!(
+            stderr.contains("svc died immediately"),
+            "stderr should name the dead launch: {stderr}"
+        );
+        assert!(
+            stderr.contains("not found") || stderr.contains("No such file"),
+            "the log tail should carry the shell's own diagnosis: {stderr}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -------------------------------------------------------------
+    // Died-during-wait detection (liveness probe + poll behaviour).
+    // -------------------------------------------------------------
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-lifecycle-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// A pid with a directory under the procfs root is running; one
+    /// without is not. The root is injected so the decision is the same
+    /// on a host that has no `/proc`.
+    #[test]
+    fn probe_liveness_reads_the_pid_file_against_the_proc_root() {
+        let dir = scratch_dir("liveness");
+        let proc_root = dir.join("proc");
+        fs::create_dir_all(proc_root.join("4242")).expect("create fake procfs entry");
+
+        let alive = dir.join("alive.pid");
+        fs::write(&alive, "4242\n").expect("write pid file");
+        assert_eq!(
+            probe_liveness(&alive.to_string_lossy(), &proc_root),
+            Liveness::Alive
+        );
+
+        let dead = dir.join("dead.pid");
+        fs::write(&dead, "4243").expect("write pid file");
+        assert_eq!(
+            probe_liveness(&dead.to_string_lossy(), &proc_root),
+            Liveness::Dead(4243)
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An absent, empty, or half-written pid file says *nothing* about
+    /// the process — the launch writes it a moment after backgrounding
+    /// the server, and losing that race must not fail a poll.
+    #[test]
+    fn probe_liveness_treats_an_unusable_pid_file_as_unknown() {
+        let dir = scratch_dir("liveness-unknown");
+        let proc_root = dir.join("proc");
+        fs::create_dir_all(&proc_root).expect("create fake procfs");
+
+        let absent = dir.join("absent.pid");
+        assert_eq!(
+            probe_liveness(&absent.to_string_lossy(), &proc_root),
+            Liveness::Unknown
+        );
+
+        for content in ["", "   ", "not-a-pid"] {
+            let path = dir.join("partial.pid");
+            fs::write(&path, content).expect("write pid file");
+            assert_eq!(
+                probe_liveness(&path.to_string_lossy(), &proc_root),
+                Liveness::Unknown,
+                "content {content:?} must not read as a death"
+            );
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The motivating case: a launch the poll *saw running* disappears
+    /// mid-wait, so the poll fails on the next iteration rather than
+    /// spending its whole deadline on a socket nobody is listening on.
+    /// The launch log travels with the failure.
+    #[test]
+    fn a_poll_fails_at_once_when_a_launch_it_saw_running_disappears() {
+        let dir = scratch_dir("died");
+        let proc_root = dir.join("proc");
+        let procfs_entry = proc_root.join("31337");
+        fs::create_dir_all(&procfs_entry).expect("create fake procfs entry");
+        let pid_file = dir.join("svc.pid");
+        fs::write(&pid_file, "31337").expect("write pid file");
+        let log_path = dir.join("svc.log");
+        fs::write(
+            &log_path,
+            "loading weights\nOSError: address already in use\n",
+        )
+        .expect("write log");
+
+        // The process exits between two poll iterations: the first
+        // probe finds it running and arms the check, the second finds
+        // it gone.
+        let exit = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            fs::remove_dir_all(&procfs_entry).expect("the launch exits");
+        });
+
+        // A port nothing listens on: every GET fails, so the poll is
+        // decided by the liveness probe alone. The deadline is long
+        // enough that reaching it would be a visible hang, proving the
+        // early return is what ended the wait.
+        let started = Instant::now();
+        let failure = execute_http_poll_in(
+            "http://127.0.0.1:1/health",
+            600,
+            Some(&pid_file.to_string_lossy()),
+            Some(&log_path.to_string_lossy()),
+            "service_ready",
+            &proc_root,
+        )
+        .expect_err("a launch that died during the wait must fail the poll");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the poll must not wait out its deadline"
+        );
+        match &failure.error {
+            ExecError::EffectFailed { op, message } => {
+                assert_eq!(op, "service_ready");
+                assert!(
+                    message.contains("process died during readiness wait (pid 31337)"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("OSError: address already in use"),
+                    "the launch log tail must ride along: {message}"
+                );
+            }
+            other => panic!("expected EffectFailed, got {other:?}"),
+        }
+
+        exit.join().expect("exit thread joins");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pid file that is already dead on the *first* probe is not this
+    /// poll's launch dying — a resume profile (a `service.ready` /
+    /// `comfyui.health` declared without the launch that pairs with it)
+    /// finds whatever an earlier apply left at the well-known path.
+    /// Reporting that as a death would fail a profile that never
+    /// launched anything, so the poll falls through to its ordinary
+    /// timeout.
+    #[test]
+    fn a_stale_pid_file_never_becomes_a_death_verdict() {
+        let dir = scratch_dir("stale");
+        let proc_root = dir.join("proc");
+        // No procfs entry for the pid: dead from the very first probe.
+        fs::create_dir_all(&proc_root).expect("create fake procfs");
+        let pid_file = dir.join("svc.pid");
+        fs::write(&pid_file, "31337").expect("write stale pid file");
+        let log_path = dir.join("svc.log");
+        fs::write(&log_path, "from a previous apply\n").expect("write log");
+
+        let failure = execute_http_poll_in(
+            "http://127.0.0.1:1/health",
+            0,
+            Some(&pid_file.to_string_lossy()),
+            Some(&log_path.to_string_lossy()),
+            "service_ready",
+            &proc_root,
+        )
+        .expect_err("an unreachable URL still fails the poll");
+        match &failure.error {
+            ExecError::EffectFailed { op, message } => {
+                assert_eq!(op, "service_ready");
+                assert!(message.contains("timed out after 0s"), "{message}");
+                assert!(
+                    !message.contains("died"),
+                    "a pid never seen alive must not be reported as a death: {message}"
+                );
+            }
+            other => panic!("expected EffectFailed, got {other:?}"),
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same stale pid file does not stand between a resume poll and
+    /// a server that is already up: the URL answering is the whole
+    /// verdict.
+    #[test]
+    fn a_stale_pid_file_does_not_block_a_resume_poll_from_passing() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let dir = scratch_dir("stale-pass");
+        let proc_root = dir.join("proc");
+        fs::create_dir_all(&proc_root).expect("create fake procfs");
+        let pid_file = dir.join("svc.pid");
+        fs::write(&pid_file, "31337").expect("write stale pid file");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .expect("write response");
+        });
+
+        let result = execute_http_poll_in(
+            &format!("http://{addr}/health"),
+            5,
+            Some(&pid_file.to_string_lossy()),
+            None,
+            "service_ready",
+            &proc_root,
+        )
+        .expect("a running server must pass regardless of a stale pid file");
+        assert_eq!(result.status, 200);
+
+        handle.join().expect("server thread joins");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Without a pid file the poll behaves exactly as it did before the
+    /// liveness check existed: it waits out its deadline and reports a
+    /// timeout.
+    #[test]
+    fn a_poll_without_a_pid_file_still_reports_a_timeout() {
+        let failure = execute_http_poll_in(
+            "http://127.0.0.1:1/health",
+            0,
+            None,
+            None,
+            "comfyui_health",
+            Path::new("/nonexistent-proc"),
+        )
+        .expect_err("an unreachable URL must fail the poll");
+        match &failure.error {
+            ExecError::EffectFailed { op, message } => {
+                assert_eq!(op, "comfyui_health");
+                assert!(message.contains("timed out after 0s"), "{message}");
+                assert!(
+                    !message.contains("died"),
+                    "no pid file means no death verdict: {message}"
+                );
+            }
+            other => panic!("expected EffectFailed, got {other:?}"),
+        }
+    }
+
+    /// A live launch that answers 2xx succeeds — the liveness probe
+    /// only runs on iterations where the server did not answer, so a
+    /// ready server is never second-guessed.
+    #[test]
+    fn a_poll_succeeds_when_the_server_answers_while_its_pid_is_live() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let dir = scratch_dir("alive");
+        let proc_root = dir.join("proc");
+        // The running process is this test itself.
+        let pid = std::process::id();
+        fs::create_dir_all(proc_root.join(pid.to_string())).expect("create fake procfs entry");
+        let pid_file = dir.join("svc.pid");
+        fs::write(&pid_file, pid.to_string()).expect("write pid file");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .expect("write response");
+        });
+
+        let result = execute_http_poll_in(
+            &format!("http://{addr}/health"),
+            5,
+            Some(&pid_file.to_string_lossy()),
+            None,
+            "service_ready",
+            &proc_root,
+        )
+        .expect("a live server answering 200 must pass");
+        assert_eq!(result.status, 200);
+
+        handle.join().expect("server thread joins");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The production entry point resolves the procfs root itself
+    /// ([`PROC_ROOT`]) — this drives that call path end to end with a
+    /// pid no process can hold, which is the resume shape: never seen
+    /// alive, so never fatal, and the step ends as an ordinary timeout.
+    ///
+    /// The armed transition cannot be driven portably here (a host
+    /// without `/proc` reads every pid as dead), so the fatal branch is
+    /// covered against an injected root by
+    /// `a_poll_fails_at_once_when_a_launch_it_saw_running_disappears`.
+    #[test]
+    fn the_real_poll_entry_point_reads_liveness_from_the_host_procfs() {
+        let dir = scratch_dir("real-proc");
+        let pid_file = dir.join("svc.pid");
+        // Above every platform's pid_max, so no process can hold it.
+        fs::write(&pid_file, "4194305").expect("write pid file");
+
+        let failure = execute_http_poll(
+            "http://127.0.0.1:1/health",
+            0,
+            Some(&pid_file.to_string_lossy()),
+            None,
+            "service_ready",
+        )
+        .expect_err("an unreachable URL must fail the poll");
+        let message = failure.error.to_string();
+        assert!(message.contains("timed out after 0s"), "{message}");
+        assert!(
+            !message.contains("died"),
+            "a pid this poll never saw alive must not read as a death: {message}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     // -------------------------------------------------------------

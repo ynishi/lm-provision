@@ -162,23 +162,38 @@ into blocking launches.
 Two consequences follow, and are intended:
 
 - the launch step reports only whether the *spawn* was accepted;
-  whether the server came up is the poll step's verdict
+  whether the server survived its first second and then came up is the
+  settle check's and the poll step's verdict
 - a crash *after* the poll succeeded is not detected, and nothing
-  guards against a double start. Process supervision (pid files, a
-  restart policy) would be a new concept in this spec, not a fix to
-  these kinds.
+  guards against a double start. Process supervision (a restart policy,
+  a watchdog) would be a new concept in this spec, not a fix to these
+  kinds. The pid file below is **not** supervision: it is read only
+  inside the readiness window, by the poll that follows the launch.
 
 The redirect in each command is load-bearing: the host reads the
 child's stdout / stderr to EOF, so a backgrounded process still
 holding those pipes would block apply for as long as it runs. Sending
 its output to a log file closes them.
 
+Each launch also records `$!` in a pid file beside its log and
+`kill -0`s it after a one-second settle, so a command that is missing
+or rejects its arguments fails the launch step instead of surfacing as
+a readiness timeout a few minutes later. The pid file is what the
+following poll reads to notice a death during the wait (§Poll
+deadlines). The `comfyui.restart` launch is brace-grouped because `&`
+binds looser than `&&`: without the group the whole `cd … && nohup …`
+list would be backgrounded and `$!` would name that subshell rather
+than the server.
+
 | kind | invocation |
 |---|---|
-| `comfyui.restart` | `sh -c "cd /workspace/ComfyUI && nohup /workspace/ComfyUI/venv/bin/python /workspace/ComfyUI/main.py --port <port> <extra_args…> > /tmp/comfyui.log 2>&1 &"` |
-| `service.start` `vllm` | `sh -c "nohup python -m vllm.entrypoints.openai.api_server --model <model> [--port <port>] [--dtype <dtype>] [--tensor-parallel-size <n>] <extra_args…> > /tmp/<name>.log 2>&1 &"` |
-| `service.start` `ollama` | `sh -c "nohup ollama serve > /tmp/<name>.log 2>&1 &"` — binds 11434 and takes its address from `OLLAMA_HOST`, so neither model nor port appears on the command line |
-| `service.start` `llamacpp` | `sh -c "nohup llama-server --model <model> [--port <port>] <extra_args…> > /tmp/<name>.log 2>&1 &"` |
+| `comfyui.restart` | `sh -c "cd /workspace/ComfyUI && { nohup /workspace/ComfyUI/venv/bin/python /workspace/ComfyUI/main.py --port <port> <extra_args…> > /tmp/comfyui.log 2>&1 & pid=$!; echo $pid > /tmp/comfyui.pid; sleep 1; kill -0 $pid 2>/dev/null \|\| { echo 'comfyui died immediately' >&2; tail -100 /tmp/comfyui.log >&2; exit 1; }; }"` |
+| `service.start` `vllm` | `sh -c "nohup python -m vllm.entrypoints.openai.api_server --model <model> [--port <port>] [--dtype <dtype>] [--tensor-parallel-size <n>] <extra_args…> > /tmp/<name>.log 2>&1 & <settle>"` |
+| `service.start` `ollama` | `sh -c "nohup ollama serve > /tmp/<name>.log 2>&1 & <settle>"` — binds 11434 and takes its address from `OLLAMA_HOST`, so neither model nor port appears on the command line |
+| `service.start` `llamacpp` | `sh -c "nohup llama-server --model <model> [--port <port>] <extra_args…> > /tmp/<name>.log 2>&1 & <settle>"` |
+
+`<settle>` is the same tail on every `service.start`:
+`pid=$!; echo $pid > /tmp/<name>.pid; sleep 1; kill -0 $pid 2>/dev/null || { echo 'service <name> died immediately' >&2; tail -100 /tmp/<name>.log >&2; exit 1; }`.
 
 `--port` / `--dtype` / `--tensor-parallel-size` are synthesized only
 when the corresponding optional payload field is declared. When a field
@@ -235,10 +250,37 @@ Omitting the field is not the same statement as declaring the default
 value: an absent `timeout_sec` is omitted from the canonical encoding,
 so profiles written before the field existed keep their hash.
 
-Neither poll observes the process it is waiting for. A server that
-exits during the wait is reported as a timeout, not as a death — the
-launch step already returned, and nothing carries its pid forward
-(§Spawn-and-poll invocations).
+Each poll also watches the process it is waiting for. On every
+iteration where the server did not answer, the poll re-reads the pid
+file its launch wrote (`/tmp/comfyui.pid` for `comfyui.health`,
+`/tmp/<name>.pid` for `service.ready`) and checks that the pid still
+exists; when a pid **it has already seen running** is gone, the step
+fails immediately with the last 100 lines of the launch log rather than
+waiting out the deadline. The launch's own one-second settle check
+cannot cover this: an inference engine typically crashes tens of
+seconds in, on `bind()` after its import phase, and reporting that as a
+300 s timeout hides a crash behind a deadline.
+
+The "already seen running" condition is what makes the check safe for a
+**resume profile** — a `comfyui.health` / `service.ready` declared
+without the launch that pairs with it, polling a server an earlier
+apply started. Such a poll finds whatever pid file that earlier apply
+left at the well-known path; because the pid never reads as alive
+*during this poll*, it can never turn into a death verdict, and the
+step behaves exactly as it did before the check existed. A stale file
+is therefore inert, not a source of wrong failures.
+
+The cost of that condition is a small blind spot, accepted knowingly: a
+launch that dies between its own settle check and the first probe of
+the poll is never observed alive, so it surfaces as a timeout rather
+than as a death. That window is a couple of seconds wide, while the
+crash class this exists for lands tens of seconds in — comfortably
+inside the watched window.
+
+A pid file that is absent, empty, or unparsable is likewise *not* read
+as a death: the launch writes it just after backgrounding the server,
+and losing that race must not fail a poll that would otherwise succeed.
+The check is skipped entirely for a poll with no pid file.
 
 ### Shared vocabulary (frozen literal sets)
 
@@ -280,9 +322,15 @@ install dir `/workspace/ComfyUI`, venv pip
 `/workspace/ComfyUI/venv/bin/pip`, models root
 `/workspace/ComfyUI/models`, custom nodes
 `/workspace/ComfyUI/custom_nodes`, service logs
-`/tmp/<name>.log`, ComfyUI log `/tmp/comfyui.log`. Profiles that use
-these kinds must declare `paths` roots covering them when the
+`/tmp/<name>.log`, service pid files `/tmp/<name>.pid`, ComfyUI log
+`/tmp/comfyui.log`, ComfyUI pid file `/tmp/comfyui.pid`. Profiles that
+use these kinds must declare `paths` roots covering them when the
 corresponding bridges gate on paths.
+
+The pid file of a launch always sits beside its log, differing only in
+extension: the poll that follows derives one path from the other's
+convention, so the two constants are a pair, not two independent
+choices (§Spawn-and-poll invocations).
 
 ## Error surface
 

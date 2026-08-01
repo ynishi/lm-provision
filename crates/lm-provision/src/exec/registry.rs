@@ -745,9 +745,9 @@ fn audit_lifecycle_step(
     match step {
         lifecycle::Step::Sh(argv) => audit::sh_exec(mode, kind, argv, env),
         lifecycle::Step::Transfer { src, dst } => audit::transfer(mode, kind, src, dst),
-        lifecycle::Step::HttpPoll { url, timeout_sec } => {
-            audit::http_poll(mode, kind, url, *timeout_sec)
-        }
+        lifecycle::Step::HttpPoll {
+            url, timeout_sec, ..
+        } => audit::http_poll(mode, kind, url, *timeout_sec),
         lifecycle::Step::Note(message) => audit::note(mode, kind, message),
     }
 }
