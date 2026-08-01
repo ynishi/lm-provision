@@ -366,7 +366,7 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
 }
 
 /// `staging_push` to an `hf://` dst now composes a concrete
-/// `huggingface-cli upload` step (spec 02 §Dispatch routing); a dry run
+/// `hf upload` step (spec 02 §Dispatch routing); a dry run
 /// renders the CLI trace without touching the network. The upload is
 /// always CLI-routed regardless of `env` (04-bridge §net.transfer).
 #[test]
@@ -400,7 +400,7 @@ fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
     assert_eq!(log.len(), 1);
     assert!(log[0].starts_with("staging_push"), "{}", log[0]);
     assert!(
-        log[0].contains("huggingface-cli")
+        log[0].contains("\"hf\"")
             && log[0].contains("upload")
             && log[0].contains("owner/repo")
             && log[0].contains("--revision")

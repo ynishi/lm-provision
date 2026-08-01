@@ -22,7 +22,7 @@ not here.
 
   ```json
   { "type": "ShExec",
-    "argv": ["huggingface-cli", "whoami"],
+    "argv": ["hf", "auth", "whoami"],
     "env": { "HF_TOKEN": { "type": "EnvSecret", "name": "HF_TOKEN" } } }
   ```
 

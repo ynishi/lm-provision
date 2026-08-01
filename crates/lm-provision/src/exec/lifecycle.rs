@@ -46,8 +46,11 @@
 //! - `SyncPull` `b2://` src **with a non-empty `env`** → the native
 //!   `b2 download-file-by-name <bucket> <path> <dst>` over `sh.exec`.
 //! - `SyncPull` `hf://` src **with a non-empty `env`** → the native
-//!   `huggingface-cli download <owner>/<repo> <path> --local-dir <dst>
-//!   [--revision <rev>]`. On this route `dst` is the `--local-dir`
+//!   `hf download <owner>/<repo> <path> --local-dir <dst>
+//!   [--revision <rev>]`. (`hf` superseded `huggingface-cli` — the old
+//!   entry point prints a deprecation and exits 1 on current
+//!   huggingface_hub, observed live 2026-08-01; the argument shape is
+//!   unchanged.) On this route `dst` is the `--local-dir`
 //!   target, so the file lands at `<dst>/<path>` and `dst` names a
 //!   *directory* — asymmetric with the b2 route, where `dst` is the
 //!   destination file path. The asymmetry is hf-cli's (it exposes no
@@ -59,7 +62,7 @@
 //!   scheme resolution is not implemented).
 //! - `StagingPush` uploads are **always** CLI-routed (04-bridge
 //!   §net.transfer): `b2://` dst → `b2 upload-file`, `hf://` dst →
-//!   `huggingface-cli upload`; an `https://` dst (HTTP PUT) is
+//!   `hf upload`; an `https://` dst (HTTP PUT) is
 //!   [`ExecError::Unsupported`].
 
 use std::collections::BTreeMap;
@@ -82,7 +85,7 @@ const CUSTOM_NODES_ROOT: &str = "/workspace/ComfyUI/custom_nodes";
 /// `models` entry default subdir when neither `subdir` nor `kind` is set.
 const DEFAULT_MODEL_SUBDIR: &str = "checkpoints";
 /// `llm_models` entry default destination directory
-/// (`huggingface-cli download --local-dir` target).
+/// (`hf download --local-dir` target).
 const DEFAULT_LLM_MODELS_DST_DIR: &str = "/tmp/";
 /// Venv-relative python binary, the ComfyUI launch interpreter
 /// (spec 02 §Built-in path constants).
@@ -362,7 +365,7 @@ fn expand_sync_pull(
         // opts.revision") — the URL is the more specific address.
         let rev = url_rev.or_else(|| revision.map(str::to_string));
         let mut argv = vec![
-            "huggingface-cli".to_string(),
+            "hf".to_string(),
             "download".to_string(),
             format!("{owner}/{repo}"),
             path_in_repo,
@@ -413,7 +416,7 @@ fn expand_staging_push(
         let (owner, repo, url_rev, path_in_repo) = parse_hf_uri(rest, "staging_push", dst)?;
         let rev = url_rev.or_else(|| revision.map(str::to_string));
         let mut argv = vec![
-            "huggingface-cli".to_string(),
+            "hf".to_string(),
             "upload".to_string(),
             format!("{owner}/{repo}"),
             src.to_string(),
@@ -577,7 +580,7 @@ fn expand_llm_models(json: &str) -> Result<Vec<Step>, ExecError> {
             .dst_dir
             .unwrap_or_else(|| DEFAULT_LLM_MODELS_DST_DIR.to_string());
         let mut argv = vec![
-            "huggingface-cli".to_string(),
+            "hf".to_string(),
             "download".to_string(),
             format!("{owner}/{repo}"),
             "--local-dir".to_string(),
@@ -1229,7 +1232,7 @@ mod tests {
         assert_eq!(
             steps,
             vec![Step::Sh(vec![
-                "huggingface-cli".to_string(),
+                "hf".to_string(),
                 "download".to_string(),
                 "my-org/private-lora".to_string(),
                 "weights/v1.safetensors".to_string(),
@@ -1264,7 +1267,7 @@ mod tests {
         assert_eq!(
             steps,
             vec![Step::Sh(vec![
-                "huggingface-cli".to_string(),
+                "hf".to_string(),
                 "download".to_string(),
                 "owner/repo".to_string(),
                 "weights/model.bin".to_string(),
@@ -1415,7 +1418,7 @@ mod tests {
         assert_eq!(
             steps,
             vec![Step::Sh(vec![
-                "huggingface-cli".to_string(),
+                "hf".to_string(),
                 "upload".to_string(),
                 "owner/repo".to_string(),
                 "/workspace/out.bin".to_string(),
@@ -1530,7 +1533,7 @@ mod tests {
         assert_eq!(
             steps[0],
             Step::Sh(vec![
-                "huggingface-cli".to_string(),
+                "hf".to_string(),
                 "download".to_string(),
                 "owner/repo".to_string(),
                 "--local-dir".to_string(),
@@ -1540,7 +1543,7 @@ mod tests {
         assert_eq!(
             steps[1],
             Step::Sh(vec![
-                "huggingface-cli".to_string(),
+                "hf".to_string(),
                 "download".to_string(),
                 "owner/repo".to_string(),
                 "--local-dir".to_string(),
@@ -1897,7 +1900,7 @@ mod tests {
     fn render_dry_shows_env_keys_but_not_values_for_a_sh_step() {
         let mut env = BTreeMap::new();
         env.insert("HF_TOKEN".to_string(), "super-secret".to_string());
-        let rendered = render_dry(&Step::Sh(vec!["huggingface-cli".into()]), &env);
+        let rendered = render_dry(&Step::Sh(vec!["hf".into()]), &env);
         assert!(
             rendered.contains("env_keys=") && rendered.contains("HF_TOKEN"),
             "{rendered}"

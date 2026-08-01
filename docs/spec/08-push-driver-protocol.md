@@ -67,7 +67,7 @@ of §Session steps.
   driver side and the MCP server (chapter 10); neither is uploaded
   into the pod.
 - External tools invoked *by profiles* (`apt-get`, `git`, `pip`,
-  `curl`, `b2`, `huggingface-cli`, ...) are pod-image prerequisites
+  `curl`, `b2`, `hf`, ...) are pod-image prerequisites
   of the specific profile, not of the binary. A missing tool fails
   the corresponding step at apply time with the exec error in the
   report.

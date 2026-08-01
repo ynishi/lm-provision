@@ -142,7 +142,7 @@ JSON form:
 ```json
 {
   "type": "ShExec",
-  "argv": ["huggingface-cli", "whoami"],
+  "argv": ["hf", "auth", "whoami"],
   "env": {
     "HF_HUB_ENABLE_HF_TRANSFER": { "type": "EnvLiteral", "value": "1" },
     "HF_TOKEN": { "type": "EnvSecret", "name": "HF_TOKEN" }
@@ -156,7 +156,7 @@ and quoted otherwise:
 
 ```text
 ShExec(
-    argv: ["huggingface-cli", "whoami"],
+    argv: ["hf", "auth", "whoami"],
     env: {
         HF_HUB_ENABLE_HF_TRANSFER: EnvLiteral(value: "1"),
         HF_TOKEN: EnvSecret(name: "HF_TOKEN")

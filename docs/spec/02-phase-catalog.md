@@ -31,7 +31,7 @@ The catalog below is exhaustive: **22 user-facing phase variants**.
 | `sync.push` | `src` absolute path; `dst` = `b2://...` or `hf://<owner>/<repo>/<path>`; `{pod_id}` placeholder allowed in dst | none — marker only, not executed during apply |
 | `staging.push` | same shape as `sync.push` plus `env`, `revision`, `commit_message`, `include` list, `exclude` list, `content_type` | `net.transfer` or `sh.exec` (§Dispatch routing) |
 | `models` | `models` list of `{ src, dst? \| name?, subdir? \| kind? (default "checkpoints"), sha256? }` → downloads to `/workspace/ComfyUI/models/<subdir>/<dst>` | `net.transfer` |
-| `llm_models` | `models` list of `{ src = "hf://<owner>/<repo>[@<rev>]", dst_dir? (default "/tmp/"), revision? }` — repo snapshot download | `sh.exec` (huggingface-cli) |
+| `llm_models` | `models` list of `{ src = "hf://<owner>/<repo>[@<rev>]", dst_dir? (default "/tmp/"), revision? }` — repo snapshot download | `sh.exec` (hf CLI) |
 | `hooks.post_install` | `script` string — raw shell, inner escape (chapter 01) | `sh.exec` |
 | `comfyui.restart` | `port` number (default 8188); `extra_args` list\<string\> (shell-safe) | `sh.exec` |
 | `comfyui.health` | `port` number (default 8188) — 60 s poll of `/object_info` | `net.http_get` |
@@ -118,11 +118,15 @@ Dispatch turns each planned step into one or more bridge invocations
 
   ```
   b2 download-file-by-name <bucket> <path> <dst>
-  huggingface-cli download <owner>/<repo> <path> --local-dir <dst> [--revision <rev>]
+  hf download <owner>/<repo> <path> --local-dir <dst> [--revision <rev>]
   ```
 
+  (`hf` superseded `huggingface-cli`: on current huggingface_hub the
+  old entry point prints a deprecation notice and exits 1 — observed
+  live on a fresh pod, 2026-08-01. The argument shape is unchanged.)
+
   **`dst` means different things on these two routes.** `b2` takes the
-  destination file path; `huggingface-cli` exposes no output-file flag
+  destination file path; `hf` exposes no output-file flag
   at all, only `--local-dir`, so the file lands at
   `<dst>/<path>` and `dst` names a *directory*. The asymmetry is the
   CLI's, and a profile author has to know it — a `sync.pull` with an
@@ -134,7 +138,7 @@ Dispatch turns each planned step into one or more bridge invocations
   invented step to the operator's pod that no chapter describes, to
   hide a convention the CLI states plainly.
 - Uploads (`staging.push`, `net.transfer` upload): `hf://` dst →
-  `huggingface-cli upload` argv; `b2://` dst → `b2 upload-file` argv;
+  `hf upload` argv; `b2://` dst → `b2 upload-file` argv;
   `https://` dst → `net.transfer` bridge (HTTP PUT).
 - `hf://<owner>/<repo>@<rev>/<path>`: the `@<rev>` suffix on the repo
   segment pins a revision; a URL-carried revision wins over

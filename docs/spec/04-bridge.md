@@ -134,7 +134,7 @@ those options are deferred, not withdrawn.
   downloads and every upload are routed to the native CLIs over
   `sh.exec` by the lifecycle layer (chapter 02 §Dispatch routing), so
   they never reach this primitive. Note that the destination
-  convention differs there: `huggingface-cli download` takes a
+  convention differs there: `hf download` takes a
   `--local-dir`, so on that route the phase's `dst` is a *directory*,
   not the file path this primitive writes.
 - A `b2://` / `hf://` source or a URL destination that *does* reach
