@@ -300,6 +300,102 @@ mod tests {
         assert_eq!(canonical::hash(&ast), canonical::hash(&ast));
     }
 
+    /// `comfyui.health` / `service.ready` carry `timeout_sec` as an
+    /// `Option<u16>`, the same shape `service.start`'s `port` uses — so
+    /// the JSON bridge takes it through `build_field_optional::<u16>`
+    /// and the text grammar through the `for_type("Option<u16>", …)`
+    /// override, with no per-field adapter on either side.
+    #[test]
+    fn json_and_text_frontends_both_accept_a_declared_poll_timeout() {
+        let value = serde_json::json!({
+            "type": "Spec",
+            "name": "poll-timeout",
+            "capabilities": ["sh.exec"],
+            "phases": [
+                { "type": "ComfyUiHealth", "port": 8188, "timeout_sec": 240 },
+                {
+                    "type": "ServiceReady",
+                    "name": "llm",
+                    "check_url": "http://127.0.0.1:9000/health",
+                    "timeout_sec": 600
+                }
+            ]
+        });
+        let json_path = write_temp("poll-timeout.json", &value.to_string());
+        let ast = load_profile(&json_path).expect("declared timeouts must parse from JSON");
+
+        let ProfileNode::Spec { phases, .. } = &ast else {
+            panic!("expected Spec root");
+        };
+        match &phases[0] {
+            ProfileNode::ComfyUiHealth { timeout_sec, .. } => assert_eq!(*timeout_sec, Some(240)),
+            other => panic!("expected ComfyUiHealth, got {other:?}"),
+        }
+        match &phases[1] {
+            ProfileNode::ServiceReady { timeout_sec, .. } => assert_eq!(*timeout_sec, Some(600)),
+            other => panic!("expected ServiceReady, got {other:?}"),
+        }
+
+        let text = concat!(
+            "Spec(",
+            "name: \"poll-timeout\", ",
+            "version: none, ",
+            "description: none, ",
+            "capabilities: [\"sh.exec\"], ",
+            "env: {}, ",
+            "env_secrets: [], ",
+            "phases: [",
+            "ComfyUiHealth(port: 8188, timeout_sec: 240), ",
+            "ServiceReady(name: \"llm\", ",
+            "check_url: \"http://127.0.0.1:9000/health\", ",
+            "timeout_sec: 600)",
+            "])",
+        );
+        let text_path = write_temp("poll-timeout.txt", text);
+        let ast_text = load_profile(&text_path).expect("declared timeouts must parse as text");
+        assert_eq!(canonical::hash(&ast), canonical::hash(&ast_text));
+    }
+
+    /// An omitted `timeout_sec` parses as `None` (the kind default then
+    /// applies at expand time) rather than defaulting to a number in
+    /// the AST — which is what keeps the canonical encoding, and so the
+    /// hash, unchanged for profiles written before the field existed.
+    #[test]
+    fn an_omitted_poll_timeout_parses_as_none() {
+        let value = serde_json::json!({
+            "type": "Spec",
+            "name": "poll-timeout-absent",
+            "capabilities": ["sh.exec"],
+            "phases": [
+                { "type": "ComfyUiHealth", "port": 8188 },
+                {
+                    "type": "ServiceReady",
+                    "name": "llm",
+                    "check_url": "http://127.0.0.1:9000/health"
+                }
+            ]
+        });
+        let path = write_temp("poll-timeout-absent.json", &value.to_string());
+        let ast = load_profile(&path).expect("a profile without timeouts must still parse");
+        let ProfileNode::Spec { phases, .. } = &ast else {
+            panic!("expected Spec root");
+        };
+        assert!(matches!(
+            &phases[0],
+            ProfileNode::ComfyUiHealth {
+                timeout_sec: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &phases[1],
+            ProfileNode::ServiceReady {
+                timeout_sec: None,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn malformed_json_surfaces_as_parse_error() {
         let path = write_temp("bad.json", "{not: valid json,");

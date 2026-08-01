@@ -34,9 +34,9 @@ The catalog below is exhaustive: **22 user-facing phase variants**.
 | `llm_models` | `models` list of `{ src = "hf://<owner>/<repo>[@<rev>]", dst_dir? (default "/tmp/"), revision? }` — repo snapshot download | `sh.exec` (hf CLI) |
 | `hooks.post_install` | `script` string — raw shell, inner escape (chapter 01) | `sh.exec` |
 | `comfyui.restart` | `port` number (default 8188); `extra_args` list\<string\> (shell-safe) | `sh.exec` |
-| `comfyui.health` | `port` number (default 8188) — 60 s poll of `/object_info` | `net.http_get` |
+| `comfyui.health` | `port` number (default 8188); `timeout_sec?` number (default 180) — poll of `/object_info` | `net.http_get` |
 | `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind = "vllm"\|"ollama"\|"llamacpp", model? (shell-safe), port?, dtype? (shell-safe), tensor_parallel_size?, extra_args? (shell-safe) }` | `sh.exec` |
-| `service.ready` | `name` string; `check` = `{ http = "<url>", timeout_sec? (default 60) }` | `sh.exec` |
+| `service.ready` | `name` string; `check` = `{ http = "<url>", timeout_sec? (default 300) }` | `sh.exec` |
 
 ### Catalog kinds (direct operations)
 
@@ -206,6 +206,37 @@ so polling it reports ready too early.
 "python version mismatch: want <want>, got " + sys.version'`. A
 mismatch exits non-zero and fails the step, with the interpreter's real
 version in the captured stderr.
+
+#### Poll deadlines
+
+| kind | payload field | default |
+|---|---|---|
+| `comfyui.health` | `timeout_sec?` | 180 s |
+| `service.ready` | `check.timeout_sec?` | 300 s |
+
+Both polls GET every 2 s until a 2xx answers or the deadline passes; a
+deadline reached is a step failure carrying the last status seen.
+
+The two defaults are separate because they wait for different things.
+A ComfyUI cold boot spends its budget before the API answers —
+ComfyUI-Manager's prestartup script alone took 49.7 s on the pod this
+was measured on, with model and custom-node scanning after it. An
+inference engine's start-up is dominated by weight loading and CUDA
+graph capture (a vllm engine init measured ~100 s on the same pod), so
+its deadline is a multiple of that rather than of an HTTP round trip.
+A single flat 60 s deadline shared by both failed apply on servers
+that were merely still starting.
+
+A declared `timeout_sec` replaces the default in both directions,
+including downwards — a profile that wants to fail fast asks for it.
+Omitting the field is not the same statement as declaring the default
+value: an absent `timeout_sec` is omitted from the canonical encoding,
+so profiles written before the field existed keep their hash.
+
+Neither poll observes the process it is waiting for. A server that
+exits during the wait is reported as a timeout, not as a death — the
+launch step already returned, and nothing carries its pid forward
+(§Spawn-and-poll invocations).
 
 ### Shared vocabulary (frozen literal sets)
 

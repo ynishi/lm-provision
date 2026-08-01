@@ -241,9 +241,17 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             CanonValue::Object(fields)
         }
 
-        ProfileNode::ComfyUiHealth { id: _, port } => {
+        ProfileNode::ComfyUiHealth {
+            id: _,
+            port,
+            timeout_sec,
+        } => {
             let mut fields = variant_object("ComfyUiHealth");
             fields.insert("port".into(), CanonValue::Int(i64::from(*port)));
+            // Omitted when unset, so a profile that leaves the deadline
+            // to the kind default keeps the bytes — and therefore the
+            // hash — it had before the field existed.
+            insert_optional_u16(&mut fields, "timeout_sec", timeout_sec);
             CanonValue::Object(fields)
         }
 
@@ -278,10 +286,13 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             id: _,
             name,
             check_url,
+            timeout_sec,
         } => {
             let mut fields = variant_object("ServiceReady");
             fields.insert("name".into(), CanonValue::Str(name.clone()));
             fields.insert("check_url".into(), CanonValue::Str(check_url.clone()));
+            // Omitted when unset, same rule as `ComfyUiHealth`'s.
+            insert_optional_u16(&mut fields, "timeout_sec", timeout_sec);
             CanonValue::Object(fields)
         }
 
@@ -961,6 +972,77 @@ mod tests {
              \"tensor_parallel_size\":4,\"type\":\"ServiceStart\"}"
         );
         assert_ne!(hash(&bare), hash(&detailed));
+    }
+
+    /// A poll kind that leaves its deadline to the kind default must
+    /// encode exactly as it did before `timeout_sec` existed (both
+    /// expected strings are the pre-field encodings, verbatim), so
+    /// adding the field left every existing profile's hash alone.
+    #[test]
+    fn undeclared_poll_timeouts_keep_their_pre_field_bytes() {
+        let gen = IdGen::new();
+        let health = ProfileNode::ComfyUiHealth {
+            id: new_id(&gen),
+            port: 8188,
+            timeout_sec: None,
+        };
+        assert_eq!(
+            encode(&health),
+            "{\"port\":8188,\"type\":\"ComfyUiHealth\"}"
+        );
+
+        let ready = ProfileNode::ServiceReady {
+            id: new_id(&gen),
+            name: "llm".to_string(),
+            check_url: "http://127.0.0.1:9000/health".to_string(),
+            timeout_sec: None,
+        };
+        assert_eq!(
+            encode(&ready),
+            "{\"check_url\":\"http://127.0.0.1:9000/health\",\
+             \"name\":\"llm\",\"type\":\"ServiceReady\"}"
+        );
+    }
+
+    /// A declared deadline encodes as an `Int` and changes the hash:
+    /// two polls that wait for different lengths are not the same poll.
+    #[test]
+    fn declared_poll_timeouts_encode_and_change_the_hash() {
+        let gen = IdGen::new();
+        let health_bare = ProfileNode::ComfyUiHealth {
+            id: new_id(&gen),
+            port: 8188,
+            timeout_sec: None,
+        };
+        let health_declared = ProfileNode::ComfyUiHealth {
+            id: new_id(&gen),
+            port: 8188,
+            timeout_sec: Some(240),
+        };
+        assert_eq!(
+            encode(&health_declared),
+            "{\"port\":8188,\"timeout_sec\":240,\"type\":\"ComfyUiHealth\"}"
+        );
+        assert_ne!(hash(&health_bare), hash(&health_declared));
+
+        let ready_bare = ProfileNode::ServiceReady {
+            id: new_id(&gen),
+            name: "llm".to_string(),
+            check_url: "http://127.0.0.1:9000/health".to_string(),
+            timeout_sec: None,
+        };
+        let ready_declared = ProfileNode::ServiceReady {
+            id: new_id(&gen),
+            name: "llm".to_string(),
+            check_url: "http://127.0.0.1:9000/health".to_string(),
+            timeout_sec: Some(600),
+        };
+        assert_eq!(
+            encode(&ready_declared),
+            "{\"check_url\":\"http://127.0.0.1:9000/health\",\
+             \"name\":\"llm\",\"timeout_sec\":600,\"type\":\"ServiceReady\"}"
+        );
+        assert_ne!(hash(&ready_bare), hash(&ready_declared));
     }
 
     /// Declaring extra args must change the hash — the field is part of

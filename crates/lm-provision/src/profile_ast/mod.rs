@@ -219,6 +219,19 @@ pub enum ProfileNode {
         id: NodeId,
         /// Target port.
         port: u16,
+        /// Poll deadline in seconds. When omitted the kind default
+        /// applies (`comfyui.health` 180 s, `service.ready` 300 s —
+        /// see [`crate::exec::lifecycle`]), so a cold ComfyUI boot
+        /// whose Manager prestartup alone runs ~50 s still has room to
+        /// answer. Omitted from the canonical encoding when unset, so
+        /// every profile that does not declare it hashes as it did
+        /// before the field existed.
+        ///
+        /// Same `Option<u16>` shape as [`ProfileNode::ServiceStart`]'s
+        /// `port` / `tensor_parallel_size` — the frontend's
+        /// `for_type("Option<u16>", …)` override covers it, and
+        /// canonical encodes it as an `Int` when set.
+        timeout_sec: Option<u16>,
     },
 
     /// `service.start`: Start background service
@@ -277,6 +290,20 @@ pub enum ProfileNode {
         name: String,
         /// HTTP health check URL.
         check_url: String,
+        /// Poll deadline in seconds (spec 02 `service.ready`
+        /// `check.timeout_sec`). When omitted the kind default applies
+        /// (`service.ready` 300 s, `comfyui.health` 180 s — see
+        /// [`crate::exec::lifecycle`]), which covers an engine
+        /// initialisation measured in minutes rather than seconds.
+        /// Omitted from the canonical encoding when unset, so every
+        /// profile that does not declare it hashes as it did before the
+        /// field existed.
+        ///
+        /// Same `Option<u16>` shape as [`ProfileNode::ServiceStart`]'s
+        /// `port` / `tensor_parallel_size` — the frontend's
+        /// `for_type("Option<u16>", …)` override covers it, and
+        /// canonical encodes it as an `Int` when set.
+        timeout_sec: Option<u16>,
     },
 
     // --- Catalog Kinds: Direct Operations ---

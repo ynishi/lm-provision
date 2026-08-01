@@ -387,7 +387,19 @@ fn payload_of(phase: &ProfileNode) -> Value {
                 json!({ "port": port, "extra_args": extra_args })
             }
         }
-        ProfileNode::ComfyUiHealth { port, .. } => json!({ "port": port }),
+        // `timeout_sec` follows the same omit-when-unset rule as the
+        // canonical encoder: an absent deadline is not the same
+        // statement as one that happens to equal the kind default.
+        ProfileNode::ComfyUiHealth {
+            port, timeout_sec, ..
+        } => {
+            let mut m = Map::new();
+            m.insert("port".into(), json!(port));
+            if let Some(timeout_sec) = timeout_sec {
+                m.insert("timeout_sec".into(), json!(timeout_sec));
+            }
+            Value::Object(m)
+        }
         // Platform detail follows the same omit-when-unset rule as the
         // canonical encoder: the plan renders what the author declared,
         // and an absent field is not the same statement as a zero one.
@@ -422,8 +434,19 @@ fn payload_of(phase: &ProfileNode) -> Value {
             Value::Object(m)
         }
         ProfileNode::ServiceReady {
-            name, check_url, ..
-        } => json!({ "name": name, "check_url": check_url }),
+            name,
+            check_url,
+            timeout_sec,
+            ..
+        } => {
+            let mut m = Map::new();
+            m.insert("name".into(), json!(name));
+            m.insert("check_url".into(), json!(check_url));
+            if let Some(timeout_sec) = timeout_sec {
+                m.insert("timeout_sec".into(), json!(timeout_sec));
+            }
+            Value::Object(m)
+        }
         ProfileNode::ShExec { argv, env, .. } => {
             let mut m = Map::new();
             m.insert("argv".into(), json!(argv));
@@ -629,6 +652,7 @@ mod tests {
                     id: g.node(),
                     name: "svc".into(),
                     check_url: "http://x/health".into(),
+                    timeout_sec: None,
                 },
                 ProfileNode::ComfyUiRestart {
                     id: g.node(),
@@ -638,6 +662,7 @@ mod tests {
                 ProfileNode::ComfyUiHealth {
                     id: g.node(),
                     port: 9000,
+                    timeout_sec: None,
                 },
                 ProfileNode::PostInstall {
                     id: g.node(),
@@ -804,6 +829,7 @@ mod tests {
                 ProfileNode::ComfyUiHealth {
                     id: g.node(),
                     port: 9002,
+                    timeout_sec: None,
                 },
             ],
         ));
@@ -842,6 +868,7 @@ mod tests {
                 ProfileNode::ComfyUiHealth {
                     id: g.node(),
                     port: 2222,
+                    timeout_sec: None,
                 },
             ],
         ));
@@ -868,6 +895,7 @@ mod tests {
                 id: g.node(),
                 name: "svc".into(),
                 check_url: "http://x/health".into(),
+                timeout_sec: None,
             }],
         ));
         assert_eq!(step_ids(&plan), vec!["11_service_0_ready"]);
@@ -893,6 +921,7 @@ mod tests {
                     id: g.node(),
                     name: "svc-a".into(),
                     check_url: "http://a/health".into(),
+                    timeout_sec: None,
                 },
                 ProfileNode::ServiceStart {
                     id: g.node(),
@@ -908,6 +937,7 @@ mod tests {
                     id: g.node(),
                     name: "svc-b".into(),
                     check_url: "http://b/health".into(),
+                    timeout_sec: None,
                 },
             ],
         ));
@@ -952,6 +982,7 @@ mod tests {
                     id: g.node(),
                     name: "svc-b".into(),
                     check_url: "http://b/health".into(),
+                    timeout_sec: None,
                 },
             ],
         ));

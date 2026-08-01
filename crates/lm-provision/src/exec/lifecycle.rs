@@ -96,8 +96,25 @@ const COMFYUI_MAIN_PY: &str = "/workspace/ComfyUI/main.py";
 const COMFYUI_LOG_PATH: &str = "/tmp/comfyui.log";
 /// `comfyui.install` default repo when the payload omits `repo`.
 const DEFAULT_COMFYUI_REPO: &str = "comfyanonymous/ComfyUI";
-/// Health-poll deadline (spec 02: 60 s HTTP poll loop).
-const HTTP_POLL_TIMEOUT_SEC: u64 = 60;
+/// `comfyui.health` poll deadline when the payload declares no
+/// `timeout_sec` (spec 02 `comfyui.health`).
+///
+/// 180 s matches the predecessor implementation's ComfyUI readiness
+/// bound. A cold boot spends that budget before the API answers:
+/// ComfyUI-Manager's prestartup script alone took 49.7 s on the pod
+/// this was measured on, and model / custom-node scanning follows it.
+/// The earlier flat 60 s deadline failed apply on a server that was
+/// merely still starting.
+const COMFYUI_HEALTH_TIMEOUT_SEC: u64 = 180;
+/// `service.ready` poll deadline when the payload declares no
+/// `timeout_sec` (spec 02 `service.ready` `check.timeout_sec`).
+///
+/// 300 s matches the predecessor implementation's `ready_check`
+/// default. An inference engine's start-up is dominated by weight
+/// loading and CUDA graph capture — a vllm engine init measured ~100 s
+/// on the same pod — so the deadline is a multiple of that, not of an
+/// HTTP round trip.
+const SERVICE_READY_TIMEOUT_SEC: u64 = 300;
 /// Poll interval between GETs while waiting for a 2xx.
 const HTTP_POLL_INTERVAL_SEC: u64 = 2;
 
@@ -173,12 +190,14 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
         ProfileNode::ComfyUiRestart {
             port, extra_args, ..
         } => Ok(expand_comfyui_restart(*port, extra_args)),
-        ProfileNode::ComfyUiHealth { port, .. } => Ok(vec![Step::HttpPoll {
+        ProfileNode::ComfyUiHealth {
+            port, timeout_sec, ..
+        } => Ok(vec![Step::HttpPoll {
             // `/object_info` is the API readiness endpoint. `/` serves
             // the UI's HTML and answers 200 before the backend can take
             // an API call, so polling it reports ready too early.
             url: format!("http://127.0.0.1:{port}/object_info"),
-            timeout_sec: HTTP_POLL_TIMEOUT_SEC,
+            timeout_sec: poll_timeout(*timeout_sec, COMFYUI_HEALTH_TIMEOUT_SEC),
         }]),
         ProfileNode::ServiceStart {
             name,
@@ -198,9 +217,13 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             *tensor_parallel_size,
             extra_args,
         )),
-        ProfileNode::ServiceReady { check_url, .. } => Ok(vec![Step::HttpPoll {
+        ProfileNode::ServiceReady {
+            check_url,
+            timeout_sec,
+            ..
+        } => Ok(vec![Step::HttpPoll {
             url: check_url.clone(),
-            timeout_sec: HTTP_POLL_TIMEOUT_SEC,
+            timeout_sec: poll_timeout(*timeout_sec, SERVICE_READY_TIMEOUT_SEC),
         }]),
         other => {
             use dsl_kit::DslNode as _;
@@ -210,6 +233,16 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             })
         }
     }
+}
+
+/// The deadline a poll step runs with: the payload's `timeout_sec`
+/// when the profile declares one, otherwise the kind's default
+/// ([`COMFYUI_HEALTH_TIMEOUT_SEC`] / [`SERVICE_READY_TIMEOUT_SEC`]).
+///
+/// The declared value is authoritative even when it is shorter than
+/// the default — a profile that asks for a fast failure gets one.
+fn poll_timeout(declared: Option<u16>, default_sec: u64) -> u64 {
+    declared.map_or(default_sec, u64::from)
 }
 
 fn expand_system_apt(packages: &[String]) -> Vec<Step> {
@@ -1694,6 +1727,7 @@ mod tests {
         let payload = ProfileNode::ComfyUiHealth {
             id: node_id(&ids),
             port: 8188,
+            timeout_sec: None,
         };
         let steps = expand(&payload).expect("comfyui_health expands");
         assert_eq!(
@@ -1701,9 +1735,35 @@ mod tests {
             vec![Step::HttpPoll {
                 // `/` answers 200 from the UI before the API is usable.
                 url: "http://127.0.0.1:8188/object_info".to_string(),
-                timeout_sec: HTTP_POLL_TIMEOUT_SEC,
+                // An undeclared deadline falls back to the kind default,
+                // which is sized for a cold boot rather than for an HTTP
+                // round trip.
+                timeout_sec: COMFYUI_HEALTH_TIMEOUT_SEC,
             }]
         );
+        assert_eq!(COMFYUI_HEALTH_TIMEOUT_SEC, 180);
+    }
+
+    /// A declared `timeout_sec` replaces the kind default — including
+    /// when it is shorter, so a profile can ask for a fast failure.
+    #[test]
+    fn expand_comfyui_health_honours_a_declared_timeout() {
+        let ids = IdGen::new();
+        for declared in [30u16, 600] {
+            let payload = ProfileNode::ComfyUiHealth {
+                id: node_id(&ids),
+                port: 8188,
+                timeout_sec: Some(declared),
+            };
+            let steps = expand(&payload).expect("comfyui_health expands");
+            assert_eq!(
+                steps,
+                vec![Step::HttpPoll {
+                    url: "http://127.0.0.1:8188/object_info".to_string(),
+                    timeout_sec: u64::from(declared),
+                }]
+            );
+        }
     }
 
     fn service_start(
@@ -1841,15 +1901,69 @@ mod tests {
             id: node_id(&ids),
             name: "llm".to_string(),
             check_url: "http://127.0.0.1:9000/health".to_string(),
+            timeout_sec: None,
         };
         let steps = expand(&payload).expect("service_ready expands");
         assert_eq!(
             steps,
             vec![Step::HttpPoll {
                 url: "http://127.0.0.1:9000/health".to_string(),
-                timeout_sec: HTTP_POLL_TIMEOUT_SEC,
+                // Engine start-up, not an HTTP round trip, sets this
+                // default.
+                timeout_sec: SERVICE_READY_TIMEOUT_SEC,
             }]
         );
+        assert_eq!(SERVICE_READY_TIMEOUT_SEC, 300);
+    }
+
+    /// A declared `check.timeout_sec` replaces the kind default in
+    /// both directions.
+    #[test]
+    fn expand_service_ready_honours_a_declared_timeout() {
+        let ids = IdGen::new();
+        for declared in [15u16, 900] {
+            let payload = ProfileNode::ServiceReady {
+                id: node_id(&ids),
+                name: "llm".to_string(),
+                check_url: "http://127.0.0.1:9000/health".to_string(),
+                timeout_sec: Some(declared),
+            };
+            let steps = expand(&payload).expect("service_ready expands");
+            assert_eq!(
+                steps,
+                vec![Step::HttpPoll {
+                    url: "http://127.0.0.1:9000/health".to_string(),
+                    timeout_sec: u64::from(declared),
+                }]
+            );
+        }
+    }
+
+    /// The two poll kinds do not share one deadline: a ComfyUI cold
+    /// boot and an inference-engine init are different budgets, which
+    /// is why the single flat constant they used to share is gone.
+    #[test]
+    fn the_two_poll_kinds_carry_separate_defaults() {
+        let ids = IdGen::new();
+        let health = expand(&ProfileNode::ComfyUiHealth {
+            id: node_id(&ids),
+            port: 8188,
+            timeout_sec: None,
+        })
+        .expect("comfyui_health expands");
+        let ready = expand(&ProfileNode::ServiceReady {
+            id: node_id(&ids),
+            name: "llm".to_string(),
+            check_url: "http://127.0.0.1:9000/health".to_string(),
+            timeout_sec: None,
+        })
+        .expect("service_ready expands");
+        let deadline = |steps: &[Step]| match &steps[0] {
+            Step::HttpPoll { timeout_sec, .. } => *timeout_sec,
+            other => panic!("expected HttpPoll, got {other:?}"),
+        };
+        assert_eq!(deadline(&health), 180);
+        assert_eq!(deadline(&ready), 300);
     }
 
     #[test]

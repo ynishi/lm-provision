@@ -303,6 +303,7 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
             ProfileNode::ComfyUiHealth {
                 id: ids.node(),
                 port: addr.port(),
+                timeout_sec: None,
             },
             ProfileNode::ServiceStart {
                 id: ids.node(),
@@ -318,6 +319,7 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
                 id: ids.node(),
                 name: "llm".to_string(),
                 check_url: format!("http://127.0.0.1:{}/health", addr.port()),
+                timeout_sec: None,
             },
         ],
     };
@@ -559,6 +561,10 @@ fn comfyui_health_polls_a_local_server_when_executing_effects() {
         phases: vec![ProfileNode::ComfyUiHealth {
             id: ids.node(),
             port,
+            // The server answers on the first GET, so the deadline is
+            // never approached; a short one keeps a regression here
+            // from stalling the suite for the kind default's 180 s.
+            timeout_sec: Some(5),
         }],
     };
 
