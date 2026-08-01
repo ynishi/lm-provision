@@ -176,17 +176,19 @@ its output to a log file closes them.
 | kind | invocation |
 |---|---|
 | `comfyui.restart` | `sh -c "cd /workspace/ComfyUI && nohup /workspace/ComfyUI/venv/bin/python /workspace/ComfyUI/main.py --port <port> <extra_args…> > /tmp/comfyui.log 2>&1 &"` |
-| `service.start` `vllm` | `sh -c "nohup python -m vllm.entrypoints.openai.api_server --model <model> [--dtype <dtype>] <extra_args…> > /tmp/<name>.log 2>&1 &"` |
+| `service.start` `vllm` | `sh -c "nohup python -m vllm.entrypoints.openai.api_server --model <model> [--port <port>] [--dtype <dtype>] [--tensor-parallel-size <n>] <extra_args…> > /tmp/<name>.log 2>&1 &"` |
 | `service.start` `ollama` | `sh -c "nohup ollama serve > /tmp/<name>.log 2>&1 &"` — binds 11434 and takes its address from `OLLAMA_HOST`, so neither model nor port appears on the command line |
-| `service.start` `llamacpp` | `sh -c "nohup llama-server --model <model> <extra_args…> > /tmp/<name>.log 2>&1 &"` |
+| `service.start` `llamacpp` | `sh -c "nohup llama-server --model <model> [--port <port>] <extra_args…> > /tmp/<name>.log 2>&1 &"` |
 
-`--port` is **not** synthesized for `service.start`. The AST carries no
-`port` / `tensor_parallel_size` (see §Payload fields not carried by the
-AST), and the values that would be substituted — 8000 for `vllm`, 8080
-for `llamacpp` — are each platform's own default, so omitting the flag
-lands on the same port. A profile that wants another one declares it in
-`extra_args`, where it appears exactly once rather than overriding a
-flag the launch already emitted.
+`--port` / `--dtype` / `--tensor-parallel-size` are synthesized only
+when the corresponding optional payload field is declared. When a field
+is unset the flag is omitted and each platform's own default takes over
+— 8000 for `vllm`, 8080 for `llamacpp` (`ollama` reads `OLLAMA_HOST`).
+`extra_args` is appended verbatim after the declared flags, so an
+author who prefers to write `["--port", "9000"]` there directly stays
+in control; declaring both puts the flag on the argv twice, which the
+platform CLI will normally reject as a duplicate — validate does not
+police that overlap.
 
 `service.start` expands to a **note** step instead of a command when
 the platform is not one of the three above, or when `vllm` / `llamacpp`

@@ -18,9 +18,8 @@
 //! ## Payload subset carried by the AST
 //!
 //! The `ProfileNode` payload is still a partial projection of the full
-//! spec-02 payload (`PythonDeps` has no `force_reinstall`,
-//! `ServiceStart` carries no `port` / `tensor_parallel_size`, and so
-//! on). So:
+//! spec-02 payload (`PythonDeps` has no `force_reinstall`, and so on).
+//! So:
 //!
 //! - Fields with a defensible built-in default are constant-substituted
 //!   (`PythonDeps.in_comfy_venv=false` → the system `pip` on `PATH`;
