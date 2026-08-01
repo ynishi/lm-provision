@@ -1198,8 +1198,13 @@ fn execute_http_poll_in(
     // Set once the launch has been seen running; until then a death
     // verdict is not this poll's to report (§Arming rule).
     let mut armed = false;
+    // The poll's own probes carry no declared headers and use the
+    // effect-default per-request timeout: the phase's `timeout_sec` is
+    // the *deadline for the whole poll* (`deadline` above), not a
+    // per-probe one.
+    let probe_opts = effects::HttpOpts::default();
     loop {
-        match effects::http_get(url) {
+        match effects::http_get(url, &probe_opts) {
             Ok(outcome) => {
                 if (200..300).contains(&outcome.status) {
                     return Ok(StepResult {

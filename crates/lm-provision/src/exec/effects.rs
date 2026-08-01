@@ -11,7 +11,9 @@
 //! - `sh_exec` runs `std::process::Command`; a non-zero exit is returned
 //!   as `Ok(outcome)`, not an error — the caller decides.
 //! - `http_get` / `http_post` use `ureq` (sync, rustls) with redirect
-//!   following disabled, reporting the raw status.
+//!   following disabled, reporting the raw status. Both take an
+//!   [`HttpOpts`] carrying the caller-resolved request headers and an
+//!   optional deadline override (default 30 s).
 //! - `transfer` implements only `https://` download. `b2://` / `hf://`
 //!   downloads and uploads that carry credentials are routed to the
 //!   native CLIs over `sh.exec` one layer up (see [`super::lifecycle`],
@@ -83,6 +85,64 @@ pub struct ExecOutcome {
     pub stderr_tail: String,
 }
 
+/// Options for [`http_get`] / [`http_post`]. Carries the resolved
+/// request headers (spec 06 §Resolution: the caller resolves the
+/// `headers` keyed slot into `name → value` and hands them here) and an
+/// optional per-request deadline overriding [`DEFAULT_TIMEOUT_SEC`].
+///
+/// The [`std::fmt::Debug`] impl is deliberately hand-written to redact
+/// the values — an `HttpOpts` printed with `{:?}` shows only the header
+/// *names*, never a resolved secret (spec 06 opacity, spec 09 §Audit
+/// log "header names are logged, header values never"), mirroring
+/// [`ShOpts`].
+#[derive(Default, Clone)]
+pub struct HttpOpts {
+    /// Resolved `name → value` headers sent with the request.
+    headers: BTreeMap<String, String>,
+    /// Request deadline in seconds; [`DEFAULT_TIMEOUT_SEC`] when `None`.
+    timeout_sec: Option<u16>,
+}
+
+impl HttpOpts {
+    /// Build options carrying the resolved headers and an optional
+    /// deadline override.
+    pub fn new(headers: BTreeMap<String, String>, timeout_sec: Option<u16>) -> Self {
+        Self {
+            headers,
+            timeout_sec,
+        }
+    }
+
+    /// The effective request deadline.
+    fn timeout(&self) -> Duration {
+        match self.timeout_sec {
+            Some(secs) => Duration::from_secs(u64::from(secs)),
+            None => Duration::from_secs_f64(DEFAULT_TIMEOUT_SEC),
+        }
+    }
+
+    /// Whether the declared headers already carry `content-type`
+    /// (matched case-insensitively, as HTTP field names are). When they
+    /// do, the caller's derived content type is dropped: an explicit
+    /// header wins (spec 04 §`net.http_post`).
+    fn declares_content_type(&self) -> bool {
+        self.headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-type"))
+    }
+}
+
+impl std::fmt::Debug for HttpOpts {
+    /// Redacts values: only the header names are rendered so that a
+    /// stray `{:?}` of an `HttpOpts` can never leak a resolved secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpOpts")
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("timeout_sec", &self.timeout_sec)
+            .finish()
+    }
+}
+
 /// Result of an [`http_get`] / [`http_post`] call.
 #[derive(Debug, Clone)]
 pub struct HttpOutcome {
@@ -136,13 +196,18 @@ pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError>
     })
 }
 
-/// HTTP GET `url`, reporting the raw status (redirects disabled).
-pub fn http_get(url: &str) -> Result<HttpOutcome, ExecError> {
-    let request = ureq::get(url)
+/// HTTP GET `url` with `opts`' resolved headers, reporting the raw
+/// status (redirects disabled).
+pub fn http_get(url: &str, opts: &HttpOpts) -> Result<HttpOutcome, ExecError> {
+    let mut builder = ureq::get(url);
+    for (name, value) in &opts.headers {
+        builder = builder.header(name, value);
+    }
+    let request = builder
         .config()
         .http_status_as_error(false)
         .max_redirects(0)
-        .timeout_global(Some(Duration::from_secs_f64(DEFAULT_TIMEOUT_SEC)))
+        .timeout_global(Some(opts.timeout()))
         .build();
 
     match request.call() {
@@ -154,15 +219,33 @@ pub fn http_get(url: &str) -> Result<HttpOutcome, ExecError> {
     }
 }
 
-/// HTTP POST `body` to `url` with `content_type`, reporting the raw
-/// status (redirects disabled).
-pub fn http_post(url: &str, body: &[u8], content_type: &str) -> Result<HttpOutcome, ExecError> {
-    let request = ureq::post(url)
-        .header("content-type", content_type)
+/// HTTP POST `body` to `url` with `content_type` and `opts`' resolved
+/// headers, reporting the raw status (redirects disabled).
+///
+/// `content_type` is the caller's derived value (spec 04
+/// §`net.http_post`: `application/json` for the `body_json` form,
+/// `application/octet-stream` otherwise). It is applied **only** when
+/// `opts` declares no `content-type` header of its own — `ureq`'s
+/// `header` appends rather than replaces, so an explicit header must
+/// suppress the derived one instead of racing it.
+pub fn http_post(
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+    opts: &HttpOpts,
+) -> Result<HttpOutcome, ExecError> {
+    let mut builder = ureq::post(url);
+    if !opts.declares_content_type() {
+        builder = builder.header("content-type", content_type);
+    }
+    for (name, value) in &opts.headers {
+        builder = builder.header(name, value);
+    }
+    let request = builder
         .config()
         .http_status_as_error(false)
         .max_redirects(0)
-        .timeout_global(Some(Duration::from_secs_f64(DEFAULT_TIMEOUT_SEC)))
+        .timeout_global(Some(opts.timeout()))
         .build();
 
     match request.send(body) {
@@ -482,11 +565,167 @@ mod tests {
         });
 
         let url = format!("http://{addr}/");
-        let outcome = http_get(&url).expect("http_get should succeed");
+        let outcome = http_get(&url, &HttpOpts::default()).expect("http_get should succeed");
         assert_eq!(outcome.status, 200);
         assert!(outcome.body_tail.contains("pong"));
 
         handle.join().expect("server thread joins");
+    }
+
+    /// Spawn a one-shot local HTTP server. Returns the URL to call and a
+    /// join handle yielding the **raw request text** (request line +
+    /// headers + body), so a test can assert on exactly what went over
+    /// the wire.
+    fn one_shot_server() -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_request(&mut stream);
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            request
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// Read one whole HTTP request (headers plus a `Content-Length`
+    /// body, when declared) off `stream`.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).expect("read request");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let want = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if buf.len() - (head_end + 4) >= want {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn http_get_sends_the_declared_headers() {
+        let (url, handle) = one_shot_server();
+        let headers = BTreeMap::from([
+            ("X-Demo".to_string(), "demo-value".to_string()),
+            ("Authorization".to_string(), "Bearer tok".to_string()),
+        ]);
+
+        let outcome =
+            http_get(&url, &HttpOpts::new(headers, None)).expect("http_get should succeed");
+        assert_eq!(outcome.status, 200);
+
+        let request = handle.join().expect("server thread joins").to_lowercase();
+        assert!(
+            request.contains("x-demo: demo-value"),
+            "declared header must reach the wire: {request}"
+        );
+        assert!(
+            request.contains("authorization: bearer tok"),
+            "declared header must reach the wire: {request}"
+        );
+    }
+
+    #[test]
+    fn http_post_sends_the_body_with_the_derived_content_type() {
+        let (url, handle) = one_shot_server();
+        let outcome = http_post(
+            &url,
+            br#"{"prompt":"hi"}"#,
+            "application/json",
+            &HttpOpts::default(),
+        )
+        .expect("http_post should succeed");
+        assert_eq!(outcome.status, 200);
+
+        let request = handle.join().expect("server thread joins");
+        assert!(
+            request
+                .to_lowercase()
+                .contains("content-type: application/json"),
+            "the derived content type must reach the wire: {request}"
+        );
+        assert!(
+            request.contains(r#"{"prompt":"hi"}"#),
+            "the body must reach the wire: {request}"
+        );
+    }
+
+    /// `ureq`'s `header` appends rather than replaces, so a
+    /// `content-type` declared in `headers` must *suppress* the derived
+    /// one — not race it into a duplicated field (spec 04
+    /// §`net.http_post`: an explicit header wins).
+    #[test]
+    fn an_explicit_content_type_header_replaces_the_derived_one() {
+        let (url, handle) = one_shot_server();
+        let headers = BTreeMap::from([(
+            // Deliberately cased differently from the derived header's
+            // name: HTTP field names are case-insensitive.
+            "Content-Type".to_string(),
+            "text/plain".to_string(),
+        )]);
+        http_post(
+            &url,
+            b"raw",
+            "application/json",
+            &HttpOpts::new(headers, None),
+        )
+        .expect("http_post should succeed");
+
+        let request = handle.join().expect("server thread joins").to_lowercase();
+        assert!(
+            request.contains("content-type: text/plain"),
+            "the explicit header must win: {request}"
+        );
+        assert!(
+            !request.contains("content-type: application/json"),
+            "the derived content type must be suppressed, not appended: {request}"
+        );
+        assert_eq!(
+            request.matches("content-type:").count(),
+            1,
+            "exactly one content-type field: {request}"
+        );
+    }
+
+    #[test]
+    fn http_opts_debug_redacts_the_header_values() {
+        let headers = BTreeMap::from([(
+            "Authorization".to_string(),
+            "Bearer super-secret-value".to_string(),
+        )]);
+        let rendered = format!("{:?}", HttpOpts::new(headers, Some(5)));
+        assert!(
+            rendered.contains("Authorization"),
+            "names are shown: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "values must be redacted: {rendered}"
+        );
     }
 
     #[test]

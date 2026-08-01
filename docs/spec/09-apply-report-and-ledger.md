@@ -125,9 +125,15 @@ Redaction rules:
   `EnvSecret` content node, `"env_ref:<name>"` for an `EnvRef`
   pointing at a `Spec.env` entry (chapter 04 §`fs.write`). Content
   bytes are never logged, whatever the source.
-- HTTP: URL, status, and body byte counts are logged; header
-  **names** are logged, header values never (headers may carry
-  tokens); bodies never.
+- HTTP: URL, status, and body byte counts are logged; request header
+  **names** are logged through the same helper the env keys use — so a
+  sensitive-shaped name such as `Authorization` renders as
+  `Authorization [REDACTED]` — and header values never (headers may
+  carry tokens); bodies never. `net.http_post` additionally logs
+  `body_source`, the body's origin named the way `fs.write`'s
+  `content_source` is: `"none"` (no body declared), `"body:string"` /
+  `"body:secret:<name>"` / `"body:env_ref:<name>"` for the `body`
+  value node, or `"body_json"` (chapter 04 §`net.http_post`).
 - `sh.exec`: argv is logged verbatim (validate's shell-safety and
   the env-injection design keep secrets out of argv); stdin is
   logged as a byte count only.

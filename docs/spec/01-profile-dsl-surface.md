@@ -169,6 +169,12 @@ the slot is stored ordered by key, and canonical (chapter 03) emits it
 in that order, so two profiles differing only in the order env entries
 were written hash identically.
 
+The same keyed-slot shape carries the `net.http_get` / `net.http_post`
+`headers` field (chapter 04) — same three value nodes, same
+omitted-binds-to-empty rule, same key-order insignificance. It is not
+an `env` slot: the resolved value becomes an HTTP request header rather
+than a child-process variable.
+
 Representing env as a keyed slot of nodes — rather than a JSON string
 field, a list of pairs, or a scalar map — is what lets the schema, the
 grammar, validate, and canonical all see *inside* the value: validate

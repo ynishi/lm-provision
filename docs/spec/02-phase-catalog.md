@@ -48,8 +48,8 @@ mirror the bridge signatures, with non-core fields forwarded as
 |---|---|---|
 | `sh.exec` | `argv` list\<string\> (non-empty); `opts` table (chapter 04 §sh.exec) | `sh.exec` |
 | `fs.write` | `path` string; `content` value node (bare string \| `EnvSecret` \| `EnvRef`, chapter 04 §`fs.write`); other fields → opts | `fs.write` |
-| `net.http_get` | `url` string; other fields → opts | `net.http_get` |
-| `net.http_post` | `url` string; `body` \| `body_json` \| `body_form`, `headers`, ... → opts | `net.http_post` |
+| `net.http_get` | `url` string; `headers` table\<string, string\|SecretRef\> optional (names shell-safe); `timeout_sec?` number (default 30) | `net.http_get` |
+| `net.http_post` | `url` string; `headers`, `timeout_sec?` as above; `body` value node \| `body_json` JSON string — **mutually exclusive**, and the content type follows from which one is declared (chapter 04 §`net.http_post`); `body_form` deferred | `net.http_post` |
 | `net.transfer` | `src`, `dst` strings; other fields → opts | `net.transfer`, or `sh.exec` when routed (§Dispatch routing) |
 | `mount.bind` | `src`, `dst` strings; `recursive?`, `read_only?` → opts | `mount.bind` |
 | `mount.umount` | `path` string; `lazy?`, `force?` → opts | `mount.umount` |

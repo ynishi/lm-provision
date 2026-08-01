@@ -462,8 +462,55 @@ fn payload_of(phase: &ProfileNode) -> Value {
         ProfileNode::FsWrite { path, content, .. } => {
             json!({ "path": path, "content": env_value(content) })
         }
-        ProfileNode::NetHttpGet { url, .. } => json!({ "url": url }),
-        ProfileNode::NetHttpPost { url, .. } => json!({ "url": url }),
+        // `headers` renders in its keyed-slot form (a literal is its
+        // bare string, a secret / ref its marker object) and is omitted
+        // when empty, mirroring the canonical encoder: the plan renders
+        // what the author declared, and an absent slot is not the same
+        // statement as an empty one. The resolved header value never
+        // enters a plan.
+        ProfileNode::NetHttpGet {
+            url,
+            headers,
+            timeout_sec,
+            ..
+        } => {
+            let mut m = Map::new();
+            m.insert("url".into(), json!(url));
+            if !headers.is_empty() {
+                m.insert("headers".into(), env_object(headers));
+            }
+            if let Some(timeout_sec) = timeout_sec {
+                m.insert("timeout_sec".into(), json!(timeout_sec));
+            }
+            Value::Object(m)
+        }
+        // Same rules, plus the two mutually exclusive body forms:
+        // `body` is a value node (rendered like a header / env value),
+        // `body_json` an opaque JSON string.
+        ProfileNode::NetHttpPost {
+            url,
+            headers,
+            body,
+            body_json,
+            timeout_sec,
+            ..
+        } => {
+            let mut m = Map::new();
+            m.insert("url".into(), json!(url));
+            if !headers.is_empty() {
+                m.insert("headers".into(), env_object(headers));
+            }
+            if let Some(body) = body {
+                m.insert("body".into(), env_value(body));
+            }
+            if let Some(body_json) = body_json {
+                m.insert("body_json".into(), json!(body_json));
+            }
+            if let Some(timeout_sec) = timeout_sec {
+                m.insert("timeout_sec".into(), json!(timeout_sec));
+            }
+            Value::Object(m)
+        }
         ProfileNode::NetTransfer { src, dst, .. } => json!({ "src": src, "dst": dst }),
         ProfileNode::MountBind { src, dst, .. } => json!({ "src": src, "dst": dst }),
         ProfileNode::MountUmount { path, .. } => json!({ "path": path }),
@@ -1135,6 +1182,83 @@ mod tests {
         );
     }
 
+    /// `net.http_*` request fields render like their `env` / `content`
+    /// siblings: header values as marker objects or bare strings, the
+    /// body value node the same way, `body_json` as its opaque string.
+    /// The resolved value of a secret never enters a plan.
+    #[test]
+    fn http_request_fields_appear_in_the_payload() {
+        let g = ids();
+        let headers = BTreeMap::from([
+            (
+                "Accept".to_string(),
+                ProfileNode::EnvLiteral {
+                    id: g.node(),
+                    value: "application/json".into(),
+                },
+            ),
+            (
+                "Authorization".to_string(),
+                ProfileNode::EnvSecret {
+                    id: g.node(),
+                    name: "API_TOKEN".into(),
+                },
+            ),
+        ]);
+        let plan = expand(&spec(
+            "demo",
+            vec![
+                ProfileNode::NetHttpGet {
+                    id: g.node(),
+                    url: "https://example.com/get".into(),
+                    headers: headers.clone(),
+                    timeout_sec: Some(5),
+                },
+                ProfileNode::NetHttpPost {
+                    id: g.node(),
+                    url: "https://example.com/post".into(),
+                    headers: BTreeMap::new(),
+                    body: Some(Box::new(ProfileNode::EnvSecret {
+                        id: g.node(),
+                        name: "API_TOKEN".into(),
+                    })),
+                    body_json: None,
+                    timeout_sec: None,
+                },
+                ProfileNode::NetHttpPost {
+                    id: g.node(),
+                    url: "https://example.com/post".into(),
+                    headers: BTreeMap::new(),
+                    body: None,
+                    body_json: Some("{\"k\":1}".into()),
+                    timeout_sec: None,
+                },
+            ],
+        ));
+
+        let get = &plan["steps"][0]["payload"];
+        assert_eq!(get["headers"]["Accept"], json!("application/json"));
+        assert_eq!(
+            get["headers"]["Authorization"],
+            json!({ "__secret": "API_TOKEN" })
+        );
+        assert_eq!(get["timeout_sec"], json!(5));
+
+        let post_body = &plan["steps"][1]["payload"];
+        assert_eq!(post_body["body"], json!({ "__secret": "API_TOKEN" }));
+        assert!(
+            post_body.get("headers").is_none() && post_body.get("body_json").is_none(),
+            "undeclared request fields must be omitted: {post_body}"
+        );
+
+        let post_json = &plan["steps"][2]["payload"];
+        assert_eq!(post_json["body_json"], json!("{\"k\":1}"));
+        assert!(
+            post_json.get("body").is_none(),
+            "undeclared request fields must be omitted: {post_json}"
+        );
+    }
+
     #[test]
     fn sync_pull_without_env_omits_the_env_and_revision_keys() {
         let g = ids();
@@ -1195,6 +1319,8 @@ mod tests {
                 ProfileNode::NetHttpGet {
                     id: g.node(),
                     url: "https://example/".into(),
+                    headers: BTreeMap::new(),
+                    timeout_sec: None,
                 },
                 ProfileNode::MountBind {
                     id: g.node(),

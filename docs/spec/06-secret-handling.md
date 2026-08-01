@@ -16,9 +16,11 @@ not here.
 
 ### `EnvSecret { name }` — the secret reference
 
-- A value node inhabiting an `env` keyed slot (chapter 04 §Env value
-  nodes). It carries the **logical name only**; there is no field, no
-  spelling, and no encoding in which a value could be written.
+- A value node inhabiting an `env` keyed slot, or any of the sibling
+  value-node slots the consumption-point list below enumerates
+  (chapter 04 §Env value nodes). It carries the **logical name only**;
+  there is no field, no spelling, and no encoding in which a value
+  could be written.
 
   ```json
   { "type": "ShExec",
@@ -101,18 +103,34 @@ expresses can mutate the host process environment.
 
 - Resolution reads the host process environment (`NAME` → value) at
   consumption time, immediately before the effect. The resolved value
-  flows into exactly one destination — the child process environment of
-  the consuming step — and is never stored, returned, or logged.
-- Consumption points currently implemented: the `env` keyed slot of
-  `sh.exec` (`ShExec`), `sync.pull` (`SyncPull`), and `staging.push`
-  (`StagingPush`) — the latter two are what make the
-  credential-carrying CLI dispatch route work (chapter 02 §Dispatch
-  routing) — and the `fs.write` `content` value node (→ file bytes,
-  chapter 04 §`fs.write`), which follows the identical
-  check-then-resolve protocol.
+  flows into exactly one destination — the consuming step's own sink,
+  enumerated per consumption point below — and is never stored,
+  returned, or logged.
+- Consumption points currently implemented. All four follow the
+  identical check-then-resolve protocol; they differ only in where the
+  resolved value goes.
+
+  1. The `env` keyed slot of `sh.exec` (`ShExec`) → the child process
+     environment.
+  2. The `env` keyed slot of `sync.pull` (`SyncPull`) and
+     `staging.push` (`StagingPush`) → the child process environment of
+     the credential-carrying CLI dispatch route (chapter 02 §Dispatch
+     routing).
+  3. The `fs.write` `content` value node → file bytes (chapter 04
+     §`fs.write`).
+  4. The `net.http_get` / `net.http_post` `headers` keyed slot → an
+     HTTP request header value, and the `net.http_post` `body` value
+     node → the HTTP request body (chapter 04 §`net.http_get`). This
+     is the point an API bearer token goes through:
+     `"headers": { "Authorization": { "type": "EnvSecret", "name":
+     "API_TOKEN" } }`. The audit transcript carries header *names*
+     (sensitive-shaped ones marked `[REDACTED]`) and the body's source
+     form plus byte length — never a header value, never body content.
 - Consumption point specified but deferred (chapter 04): a
   `net.transfer` `auth_bearer` (→ an `Authorization: Bearer` header).
-  It will adopt the identical check-then-resolve protocol.
+  It will adopt the identical check-then-resolve protocol. Note this is
+  `net.transfer`'s own surface: the `net.http_*` header route above
+  already covers bearer auth on the request primitives.
 - Missing host env is fail-fast: a declared, consumed secret absent
   from the host environment aborts the step with
   `secret 'NAME' missing in host env` — no silent fallback, no
@@ -148,8 +166,8 @@ step:
   dry-run-resolves): **stable**.
 - The `{"__secret":"NAME"}` canonical marker: **stable** (chapter 03
   owns the encoding).
-- The consumption-point set: **provisional** — the two deferred points
-  above join it, each adopting the identical protocol.
+- The consumption-point set: **provisional** — the deferred point above
+  joins it, adopting the identical protocol.
 - Secret-key substring set: sourced from chapter 02 shared vocabulary,
   **stable once frozen** (frozen there).
 
@@ -175,4 +193,5 @@ references, secret-shaped `env` keys, and a missing host env.
 Deferred: the `net.transfer` `auth_bearer` consumption point, blocked
 on the corresponding AST field (chapter 04 §MVP scope). The `fs.write`
 `content` point landed with dsl-kit 0.8's scalar shorthand (chapter 04
-§`fs.write`).
+§`fs.write`); the `net.http_*` `headers` / `body` point (4) landed with
+the HTTP request fields (chapter 04 §`net.http_get`).

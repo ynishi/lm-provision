@@ -78,11 +78,12 @@ before its payload reaches any effect, in dry-run and real alike.
   the apply report's last `steps` entry plus the envelope `error` line
   (chapter 09).
 - Secret acceptance points are the `env` keyed slots (`sh.exec`,
-  `sync.pull`, `staging.push`): the value node names a secret, the
-  name is checked against declared `env_secrets`, and the value is
-  resolved from the host environment immediately before the effect,
-  never surfacing in the AST, the trace log, or the report
-  (chapter 06).
+  `sync.pull`, `staging.push`), the `fs.write` `content` slot, and the
+  `net.http_*` `headers` slot / `net.http_post` `body` slot: the value
+  node names a secret, the name is checked against declared
+  `env_secrets`, and the value is resolved from the host environment
+  immediately before the effect, never surfacing in the AST, the trace
+  log, or the report (chapter 06).
 
 ## Outputs
 
@@ -106,21 +107,64 @@ those options are deferred, not withdrawn.
   `stdin_file`, `timeout_sec`, `term_grace_sec`, the `on_line`
   streaming callback, and process-group-scoped timeout signalling.
 
-### `net.http_get` — `NetHttpGet { url }` / `net.http_post` — `NetHttpPost { url }`
+### `net.http_get` — `NetHttpGet { url, headers, timeout_sec }` / `net.http_post` — `NetHttpPost { url, headers, body, body_json, timeout_sec }`
 
 - The URL must pass the profile's `http_allowlist` policy
   (chapter 05 L3), checked in both modes.
+- `headers`: keyed slot, `name → EnvLiteral | EnvSecret | EnvRef`
+  (chapter 06) — the same value-node shape `sh.exec`'s `env` uses, and
+  the fourth secret consumption point. Header *names* must be
+  shell-safe (chapter 03's charset, a subset of the RFC 7230 token
+  charset, so `Content-Type` / `X-Api-Version` pass); values are
+  free-form and never checked. Resolution runs in both modes, so an
+  undeclared or host-absent header secret fails a dry run identically.
+- `body` (POST only): a value node, exactly like `fs.write`'s
+  `content` but optional — a bare string spelling (`"body": "text"`)
+  lowers to an `EnvLiteral` through the declared scalar shorthand.
+  Resolved bytes are the request body.
+- `body_json` (POST only): a JSON document carried as its serialized
+  **string**, the same opaque-JSON-string payload shape `llm_models`'s
+  `models_json` uses. Sent verbatim. There is no object spelling: the
+  canonical text grammar has no object literal, and a JSON-only sugar
+  would break front-end parity.
+- **`body` and `body_json` are mutually exclusive.** Declaring both is
+  a validate rejection (`phases[<i>]: body and body_json are mutually
+  exclusive`) — they name different bodies *and* different content
+  types, with no defensible precedence between them. The exec layer
+  re-checks it before the request, the same defense-in-depth the secret
+  allowlist gets: `apply` does not run validate first (chapter 07
+  §Invocation), so a profile reaching apply directly must not silently
+  acquire an invented precedence.
+- Content type is derived from the body form: `application/json` for
+  `body_json`, `application/octet-stream` for `body` and for the
+  no-body case (which remains the pre-field behaviour: an empty
+  octet-stream body). A `content-type` entry in `headers` (matched
+  case-insensitively) always wins over the derived value, and
+  *suppresses* it rather than duplicating the field.
+- `timeout_sec`: per-request deadline; the effect default (30 s)
+  applies when omitted.
 - Effect: a single request with redirects **disabled** (the raw status
-  is reported, not followed), a 30 s timeout, and a 16 MiB response
-  cap — a larger body is an error, never buffered unbounded. The
-  report carries the status; the trace log carries the body tail
-  (last 4 KiB).
-- `net.http_post` currently sends an empty body with
-  `Content-Type: application/octet-stream`, because the AST carries no
-  body field.
-- Deferred: `headers`, `timeout_sec`, `max_bytes`, and the three
-  mutually exclusive POST body forms (`body` / `body_json` /
-  `body_form`).
+  is reported, not followed) and a 16 MiB response cap — a larger body
+  is an error, never buffered unbounded. The report carries the status;
+  the trace log carries the body tail (last 4 KiB).
+- Redaction (chapter 09): the audit event carries the URL, the request
+  header *names* (sensitive-shaped ones marked `[REDACTED]`), and — for
+  POST — the body's source form (`none` / `body:string` /
+  `body:secret:<name>` / `body:env_ref:<name>` / `body_json`) plus its
+  byte length. Header values and body content never reach the
+  transcript, the trace log, or the report.
+- Every one of the five fields is omitted from the canonical encoding
+  when unset (empty map / `None`), so a profile written before they
+  existed keeps its bytes and its hash (chapter 03 §canonical).
+- Deferred, with reasons:
+  - `max_bytes` — the 16 MiB cap is not yet author-tunable; no
+    consumer has needed a different one.
+  - `body_form` (urlencoded) — nothing asks for it: the generic API
+    surface this primitive exists for is JSON-bodied.
+  - multipart upload — when a consumer needs it, it gets its **own
+    catalog kind** rather than a fourth body form here: multipart
+    carries per-part filenames, content types, and streaming
+    concerns that do not belong in a generic request primitive.
 
 ### `net.transfer` — `NetTransfer { src, dst }`
 
@@ -281,6 +325,11 @@ Deferred with one-line reasons:
   coercion for the `One` child slot.~~ Landed: dsl-kit 0.8 shipped the
   scalar shorthand (issue #14) and `content` is a value node now
   (§`fs.write` above).
+- ~~`net.http_*` `headers` / `timeout_sec` and the POST body forms —
+  the AST carried only `url`.~~ Landed: `headers` / `timeout_sec` /
+  `body` / `body_json` are AST fields now (§`net.http_get` above).
+  `max_bytes`, `body_form`, and multipart stay deferred with the
+  reasons given there.
 - `mount.volume_attach` has a reserved capability key and no
   primitive (provider-API territory behind the provisioning boundary,
   chapter 08).

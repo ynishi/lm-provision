@@ -340,21 +340,98 @@ pub enum ProfileNode {
     },
 
     /// `net.http_get`: Perform HTTP GET request
+    ///
+    /// `headers` / `timeout_sec` are omitted from the canonical
+    /// encoding when unset (empty map / `None`), so every profile
+    /// written before they existed keeps its bytes — and therefore its
+    /// hash — unchanged.
     #[dsl_exec(apply = "net_http_get")]
     NetHttpGet {
         /// Stable node ID.
         id: NodeId,
         /// Target URL.
         url: String,
+        /// Request header map: `name → value node` (spec 04
+        /// §`net.http_get` / `net.http_post`, spec 06 consumption
+        /// point 4). Same keyed-slot shape as [`ProfileNode::ShExec`]'s
+        /// `env`: each value is an [`ProfileNode::EnvLiteral`],
+        /// an [`ProfileNode::EnvSecret`] (host-env-resolved through the
+        /// same `env_secrets` gate), or an [`ProfileNode::EnvRef`]
+        /// (a [`ProfileNode::Spec::env`] entry). Resolution runs in both
+        /// modes; the resolved value reaches the request and nothing
+        /// else — the audit transcript carries header *names* only.
+        headers: BTreeMap<String, ProfileNode>,
+        /// Request deadline in seconds. When omitted the effect
+        /// default applies (30 s — see [`crate::exec::effects`]).
+        ///
+        /// Same `Option<u16>` shape as [`ProfileNode::ServiceReady`]'s
+        /// `timeout_sec` — the frontend's `for_type("Option<u16>", …)`
+        /// override covers it, and canonical encodes it as an `Int`
+        /// when set.
+        timeout_sec: Option<u16>,
     },
 
     /// `net.http_post`: Perform HTTP POST request
+    ///
+    /// `headers` / `body` / `body_json` / `timeout_sec` are omitted
+    /// from the canonical encoding when unset, so every profile written
+    /// before they existed keeps its bytes — and therefore its hash —
+    /// unchanged.
+    ///
+    /// **`body` and `body_json` are mutually exclusive**: declaring
+    /// both is a [`crate::validate`] rejection, because the two name
+    /// different request bodies *and* different content types and
+    /// there is no defensible precedence between them. The exec layer
+    /// re-checks it (`apply` does not run validate first), so the rule
+    /// holds on both entry paths.
+    ///
+    /// Content-type derivation (spec 04 §`net.http_post`):
+    ///
+    /// | declared | `Content-Type` |
+    /// |---|---|
+    /// | neither | `application/octet-stream` (empty body — the pre-field behaviour) |
+    /// | `body` | `application/octet-stream` |
+    /// | `body_json` | `application/json` |
+    ///
+    /// A `content-type` entry in `headers` (matched case-insensitively)
+    /// always wins over the derived value.
     #[dsl_exec(apply = "net_http_post")]
     NetHttpPost {
         /// Stable node ID.
         id: NodeId,
         /// Target URL.
         url: String,
+        /// Request header map — same shape and semantics as
+        /// [`ProfileNode::NetHttpGet`]'s `headers`.
+        headers: BTreeMap<String, ProfileNode>,
+        /// Request body — a value node (spec 06 consumption point 4),
+        /// the optional counterpart of [`ProfileNode::FsWrite`]'s
+        /// `content`: an [`ProfileNode::EnvLiteral`] carries the body
+        /// verbatim, an [`ProfileNode::EnvSecret`] resolves from the
+        /// host env through the `env_secrets` gate, an
+        /// [`ProfileNode::EnvRef`] points at a
+        /// [`ProfileNode::Spec::env`] entry. A bare string spelling
+        /// (`"body": "text"`) lowers to an `EnvLiteral` via the declared
+        /// scalar shorthand (dsl-kit 0.8 #14), which the macro supports
+        /// on `Optional` slots exactly as it does on `One` slots.
+        ///
+        /// The resolved bytes reach the request and nothing else: the
+        /// audit transcript carries the body's *form* and byte length,
+        /// never its content.
+        #[dsl_schema(scalar(string = EnvLiteral::value))]
+        body: Option<Box<ProfileNode>>,
+        /// Request body as a JSON document, carried as its serialized
+        /// string — the same opaque-JSON-string payload shape
+        /// [`ProfileNode::LlmModels`]'s `models_json` uses (both
+        /// front-ends spell it as a string; there is no object
+        /// spelling, since the canonical text grammar has no object
+        /// literal). Sent verbatim with `Content-Type: application/json`.
+        ///
+        /// Mutually exclusive with `body` (see the variant doc).
+        body_json: Option<String>,
+        /// Request deadline in seconds — same shape and default (30 s)
+        /// as [`ProfileNode::NetHttpGet`]'s `timeout_sec`.
+        timeout_sec: Option<u16>,
     },
 
     /// `net.transfer`: Transfer file across network

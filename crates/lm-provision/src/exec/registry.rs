@@ -432,11 +432,7 @@ impl ProfileOp {
         // secret fails a dry run identically to a real run. The label
         // names the source (spec 09 names-not-values) — the resolved
         // value itself never reaches the event or the report.
-        let content_source = match &**content {
-            ProfileNode::EnvSecret { name, .. } => format!("secret:{name}"),
-            ProfileNode::EnvRef { name, .. } => format!("env_ref:{name}"),
-            _ => "string".to_string(),
-        };
+        let content_source = value_source(content);
         let resolved = match self.ctx.env_policy.resolve_one(content) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -485,8 +481,22 @@ impl ProfileOp {
         }
     }
 
+    /// `net.http_get`: URL policy → header resolution → effect.
+    ///
+    /// The `headers` keyed slot is resolved through the
+    /// [`EnvPolicy`](super::policy::EnvPolicy) in **both** modes
+    /// (spec 06 §Resolution "dry-run resolves too"), so an undeclared or
+    /// host-absent header secret fails a dry run identically. Neither
+    /// the trace line nor the report carries a resolved value — only the
+    /// header names reach the transcript.
     fn run_http_get(&self, node: NodeId, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
-        let ProfileNode::NetHttpGet { url, .. } = payload else {
+        let ProfileNode::NetHttpGet {
+            url,
+            headers,
+            timeout_sec,
+            ..
+        } = payload
+        else {
             return Err(self.variant_fail(node, "net.http_get", "NetHttpGet"));
         };
         let (id, kind) = self.base(node);
@@ -497,10 +507,23 @@ impl ProfileOp {
             self.push(entry);
             return Err(err);
         }
-        audit::http_get(self.ctx.mode, &kind, url);
+        let resolved_headers = match self.ctx.env_policy.resolve(headers) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let mut entry = StepReport::new(id, kind, "net.http_get");
+                entry.url = Some(url.clone());
+                self.mark_fail(&mut entry, &err);
+                self.push(entry);
+                return Err(err);
+            }
+        };
+        audit::http_get(self.ctx.mode, &kind, url, &resolved_headers);
         match self.ctx.mode {
             ExecMode::DryRun => {
-                let value = self.record(format!("net_http_get url={url}"));
+                let value = self.record(format!(
+                    "net_http_get url={url}{}",
+                    render_http_request(&resolved_headers, *timeout_sec)
+                ));
                 let mut entry = StepReport::new(id, kind, "net.http_get");
                 entry.url = Some(url.clone());
                 entry.dry_run = Some(true);
@@ -508,7 +531,8 @@ impl ProfileOp {
                 Ok(value)
             }
             ExecMode::Real => {
-                let outcome = match effects::http_get(url) {
+                let opts = effects::HttpOpts::new(resolved_headers, *timeout_sec);
+                let outcome = match effects::http_get(url, &opts) {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         let mut entry = StepReport::new(id, kind, "net.http_get");
@@ -529,26 +553,104 @@ impl ProfileOp {
         }
     }
 
+    /// `net.http_post`: URL policy → header + body resolution → effect.
+    ///
+    /// Headers resolve exactly as in [`run_http_get`](Self::run_http_get).
+    /// The body is whichever of the two mutually exclusive forms the
+    /// profile declared — declaring both is rejected here as well as at
+    /// validate, since `apply` does not run validate first: a `body`
+    /// value node resolves through the same secret pipe as `fs.write`'s
+    /// `content`, a `body_json` string is sent verbatim. The content
+    /// type follows from the form (`application/json` for `body_json`,
+    /// `application/octet-stream` otherwise) unless `headers` declares
+    /// one, which wins.
     fn run_http_post(
         &self,
         node: NodeId,
         payload: &ProfileNode,
     ) -> Result<ProfileValue, ExecError> {
-        let ProfileNode::NetHttpPost { url, .. } = payload else {
+        let ProfileNode::NetHttpPost {
+            url,
+            headers,
+            body,
+            body_json,
+            timeout_sec,
+            ..
+        } = payload
+        else {
             return Err(self.variant_fail(node, "net.http_post", "NetHttpPost"));
         };
         let (id, kind) = self.base(node);
         if let Err(err) = self.ctx.http_policy.check(url) {
-            let mut entry = StepReport::new(id, kind, "net.http_post");
-            entry.url = Some(url.clone());
-            self.mark_fail(&mut entry, &err);
-            self.push(entry);
+            self.push_http_post_failure(&id, &kind, url, &err);
             return Err(err);
         }
-        audit::http_post(self.ctx.mode, &kind, url);
+        let resolved_headers = match self.ctx.env_policy.resolve(headers) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                self.push_http_post_failure(&id, &kind, url, &err);
+                return Err(err);
+            }
+        };
+        // Resolve the body in both modes, like `fs.write`'s content:
+        // a dry run that passes proves the secret plumbing.
+        let (body_bytes, content_type, body_source) = match (body, body_json) {
+            // Both forms declared. Validate rejects this, but `apply`
+            // does not run validate first (spec 07 §Invocation), so the
+            // rule is re-checked here rather than silently resolved by
+            // an invented precedence — the two name different bodies
+            // *and* different content types.
+            (Some(_), Some(_)) => {
+                let err = ExecError::EffectFailed {
+                    op: "net_http_post".to_string(),
+                    message: "body and body_json are mutually exclusive".to_string(),
+                };
+                self.push_http_post_failure(&id, &kind, url, &err);
+                return Err(err);
+            }
+            (Some(body), None) => {
+                let source = format!("body:{}", value_source(body));
+                let resolved = match self.ctx.env_policy.resolve_one(body) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        self.push_http_post_failure(&id, &kind, url, &err);
+                        return Err(err);
+                    }
+                };
+                (
+                    resolved.into_bytes(),
+                    "application/octet-stream".to_string(),
+                    source,
+                )
+            }
+            (None, Some(body_json)) => (
+                body_json.clone().into_bytes(),
+                "application/json".to_string(),
+                "body_json".to_string(),
+            ),
+            // Neither form declared: the pre-field behaviour, an empty
+            // octet-stream body.
+            (None, None) => (
+                Vec::new(),
+                "application/octet-stream".to_string(),
+                "none".to_string(),
+            ),
+        };
+        audit::http_post(
+            self.ctx.mode,
+            &kind,
+            url,
+            &resolved_headers,
+            &body_source,
+            body_bytes.len() as u64,
+        );
         match self.ctx.mode {
             ExecMode::DryRun => {
-                let value = self.record(format!("net_http_post url={url}"));
+                let value = self.record(format!(
+                    "net_http_post url={url}{} body={body_source} body_bytes={}",
+                    render_http_request(&resolved_headers, *timeout_sec),
+                    body_bytes.len(),
+                ));
                 let mut entry = StepReport::new(id, kind, "net.http_post");
                 entry.url = Some(url.clone());
                 entry.dry_run = Some(true);
@@ -556,13 +658,11 @@ impl ProfileOp {
                 Ok(value)
             }
             ExecMode::Real => {
-                let outcome = match effects::http_post(url, &[], "application/octet-stream") {
+                let opts = effects::HttpOpts::new(resolved_headers, *timeout_sec);
+                let outcome = match effects::http_post(url, &body_bytes, &content_type, &opts) {
                     Ok(outcome) => outcome,
                     Err(err) => {
-                        let mut entry = StepReport::new(id, kind, "net.http_post");
-                        entry.url = Some(url.clone());
-                        self.mark_fail(&mut entry, &err);
-                        self.push(entry);
+                        self.push_http_post_failure(&id, &kind, url, &err);
                         return Err(err);
                     }
                 };
@@ -626,6 +726,18 @@ impl ProfileOp {
                 Ok(value)
             }
         }
+    }
+
+    /// Push a failed `net.http_post` report carrying the declared URL. The
+    /// handler has four pre-effect / effect failure points (URL policy,
+    /// header resolution, body resolution, the request itself), so the
+    /// entry is built here once rather than at each of them — the
+    /// sibling of [`push_transfer_failure`](Self::push_transfer_failure).
+    fn push_http_post_failure(&self, id: &str, kind: &str, url: &str, err: &ExecError) {
+        let mut entry = StepReport::new(id.to_string(), kind.to_string(), "net.http_post");
+        entry.url = Some(url.to_string());
+        self.mark_fail(&mut entry, err);
+        self.push(entry);
     }
 
     /// Push a failed `net.transfer` report carrying the declared src/dst.
@@ -728,6 +840,42 @@ impl ProfileOp {
             }
         }
     }
+}
+
+/// Name where a resolved value node's content came from without
+/// carrying it (spec 09 names-not-values): `"string"` for a literal,
+/// `"secret:<name>"` for an [`ProfileNode::EnvSecret`],
+/// `"env_ref:<name>"` for an [`ProfileNode::EnvRef`]. Shared by the
+/// `fs.write` `content` and `net.http_post` `body` positions so the two
+/// transcripts label the same shape the same way.
+fn value_source(node: &ProfileNode) -> String {
+    match node {
+        ProfileNode::EnvSecret { name, .. } => format!("secret:{name}"),
+        ProfileNode::EnvRef { name, .. } => format!("env_ref:{name}"),
+        _ => "string".to_string(),
+    }
+}
+
+/// The dry-run trace suffix common to both HTTP ops: the resolved
+/// header *names* and the declared deadline, each omitted when the
+/// profile declared none. Header values never reach the trace (spec 09),
+/// so this renders keys only — the same shape `sh_exec`'s `env_keys=`
+/// suffix uses.
+fn render_http_request(
+    headers: &std::collections::BTreeMap<String, String>,
+    timeout_sec: Option<u16>,
+) -> String {
+    let mut out = String::new();
+    if !headers.is_empty() {
+        out.push_str(&format!(
+            " header_names={:?}",
+            headers.keys().collect::<Vec<_>>()
+        ));
+    }
+    if let Some(timeout_sec) = timeout_sec {
+        out.push_str(&format!(" timeout_sec={timeout_sec}"));
+    }
+    out
 }
 
 /// Emit one audit event for a lifecycle sub-step, dispatched by its

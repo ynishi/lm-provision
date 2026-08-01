@@ -24,7 +24,10 @@
 //!   imposes no further *content* condition (it never rejects empty
 //!   strings), so nothing remains to port — check 2 is a no-op here.
 //! - **Check 6 is scoped to payload-string shell-safety, the
-//!   `sync.*` / `staging.*` route shape, and the `env` keyed slot.** The
+//!   `sync.*` / `staging.*` route shape, the `env` keyed slot, and the
+//!   value-node slots outside it** (`fs.write` `content`,
+//!   `net.http_*` `headers`, `net.http_post` `body` — which also
+//!   carries the `body` / `body_json` exclusivity rule). The
 //!   typed enum removes the unknown-kind and per-field type/requiredness
 //!   walk the Lua port ran against `lm.catalog_data`. [`ProfileNode::SyncPull`]
 //!   / [`ProfileNode::StagingPush`] / [`ProfileNode::ShExec`] now carry
@@ -558,13 +561,46 @@ fn check_phase(
         ProfileNode::ShExec { env, .. } => {
             check_env_map(env, env_secrets, declared_env_keys, index)
         }
+        // `net.http_get` / `net.http_post` `headers` is a keyed slot of
+        // value nodes (spec 04, spec 06 consumption point 4): the same
+        // admissible-variant / cross-reference rules as an `env` slot,
+        // reported under the `headers` field path. Header *names* are
+        // checked for shell-safety like `env` keys are — the charset
+        // (`[A-Za-z0-9._/@:+=~-]`) is a subset of the RFC 7230 token
+        // charset, so a legal header name such as `Content-Type` or
+        // `X-Api-Version` passes while a metacharacter-bearing one does
+        // not.
+        ProfileNode::NetHttpGet { headers, .. } => {
+            check_value_map(headers, "headers", env_secrets, declared_env_keys, index)
+        }
+        ProfileNode::NetHttpPost {
+            headers,
+            body,
+            body_json,
+            ..
+        } => {
+            check_value_map(headers, "headers", env_secrets, declared_env_keys, index)?;
+            // The two body forms name different bodies *and* different
+            // content types, with no defensible precedence between
+            // them, so declaring both is a rejection rather than a
+            // silent pick (spec 04 §`net.http_post`).
+            if body.is_some() && body_json.is_some() {
+                return Err(ValidateError::PhaseShape(format!(
+                    "phases[{index}]: body and body_json are mutually exclusive"
+                )));
+            }
+            if let Some(body) = body {
+                check_single_value(body, "body", env_secrets, declared_env_keys, index)?;
+            }
+            Ok(())
+        }
         // `fs.write` `content` is a value node (spec 04 §`fs.write`,
         // spec 06 consumption point 3): the same admissible-variant /
         // cross-reference rules as one `env`-map value, minus the key
         // shell-safety (there is no key). The content itself stays
         // free-form — a literal is never shell-safety-checked.
         ProfileNode::FsWrite { content, .. } => {
-            check_content_value(content, env_secrets, declared_env_keys, index)
+            check_single_value(content, "content", env_secrets, declared_env_keys, index)
         }
         // Every remaining variant carries no `shell_safe`-marked field,
         // no route shape, and no `env` slot (`hooks.post_install.script`
@@ -630,41 +666,95 @@ fn check_env_map(
     Ok(())
 }
 
-/// Check the `fs.write` `content` value node: the admissible variants
-/// and cross-references mirror one [`check_env_map`] value —
+/// The admissible-variant / cross-reference rules shared by every value
+/// node that sits *outside* an `env` keyed slot: `Some(reason)` when the
+/// node is inadmissible, `None` when it checks out. The caller supplies
+/// the field path the reason is reported under, which is the only thing
+/// that differs between the `fs.write` `content`, `net.http_post`
+/// `body`, and `net.http_*` `headers[key]` positions.
+///
+/// The rules themselves mirror one [`check_env_map`] value:
 /// [`ProfileNode::EnvSecret`] must name a declared secret,
-/// [`ProfileNode::EnvRef`] must name a `Spec.env` entry — reported
-/// under the `content` field path rather than an `env[key]` path.
-fn check_content_value(
-    content: &ProfileNode,
+/// [`ProfileNode::EnvRef`] must name a `Spec.env` entry, and
+/// [`ProfileNode::EnvLiteral`] carries free-form content that is never
+/// value-checked.
+fn value_node_violation(
+    value: &ProfileNode,
     env_secrets: &HashSet<&str>,
     declared_env_keys: &HashSet<&str>,
-    index: usize,
-) -> Result<(), ValidateError> {
-    match content {
-        ProfileNode::EnvLiteral { .. } => Ok(()),
+) -> Option<String> {
+    match value {
+        ProfileNode::EnvLiteral { .. } => None,
         ProfileNode::EnvSecret { name, .. } => {
             if env_secrets.contains(name.as_str()) {
-                Ok(())
+                None
             } else {
-                Err(ValidateError::PhaseShape(format!(
-                    "phases[{index}].content: secret {name:?} is not declared in env_secrets"
-                )))
+                Some(format!("secret {name:?} is not declared in env_secrets"))
             }
         }
         ProfileNode::EnvRef { name, .. } => {
             if declared_env_keys.contains(name.as_str()) {
-                Ok(())
+                None
             } else {
-                Err(ValidateError::PhaseShape(format!(
-                    "phases[{index}].content: reference {name:?} not declared in Spec.env"
-                )))
+                Some(format!("reference {name:?} not declared in Spec.env"))
             }
         }
-        _ => Err(ValidateError::PhaseShape(format!(
-            "phases[{index}].content: value must be EnvLiteral, EnvSecret, or EnvRef"
+        _ => Some("value must be EnvLiteral, EnvSecret, or EnvRef".to_string()),
+    }
+}
+
+/// Check one value node occupying a named single slot (`fs.write`
+/// `content`, `net.http_post` `body`). Error message shape:
+/// `phases[<i>].<field>: <reason>`.
+fn check_single_value(
+    value: &ProfileNode,
+    field: &str,
+    env_secrets: &HashSet<&str>,
+    declared_env_keys: &HashSet<&str>,
+    index: usize,
+) -> Result<(), ValidateError> {
+    match value_node_violation(value, env_secrets, declared_env_keys) {
+        None => Ok(()),
+        Some(reason) => Err(ValidateError::PhaseShape(format!(
+            "phases[{index}].{field}: {reason}"
         ))),
     }
+}
+
+/// Check a keyed slot of value nodes that is *not* the `env` slot
+/// (`net.http_*` `headers`): keys must be shell-safe and each value
+/// obeys [`value_node_violation`]. Error message shape:
+/// `phases[<i>].<field>[<key>]: <reason>`.
+///
+/// The `env`-slot sibling [`check_env_map`] reports through the typed
+/// [`ValidateError::UndeclaredEnvSecret`] / [`ValidateError::UndeclaredEnvRef`]
+/// variants instead; those name the `env` slot in their `Display`, so a
+/// second slot reports as a [`ValidateError::PhaseShape`] the same way
+/// every other per-phase payload violation does.
+fn check_value_map(
+    map: &BTreeMap<String, ProfileNode>,
+    field: &str,
+    env_secrets: &HashSet<&str>,
+    declared_env_keys: &HashSet<&str>,
+    index: usize,
+) -> Result<(), ValidateError> {
+    // Keys first, then values — the same two-pass order (and therefore
+    // the same deterministic first violation) `check_env_map` uses.
+    for key in map.keys() {
+        if !is_shell_safe(key) {
+            return Err(ValidateError::PhaseShape(format!(
+                "phases[{index}].{field}[{key}]: key is not shell-safe"
+            )));
+        }
+    }
+    for (key, value) in map {
+        if let Some(reason) = value_node_violation(value, env_secrets, declared_env_keys) {
+            return Err(ValidateError::PhaseShape(format!(
+                "phases[{index}].{field}[{key}]: {reason}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Shell-safety of one string field, honoring the `{pod_id}` exemption
@@ -1515,6 +1605,230 @@ mod tests {
                 "phases[1].content: value must be EnvLiteral, EnvSecret, or EnvRef".into()
             ))
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Check 6: `net.http_*` headers / body value nodes (spec 06
+    // consumption point 4) + the `body` / `body_json` exclusivity rule.
+    // -----------------------------------------------------------------
+
+    fn http_post_with(
+        headers: &[(&str, ProfileNode)],
+        body: Option<ProfileNode>,
+        body_json: Option<&str>,
+        g: &IdGen,
+    ) -> ProfileNode {
+        ProfileNode::NetHttpPost {
+            id: g.node(),
+            url: "https://example.com/post".into(),
+            headers: env_of(headers),
+            body: body.map(Box::new),
+            body_json: body_json.map(str::to_string),
+            timeout_sec: None,
+        }
+    }
+
+    #[test]
+    fn http_headers_and_body_accept_literals_declared_secrets_and_refs() {
+        let g = ids();
+        let node = spec_full(
+            "demo",
+            &["MODEL_DIR"],
+            &["API_TOKEN"],
+            &[],
+            vec![
+                ProfileNode::NetHttpGet {
+                    id: g.node(),
+                    url: "https://example.com/get".into(),
+                    headers: env_of(&[
+                        (
+                            "Accept",
+                            ProfileNode::EnvLiteral {
+                                id: g.node(),
+                                value: "application/json".into(),
+                            },
+                        ),
+                        (
+                            "Authorization",
+                            ProfileNode::EnvSecret {
+                                id: g.node(),
+                                name: "API_TOKEN".into(),
+                            },
+                        ),
+                        (
+                            "X-Model-Dir",
+                            ProfileNode::EnvRef {
+                                id: g.node(),
+                                name: "MODEL_DIR".into(),
+                            },
+                        ),
+                    ]),
+                    timeout_sec: Some(5),
+                },
+                http_post_with(
+                    &[],
+                    Some(ProfileNode::EnvSecret {
+                        id: g.node(),
+                        name: "API_TOKEN".into(),
+                    }),
+                    None,
+                    &g,
+                ),
+                http_post_with(&[], None, Some("{\"k\":1}"), &g),
+            ],
+        );
+        assert!(validate(&node).is_ok(), "{:?}", validate(&node));
+    }
+
+    #[test]
+    fn http_header_naming_an_undeclared_secret_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![http_post_with(
+                &[(
+                    "Authorization",
+                    ProfileNode::EnvSecret {
+                        id: g.node(),
+                        name: "UNDECLARED".into(),
+                    },
+                )],
+                None,
+                None,
+                &g,
+            )],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].headers[Authorization]: secret \"UNDECLARED\" \
+                 is not declared in env_secrets"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn http_header_referencing_an_undeclared_spec_env_key_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![ProfileNode::NetHttpGet {
+                id: g.node(),
+                url: "https://example.com/get".into(),
+                headers: env_of(&[(
+                    "X-Missing",
+                    ProfileNode::EnvRef {
+                        id: g.node(),
+                        name: "MISSING".into(),
+                    },
+                )]),
+                timeout_sec: None,
+            }],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].headers[X-Missing]: reference \"MISSING\" not declared in Spec.env"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn non_shell_safe_http_header_name_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![http_post_with(
+                &[(
+                    "Bad Header",
+                    ProfileNode::EnvLiteral {
+                        id: g.node(),
+                        value: "v".into(),
+                    },
+                )],
+                None,
+                None,
+                &g,
+            )],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].headers[Bad Header]: key is not shell-safe".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn declaring_both_body_forms_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![http_post_with(
+                &[],
+                Some(ProfileNode::EnvLiteral {
+                    id: g.node(),
+                    value: "raw".into(),
+                }),
+                Some("{\"k\":1}"),
+                &g,
+            )],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1]: body and body_json are mutually exclusive".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn http_body_naming_an_undeclared_secret_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![http_post_with(
+                &[],
+                Some(ProfileNode::EnvSecret {
+                    id: g.node(),
+                    name: "UNDECLARED".into(),
+                }),
+                None,
+                &g,
+            )],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].body: secret \"UNDECLARED\" is not declared in env_secrets".into()
+            ))
+        );
+    }
+
+    /// A header value carrying free-form content is never
+    /// shell-safety-checked (only the *name* is), matching the
+    /// `env`-slot rule.
+    #[test]
+    fn http_header_literal_value_is_not_content_checked() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![http_post_with(
+                &[(
+                    "X-Note",
+                    ProfileNode::EnvLiteral {
+                        id: g.node(),
+                        value: "free form; $(not shell checked)".into(),
+                    },
+                )],
+                None,
+                None,
+                &g,
+            )],
+        );
+        assert!(validate(&node).is_ok(), "{:?}", validate(&node));
     }
 
     #[test]

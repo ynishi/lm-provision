@@ -185,6 +185,80 @@ fn fs_write_content_spellings_share_canonical_bytes_across_frontends() {
     );
 }
 
+/// `net.http_post` `body` is the *optional* sibling of `fs.write`'s
+/// `content` slot, and carries the same two spellings per front-end —
+/// the bare scalar shorthand and the explicit value node. All four land
+/// on the same canonical bytes. A request that declares no body at all
+/// keeps the exact bytes the variant produced before the field existed
+/// (hash neutrality, spec 04 §`net.http_post`).
+#[test]
+fn http_post_body_spellings_share_canonical_bytes_across_frontends() {
+    let url = "https://example.com/post";
+    let text_bare = r#"NetHttpPost(url: "https://example.com/post", body: "raw")"#;
+    let text_explicit =
+        r#"NetHttpPost(url: "https://example.com/post", body: EnvLiteral(value: "raw"))"#;
+    let json_bare = serde_json::json!({ "type": "NetHttpPost", "url": url, "body": "raw" });
+    let json_explicit = serde_json::json!({
+        "type": "NetHttpPost",
+        "url": url,
+        "body": { "type": "EnvLiteral", "value": "raw" },
+    });
+
+    let baseline = canonical::encode(&build_from_text(text_bare));
+    assert_eq!(
+        baseline,
+        r#"{"body":"raw","type":"NetHttpPost","url":"https://example.com/post"}"#
+    );
+    for (label, ast) in [
+        ("text explicit", build_from_text(text_explicit)),
+        ("json bare", build_from_json(&json_bare)),
+        ("json explicit", build_from_json(&json_explicit)),
+    ] {
+        assert_eq!(
+            canonical::encode(&ast),
+            baseline,
+            "{label} spelling must share the bare-string canonical bytes",
+        );
+    }
+
+    // Pre-field byte shape: no body, no headers, no deadline.
+    let bare_text = r#"NetHttpPost(url: "https://example.com/post")"#;
+    let bare_json = serde_json::json!({ "type": "NetHttpPost", "url": url });
+    let pre_field = r#"{"type":"NetHttpPost","url":"https://example.com/post"}"#;
+    assert_eq!(canonical::encode(&build_from_text(bare_text)), pre_field);
+    assert_eq!(canonical::encode(&build_from_json(&bare_json)), pre_field);
+}
+
+/// The `headers` keyed slot normalises key order exactly as `env` does,
+/// so the two front-ends may declare the same headers in opposite order
+/// and still hash identically.
+#[test]
+fn http_header_slot_key_order_is_normalised_across_frontends() {
+    let text = concat!(
+        r#"NetHttpGet(url: "https://example.com/get", headers: {"#,
+        r#"Accept: EnvLiteral(value: "application/json"), "#,
+        r#"Authorization: EnvSecret(name: "API_TOKEN")"#,
+        r#"}, timeout_sec: 5)"#,
+    );
+    let json = serde_json::json!({
+        "type": "NetHttpGet",
+        "url": "https://example.com/get",
+        "headers": {
+            "Authorization": { "type": "EnvSecret", "name": "API_TOKEN" },
+            "Accept": { "type": "EnvLiteral", "value": "application/json" },
+        },
+        "timeout_sec": 5,
+    });
+    assert_eq!(
+        canonical::encode(&build_from_text(text)),
+        canonical::encode(&build_from_json(&json)),
+    );
+    assert_eq!(
+        canonical::hash(&build_from_text(text)),
+        canonical::hash(&build_from_json(&json)),
+    );
+}
+
 #[test]
 fn frontend_parity_holds_despite_distinct_node_ids() {
     let ast_text = build_from_text(TEXT_PROFILE);

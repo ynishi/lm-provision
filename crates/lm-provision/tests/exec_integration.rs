@@ -118,10 +118,16 @@ fn dry_run_traces_every_direct_op() {
             ProfileNode::NetHttpGet {
                 id: ids.node(),
                 url: "https://example.com/get".to_string(),
+                headers: std::collections::BTreeMap::new(),
+                timeout_sec: None,
             },
             ProfileNode::NetHttpPost {
                 id: ids.node(),
                 url: "https://example.com/post".to_string(),
+                headers: std::collections::BTreeMap::new(),
+                body: None,
+                body_json: None,
+                timeout_sec: None,
             },
             ProfileNode::NetTransfer {
                 id: ids.node(),
@@ -712,6 +718,8 @@ fn http_get_to_an_undeclared_url_fails_in_dry_run() {
         phases: vec![ProfileNode::NetHttpGet {
             id: ids.node(),
             url: "https://denied.example/".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            timeout_sec: None,
         }],
     };
 
@@ -802,5 +810,287 @@ fn mount_bind_denies_when_only_the_source_is_declared() {
     assert!(
         source.to_string().contains("outside profile.paths"),
         "expected the path-denied cause, got: {source}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// net.http_* request fields: headers / body / body_json / timeout_sec
+// (spec 04 §`net.http_get` / `net.http_post`, spec 06 consumption
+// point 4).
+// ---------------------------------------------------------------------
+
+/// Spawn a one-shot local HTTP server. Returns `(url, allowlist
+/// pattern, handle)`; the handle yields the raw request text so a test
+/// can assert on what actually went over the wire.
+fn one_shot_server() -> (String, String, std::thread::JoinHandle<String>) {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept connection");
+        // The fixtures below send small bodies, so one read carries the
+        // whole request; a partial read would only weaken the assertion,
+        // never make it pass spuriously.
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("read request");
+        let body = "ok";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    });
+    (
+        format!("http://{addr}/post"),
+        format!("http://{addr}"),
+        handle,
+    )
+}
+
+/// A secret header and a secret body resolve in **dry-run** (spec 06
+/// §Resolution "dry-run resolves too") — and neither resolved value
+/// reaches the trace line, which carries header *names* and the body's
+/// form plus byte length only (spec 09).
+#[test]
+fn http_post_dry_run_resolves_the_secret_header_and_body_without_tracing_them() {
+    let header_var = format!("LM_HTTP_HEADER_TOKEN_{}", std::process::id());
+    let body_var = format!("LM_HTTP_BODY_SECRET_{}", std::process::id());
+    std::env::set_var(&header_var, "header-value-that-must-not-leak");
+    std::env::set_var(&body_var, "body-value-that-must-not-leak");
+
+    let ids = IdGen::new();
+    let headers = std::collections::BTreeMap::from([
+        (
+            "Authorization".to_string(),
+            ProfileNode::EnvSecret {
+                id: ids.node(),
+                name: header_var.clone(),
+            },
+        ),
+        (
+            "Accept".to_string(),
+            ProfileNode::EnvLiteral {
+                id: ids.node(),
+                value: "application/json".to_string(),
+            },
+        ),
+    ]);
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "http-secrets".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["net.http_post".to_string()],
+        env: std::collections::BTreeMap::new(),
+        env_secrets: vec![header_var.clone(), body_var.clone()],
+        paths: Vec::new(),
+        http_allowlist: vec!["https://example.com".to_string()],
+        phases: vec![ProfileNode::NetHttpPost {
+            id: ids.node(),
+            url: "https://example.com/post".to_string(),
+            headers,
+            body: Some(Box::new(ProfileNode::EnvSecret {
+                id: ids.node(),
+                name: body_var.clone(),
+            })),
+            body_json: None,
+            timeout_sec: Some(7),
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds with a declared net.http_post capability");
+    run_to_done(&mut engine).expect("a dry run with resolvable secrets must succeed");
+    std::env::remove_var(&header_var);
+    std::env::remove_var(&body_var);
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    let line = &log[0];
+    assert!(
+        !line.contains("header-value-that-must-not-leak")
+            && !line.contains("body-value-that-must-not-leak"),
+        "no resolved value may reach the trace: {line}"
+    );
+    assert!(
+        line.contains("Authorization") && line.contains("Accept"),
+        "header names are traced: {line}"
+    );
+    assert!(
+        line.contains(&format!("body=body:secret:{body_var}")),
+        "the body is named by its source form, not its content: {line}"
+    );
+    assert!(
+        line.contains(&format!(
+            "body_bytes={}",
+            "body-value-that-must-not-leak".len()
+        )),
+        "the body's byte length is traced: {line}"
+    );
+    assert!(
+        line.contains("timeout_sec=7"),
+        "the declared deadline is traced: {line}"
+    );
+}
+
+/// A header naming a secret that is missing from the host env fails the
+/// **dry run**, identically to a real run — the header slot goes through
+/// the same check-then-resolve pipe as an `env` slot.
+#[test]
+fn http_get_with_a_host_absent_header_secret_fails_in_dry_run() {
+    let var = format!("LM_HTTP_HEADER_ABSENT_{}", std::process::id());
+    std::env::remove_var(&var);
+
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "http-missing-secret".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["net.http_get".to_string()],
+        env: std::collections::BTreeMap::new(),
+        env_secrets: vec![var.clone()],
+        paths: Vec::new(),
+        http_allowlist: vec!["https://example.com".to_string()],
+        phases: vec![ProfileNode::NetHttpGet {
+            id: ids.node(),
+            url: "https://example.com/get".to_string(),
+            headers: std::collections::BTreeMap::from([(
+                "Authorization".to_string(),
+                ProfileNode::EnvSecret {
+                    id: ids.node(),
+                    name: var.clone(),
+                },
+            )]),
+            timeout_sec: None,
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds with a declared net.http_get capability");
+    let err = run_to_done(&mut engine).expect_err("a host-absent header secret must fail");
+    let source = err
+        .source()
+        .expect("EvalFailed carries the ExecError source");
+    assert!(
+        source.to_string().contains("missing in host env"),
+        "expected the missing-secret cause, got: {source}"
+    );
+    assert!(log.lock().unwrap().is_empty());
+}
+
+/// `apply` does not run validate first (spec 07 §Invocation), so the
+/// `body` / `body_json` exclusivity rule is re-checked at exec: an AST
+/// carrying both fails the step rather than silently acquiring an
+/// invented precedence.
+#[test]
+fn declaring_both_body_forms_fails_the_step_even_without_validate() {
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "http-both-bodies".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["net.http_post".to_string()],
+        env: std::collections::BTreeMap::new(),
+        env_secrets: Vec::new(),
+        paths: Vec::new(),
+        http_allowlist: vec!["https://example.com".to_string()],
+        phases: vec![ProfileNode::NetHttpPost {
+            id: ids.node(),
+            url: "https://example.com/post".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            body: Some(Box::new(ProfileNode::EnvLiteral {
+                id: ids.node(),
+                value: "raw".to_string(),
+            })),
+            body_json: Some("{\"k\":1}".to_string()),
+            timeout_sec: None,
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds with a declared net.http_post capability");
+    let err = run_to_done(&mut engine).expect_err("declaring both body forms must fail");
+    let source = err
+        .source()
+        .expect("EvalFailed carries the ExecError source");
+    assert!(
+        source
+            .to_string()
+            .contains("body and body_json are mutually exclusive"),
+        "expected the exclusivity cause, got: {source}"
+    );
+    assert!(log.lock().unwrap().is_empty());
+}
+
+/// Real mode: the declared headers and the `body_json` document reach
+/// the wire, with `Content-Type: application/json` derived from the body
+/// form (spec 04 §`net.http_post`).
+#[test]
+fn http_post_real_mode_sends_the_declared_headers_and_json_body() {
+    let (url, allow, handle) = one_shot_server();
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "http-real".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["net.http_post".to_string()],
+        env: std::collections::BTreeMap::new(),
+        env_secrets: Vec::new(),
+        paths: Vec::new(),
+        http_allowlist: vec![allow],
+        phases: vec![ProfileNode::NetHttpPost {
+            id: ids.node(),
+            url: url.clone(),
+            headers: std::collections::BTreeMap::from([(
+                "X-Demo".to_string(),
+                ProfileNode::EnvLiteral {
+                    id: ids.node(),
+                    value: "demo-value".to_string(),
+                },
+            )]),
+            body: None,
+            body_json: Some(r#"{"prompt":"hi"}"#.to_string()),
+            timeout_sec: Some(10),
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&program, ExecMode::Real, Arc::clone(&log))
+        .expect("engine builds with a declared net.http_post capability");
+    run_to_done(&mut engine).expect("the local server answers 200");
+
+    let request = handle.join().expect("server thread joins");
+    let lowered = request.to_lowercase();
+    assert!(
+        lowered.contains("x-demo: demo-value"),
+        "declared header must reach the wire: {request}"
+    );
+    assert!(
+        lowered.contains("content-type: application/json"),
+        "body_json derives the JSON content type: {request}"
+    );
+    assert!(
+        request.contains(r#"{"prompt":"hi"}"#),
+        "the JSON body must reach the wire: {request}"
+    );
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(
+        log[0].contains("status=200"),
+        "the summary carries the status: {}",
+        log[0]
     );
 }

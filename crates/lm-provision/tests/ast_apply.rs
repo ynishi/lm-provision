@@ -923,3 +923,128 @@ fn fs_write_secret_content_missing_from_the_host_env_fails_the_dry_run() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_file(&path).ok();
 }
+
+/// `net.http_post` `headers` / `body` as secret consumption points
+/// (spec 06 point 4): a dry run resolves both, and neither the audit
+/// transcript on stderr nor the report on stdout carries a resolved
+/// header value or any body content — only header *names* (with the
+/// sensitive-key `[REDACTED]` marker) and the body's source form plus
+/// byte length.
+#[test]
+fn http_post_secret_header_and_body_never_leak_on_the_transcript_or_report() {
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-secret-demo",
+        "capabilities": ["net.http_post"],
+        "http_allowlist": ["https://example.com"],
+        "env_secrets": ["HTTP_HEADER_TOKEN", "HTTP_BODY_SECRET"],
+        "phases": [
+            {
+                "type": "NetHttpPost",
+                "url": "https://example.com/v1/completions",
+                "headers": {
+                    "Authorization": { "type": "EnvSecret", "name": "HTTP_HEADER_TOKEN" },
+                    "Accept": { "type": "EnvLiteral", "value": "accept-value-not-logged" }
+                },
+                "body": { "type": "EnvSecret", "name": "HTTP_BODY_SECRET" }
+            }
+        ]
+    });
+    let path = write_json_profile("http-secret", &profile);
+
+    // Dry-run: resolution runs, the request does not — so no network is
+    // touched while the secret plumbing is still proven end to end.
+    let output = bin()
+        .args(["apply", "--dry-run", path.to_str().unwrap()])
+        .env("HTTP_HEADER_TOKEN", "header-token-that-must-not-leak")
+        .env("HTTP_BODY_SECRET", "body-secret-that-must-not-leak")
+        .output()
+        .expect("process runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // (a) No resolved value on either stream, sensitive or not.
+    for leaked in [
+        "header-token-that-must-not-leak",
+        "body-secret-that-must-not-leak",
+        "accept-value-not-logged",
+    ] {
+        assert!(
+            !stderr.contains(leaked),
+            "{leaked:?} must never reach the audit transcript: {stderr}"
+        );
+        assert!(
+            !stdout.contains(leaked),
+            "{leaked:?} must never reach the report: {stdout}"
+        );
+    }
+
+    // (b) Header names do appear, with the sensitive-key marker on the
+    // one whose name matches the set (`AUTH` ⊂ `Authorization`).
+    assert!(
+        stderr.contains("Authorization [REDACTED]"),
+        "a sensitive header name is marked: {stderr}"
+    );
+    assert!(
+        stderr.contains("Accept"),
+        "header names are logged: {stderr}"
+    );
+
+    // (c) The body is named by its source form + byte length only.
+    assert!(
+        stderr.contains("body_source=\"body:secret:HTTP_BODY_SECRET\"")
+            || stderr.contains("body_source=body:secret:HTTP_BODY_SECRET"),
+        "the post event names the body's source: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "body_bytes={}",
+            "body-secret-that-must-not-leak".len()
+        )),
+        "the post event carries the body's byte length: {stderr}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// Validate rejects a `net.http_post` that declares both body forms —
+/// the two name different bodies and different content types, so there
+/// is nothing to pick between them (spec 04 §`net.http_post`).
+#[test]
+fn declaring_both_http_body_forms_is_rejected_at_validate() {
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-both-bodies",
+        "capabilities": ["net.http_post"],
+        "http_allowlist": ["https://example.com"],
+        "phases": [
+            {
+                "type": "NetHttpPost",
+                "url": "https://example.com/post",
+                "body": "raw",
+                "body_json": "{\"k\":1}"
+            }
+        ]
+    });
+    let path = write_json_profile("http-both-bodies", &profile);
+
+    let output = bin()
+        .args(["validate", path.to_str().unwrap()])
+        .output()
+        .expect("process runs");
+    assert_ne!(output.status.code(), Some(0), "validate must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("body and body_json are mutually exclusive"),
+        "validate names the exclusivity rule: {stderr}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}

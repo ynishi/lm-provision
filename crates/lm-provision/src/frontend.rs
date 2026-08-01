@@ -396,6 +396,181 @@ mod tests {
         ));
     }
 
+    /// `net.http_get` / `net.http_post` carry the request fields
+    /// through both front-ends: `headers` is a keyed slot of value
+    /// nodes (the `env` shape), `body` an *optional* value-node slot
+    /// whose bare-string spelling lowers through the declared scalar
+    /// shorthand, `body_json` an opaque JSON string, `timeout_sec` the
+    /// `Option<u16>` shape the syntax override covers. The two
+    /// front-ends must agree on the resulting AST, hence on the hash.
+    #[test]
+    fn json_and_text_frontends_both_carry_the_http_request_fields() {
+        let value = serde_json::json!({
+            "type": "Spec",
+            "name": "http-fields",
+            "capabilities": ["net.http_get", "net.http_post"],
+            "env_secrets": ["API_TOKEN"],
+            "http_allowlist": ["https://example.com"],
+            "phases": [
+                {
+                    "type": "NetHttpGet",
+                    "url": "https://example.com/get",
+                    "headers": {
+                        "Accept": { "type": "EnvLiteral", "value": "application/json" },
+                        "Authorization": { "type": "EnvSecret", "name": "API_TOKEN" }
+                    },
+                    "timeout_sec": 5
+                },
+                {
+                    "type": "NetHttpPost",
+                    "url": "https://example.com/post",
+                    // Bare string: lowers to an EnvLiteral through the
+                    // scalar shorthand declared on the optional slot.
+                    "body": "raw-bytes"
+                },
+                {
+                    "type": "NetHttpPost",
+                    "url": "https://example.com/post",
+                    "body_json": "{\"prompt\":\"hi\"}"
+                }
+            ]
+        });
+        let path = write_temp("http-fields.json", &value.to_string());
+        let ast = load_profile(&path).expect("http request fields must parse from JSON");
+
+        let ProfileNode::Spec { phases, .. } = &ast else {
+            panic!("expected Spec root");
+        };
+        let ProfileNode::NetHttpGet {
+            headers,
+            timeout_sec,
+            ..
+        } = &phases[0]
+        else {
+            panic!("expected NetHttpGet, got {:?}", phases[0]);
+        };
+        assert_eq!(*timeout_sec, Some(5));
+        assert_eq!(headers.len(), 2);
+        match headers.get("Accept") {
+            Some(ProfileNode::EnvLiteral { value, .. }) => assert_eq!(value, "application/json"),
+            other => panic!("expected EnvLiteral for Accept, got {other:?}"),
+        }
+        match headers.get("Authorization") {
+            Some(ProfileNode::EnvSecret { name, .. }) => assert_eq!(name, "API_TOKEN"),
+            other => panic!("expected EnvSecret for Authorization, got {other:?}"),
+        }
+        match &phases[1] {
+            ProfileNode::NetHttpPost {
+                body, body_json, ..
+            } => {
+                assert!(body_json.is_none());
+                match body.as_deref() {
+                    Some(ProfileNode::EnvLiteral { value, .. }) => assert_eq!(value, "raw-bytes"),
+                    other => panic!("bare string body must lower to EnvLiteral, got {other:?}"),
+                }
+            }
+            other => panic!("expected NetHttpPost, got {other:?}"),
+        }
+        match &phases[2] {
+            ProfileNode::NetHttpPost {
+                body, body_json, ..
+            } => {
+                assert!(body.is_none());
+                assert_eq!(body_json.as_deref(), Some("{\"prompt\":\"hi\"}"));
+            }
+            other => panic!("expected NetHttpPost, got {other:?}"),
+        }
+        assert!(crate::validate::validate(&ast).is_ok());
+
+        // Same profile in the canonical text form — including the
+        // explicit `EnvLiteral(...)` node spelling for the body, which
+        // must build the same AST the bare string does.
+        let text = concat!(
+            "Spec(",
+            "name: \"http-fields\", ",
+            "version: none, ",
+            "description: none, ",
+            "capabilities: [\"net.http_get\", \"net.http_post\"], ",
+            "env: {}, ",
+            "env_secrets: [\"API_TOKEN\"], ",
+            "paths: [], ",
+            "http_allowlist: [\"https://example.com\"], ",
+            "phases: [",
+            "NetHttpGet(url: \"https://example.com/get\", ",
+            "headers: {Accept: EnvLiteral(value: \"application/json\"), ",
+            "Authorization: EnvSecret(name: \"API_TOKEN\")}, ",
+            "timeout_sec: 5), ",
+            "NetHttpPost(url: \"https://example.com/post\", ",
+            "body: EnvLiteral(value: \"raw-bytes\")), ",
+            "NetHttpPost(url: \"https://example.com/post\", ",
+            "body_json: \"{\\\"prompt\\\":\\\"hi\\\"}\")",
+            "])",
+        );
+        let text_path = write_temp("http-fields.txt", text);
+        let ast_text = load_profile(&text_path).expect("http request fields must parse as text");
+        assert_eq!(canonical::hash(&ast), canonical::hash(&ast_text));
+    }
+
+    /// A request that declares none of the new fields still parses, and
+    /// parses to the *absent* shape (empty map / `None`) rather than to
+    /// a defaulted one — which is what keeps the canonical encoding, and
+    /// so the hash, unchanged for profiles written before they existed.
+    #[test]
+    fn an_http_request_without_the_new_fields_parses_as_absent() {
+        let value = serde_json::json!({
+            "type": "Spec",
+            "name": "http-bare",
+            "capabilities": ["net.http_get", "net.http_post"],
+            "phases": [
+                { "type": "NetHttpGet", "url": "https://example.com/get" },
+                { "type": "NetHttpPost", "url": "https://example.com/post" }
+            ]
+        });
+        let path = write_temp("http-bare.json", &value.to_string());
+        let ast = load_profile(&path).expect("a bare HTTP profile must still parse");
+        let ProfileNode::Spec { phases, .. } = &ast else {
+            panic!("expected Spec root");
+        };
+        match &phases[0] {
+            ProfileNode::NetHttpGet {
+                headers,
+                timeout_sec,
+                ..
+            } => {
+                assert!(headers.is_empty());
+                assert_eq!(*timeout_sec, None);
+            }
+            other => panic!("expected NetHttpGet, got {other:?}"),
+        }
+        assert!(matches!(
+            &phases[1],
+            ProfileNode::NetHttpPost {
+                body: None,
+                body_json: None,
+                timeout_sec: None,
+                ..
+            }
+        ));
+
+        // The bare text spelling parses to the same AST.
+        let text = concat!(
+            "Spec(",
+            "name: \"http-bare\", ",
+            "version: none, ",
+            "description: none, ",
+            "capabilities: [\"net.http_get\", \"net.http_post\"], ",
+            "env: {}, ",
+            "env_secrets: [], ",
+            "phases: [",
+            "NetHttpGet(url: \"https://example.com/get\"), ",
+            "NetHttpPost(url: \"https://example.com/post\")",
+            "])",
+        );
+        let text_path = write_temp("http-bare.txt", text);
+        let ast_text = load_profile(&text_path).expect("a bare HTTP profile must parse as text");
+        assert_eq!(canonical::hash(&ast), canonical::hash(&ast_text));
+    }
+
     #[test]
     fn malformed_json_surfaces_as_parse_error() {
         let path = write_temp("bad.json", "{not: valid json,");

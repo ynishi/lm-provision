@@ -14,12 +14,14 @@
 //!   sensitive-key set (spec 02 §Shared vocabulary,
 //!   [`crate::validate::is_secret_shaped_key`]) is rendered as
 //!   `NAME [REDACTED]` so the reader can tell a value was withheld.
-//!   Values are never logged, sensitive or not.
+//!   Values are never logged, sensitive or not. HTTP request header
+//!   names go through the same [`env_keys`] rendering.
 //! - `fs.write` logs path + byte count + `content_source` — `"string"`
 //!   for a literal `content: String`, `"secret:<name>"` once the
 //!   secret-content form lands. Content bytes are never logged.
-//! - HTTP logs URL and (once available) status + body byte count;
-//!   header names are logged, header values never; bodies never.
+//! - HTTP logs URL, request header names, and — for `net.http_post` —
+//!   the request body's source form and byte length. Header values and
+//!   body content are never logged.
 //! - `sh.exec` logs argv verbatim (validate's shell-safety and the
 //!   env-injection design keep secrets out of argv).
 //! - `note` sub-steps log their kind + note text — they carry no
@@ -98,24 +100,42 @@ pub fn fs_write(mode: super::ExecMode, kind: &str, path: &str, bytes: u64, conte
     );
 }
 
-/// `net.http_get` audit event.
-pub fn http_get(mode: super::ExecMode, kind: &str, url: &str) {
+/// `net.http_get` audit event. `headers` is the resolved request-header
+/// map whose *names* the event carries (through [`env_keys`], so a
+/// sensitive name such as `Authorization` is marked `[REDACTED]`);
+/// header values never enter the event.
+pub fn http_get(mode: super::ExecMode, kind: &str, url: &str, headers: &BTreeMap<String, String>) {
     tracing::info!(
         mode = mode_label(mode),
         op = "net.http_get",
         kind = kind,
         url = url,
+        header_names = ?env_keys(headers),
         "audit"
     );
 }
 
-/// `net.http_post` audit event.
-pub fn http_post(mode: super::ExecMode, kind: &str, url: &str) {
+/// `net.http_post` audit event. Headers follow [`http_get`]'s rule;
+/// the request body is named by its *form* (`"none"` / `"body"` /
+/// `"body:secret:<name>"` / `"body:env_ref:<name>"` / `"body_json"`,
+/// spec 09 names-not-values) plus its byte length. The body bytes never
+/// enter the event.
+pub fn http_post(
+    mode: super::ExecMode,
+    kind: &str,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    body_source: &str,
+    body_bytes: u64,
+) {
     tracing::info!(
         mode = mode_label(mode),
         op = "net.http_post",
         kind = kind,
         url = url,
+        header_names = ?env_keys(headers),
+        body_source = body_source,
+        body_bytes = body_bytes,
         "audit"
     );
 }

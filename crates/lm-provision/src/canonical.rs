@@ -34,6 +34,10 @@
 //!   value; an empty `env` omits the key entirely, so a profile that
 //!   declares no env hashes byte-for-byte as it did before the field
 //!   was introduced. `revision` follows the `Option` omit rule above.
+//!   The `headers` keyed slot on `net.http_get` / `net.http_post`
+//!   follows the identical rule, as do those kinds' `body` (a value
+//!   node, encoded like an `env` value), `body_json` (an opaque JSON
+//!   string), and `timeout_sec` (`Option`).
 //! - `comfyui.restart`'s `extra_args` follows the same omit-when-empty
 //!   rule for the same reason: it is a payload field added after
 //!   profiles were already being hashed, and the overwhelmingly common
@@ -319,15 +323,44 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             CanonValue::Object(fields)
         }
 
-        ProfileNode::NetHttpGet { id: _, url } => {
+        ProfileNode::NetHttpGet {
+            id: _,
+            url,
+            headers,
+            timeout_sec,
+        } => {
             let mut fields = variant_object("NetHttpGet");
             fields.insert("url".into(), CanonValue::Str(url.clone()));
+            // Both follow the omit-when-unset rule: they are payload
+            // fields added after profiles were already being hashed, so
+            // a request that declares neither keeps its pre-field bytes.
+            insert_value_map(&mut fields, "headers", headers);
+            insert_optional_u16(&mut fields, "timeout_sec", timeout_sec);
             CanonValue::Object(fields)
         }
 
-        ProfileNode::NetHttpPost { id: _, url } => {
+        ProfileNode::NetHttpPost {
+            id: _,
+            url,
+            headers,
+            body,
+            body_json,
+            timeout_sec,
+        } => {
             let mut fields = variant_object("NetHttpPost");
             fields.insert("url".into(), CanonValue::Str(url.clone()));
+            insert_value_map(&mut fields, "headers", headers);
+            // `body` is a value node encoded by the same rules as an
+            // `env`-map value (a literal is its bare string, a secret /
+            // ref its marker object); `body_json` is an opaque JSON
+            // string like `models_json`. Both omitted when unset — and
+            // validate rejects declaring the two together, so at most
+            // one of these keys is ever present.
+            if let Some(body) = body {
+                fields.insert("body".into(), to_canon(body));
+            }
+            insert_optional_str(&mut fields, "body_json", body_json);
+            insert_optional_u16(&mut fields, "timeout_sec", timeout_sec);
             CanonValue::Object(fields)
         }
 
@@ -379,14 +412,29 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
 /// profile that declares no env hashes exactly as it did before the
 /// field existed. `BTreeMap` iteration is already lexicographic by key.
 fn insert_env(fields: &mut BTreeMap<String, CanonValue>, env: &BTreeMap<String, ProfileNode>) {
-    if env.is_empty() {
+    insert_value_map(fields, "env", env);
+}
+
+/// The keyed-slot counterpart of [`insert_when_non_empty`]: insert
+/// `key` as an object mapping each entry to its value node's canonical
+/// form, or omit it entirely when `map` is empty. [`insert_env`] is the
+/// `env`-slot spelling; `net.http_*`'s `headers` slot uses the same
+/// rule for the same reason (a keyed slot added after profiles were
+/// already being hashed must not move an undeclaring profile's bytes).
+/// `BTreeMap` iteration is already lexicographic by key.
+fn insert_value_map(
+    fields: &mut BTreeMap<String, CanonValue>,
+    key: &str,
+    map: &BTreeMap<String, ProfileNode>,
+) {
+    if map.is_empty() {
         return;
     }
     let mut obj = BTreeMap::new();
-    for (key, value) in env {
-        obj.insert(key.clone(), to_canon(value));
+    for (entry_key, value) in map {
+        obj.insert(entry_key.clone(), to_canon(value));
     }
-    fields.insert("env".into(), CanonValue::Object(obj));
+    fields.insert(key.into(), CanonValue::Object(obj));
 }
 
 fn variant_object(name: &str) -> BTreeMap<String, CanonValue> {
@@ -1146,6 +1194,146 @@ mod tests {
             )]),
         };
         assert_eq!(hash(&make()), hash(&make()));
+    }
+
+    // -----------------------------------------------------------------
+    // net.http_get / net.http_post request fields.
+    // -----------------------------------------------------------------
+
+    /// An HTTP op that declares none of the request fields must encode
+    /// exactly as it did before they existed (both expected strings are
+    /// the pre-field encodings, verbatim), so adding `headers` / `body`
+    /// / `body_json` / `timeout_sec` left every existing profile's hash
+    /// alone.
+    #[test]
+    fn undeclared_http_request_fields_keep_their_pre_field_bytes() {
+        let gen = IdGen::new();
+        let get = ProfileNode::NetHttpGet {
+            id: new_id(&gen),
+            url: "https://example.com/get".into(),
+            headers: BTreeMap::new(),
+            timeout_sec: None,
+        };
+        assert_eq!(
+            encode(&get),
+            "{\"type\":\"NetHttpGet\",\"url\":\"https://example.com/get\"}"
+        );
+
+        let post = ProfileNode::NetHttpPost {
+            id: new_id(&gen),
+            url: "https://example.com/post".into(),
+            headers: BTreeMap::new(),
+            body: None,
+            body_json: None,
+            timeout_sec: None,
+        };
+        assert_eq!(
+            encode(&post),
+            "{\"type\":\"NetHttpPost\",\"url\":\"https://example.com/post\"}"
+        );
+    }
+
+    /// Declared request fields encode — headers as a keyed object whose
+    /// values follow the `env`-value rules, `body` as one such value,
+    /// `body_json` as its opaque string, `timeout_sec` as an `Int` — and
+    /// each changes the hash: two requests that differ in what they send
+    /// are not the same request.
+    #[test]
+    fn declared_http_request_fields_encode_and_change_the_hash() {
+        let gen = IdGen::new();
+        let headers = env_map(&[
+            (
+                "Accept",
+                ProfileNode::EnvLiteral {
+                    id: new_id(&gen),
+                    value: "application/json".into(),
+                },
+            ),
+            (
+                "Authorization",
+                ProfileNode::EnvSecret {
+                    id: new_id(&gen),
+                    name: "API_TOKEN".into(),
+                },
+            ),
+        ]);
+
+        let get_bare = ProfileNode::NetHttpGet {
+            id: new_id(&gen),
+            url: "https://example.com/get".into(),
+            headers: BTreeMap::new(),
+            timeout_sec: None,
+        };
+        let get = ProfileNode::NetHttpGet {
+            id: new_id(&gen),
+            url: "https://example.com/get".into(),
+            headers: headers.clone(),
+            timeout_sec: Some(5),
+        };
+        assert_eq!(
+            encode(&get),
+            "{\"headers\":{\"Accept\":\"application/json\",\
+             \"Authorization\":{\"__secret\":\"API_TOKEN\"}},\
+             \"timeout_sec\":5,\"type\":\"NetHttpGet\",\
+             \"url\":\"https://example.com/get\"}"
+        );
+        assert_ne!(hash(&get_bare), hash(&get));
+
+        let post_bare = ProfileNode::NetHttpPost {
+            id: new_id(&gen),
+            url: "https://example.com/post".into(),
+            headers: BTreeMap::new(),
+            body: None,
+            body_json: None,
+            timeout_sec: None,
+        };
+        let post_body = ProfileNode::NetHttpPost {
+            id: new_id(&gen),
+            url: "https://example.com/post".into(),
+            headers,
+            body: Some(Box::new(ProfileNode::EnvSecret {
+                id: new_id(&gen),
+                name: "API_TOKEN".into(),
+            })),
+            body_json: None,
+            timeout_sec: None,
+        };
+        assert_eq!(
+            encode(&post_body),
+            "{\"body\":{\"__secret\":\"API_TOKEN\"},\
+             \"headers\":{\"Accept\":\"application/json\",\
+             \"Authorization\":{\"__secret\":\"API_TOKEN\"}},\
+             \"type\":\"NetHttpPost\",\"url\":\"https://example.com/post\"}"
+        );
+        assert_ne!(hash(&post_bare), hash(&post_body));
+
+        // The two body forms are distinct statements even when they
+        // carry the same characters, so they must not collide.
+        let post_literal_body = ProfileNode::NetHttpPost {
+            id: new_id(&gen),
+            url: "https://example.com/post".into(),
+            headers: BTreeMap::new(),
+            body: Some(Box::new(ProfileNode::EnvLiteral {
+                id: new_id(&gen),
+                value: "{\"k\":1}".into(),
+            })),
+            body_json: None,
+            timeout_sec: None,
+        };
+        let post_json_body = ProfileNode::NetHttpPost {
+            id: new_id(&gen),
+            url: "https://example.com/post".into(),
+            headers: BTreeMap::new(),
+            body: None,
+            body_json: Some("{\"k\":1}".into()),
+            timeout_sec: None,
+        };
+        assert_eq!(
+            encode(&post_json_body),
+            "{\"body_json\":\"{\\\"k\\\":1}\",\
+             \"type\":\"NetHttpPost\",\"url\":\"https://example.com/post\"}"
+        );
+        assert_ne!(hash(&post_literal_body), hash(&post_json_body));
     }
 
     #[test]
