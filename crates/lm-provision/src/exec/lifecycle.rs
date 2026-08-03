@@ -2528,7 +2528,22 @@ mod tests {
             );
 
             let recorded = fs::read_to_string(&pid_file).expect("launch wrote a pid file");
-            let reported = fs::read_to_string(&self_pid_path).expect("the server wrote its pid");
+            // The launch command returns as soon as `$!` is recorded; the
+            // detached stub writes its own pid asynchronously, so wait for
+            // the file instead of racing the read.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let reported = loop {
+                match fs::read_to_string(&self_pid_path) {
+                    Ok(text) if !text.trim().is_empty() => break text,
+                    result => {
+                        if std::time::Instant::now() >= deadline {
+                            let text = result.expect("the server wrote its pid");
+                            panic!("{grouping} stub wrote an empty pid file: {text:?}");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            };
             assert_eq!(
                 recorded.trim(),
                 reported.trim(),
