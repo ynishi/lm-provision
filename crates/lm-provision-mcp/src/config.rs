@@ -78,7 +78,7 @@ impl Config {
     /// The pure resolution [`Config::from_env`] wraps — takes already-read
     /// environment-variable values directly so tests can exercise every
     /// default/override combination without mutating the real process
-    /// environment (the same pattern [`crate::cli::resolve_log_filter_from`]
+    /// environment (the same pattern `cli::resolve_log_filter_from`
     /// in the `lm-provision` crate uses for `RUST_LOG`).
     pub fn from_vars(
         binary_path: Option<String>,

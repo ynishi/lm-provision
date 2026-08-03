@@ -99,8 +99,8 @@ pub fn run(command: &Command) -> ExitCode {
 /// single "final error line" 07-cli.md §Error surface needs is all a
 /// caller has to preserve.
 ///
-/// `pub` (rather than crate-private) so [`lm-provision-mcp`'s MCP tool
-/// wrappers][../../lm-provision-mcp] can surface the same message text
+/// `pub` (rather than crate-private) so `lm-provision-mcp`'s MCP tool
+/// wrappers can surface the same message text
 /// `print_failure` renders to stderr without depending on the underlying
 /// error types directly (10-mcp.md §Error surface "precondition ... class
 /// preserved").
@@ -155,7 +155,7 @@ fn print_json(value: &serde_json::Value) {
 /// off the `Spec` node. A successful validate guarantees the root is a
 /// [`crate::profile_ast::ProfileNode::Spec`].
 ///
-/// `pub` so [`lm-provision-mcp`'s `lm_validate` tool][../../lm-provision-mcp]
+/// `pub` so `lm-provision-mcp`'s `lm_validate` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_validate(profile: &Path) -> PipelineResult<String> {
     let node = crate::frontend::load_profile(profile)?;
@@ -186,7 +186,7 @@ fn run_validate(profile: &Path) -> ExitCode {
 /// hex digest via the frontend-agnostic [`crate::canonical::hash`] (see
 /// `tests/canonical_frontend_parity.rs`).
 ///
-/// `pub` so [`lm-provision-mcp`'s `lm_hash` tool][../../lm-provision-mcp]
+/// `pub` so `lm-provision-mcp`'s `lm_hash` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_hash(profile: &Path) -> PipelineResult<String> {
     let node = crate::frontend::load_profile(profile)?;
@@ -209,7 +209,7 @@ fn run_hash(profile: &Path) -> ExitCode {
 /// ([`crate::plan::expand`], the port of the legacy `lm.plan.expand`),
 /// returned as a `serde_json::Value` ready to pretty-print.
 ///
-/// `pub` so [`lm-provision-mcp`'s `lm_plan` tool][../../lm-provision-mcp]
+/// `pub` so `lm-provision-mcp`'s `lm_plan` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_plan(profile: &Path) -> PipelineResult<serde_json::Value> {
     let node = crate::frontend::load_profile(profile)?;

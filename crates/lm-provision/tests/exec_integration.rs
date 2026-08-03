@@ -830,11 +830,32 @@ fn one_shot_server() -> (String, String, std::thread::JoinHandle<String>) {
     let addr = listener.local_addr().expect("local addr");
     let handle = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept connection");
-        // The fixtures below send small bodies, so one read carries the
-        // whole request; a partial read would only weaken the assertion,
-        // never make it pass spuriously.
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).expect("read request");
+        // Headers and body may arrive in separate TCP segments, so keep
+        // reading until the header terminator is seen and, when a
+        // Content-Length is declared, until the full body has arrived.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).expect("read request");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let content_length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
         let body = "ok";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -844,7 +865,7 @@ fn one_shot_server() -> (String, String, std::thread::JoinHandle<String>) {
         stream
             .write_all(response.as_bytes())
             .expect("write response");
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        String::from_utf8_lossy(&buf).into_owned()
     });
     (
         format!("http://{addr}/post"),

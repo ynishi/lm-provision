@@ -79,16 +79,16 @@ impl std::fmt::Debug for ShOpts {
 pub struct ExecOutcome {
     /// Process exit code (`-1` when terminated by signal / unknown).
     pub exit_code: i32,
-    /// Last [`TAIL_LIMIT`] bytes of stdout, lossily decoded.
+    /// Last `TAIL_LIMIT` bytes of stdout, lossily decoded.
     pub stdout_tail: String,
-    /// Last [`TAIL_LIMIT`] bytes of stderr, lossily decoded.
+    /// Last `TAIL_LIMIT` bytes of stderr, lossily decoded.
     pub stderr_tail: String,
 }
 
 /// Options for [`http_get`] / [`http_post`]. Carries the resolved
 /// request headers (spec 06 §Resolution: the caller resolves the
 /// `headers` keyed slot into `name → value` and hands them here) and an
-/// optional per-request deadline overriding [`DEFAULT_TIMEOUT_SEC`].
+/// optional per-request deadline overriding `DEFAULT_TIMEOUT_SEC`.
 ///
 /// The [`std::fmt::Debug`] impl is deliberately hand-written to redact
 /// the values — an `HttpOpts` printed with `{:?}` shows only the header
@@ -148,7 +148,7 @@ impl std::fmt::Debug for HttpOpts {
 pub struct HttpOutcome {
     /// Raw HTTP status code (redirects are reported, not followed).
     pub status: u16,
-    /// Last [`TAIL_LIMIT`] bytes of the response body, lossily decoded.
+    /// Last `TAIL_LIMIT` bytes of the response body, lossily decoded.
     pub body_tail: String,
 }
 

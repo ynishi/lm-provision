@@ -1,20 +1,20 @@
 //! The 22-op [`OpRegistry`] wired onto the engine.
 //!
-//! Every catalog op is one [`ProfileOp`] handler sharing the same
+//! Every catalog op is one `ProfileOp` handler sharing the same
 //! [`ExecContext`]. On each `apply` the handler recovers its payload
 //! node ([`payload`](super::payload)), enforces the required capability
 //! ([`capgate`](super::capgate)), then branches on [`ExecMode`]:
 //!
 //! - **direct 7 ops** (`sh_exec` / `fs_write` / `net_http_get` /
 //!   `net_http_post` / `net_transfer` / `mount_bind` / `mount_umount`)
-//!   render a trace line in `DryRun` and call [`effects`](super::effects)
+//!   render a trace line in `DryRun` and call [`effects`]
 //!   in `Real`. Path- and URL-carrying ops (all six except `sh_exec`)
 //!   additionally consult [`policy`](super::policy) in both modes
 //!   (spec 07 "dry-run does policy"), rejecting targets that fall
 //!   outside the profile's declared `paths` / `http_allowlist`.
-//! - **lifecycle 15 ops** delegate to [`lifecycle::expand`](super::lifecycle::expand)
+//! - **lifecycle 15 ops** delegate to [`lifecycle::expand`]
 //!   for step composition, then render each step in `DryRun` and execute
-//!   each step (via [`lifecycle::execute_step`](super::lifecycle::execute_step))
+//!   each step (via [`lifecycle::execute_step`])
 //!   in `Real`. A single per-op log line joins the per-step summaries
 //!   with `; `, preserving the direct-op shape (`"<op> ..."`).
 //!

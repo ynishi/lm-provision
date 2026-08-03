@@ -53,7 +53,7 @@ pub enum ProfileNode {
         /// did while `env` was a bare allowlist `Vec<String>`.
         env: BTreeMap<String, ProfileNode>,
         /// Secret env allowlist (host-env-resolved). A [`ProfileNode::EnvSecret`]
-        /// value — whether stored in [`Spec::env`] above or written
+        /// value — whether stored in `Spec::env` above or written
         /// inline in a phase's `env` — carries a `name` this list must
         /// contain.
         env_secrets: Vec<String>,

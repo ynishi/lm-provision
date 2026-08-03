@@ -85,7 +85,7 @@ pub fn encode(node: &ProfileNode) -> String {
     out
 }
 
-/// SHA-256 of [`encode(node)`], lowercase hex, no prefix (64 chars).
+/// SHA-256 of the [`encode`] bytes, lowercase hex, no prefix (64 chars).
 pub fn hash(node: &ProfileNode) -> String {
     let bytes = encode(node);
     let digest = Sha256::digest(bytes.as_bytes());
