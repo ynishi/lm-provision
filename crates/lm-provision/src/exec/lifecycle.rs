@@ -1906,11 +1906,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Spawn-and-poll launches. The expected argv are the predecessor's
-    // literals (`pod-setup/dispatch.lua`), which the
-    // production pod-setup script uses verbatim — they are the
-    // specification here, so the tests pin them exactly rather than
-    // asserting on fragments.
+    // Spawn-and-poll launches. The expected argv are the pod-setup
+    // dispatch script's literals, which the production script uses
+    // verbatim — they are the specification here, so the tests pin
+    // them exactly rather than asserting on fragments.
     // -------------------------------------------------------------
 
     fn sh_command(step: &Step) -> &str {
