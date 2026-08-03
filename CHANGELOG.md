@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.1.0] - 2026-08-03
+
+### Added
+
 - Typed profile AST pipeline: JSON / canonical-text frontend, validate,
   deterministic canonical encoding + SHA-256 profile hash, plan, and the
   effectful apply engine (`lm-provision` lib + CLI with `validate` /
