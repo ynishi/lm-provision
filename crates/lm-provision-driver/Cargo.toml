@@ -1,19 +1,22 @@
 [package]
 name = "lm-provision-driver"
-description = "Push driver protocol (upload/invoke/collect) and append-only apply ledger for lm-provision (08/09 spec, Phase G)"
+description = "Push driver for lm-provision: one-shot SSH session (ensure-binary / apply / collect) and append-only apply ledger"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/lm-provision-driver"
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "lm-provision-driver"
 path = "src/main.rs"
 
 [dependencies]
-lm-provision = { path = "../lm-provision" }
+lm-provision = { path = "../lm-provision", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
