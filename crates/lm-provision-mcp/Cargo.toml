@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/lm-provision-mcp"
 license.workspace = true
+readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
