@@ -36,7 +36,7 @@ The catalog below is exhaustive: **22 user-facing phase variants**.
 | `comfyui.restart` | `port` number (default 8188); `extra_args` list\<string\> (shell-safe) | `sh.exec` |
 | `comfyui.health` | `port` number (default 8188); `timeout_sec?` number (default 180) — poll of `/object_info` | `net.http_get` |
 | `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind = "vllm"\|"ollama"\|"llamacpp", model? (shell-safe), port?, dtype? (shell-safe), tensor_parallel_size?, extra_args? (shell-safe) }` | `sh.exec` |
-| `service.ready` | `name` string; `check` = `{ http = "<url>", timeout_sec? (default 300) }` | `sh.exec` |
+| `service.ready` | `name` string; `check` = `{ http = "<url>", timeout_sec? (default 300) }` | `net.http_get` |
 
 ### Catalog kinds (direct operations)
 
@@ -281,6 +281,13 @@ A pid file that is absent, empty, or unparsable is likewise *not* read
 as a death: the launch writes it just after backgrounding the server,
 and losing that race must not fail a poll that would otherwise succeed.
 The check is skipped entirely for a poll with no pid file.
+
+Reading that pid file is a file read inside the provisioner, not a
+bridge operation: neither poll composes a `sh.exec` or an `fs.write`
+step to look at it, and nothing outside the poll observes the read. Both
+kinds therefore require `net.http_get` and nothing else — the capability
+of the only effect they expand into, which is the GET they issue
+(chapter 05 §L4).
 
 ### Shared vocabulary (frozen literal sets)
 

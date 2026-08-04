@@ -60,8 +60,13 @@ const LIFECYCLE_OPS: [&str; 15] = [
 
 /// Capability an op requires, or `None` for a marker op (`sync_push`).
 ///
-/// The mapping is frozen against plan.md §Capability mapping (spec 02
-/// §Catalog kinds).
+/// The mapping is frozen against spec 02 §Catalog kinds: a lifecycle op
+/// requires the capability of the effect it expands into (spec 05 §L4).
+/// The two HTTP polls (`comfyui_health` / `service_ready`) expand into a
+/// single `HttpPoll` step and therefore require `net.http_get`, not
+/// `sh.exec` — the pid file they re-read between attempts is a
+/// provisioner-internal file read, not a bridge op (spec 02
+/// §Poll deadlines).
 fn required_capability(op: &str) -> Option<&'static str> {
     match op {
         "sh_exec" => Some("sh.exec"),
@@ -79,9 +84,8 @@ fn required_capability(op: &str) -> Option<&'static str> {
         | "llm_models"
         | "post_install"
         | "comfyui_restart"
-        | "comfyui_health"
-        | "service_start"
-        | "service_ready" => Some("sh.exec"),
+        | "service_start" => Some("sh.exec"),
+        "comfyui_health" | "service_ready" => Some("net.http_get"),
         "sync_pull" | "staging_push" | "models" => Some("net.transfer"),
         "sync_push" => None,
         _ => None,

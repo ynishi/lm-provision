@@ -174,7 +174,11 @@ a plain string takes.
   alike. Lifecycle phases are gated by the capability of the effect
   they expand into (e.g. every `sh.exec`-composing lifecycle op
   requires `sh.exec`; `sync.pull` / `staging.push` / `models` require
-  `net.transfer`).
+  `net.transfer`; the two HTTP polls `comfyui.health` /
+  `service.ready` expand into a GET and so require `net.http_get`,
+  not `sh.exec` — the pid file they re-read between attempts is a
+  provisioner-internal read, not a bridge op, chapter 02
+  §Poll deadlines).
 - Declared-but-unknown capability → fail-fast at context-build time
   (`capability '<x>' declared but not implemented by host`), before
   any op runs. No silent skip.

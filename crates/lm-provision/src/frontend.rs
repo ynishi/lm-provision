@@ -310,7 +310,7 @@ mod tests {
         let value = serde_json::json!({
             "type": "Spec",
             "name": "poll-timeout",
-            "capabilities": ["sh.exec"],
+            "capabilities": ["net.http_get"],
             "phases": [
                 { "type": "ComfyUiHealth", "port": 8188, "timeout_sec": 240 },
                 {
@@ -341,7 +341,7 @@ mod tests {
             "name: \"poll-timeout\", ",
             "version: none, ",
             "description: none, ",
-            "capabilities: [\"sh.exec\"], ",
+            "capabilities: [\"net.http_get\"], ",
             "env: {}, ",
             "env_secrets: [], ",
             "phases: [",
@@ -365,7 +365,7 @@ mod tests {
         let value = serde_json::json!({
             "type": "Spec",
             "name": "poll-timeout-absent",
-            "capabilities": ["sh.exec"],
+            "capabilities": ["net.http_get"],
             "phases": [
                 { "type": "ComfyUiHealth", "port": 8188 },
                 {

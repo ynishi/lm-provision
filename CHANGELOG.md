@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (profile capabilities):** `comfyui.health` and `service.ready`
+  now require `net.http_get` instead of `sh.exec`. Both kinds expand into a
+  single HTTP poll, so they are gated on the capability of the effect they
+  perform (spec 02 §Catalog kinds, 03 §dispatch, 05 §L4); the pid file the
+  poll re-reads between attempts is a provisioner-internal file read, not a
+  bridge operation. A profile that declares only `sh.exec` and uses either
+  kind must add `net.http_get` to its `capabilities`.
+
 ### Deprecated
 
 ### Removed

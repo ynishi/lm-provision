@@ -245,7 +245,14 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
         name: "lifecycle-traceable".to_string(),
         version: None,
         description: None,
-        capabilities: vec!["sh.exec".to_string(), "net.transfer".to_string()],
+        // The two HTTP polls (comfyui_health / service_ready) are gated
+        // on `net.http_get`, not `sh.exec` — they expand into a single
+        // poll step (spec 02 §Catalog kinds / 05 §L4).
+        capabilities: vec![
+            "sh.exec".to_string(),
+            "net.transfer".to_string(),
+            "net.http_get".to_string(),
+        ],
         env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // Lifecycle ops do not run through the direct-op path / URL
@@ -580,7 +587,7 @@ fn comfyui_health_polls_a_local_server_when_executing_effects() {
         name: "health".to_string(),
         version: None,
         description: None,
-        capabilities: vec!["sh.exec".to_string()],
+        capabilities: vec!["net.http_get".to_string()],
         env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         // ComfyUiHealth is a lifecycle op; the direct-op HTTP policy
@@ -600,7 +607,7 @@ fn comfyui_health_polls_a_local_server_when_executing_effects() {
 
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut engine = create_profile_engine(&program, ExecMode::Real, Arc::clone(&log))
-        .expect("engine builds for a declared sh.exec capability");
+        .expect("engine builds for a declared net.http_get capability");
     run_to_done(&mut engine).expect("health poll must succeed on the first attempt");
 
     handle.join().expect("server thread joins");
@@ -613,6 +620,73 @@ fn comfyui_health_polls_a_local_server_when_executing_effects() {
         "summary should record status=200: {}",
         log[0]
     );
+}
+
+/// The two HTTP polls are gated on the capability of the effect they
+/// expand into, which is a GET (spec 02 §Catalog kinds, chapter 05
+/// §L4): `sh.exec` alone no longer reaches either poll, and
+/// `net.http_get` alone is the whole requirement — the pid file the
+/// poll re-reads is a provisioner-internal read, not a bridge op.
+/// Dry-run is enough to prove both halves: the gate is an entry check
+/// that fires before any effect.
+#[test]
+fn http_poll_lifecycle_ops_are_gated_on_net_http_get_not_sh_exec() {
+    let poll_profile = |capabilities: Vec<String>| {
+        let ids = IdGen::new();
+        ProfileNode::Spec {
+            id: ids.node(),
+            name: "poll-gate".to_string(),
+            version: None,
+            description: None,
+            capabilities,
+            env: std::collections::BTreeMap::new(),
+            env_secrets: Vec::new(),
+            // Lifecycle ops do not run through the direct-op path / URL
+            // policy check, so both allowlists stay empty and the
+            // capability gate is the only thing under test.
+            paths: Vec::new(),
+            http_allowlist: Vec::new(),
+            phases: vec![
+                ProfileNode::ComfyUiHealth {
+                    id: ids.node(),
+                    port: 8188,
+                    timeout_sec: Some(1),
+                },
+                ProfileNode::ServiceReady {
+                    id: ids.node(),
+                    name: "llm".to_string(),
+                    check_url: "http://127.0.0.1:9000/health".to_string(),
+                    timeout_sec: Some(1),
+                },
+            ],
+        }
+    };
+
+    let sh_only = poll_profile(vec!["sh.exec".to_string()]);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&sh_only, ExecMode::DryRun, log).expect("engine builds");
+    let err = run_to_done(&mut engine)
+        .expect_err("a poll without net.http_get declared must fail at step");
+    let source = err
+        .source()
+        .expect("EvalFailed carries the ExecError source");
+    let message = source.to_string();
+    assert_eq!(
+        message, "capability 'net.http_get' not declared in profile.capabilities",
+        "the denial must name the GET capability, not sh.exec: {message}"
+    );
+
+    let http_only = poll_profile(vec!["net.http_get".to_string()]);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = create_profile_engine(&http_only, ExecMode::DryRun, Arc::clone(&log))
+        .expect("engine builds");
+    run_to_done(&mut engine)
+        .expect("net.http_get alone must open both polls, with no sh.exec declared");
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 2);
+    assert!(log[0].starts_with("comfyui_health"), "{}", log[0]);
+    assert!(log[1].starts_with("service_ready"), "{}", log[1]);
 }
 
 /// A dry-run `FsWrite` whose target path is not covered by any
