@@ -67,11 +67,15 @@ expresses can mutate the host process environment.
 
 - `env_secrets` lists the secret names a profile may reference. The
   names must be shell-safe (chapter 03 §validate).
-- `env` (the plain list) must not contain secret-shaped keys — validate
-  rejects any key containing one of the secret-key substrings
-  (chapter 02 §Shared vocabulary, case-insensitive): `KEY`, `SECRET`,
-  `TOKEN`, `PASSWORD`, `PWD`, `AUTH`, `CRED`, `APIKEY`. Secret-shaped
-  configuration belongs in `env_secrets`.
+- `env` (the profile-scoped table, chapter 01 §Profile-scoped env
+  table) must not bind a secret-shaped key to a literal — validate
+  rejects an `EnvLiteral` under any key containing one of the
+  secret-key substrings (chapter 02 §Shared vocabulary,
+  case-insensitive): `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PWD`,
+  `AUTH`, `CRED`, `APIKEY`. Secret-shaped configuration belongs in
+  `env_secrets`, referenced through an `EnvSecret` value — which is
+  accepted under a secret-shaped key precisely because it carries no
+  value.
 
 ## Outputs
 

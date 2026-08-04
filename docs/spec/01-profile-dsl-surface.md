@@ -96,7 +96,7 @@ An AI-native JSON representation ideal for programmatic generation and tool inte
 | `version` | string | no | `"0.0.0"` | semver string |
 | `description` | string | no | `nil` | — |
 | `capabilities` | list\<string\> | no | `{}` | entries from `KNOWN_CAPABILITIES` (chapter 05 L4) |
-| `env` | list\<string\> | no | `{}` | non-secret env name declaration (distinct from a phase's `env` keyed slot, below) |
+| `env` | table\<string, `EnvLiteral` \| `EnvSecret`\> | no | `{}` | profile-scoped env table (§Profile-scoped env table below); every key must be shell-safe, and a secret-shaped key must carry an `EnvSecret` value rather than a literal (chapter 03 §validate) |
 | `env_secrets` | list\<string\> | no | `{}` | secret allowlist; every `EnvSecret` reference must name an entry here |
 | `paths` | list\<string\> | no | `{}` | filesystem path root allowlist (chapter 05 §L3 path policy) |
 | `http_allowlist` | list\<string\> | no | `{}` | HTTP URL pattern allowlist (chapter 05 §L3 HTTP policy) |
@@ -107,12 +107,16 @@ Optional fields (`Option<T>` / list-typed) may be omitted on the wire
 empty list. Explicit `null` (JSON) / `none` (canonical text) / `[]`
 remain accepted spellings of the same values.
 
-The declared lists `capabilities`, `env`, `env_secrets`, `paths`,
-and `http_allowlist` are **set-shaped** (declaration order is not
+The declared lists `capabilities`, `env_secrets`, `paths`, and
+`http_allowlist` are **set-shaped** (declaration order is not
 significant): the canonical encoder (chapter 03 §canonical) sorts them
 lexicographically before hashing, so two profiles that differ only in
 the order these entries were written yield the same profile hash.
-Phase order is semantic and is preserved by canonical.
+`env` reaches the same order-independence as a **table** rather than
+as a sorted list: it is stored keyed by name and canonical emits it in
+key order, so no sort step applies — and an empty table is omitted
+from canonical entirely rather than emitted as `[]` (chapter 03
+§canonical). Phase order is semantic and is preserved by canonical.
 
 The profile hash (chapter 03 §hash) is **frontend-independent**: the
 canonical text grammar and the JSON serde bridge that both build the

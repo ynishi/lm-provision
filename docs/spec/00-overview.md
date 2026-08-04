@@ -207,7 +207,14 @@ absorbs it, so the graph stays acyclic.
   note.
 - **Capability derivation.** The phase catalog (02) declares
   required capabilities per phase kind; the compiler derives the
-  profile's capability set by walking the IR. Declared
+  profile's capability set by walking the IR. The walk runs over the
+  **expanded plan** (03 §plan), not the declared phase list: implicit
+  insertion happens at plan time (`comfyui.install` expands to install
+  + restart + health), so deriving from the phases as written misses
+  the inserted steps' capabilities — `net.http_get` for the health
+  poll — and the built-in path constants (02 §Built-in path
+  constants) those steps touch, leaving them to fail at the L4 entry
+  check during apply instead. Declared
   `capabilities` / `env` / `paths` / `http_allowlist` fields become
   `declared ⊇ derived` assertions rather than free-form declarations.
   Absorbed by 01 (assertion form) and 02 (per-kind required
@@ -290,7 +297,8 @@ absorbs it, so the graph stays acyclic.
   which a profile could read an arbitrary host env var. That path is
   gone; the only host-env read is `EnvSecret` resolution, gated by
   `env_secrets`. The secret-shaped-key rejection survives as a
-  validate rule on the declared `env` list.
+  validate rule on the declared `env` table (scoped to literal-valued
+  keys — 05 §L3).
   Absorbed by 06.
 - **Secret resolution happens host-side, never in the profile.** The
   resolved value flows into the consuming step's child-process

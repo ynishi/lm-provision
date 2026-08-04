@@ -41,13 +41,21 @@ Checks, in order:
    stage: the wire tag is a frontend invariant (reaching validate at
    all means a well-typed AST was built), and the AST carries no
    `schema` field.
-2. *(subsumed by the type system)* The five declared lists are
+2. *(subsumed by the type system)* The four declared lists
+   (`capabilities`, `env_secrets`, `paths`, `http_allowlist`) are
    `Vec<String>` on the AST, so "each entry is a string" is
-   unrepresentable-as-invalid. No content condition remains.
-3. No `env` key is secret-shaped (chapter 02 §Shared vocabulary,
-   case-insensitive substring match) — secret names belong in
-   `env_secrets`.
-4. Every `env` / `env_secrets` name is shell-safe.
+   unrepresentable-as-invalid, and `Spec.env` is a keyed table whose
+   values are value nodes rather than strings. No content condition
+   remains.
+3. No secret-shaped `env` key (chapter 02 §Shared vocabulary,
+   case-insensitive substring match) carries an `EnvLiteral` value —
+   that is the shape a secret pasted as a plain string takes, and it
+   belongs in `env_secrets` instead. The same key bound to an
+   `EnvSecret` is accepted: the name is then cross-checked against
+   `env_secrets` like every other secret reference (chapter 06).
+4. Every `env` key / `env_secrets` name is shell-safe, and every
+   `Spec.env` value is an `EnvLiteral` or an `EnvSecret` (an `EnvRef`
+   here would resolve into the table it sits in).
 5. Every `paths` entry is absolute (`/`-leading), free of `..`
    segments, and shell-safe.
 6. Each phase passes its per-kind walk: shell-safety of the payload
@@ -98,10 +106,13 @@ and therefore byte-identical canonical output.
   `platform_kind`, `deps`, `in_comfy_venv`, `path`, `content`,
   `src`, `dst`, `script`, `models_json`, `want`, plus the `Spec`
   fields).
-- **Declared lists**: the `Spec` fields `capabilities`, `env`,
+- **Declared lists**: the `Spec` fields `capabilities`,
   `env_secrets`, `paths`, and `http_allowlist` are set-shaped
   (declaration-order independent). Canonical sorts them
   lexicographically before encoding (the AST is not mutated).
+  `Spec.env` is order-independent without a sort: it is a keyed table
+  and follows the `env` keyed-slot rule below (key order, omitted when
+  empty), one level up.
 - **Phase order**: `Spec.phases` is order-preserving — phase order
   is semantic.
 - **`Option<String>`**: `None` omits the key entirely; `Some(x)`
@@ -152,11 +163,12 @@ hash contract below.
 SHA-256 over the canonical bytes, rendered as a 64-character
 lowercase hex string with no prefix. The profile hash is defined as
 `sha256_hex(canonical::encode(node))`. Because canonical sorts the
-declared lists (`capabilities`, `env`, `env_secrets`, `paths`,
-`http_allowlist`) and excludes `NodeId` during encoding, the hash is:
+declared lists (`capabilities`, `env_secrets`, `paths`,
+`http_allowlist`), emits the `env` table in key order, and excludes
+`NodeId` during encoding, the hash is:
 
 - byte-identical across declaration-order permutations of the
-  declared lists;
+  declared lists and of the `env` table's entries;
 - byte-identical across the two frontends (text grammar / JSON
   serde bridge) for the same logical profile;
 - sensitive to phase order (which is semantic).

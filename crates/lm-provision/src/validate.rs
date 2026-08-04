@@ -18,11 +18,14 @@
 //!   frontend invariant rather than a runtime content check. Check 1
 //!   here is only "root is a `Spec` with a non-empty `name`".
 //! - **Check 2's per-entry type check is subsumed by the type system.**
-//!   The five declared lists (`capabilities` / `env` / `env_secrets` /
-//!   `paths` / `http_allowlist`) are `Vec<String>` on the AST, so "each
-//!   entry is a string" is unrepresentable-as-invalid. The Lua check 2
-//!   imposes no further *content* condition (it never rejects empty
-//!   strings), so nothing remains to port — check 2 is a no-op here.
+//!   The four declared lists (`capabilities` / `env_secrets` / `paths`
+//!   / `http_allowlist`) are `Vec<String>` on the AST, so "each entry
+//!   is a string" is unrepresentable-as-invalid, and `env` is a
+//!   `BTreeMap<String, ProfileNode>` whose values are value nodes
+//!   rather than strings (checks 3 / 4 / 4b below cover its keys and
+//!   values). The Lua check 2 imposes no further *content* condition
+//!   (it never rejects empty strings), so nothing remains to port —
+//!   check 2 is a no-op here.
 //! - **Check 6 is scoped to payload-string shell-safety, the
 //!   `sync.*` / `staging.*` route shape, the `env` keyed slot, and the
 //!   value-node slots outside it** (`fs.write` `content`,

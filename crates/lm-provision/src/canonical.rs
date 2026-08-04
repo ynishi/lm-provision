@@ -15,10 +15,12 @@
 //! - `NodeId` is excluded from every variant. IdGen mints fresh ids
 //!   per parse-run; keeping them in canonical would break the
 //!   frontend-parity guarantee that is the point of this module.
-//! - the `Spec` fields `capabilities`, `env`, `env_secrets`, `paths`,
-//!   and `http_allowlist` are declaration-order independent
-//!   (set-shaped) — canonical sorts them lexicographically before
-//!   encoding (the AST itself is not mutated).
+//! - the `Spec` fields `capabilities`, `env_secrets`, `paths`, and
+//!   `http_allowlist` are declaration-order independent (set-shaped) —
+//!   canonical sorts them lexicographically before encoding (the AST
+//!   itself is not mutated). `Spec.env` is order-independent without a
+//!   sort: it is a keyed table encoded by the `env` keyed-slot rule
+//!   below (`BTreeMap` key order, key omitted entirely when empty).
 //! - `Spec.phases` is order-preserving (phase order is semantic).
 //! - `Option::None` omits the key; `Option::Some(x)` emits it.
 //! - Empty `Vec` encodes as `[]` (the typed AST removes the

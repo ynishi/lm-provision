@@ -88,18 +88,79 @@ op is reachable, and consulted in **both** dry-run and real mode
   upgrade slot remains available if the threat model changes.
 
 An empty declared list denies everything in its domain: a profile that
-declares no `paths` cannot write any path, and one that declares no
-`http_allowlist` cannot reach any URL.
+declares no `paths` cannot write any path **through the bridge write
+ops below**, and one that declares no `http_allowlist` cannot reach any
+URL.
 
-The `env` declared list (the non-secret allowlist) is currently
-consumed by **validate only** — it must contain no secret-shaped key
-and every entry must be shell-safe (chapter 03 §validate). It carries
-no execution-time role, because the plain host-env read surface it used
-to gate (`env.get`) no longer exists: a non-secret env value is written
-into the profile as an `EnvLiteral` and never read from the host. The
-list is retained as a declaration and as the anchor for the
-secret-shaped-key rejection; re-binding it to an execution-time role is
-a design opening, not a silent gap (see Stability).
+The path policy's reach is narrower than "every write the profile
+performs", and the difference is worth stating rather than leaving to
+be discovered.
+
+It is consulted by the **direct bridge ops that carry a path or a
+destination as a declared field**: `fs.write`, `net.transfer` (`dst`),
+`mount.bind` (`src` and `dst`), and `mount.umount` (chapter 04). Each
+checks at op entry, dry-run and real alike.
+
+The transfer sub-steps a lifecycle phase composes do **not** currently
+pass through it — they reach the transfer effect directly when the
+lifecycle step executes. The two cases differ in how much that costs.
+`models` writes under a built-in path constant (chapter 02 §Built-in
+path constants), so an author cannot aim it anywhere: the missing check
+has no reachable escape. `sync.pull`'s `dst` is an author-written field
+(chapter 02), and validate only checks its *shape* — shell-safe,
+absolute, `..`-free (chapter 03 §validate check 6) — never against
+`paths`. The consequence, stated plainly: **a profile that declares
+`net.transfer` can download to any absolute path, whatever it declared
+in `paths`.** The path policy does not see that write.
+
+Neither case is a decided exemption. "Built-in paths are exempt" is not
+a rule this chapter states, and `sync.pull`'s `dst` is exactly the kind
+of author-written destination the policy exists for. Settling both
+belongs with the capability / path derivation work (chapter 00
+§Capability derivation), which has to enumerate the built-in constants
+anyway; until then this is an open item, recorded here rather than left
+to be discovered.
+
+`sh.exec` puts writes structurally out of reach: a subprocess — `git
+clone`, a CLI downloader, `pip install` — writes wherever the pod's
+filesystem permissions allow, and none of that traffic passes an op
+handler. So under `sh.exec` the `paths` list is a declaration plus a
+lint over the bridge ops, not a sandbox over the profile's effects: it
+states where a profile intends to write and rejects bridge calls that
+contradict that statement. Reading it as a containment boundary is
+wrong in the same way, and for the same reason, as expecting the
+lexical policy above to survive a symlink — the enforcement point is
+the op, not the kernel. A containment boundary would have to be imposed
+outside the profile (container / mount namespace / seccomp), which is a
+deployment concern rather than a spec-05 one.
+
+The `env` declared table (the non-secret declarations) carries two
+separable roles, and only one of them is a policy role.
+
+Its **key set** gates nothing. The host-env read surface it used to
+gate (`env.get`) no longer exists: a non-secret env value is written
+into the profile as an `EnvLiteral` and never read from the host, so
+there is no read for an allowlist to constrain. What remains on the
+keys is a validate-stage shape rule — every key shell-safe, and no
+secret-shaped key bound to a literal value (chapter 03 §validate) —
+plus the declaration itself. Re-binding the key set to a *gating* role,
+the way `paths` and `http_allowlist` constrain their ops at execution
+time, is a design opening, not a silent gap (see Stability).
+
+Its **values** do have an execution-time role: the exec layer builds
+its env policy over `Spec.env` and resolves a phase's `EnvRef` by
+looking the referenced name up in this table at consumption time
+(chapter 01 §Profile-scoped env table). That is a resolution source,
+not an allowlist — it decides what a reference *is*, never what a step
+is *permitted to reach*.
+
+The secret-shaped-key rejection is scoped to **literal-valued** keys.
+`HF_TOKEN: EnvSecret(name: "HF_TOKEN")` is accepted: a secret-shaped
+name bound to an `EnvSecret` is the shape the rule wants authors to
+reach for, and it is checked on the other axis instead — the referenced
+name must appear in `env_secrets` (chapter 06). What the rule rejects
+is `HF_TOKEN: EnvLiteral(value: "hf_…")`, the shape a secret pasted as
+a plain string takes.
 
 ### L4 — capability gate (operation-level)
 
@@ -159,7 +220,15 @@ effects already performed by **earlier** steps of the same apply
 - L3 semantics as specified (secret-env gating, single-`*` authority
   wildcard, lexical path policy, empty-list-denies-all): **stable**.
   The symlink-aware path-policy upgrade: **provisional**. An
-  execution-time role for the `env` declared list: **provisional**.
+  execution-time **gating** role for the `env` declared table's key
+  set: **provisional** (the table's values already carry a resolution
+  role — `EnvRef` lookup — which is stable). Which ops consult the
+  `paths` policy — direct bridge write ops today, lifecycle-composed
+  transfer sub-steps not yet: **provisional**, and moves together with
+  the capability / path derivation work (chapter 00). That subprocess
+  writes under `sh.exec` are outside the policy is structural rather
+  than provisional: closing it is a deployment-side concern, not a
+  layer change.
 - L4 entry-check enforcement and the frozen `KNOWN_CAPABILITIES` set:
   **stable**. `mount.volume_attach` reserved key: **provisional**.
 
