@@ -17,6 +17,29 @@ A phase is represented as a variant of the unified `ProfileNode` AST enum (chapt
 
 The catalog below is exhaustive: **22 user-facing phase variants**.
 
+The dotted label and the `<KindName>` are two spellings of the same
+kind, and the correspondence is tabulated rather than derived: two
+labels do not follow the mechanical UpperCamelCase rule (`comfyui`
+spells `ComfyUi`, and `hooks.post_install` drops its group).
+
+```
+system.apt            SystemApt             sh.exec         ShExec
+comfyui.install       ComfyUiInstall        fs.write        FsWrite
+python.version_check  PythonVersionCheck    net.http_get    NetHttpGet
+python.deps           PythonDeps            net.http_post   NetHttpPost
+custom_nodes          CustomNodes           net.transfer    NetTransfer
+sync.pull             SyncPull              mount.bind      MountBind
+sync.push             SyncPush              mount.umount    MountUmount
+staging.push          StagingPush
+models                Models
+llm_models            LlmModels
+hooks.post_install    PostInstall
+comfyui.restart       ComfyUiRestart
+comfyui.health        ComfyUiHealth
+service.start         ServiceStart
+service.ready         ServiceReady
+```
+
 ### Catalog kinds (setup lifecycle)
 
 
@@ -30,12 +53,12 @@ The catalog below is exhaustive: **22 user-facing phase variants**.
 | `sync.pull` | `src` = `b2://<bucket>/<path>` \| `hf://<owner>/<repo>[@<rev>]/<path>` \| `https://...`; `dst` absolute path, no `..` (a **file** path, except on the hf-cli route — §Dispatch routing); `env` table\<string, string\|SecretRef\> optional; `revision` string optional (hf) | `net.transfer`, or `sh.exec` when routed to a CLI (§Dispatch routing) |
 | `sync.push` | `src` absolute path; `dst` = `b2://...` or `hf://<owner>/<repo>/<path>`; `{pod_id}` placeholder allowed in dst | none — marker only, not executed during apply |
 | `staging.push` | same shape as `sync.push` plus `env`, `revision`, `commit_message`, `include` list, `exclude` list, `content_type` | `net.transfer` or `sh.exec` (§Dispatch routing) |
-| `models` | `models` list of `{ src, dst? \| name?, subdir? \| kind? (default "checkpoints"), sha256? }` → downloads to `/workspace/ComfyUI/models/<subdir>/<dst>` | `net.transfer` |
-| `llm_models` | `models` list of `{ src = "hf://<owner>/<repo>[@<rev>]", dst_dir? (default "/tmp/"), revision? }` — repo snapshot download | `sh.exec` (hf CLI) |
+| `models` | `models` list of `{ src = "https://...", dst? \| name?, subdir? \| kind? (default "checkpoints"), sha256? }` → downloads to `/workspace/ComfyUI/models/<subdir>/<dst>`. At least one of `dst` / `name` is required and `dst` wins when both appear; `subdir` likewise wins over `kind`. Not scheme-routed: a credential-bearing `b2://` / `hf://` source belongs on `sync.pull` (§Dispatch routing) | `net.transfer` |
+| `llm_models` | `models` list of `{ src = "hf://<owner>/<repo>[@<rev>]", dst_dir? (default "/tmp/"), revision? }` — repo snapshot download, always over the hf CLI (not scheme-routed) | `sh.exec` (hf CLI) |
 | `hooks.post_install` | `script` string — raw shell, inner escape (chapter 01) | `sh.exec` |
 | `comfyui.restart` | `port` number (default 8188); `extra_args` list\<string\> (shell-safe) | `sh.exec` |
 | `comfyui.health` | `port` number (default 8188); `timeout_sec?` number (default 180) — poll of `/object_info` | `net.http_get` |
-| `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind = "vllm"\|"ollama"\|"llamacpp", model? (shell-safe), port?, dtype? (shell-safe), tensor_parallel_size?, extra_args? (shell-safe) }` | `sh.exec` |
+| `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind string, model? (shell-safe), port?, dtype? (shell-safe), tensor_parallel_size?, extra_args? (shell-safe) }`. `kind` is a free string: `"vllm"`, `"ollama"`, `"llamacpp"` are the values this catalog gives an argv shape, any other value expands to a note step (§Spawn-and-poll invocations) | `sh.exec` |
 | `service.ready` | `name` string; `check` = `{ http = "<url>", timeout_sec? (default 300) }` | `net.http_get` |
 
 ### Catalog kinds (direct operations)
@@ -47,10 +70,10 @@ mirror the bridge signatures, with non-core fields forwarded as
 | kind | payload | required capability |
 |---|---|---|
 | `sh.exec` | `argv` list\<string\> (non-empty); `opts` table (chapter 04 §sh.exec) | `sh.exec` |
-| `fs.write` | `path` string; `content` value node (bare string \| `EnvSecret` \| `EnvRef`, chapter 04 §`fs.write`); other fields → opts | `fs.write` |
+| `fs.write` | `path` string; `content` value node (bare string \| `EnvSecret` \| `EnvRef`, chapter 04 §`fs.write`); other fields → opts | `fs.write`, plus `env.ref` when `content` is an `EnvRef` node — reading a host environment variable into written content is its own effect |
 | `net.http_get` | `url` string; `headers` table\<string, string\|SecretRef\> optional (names shell-safe); `timeout_sec?` number (default 30) | `net.http_get` |
 | `net.http_post` | `url` string; `headers`, `timeout_sec?` as above; `body` value node \| `body_json` JSON string — **mutually exclusive**, and the content type follows from which one is declared (chapter 04 §`net.http_post`); `body_form` deferred | `net.http_post` |
-| `net.transfer` | `src`, `dst` strings; other fields → opts | `net.transfer`, or `sh.exec` when routed (§Dispatch routing) |
+| `net.transfer` | `src`, `dst` strings — the direction is read off the schemes: a remote scheme on `src` is a download, one on `dst` is an upload, and a scheme on both or on neither is a validate-stage reject; other fields → opts | `net.transfer`, or `sh.exec` when routed (§Dispatch routing) |
 | `mount.bind` | `src`, `dst` strings; `recursive?`, `read_only?` → opts | `mount.bind` |
 | `mount.umount` | `path` string; `lazy?`, `force?` → opts | `mount.umount` |
 
@@ -61,6 +84,12 @@ mirror the bridge signatures, with non-core fields forwarded as
 (payload `{ pull, push_markers, staging_push }`). It is not
 user-declarable; a profile declaring `kind = "sync.routes"` falls into
 the unknown-kind bucket.
+
+The three kinds it carries do not demand the same capability, so the
+bundled step demands the **union of the resolved demands** of the
+phases inside it (§Dispatch routing, "What the L4 gate sees").
+`sync.push` markers contribute nothing to that union, since they are
+not executed during apply.
 
 ## Outputs
 
@@ -82,19 +111,41 @@ Rules:
 
 - Multiple phases of the same kind share a bucket and keep their
   relative declaration order inside it.
-- `service.start` / `service.ready` are numbered per declaration
-  index (`11_service_0_start`, `11_service_0_ready`, ...); a
-  `service.ready` inherits the index of the most recent
-  `service.start` (0 when none preceded). Duplicate `service.start`
-  names are a validate-stage error.
-- Implicit insertion: when `comfyui.install` is present and the user
-  did not declare `comfyui.restart` / `comfyui.health`, both are
-  inserted with the default port (or the port carried by whichever of
-  the two the user did declare).
+- `service.start` / `service.ready` are numbered per service index
+  (`11_service_0_start`, `11_service_0_ready`, ...). The index
+  advances on every `service.start`, and a `service.ready` takes the
+  index of the most recent one. A `service.ready` that no
+  `service.start` precedes — the resume profile of §Poll deadlines —
+  opens an index of its own instead of inheriting 0, so it cannot
+  collide with the readiness step of the first declared service.
+  Duplicate `service.start` names are a validate-stage error, and so
+  is any profile whose expansion would emit two steps carrying the
+  same id (§Stability makes ids load-bearing).
+- Implicit insertion: when `comfyui.install` is present, whichever of
+  `comfyui.restart` / `comfyui.health` the profile did not declare is
+  inserted. The guard is per phase, not "neither was declared" — a
+  profile that declares only the restart still gets its health poll.
+  The inserted step carries the port of the other one when that was
+  declared, and the default port when neither was.
 - `python.version_check` with `want == "3.12"` (the default) is
-  suppressed — asserting the default against itself cannot fail.
+  suppressed. The test is a literal equality against the default
+  rather than an analysis of which wants are vacuous: the step's own
+  check is a prefix assertion (§Spawn-and-poll invocations), so
+  `want = "3."` equally cannot fail on a 3.x host and is still
+  emitted.
 - Direct-operation kinds and any unknown kind land in the trailing
-  `zz_unknown` bucket in declaration order (§Unknown kinds).
+  `zz_unknown` bucket in declaration order. Sharing that bucket is an
+  ordering statement only: each step carries its own `kind`, so a
+  recognized direct operation dispatches to its bridge primitive
+  (chapter 04) and runs for real. Only an *unrecognized* kind degrades
+  to a no-op (§Unknown kinds).
+
+The ids are labels, not sort keys. `3a_python_version_check` precedes
+`3_python_deps` in this order but follows it in a byte comparison, and
+`10_` / `11_` sort ahead of `1_`; no zero padding repairs that. The
+order is carried by the position of each step in the emitted list —
+the plan stamps it as a 1-based `index` field — so a consumer that
+re-sorts steps by id silently reorders the plan.
 
 ### Unknown kinds
 
@@ -103,6 +154,10 @@ An unrecognized `kind` is preserved as a trailing step with id
 stage). At dispatch it becomes a `dispatch_pending` step; at apply it
 is reported with `ok = true` and a note. Unknown kinds therefore
 degrade to visible no-ops, never silent drops and never hard errors.
+
+This no-op semantics is keyed on the kind being unrecognized, not on
+the `zz_unknown` id: the direct-operation kinds that share the bucket
+are recognized, and §MVP scope's real-exec coverage for them stands.
 
 ### Dispatch routing (kind → bridge op)
 
@@ -139,10 +194,37 @@ Dispatch turns each planned step into one or more bridge invocations
   hide a convention the CLI states plainly.
 - Uploads (`staging.push`, `net.transfer` upload): `hf://` dst →
   `hf upload` argv; `b2://` dst → `b2 upload-file` argv;
-  `https://` dst → `net.transfer` bridge (HTTP PUT).
+  `https://` dst → `net.transfer` bridge (HTTP PUT). The absence of an
+  `env` condition here is deliberate, not an omission of the download
+  rule: writing to a bucket or a repo needs credentials in every case,
+  so a `b2://` / `hf://` dst is CLI-routed unconditionally.
+- `models` and `llm_models` are not scheme-routed at all: `models`
+  always takes the `net.transfer` bridge (its `src` grammar is
+  `https://` only), and `llm_models` always takes the hf CLI. A
+  credential-bearing download is expressed with `sync.pull`, which is
+  where the routing rule above applies.
 - `hf://<owner>/<repo>@<rev>/<path>`: the `@<rev>` suffix on the repo
   segment pins a revision; a URL-carried revision wins over
-  `opts.revision`. `@` is rejected in the owner segment.
+  `opts.revision`. `@` is rejected in the owner segment. This holds on
+  both sides — on an upload dst as on a download src — and it is where
+  `staging.push`'s `revision` lands: whichever revision survives that
+  precedence becomes `--revision` on the `hf` argv.
+
+**What the L4 gate sees.** Routing is decided from the payload alone,
+so the capability a routed kind requires is known statically, before
+anything runs. The gate therefore requires the **resolved** capability
+rather than the union of both routes: a profile granting
+`net.transfer` but not `sh.exec` passes with a public `hf://` download
+and fails the gate as soon as a credential `env` moves that same phase
+onto the CLI route. Granting the union up front would defeat the
+point of declaring capabilities — it would let a shell run under a
+profile that never asked for one (chapter 05 §L4).
+
+The `dst` route-shape check (§Error surface) validates path syntax —
+absolute, no `..` — and nothing more. Whether `dst` names a file or a
+directory follows from the route, as described above, and is not
+separately checked; a profile that swaps schemes changes the meaning
+of a `dst` that still validates.
 
 #### Spawn-and-poll invocations
 
@@ -205,6 +287,13 @@ in control; declaring both puts the flag on the argv twice, which the
 platform CLI will normally reject as a duplicate — validate does not
 police that overlap.
 
+`ollama` is the one platform whose argv carries neither field: a
+`model` or a `port` declared on it is accepted and then dropped, since
+`ollama serve` takes its address from `OLLAMA_HOST` and its model at
+request time. The payload shape is uniform across platforms and the
+meaning is not; a profile that wants `ollama` on another port sets
+that variable in the service environment rather than the payload.
+
 `service.start` expands to a **note** step instead of a command when
 the platform is not one of the three above, or when `vllm` / `llamacpp`
 is declared without a `model`. Neither case has an argv to run:
@@ -213,6 +302,13 @@ launching something the profile did not ask for. A profile that needs a
 launch this catalog does not cover expresses it through
 `hooks.post_install`, where the shell escape is sanctioned and visible
 (chapter 01 §Escape / Fragment Policy).
+
+An unrecognized `platform.kind` is therefore **not** a validate-stage
+error: `kind` is a free string at the JSON boundary, the three values
+above are the ones this catalog gives an argv shape, and everything
+else surfaces at apply as the note step just described. Validate
+checks the shell-safety of the payload's strings, not the membership
+of `kind` (§Error surface).
 
 `comfyui.health` polls `/object_info`, not `/`. The root path serves
 the UI's HTML and answers 200 before the backend can take an API call,
@@ -291,23 +387,39 @@ of the only effect they expand into, which is the GET they issue
 
 ### Shared vocabulary (frozen literal sets)
 
-This chapter is the source of truth for three literal sets consumed
+This chapter is the source of truth for two literal sets consumed
 elsewhere. The host embeds them; the implementation form of the
 sharing (single data file vs mirrored constants) is internal, byte
-equality of the sets is the contract.
+equality of the set literal is the contract.
 
-- Secret-shaped key substrings (chapter 06 rejects `env` keys
-  containing any, case-insensitive):
+- Secret-shaped key substrings — **one set, two consumers**: chapter
+  06 rejects a *literal* bound to an `env` key containing any of them
+  (a `SecretRef` under the same key is exactly what it asks for, which
+  is why a credential `env` can still put a phase on the CLI route
+  above), and chapter 09 redacts an audit field whose name contains
+  any of them.
   `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PWD`, `AUTH`, `CRED`,
   `APIKEY`.
-- Sensitive-key substrings (chapter 09 audit redaction,
-  case-insensitive): `key`, `token`, `secret`, `password`, `pwd`,
-  `auth`, `cred`, `apikey`.
+
+  Matching is case-insensitive in this exact sense: the candidate key
+  is upper-cased through the Unicode uppercase mapping and tested for
+  containment of these ASCII spellings. Byte equality is a statement
+  about the shared literal above, not about the comparison. A
+  lower-case mirror of the same eight words is not a second set — it
+  is a second spelling of one fact, and a chapter that carried one
+  could be edited on its own without any consumer observing the
+  divergence. Chapters 00 and 09 call this set the *sensitive-key
+  substring set*; the two names name the same eight substrings.
 - `KNOWN_CAPABILITIES` (chapter 05 L4): `env.ref`, `sh.exec`,
   `net.transfer`, `net.http_get`, `net.http_post`, `fs.write`,
   `mount.bind`, `mount.umount`, `mount.volume_attach` (reserved key —
   declaring it passes the gate build but no bridge exists for it yet,
   so no operation is reachable).
+
+  Every other key in that set is demanded by at least one row of the
+  catalog above; `mount.volume_attach` is the single reserved
+  exception. `env.ref` is demanded by an `fs.write` whose content is
+  an `EnvRef` node, which is what keeps it reachable.
 
 ### Authoring support
 
@@ -349,7 +461,15 @@ choices (§Spawn-and-poll invocations).
 - Route shape violations (`sync.*` src/dst schemes, missing bucket or
   path, `..` traversal): validate-stage reject.
 - Duplicate `service.start` name: validate-stage reject.
+- Two expanded steps carrying the same id: validate-stage reject
+  (§Canonical phase ordering — ids are what hashes and report entries
+  are keyed on).
+- A `models` element with neither `dst` nor `name`, and a
+  `net.transfer` whose direction is not fixed by a scheme on exactly
+  one side: validate-stage reject.
 - Unknown kind: **not** an error (see §Unknown kinds).
+- Unrecognized `platform.kind` on `service.start`: **not** an error —
+  it expands to a note step (§Spawn-and-poll invocations).
 
 ## Stability
 
@@ -357,8 +477,9 @@ choices (§Spawn-and-poll invocations).
   through Phase H (additive growth expected; removals are breaking).
 - Canonical phase ids, fixed ordering, implicit-insertion rules:
   **stable** (hash and report ids depend on them).
-- `KNOWN_CAPABILITIES`, secret-key set, sensitive-key set: **stable
-  once frozen** — frozen as listed above.
+- `KNOWN_CAPABILITIES` and the secret-shaped key set (the
+  sensitive-key set is the same set under another name): **stable once
+  frozen** — frozen as listed above.
 - Shared vocabulary implementation form: **internal**.
 - Per-kind `depends_on` + topological sort (a dependency DAG): not
   part of this contract; the fixed order above is the contract (see
