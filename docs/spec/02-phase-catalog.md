@@ -93,7 +93,15 @@ not executed during apply.
 
 ## Outputs
 
-### Canonical phase ordering (plan expansion contract)
+### Canonical phase ordering (execution contract)
+
+The three rules below are content-sensitive — they decide *which*
+phases exist and in *what order* — so they are applied once, to the
+AST, before either consumer reads it: the plan stage renders the
+result, and apply executes it. A plan that described an order apply did
+not follow would defeat the point of having a plan stage. The profile
+as *written* is what `hash` / `canonical` see; the rewrite never
+reaches them, so an inserted step cannot change a profile's hash.
 
 The plan stage assigns each kind a canonical phase id and emits steps
 in this fixed order (the numbering is part of the contract; the `6_`

@@ -61,7 +61,12 @@ pub enum AstApplyError {
 /// entry, and its reason drives the envelope's `error` line; no later
 /// step is reached.
 pub fn run_apply_ast(profile: &Path, dry_run: bool) -> Result<String, AstApplyError> {
-    let root = crate::frontend::load_profile(profile)?;
+    // Canonical order, implicit insertion, and suppression are applied
+    // to the AST before the engine sees it, so apply runs exactly the
+    // steps the plan artifact renders (`02` §Canonical phase ordering,
+    // [`crate::normalize`]). The profile as *written* is what `hash` /
+    // `canonical` see; normalization never reaches them.
+    let root = crate::normalize::normalize(&crate::frontend::load_profile(profile)?);
     let mode = if dry_run {
         ExecMode::DryRun
     } else {

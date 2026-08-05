@@ -57,6 +57,21 @@ fn step_ids(report: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The `kind` of every step in a plan artifact or an apply report,
+/// deduplicated consecutively so a lifecycle phase that expanded into
+/// several sub-steps counts once — the two artifacts agree on phases,
+/// not on sub-step granularity.
+fn step_kinds(artifact: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for step in artifact["steps"].as_array().expect("steps is an array") {
+        let kind = step["kind"].as_str().expect("kind is a string").to_string();
+        if out.last() != Some(&kind) {
+            out.push(kind);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------
 // Dry-run report shape (envelope field names + AST step structure).
 // ---------------------------------------------------------------------
@@ -1051,6 +1066,70 @@ fn declaring_both_http_body_forms_is_rejected_at_validate() {
         stderr.contains("body and body_json are mutually exclusive"),
         "validate names the exclusivity rule: {stderr}"
     );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// The plan artifact describes the run apply performs: same phases, same
+/// order, same insertions and suppressions (spec 02 §Canonical phase
+/// ordering, via `lm_provision::normalize`).
+///
+/// The fixture is written in an order no stage uses — a direct op first,
+/// then the install, a `python.version_check` asserting the default, and
+/// `system.apt` last — so a stage that skipped normalization would show
+/// it: declaration order, no inserted restart / health pair, and the
+/// suppressed check still present.
+#[test]
+fn the_plan_artifact_and_the_apply_report_run_the_same_phases_in_the_same_order() {
+    let profile = json!({
+        "type": "Spec",
+        "name": "normalized-demo",
+        "capabilities": ["sh.exec", "net.http_get"],
+        "http_allowlist": ["http://127.0.0.1:8188"],
+        "phases": [
+            { "type": "ShExec", "argv": ["echo", "last"] },
+            { "type": "ComfyUiInstall", "ref_name": "master" },
+            { "type": "PythonVersionCheck", "want": "3.12" },
+            { "type": "SystemApt", "packages": ["git"] }
+        ]
+    });
+    let path = write_json_profile("normalized", &profile);
+
+    let plan_out = bin()
+        .args(["plan", path.to_str().unwrap()])
+        .output()
+        .expect("process runs");
+    assert_eq!(
+        plan_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan: Value =
+        serde_json::from_slice(&plan_out.stdout).expect("plan stdout is the artifact JSON");
+
+    let apply_out = bin()
+        .args(["apply", "--dry-run", path.to_str().unwrap()])
+        .output()
+        .expect("process runs");
+    assert_eq!(
+        apply_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&apply_out.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&apply_out.stdout).expect("apply stdout is the report JSON");
+
+    let expected = vec![
+        "system.apt".to_string(),
+        "comfyui.install".to_string(),
+        "comfyui.restart".to_string(),
+        "comfyui.health".to_string(),
+        "sh.exec".to_string(),
+    ];
+    assert_eq!(step_kinds(&plan), expected, "plan: {plan}");
+    assert_eq!(step_kinds(&report), expected, "apply report: {report}");
 
     std::fs::remove_file(&path).ok();
 }

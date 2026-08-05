@@ -21,7 +21,13 @@ pub struct ProfileHost {
 
 impl ProfileHost {
     /// Builds a host around a given `ProfileNode` AST.
+    ///
+    /// The program is normalized first, so stepping through it in the
+    /// debugger walks the same phases, in the same order, that `apply`
+    /// runs and the plan artifact renders
+    /// (`lm_provision::normalize`).
     pub fn new(program: ProfileNode) -> Self {
+        let program = lm_provision::normalize::normalize(&program);
         let executed_log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&executed_log))
             .expect("profile engine construction should succeed");

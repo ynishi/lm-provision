@@ -2,11 +2,18 @@
 //! (`03-pipeline-stage-artifacts.md` §plan).
 //!
 //! Respecified from the legacy Lua `lm.plan.expand` onto the typed
-//! AST: buckets, ordering, per-declaration `service.*` indexing, the
-//! `python.version_check` default-value suppression rule, the
-//! `sync.routes` plan-internal bundle, the implicit `comfyui.restart` /
-//! `comfyui.health` insertion, and the trailing `zz_unknown` bucket
-//! are ported 1:1 from `lua/lm/plan.lua`.
+//! AST: per-declaration `service.*` indexing, the `sync.routes`
+//! plan-internal bundle, and the trailing `zz_unknown` bucket are
+//! ported 1:1 from `lua/lm/plan.lua`.
+//!
+//! The three content-sensitive rules that used to live here —
+//! bucketing / ordering, implicit `comfyui.restart` / `comfyui.health`
+//! insertion, and `python.version_check` suppression — now run in
+//! [`crate::normalize`], which apply consumes too. This stage renders
+//! the already-normalized phase list: walking it in order *is* the
+//! canonical order, so the plan artifact describes the run apply
+//! performs rather than a second reading of the same rules
+//! (`02-phase-catalog.md` §Canonical phase ordering).
 //!
 //! Unlike [`crate::canonical`], this stage is **not** hash-sensitive:
 //! declared lists inside each phase's payload keep their declaration
@@ -25,16 +32,6 @@ use serde_json::{json, Map, Value};
 
 use crate::profile_ast::ProfileNode;
 
-/// Default port used when [`crate::profile_ast::ProfileNode::ComfyUiRestart`]
-/// or [`crate::profile_ast::ProfileNode::ComfyUiHealth`] is implicitly
-/// inserted (`02-phase-catalog.md` §Canonical phase ordering).
-const DEFAULT_COMFYUI_PORT: u16 = 8188;
-
-/// Default `want` value that suppresses the
-/// [`crate::profile_ast::ProfileNode::PythonVersionCheck`] step
-/// (`02-phase-catalog.md` §Catalog kinds `python.version_check`).
-const DEFAULT_PYTHON_VERSION_WANT: &str = "3.12";
-
 /// Expand `root` into the ordered plan artifact.
 ///
 /// Returns a [`serde_json::Value`] shaped as
@@ -44,8 +41,12 @@ const DEFAULT_PYTHON_VERSION_WANT: &str = "3.12";
 /// and no steps: the frontend only ever hands a `Spec` root here, so
 /// the fallback is a total-function convenience rather than an
 /// exercised path.
+///
+/// `root` is normalized first ([`crate::normalize`]), so the artifact
+/// carries the same phases, in the same order, that apply will run.
 pub fn expand(root: &ProfileNode) -> Value {
-    let (profile_name, phases) = match root {
+    let normalized = crate::normalize::normalize(root);
+    let (profile_name, phases) = match &normalized {
         ProfileNode::Spec { name, phases, .. } => (name.as_str(), phases.as_slice()),
         _ => ("", [].as_slice()),
     };
@@ -57,10 +58,14 @@ pub fn expand(root: &ProfileNode) -> Value {
     Value::Object(top)
 }
 
-/// Iterate `phases` once, bucketing by canonical id / handling the
-/// content-sensitive rules, then emit steps in the fixed canonical
-/// order (`02-phase-catalog.md` §Canonical phase ordering) with a
-/// 1-based contiguous `index`.
+/// Iterate the already-normalized `phases` once, bucketing by canonical
+/// id, then emit steps with a 1-based contiguous `index`.
+///
+/// The bucket walk assigns each phase its slot id and bundles the three
+/// sync kinds into the plan-internal `5_sync_routes` step. Ordering,
+/// insertion, and suppression are not decided here — [`crate::normalize`]
+/// already applied them, so this is a rendering, not a second reading of
+/// the same rules.
 fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
     let mut buckets = Buckets::default();
     let mut service_steps: Vec<(String, &'static str, Value)> = Vec::new();
@@ -149,17 +154,14 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
     for p in &buckets.comfyui_install {
         steps.push(step_value("2_comfyui_install", kind_of(p), payload_of(p)));
     }
-    // 3a_python_version_check — suppressed when `want == "3.12"`.
+    // 3a_python_version_check — the default-value suppression already
+    // ran in `crate::normalize`, so every survivor is emitted.
     for p in &buckets.python_version_check {
-        if let ProfileNode::PythonVersionCheck { want, .. } = p {
-            if want != DEFAULT_PYTHON_VERSION_WANT {
-                steps.push(step_value(
-                    "3a_python_version_check",
-                    kind_of(p),
-                    payload_of(p),
-                ));
-            }
-        }
+        steps.push(step_value(
+            "3a_python_version_check",
+            kind_of(p),
+            payload_of(p),
+        ));
     }
     // 3_python_deps
     for p in &buckets.python_deps {
@@ -195,18 +197,14 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
     for p in &buckets.post_install {
         steps.push(step_value("8_post_install", kind_of(p), payload_of(p)));
     }
-    // 9_comfyui_restart / 10_comfyui_health, with implicit insertion
-    // when `comfyui.install` is declared (`02` §Canonical phase
-    // ordering: "when comfyui.install is present and the user did not
-    // declare comfyui.restart / comfyui.health, both are inserted with
-    // the default port (or the port carried by whichever of the two
-    // the user did declare)").
-    let (restart_payloads, health_payloads) = resolve_comfyui_lifecycle(&buckets);
-    for payload in restart_payloads {
-        steps.push(step_value("9_comfyui_restart", "comfyui.restart", payload));
+    // 9_comfyui_restart / 10_comfyui_health. The implicit-insertion
+    // rule ran in `crate::normalize`, so a phase the author never wrote
+    // is an ordinary bucket member by the time it reaches here.
+    for p in &buckets.comfyui_restart {
+        steps.push(step_value("9_comfyui_restart", kind_of(p), payload_of(p)));
     }
-    for payload in health_payloads {
-        steps.push(step_value("10_comfyui_health", "comfyui.health", payload));
+    for p in &buckets.comfyui_health {
+        steps.push(step_value("10_comfyui_health", kind_of(p), payload_of(p)));
     }
 
     // 11_service_<N>_start / 11_service_<N>_ready
@@ -260,52 +258,6 @@ fn step_value(id: &str, kind: &str, payload: Value) -> Value {
     m.insert("kind".into(), Value::String(kind.into()));
     m.insert("payload".into(), payload);
     Value::Object(m)
-}
-
-/// Resolve the effective restart / health payload lists after the
-/// implicit-insertion rule fires.
-///
-/// Each returned `Vec<Value>` is the list of payload objects the
-/// caller then wraps into `9_comfyui_restart` / `10_comfyui_health`
-/// steps.
-fn resolve_comfyui_lifecycle(buckets: &Buckets<'_>) -> (Vec<Value>, Vec<Value>) {
-    let mut restart: Vec<Value> = buckets
-        .comfyui_restart
-        .iter()
-        .map(|p| payload_of(p))
-        .collect();
-    let mut health: Vec<Value> = buckets
-        .comfyui_health
-        .iter()
-        .map(|p| payload_of(p))
-        .collect();
-
-    if buckets.comfyui_install.is_empty() {
-        return (restart, health);
-    }
-
-    if restart.is_empty() && health.is_empty() {
-        restart.push(json!({ "port": DEFAULT_COMFYUI_PORT }));
-        health.push(json!({ "port": DEFAULT_COMFYUI_PORT }));
-    } else if restart.is_empty() {
-        let port = port_from_payload(&health[0]).unwrap_or(DEFAULT_COMFYUI_PORT);
-        restart.push(json!({ "port": port }));
-    } else if health.is_empty() {
-        let port = port_from_payload(&restart[0]).unwrap_or(DEFAULT_COMFYUI_PORT);
-        health.push(json!({ "port": port }));
-    }
-
-    (restart, health)
-}
-
-fn port_from_payload(value: &Value) -> Option<u16> {
-    value.get("port").and_then(Value::as_u64).and_then(|n| {
-        if n <= u64::from(u16::MAX) {
-            Some(n as u16)
-        } else {
-            None
-        }
-    })
 }
 
 /// The canonical kind string for `phase`

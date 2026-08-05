@@ -53,6 +53,7 @@ pub mod canonical;
 pub mod cli;
 pub mod exec;
 pub mod frontend;
+pub mod normalize;
 pub mod plan;
 pub mod profile_ast;
 pub mod validate;
