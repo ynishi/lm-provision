@@ -227,12 +227,16 @@ effects already performed by **earlier** steps of the same apply
   execution-time **gating** role for the `env` declared table's key
   set: **provisional** (the table's values already carry a resolution
   role — `EnvRef` lookup — which is stable). Which ops consult the
-  `paths` policy — direct bridge write ops today, lifecycle-composed
-  transfer sub-steps not yet: **provisional**, and moves together with
-  the capability / path derivation work (chapter 00). That subprocess
-  writes under `sh.exec` are outside the policy is structural rather
-  than provisional: closing it is a deployment-side concern, not a
-  layer change.
+  policies is now **stable and uniform**: every step that reaches a
+  bridge answers to them, whether the profile spelled it as a direct
+  op or a lifecycle phase composed it. A `sync.pull` writing outside
+  `paths`, or a `comfyui.health` polling a host outside
+  `http_allowlist`, is denied exactly as the `net.transfer` /
+  `net.http_get` spelling of the same effect would be — the targets
+  are read off the expanded steps, so the check does not depend on how
+  the phase was written. That subprocess writes under `sh.exec` are
+  outside the policy is structural rather than provisional: closing it
+  is a deployment-side concern, not a layer change.
 - L4 entry-check enforcement and the frozen `KNOWN_CAPABILITIES` set:
   **stable**. `mount.volume_attach` reserved key: **provisional**.
 

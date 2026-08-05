@@ -298,6 +298,37 @@ impl ProfileOp {
         err
     }
 
+    /// Apply the path / http policy to one expanded lifecycle step.
+    ///
+    /// A lifecycle phase reaches the same bridges a direct op does, so
+    /// it answers to the same allowlists (spec 05 §L3): a `sync.pull`
+    /// writing outside `paths` or a `comfyui.health` polling a host
+    /// outside `http_allowlist` is denied exactly as the direct
+    /// `net.transfer` / `net.http_get` spelling of it would be. The
+    /// targets are read off the resolved step, mirroring
+    /// [`step_capability`]'s treatment of the demand.
+    ///
+    /// `Sh` steps carry no policy target — `sh.exec` is outside the
+    /// path layer by design (spec 04 §`sh.exec`) — and a `Note` runs no
+    /// effect at all. The pid file an `HttpPoll` re-reads is likewise
+    /// exempt: it is a provisioner-internal read, not a bridge op
+    /// (spec 02 §Poll deadlines).
+    fn check_step_policy(&self, step: &lifecycle::Step) -> Result<(), ExecError> {
+        match step {
+            lifecycle::Step::Transfer { src, dst } => {
+                let route = scheme::resolve("net_transfer", src, dst)?;
+                let (local, remote) = match &route {
+                    scheme::Transfer::Download { url } => (dst, url),
+                    scheme::Transfer::Upload { url } => (src, url),
+                };
+                self.ctx.path_policy.check(local)?;
+                self.ctx.http_policy.check(remote)
+            }
+            lifecycle::Step::HttpPoll { url, .. } => self.ctx.http_policy.check(url),
+            lifecycle::Step::Sh(_) | lifecycle::Step::Note(_) => Ok(()),
+        }
+    }
+
     /// Compose a lifecycle op's steps, then render (dry-run) or execute
     /// (real) each one. Each sub-step becomes its own report entry
     /// (`<phase_index>_<kind>_<n>`, labelled with the effect it runs);
@@ -332,16 +363,19 @@ impl ProfileOp {
             }
         };
 
-        // The gate sees the *resolved* demand: expansion is pure, so the
-        // route is known before any step runs, and every step's
-        // capability is required up front — a phase whose second step
-        // would be denied never executes its first (spec 02
-        // §Dispatch routing "What the L4 gate sees").
+        // Both gates see the *resolved* steps: expansion is pure, so the
+        // route is known before anything runs, and the whole phase is
+        // checked up front — a phase whose second step would be denied
+        // never executes its first (spec 02 §Dispatch routing "What the
+        // L4 gate sees", spec 05 §L3 / §L4).
         for step in &steps {
-            let Some(capability) = step_capability(step) else {
-                continue;
-            };
-            if let Err(err) = self.ctx.gate.require(capability) {
+            if let Some(capability) = step_capability(step) {
+                if let Err(err) = self.ctx.gate.require(capability) {
+                    self.record_phase_failure(node, &err);
+                    return Err(err);
+                }
+            }
+            if let Err(err) = self.check_step_policy(step) {
                 self.record_phase_failure(node, &err);
                 return Err(err);
             }

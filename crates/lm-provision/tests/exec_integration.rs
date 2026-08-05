@@ -255,12 +255,19 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
         ],
         env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
-        // Lifecycle ops do not run through the direct-op path / URL
-        // policy check (spec 07 §"lifecycle op internal steps" is
-        // deferred to a later revision), so this fixture leaves both
-        // allowlists empty and still traces every lifecycle op.
-        paths: Vec::new(),
-        http_allowlist: Vec::new(),
+        // A lifecycle op reaches the same bridges a direct op does and
+        // answers to the same allowlists (spec 05 §L3), so every
+        // destination the phases below write to and every host they
+        // reach is declared here.
+        paths: vec![
+            "/workspace".to_string(),
+            "/workspace/ComfyUI/models".to_string(),
+        ],
+        http_allowlist: vec![
+            "https://example.com".to_string(),
+            "https://ex".to_string(),
+            format!("http://127.0.0.1:{}", addr.port()),
+        ],
         phases: vec![
             ProfileNode::SystemApt {
                 id: ids.node(),
@@ -668,6 +675,83 @@ fn a_public_hf_download_gates_on_the_resolved_host() {
     );
 }
 
+/// A lifecycle phase answers to the same allowlists a direct op does
+/// (spec 05 §L3): the `sync.pull` spelling of a download is gated on
+/// `paths` / `http_allowlist` exactly as the `net.transfer` spelling
+/// is, and a poll's URL is gated like any other bridge GET. Both fire
+/// in dry-run, before any effect.
+#[test]
+fn lifecycle_steps_answer_to_the_path_and_http_allowlists() {
+    fn run(phase: ProfileNode, paths: Vec<String>, allowlist: Vec<String>) -> Result<(), String> {
+        let ids = IdGen::new();
+        let program = ProfileNode::Spec {
+            id: ids.node(),
+            name: "lifecycle-policy".to_string(),
+            version: None,
+            description: None,
+            capabilities: vec!["net.transfer".to_string(), "net.http_get".to_string()],
+            env: std::collections::BTreeMap::new(),
+            env_secrets: Vec::new(),
+            paths,
+            http_allowlist: allowlist,
+            phases: vec![phase],
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+            .expect("engine builds");
+        run_to_done(&mut engine).map(|_| ()).map_err(|err| {
+            err.source()
+                .map_or_else(|| err.to_string(), |source| source.to_string())
+        })
+    }
+
+    let pull = |ids: &IdGen| ProfileNode::SyncPull {
+        id: ids.node(),
+        src: "https://example.com/m.bin".to_string(),
+        dst: "/workspace/m.bin".to_string(),
+        env: Default::default(),
+        revision: None,
+    };
+    let ids = IdGen::new();
+    assert_eq!(
+        run(
+            pull(&ids),
+            vec!["/workspace".to_string()],
+            vec!["https://example.com".to_string()]
+        ),
+        Ok(()),
+        "a declared destination and host pass"
+    );
+    let unrooted = run(
+        pull(&ids),
+        Vec::new(),
+        vec!["https://example.com".to_string()],
+    )
+    .expect_err("an undeclared destination root must be denied");
+    assert!(
+        unrooted.contains("outside profile.paths"),
+        "expected the path denial, got: {unrooted}"
+    );
+    let unlisted = run(pull(&ids), vec!["/workspace".to_string()], Vec::new())
+        .expect_err("an unlisted download host must be denied");
+    assert!(
+        unlisted.contains("http_allowlist"),
+        "expected the allowlist denial, got: {unlisted}"
+    );
+
+    let poll = ProfileNode::ComfyUiHealth {
+        id: ids.node(),
+        port: 8188,
+        timeout_sec: Some(1),
+    };
+    let poll_denied = run(poll, Vec::new(), Vec::new())
+        .expect_err("a poll against an unlisted host must be denied");
+    assert!(
+        poll_denied.contains("http_allowlist"),
+        "expected the allowlist denial for the poll, got: {poll_denied}"
+    );
+}
+
 /// A `ShExec` referencing a secret that is not declared in
 /// `profile.env_secrets` fails at step time even under dry-run — spec 06
 /// §Resolution "dry-run resolves too": the decode path runs, so the
@@ -809,11 +893,11 @@ fn comfyui_health_polls_a_local_server_when_executing_effects() {
         capabilities: vec!["net.http_get".to_string()],
         env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
-        // ComfyUiHealth is a lifecycle op; the direct-op HTTP policy
-        // does not gate its internal poll (see the lifecycle carry
-        // note).
+        // The poll answers to the http allowlist like any other bridge
+        // GET (spec 05 §L3), so the local server it waits on is
+        // declared.
         paths: Vec::new(),
-        http_allowlist: Vec::new(),
+        http_allowlist: vec![format!("http://127.0.0.1:{port}")],
         phases: vec![ProfileNode::ComfyUiHealth {
             id: ids.node(),
             port,
@@ -860,11 +944,14 @@ fn http_poll_lifecycle_ops_are_gated_on_net_http_get_not_sh_exec() {
             capabilities,
             env: std::collections::BTreeMap::new(),
             env_secrets: Vec::new(),
-            // Lifecycle ops do not run through the direct-op path / URL
-            // policy check, so both allowlists stay empty and the
-            // capability gate is the only thing under test.
+            // Both poll targets are declared so the capability gate is
+            // the only thing under test here — the http allowlist has
+            // its own coverage below.
             paths: Vec::new(),
-            http_allowlist: Vec::new(),
+            http_allowlist: vec![
+                "http://127.0.0.1:8188".to_string(),
+                "http://127.0.0.1:9000".to_string(),
+            ],
             phases: vec![
                 ProfileNode::ComfyUiHealth {
                     id: ids.node(),

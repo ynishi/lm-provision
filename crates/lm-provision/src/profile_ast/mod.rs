@@ -562,6 +562,11 @@ mod tests {
             "name": "comfyui-vllm-pod",
             "version": "1.0.0",
             "capabilities": ["sh.exec", "net.transfer"],
+            // The `sync.pull` below reaches the same bridges a direct
+            // `net.transfer` would, so it answers to the same
+            // allowlists (spec 05 §L3).
+            "paths": ["/workspace"],
+            "http_allowlist": ["https://example.com"],
             "phases": [
                 {
                     "type": "SystemApt",
