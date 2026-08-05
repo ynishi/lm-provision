@@ -274,34 +274,24 @@ fn http_outcome(response: ureq::http::Response<ureq::Body>) -> Result<HttpOutcom
 
 /// Transfer `src` to `dst`.
 ///
-/// MVP: `https://` (or `http://`) source → GET and stream to the `dst`
-/// path. Credential-carrying `b2://` / `hf://` downloads and uploads are
-/// routed to the native CLIs over `sh.exec` one layer up (see
-/// [`super::lifecycle`], spec 02 §Dispatch routing) and never reach
-/// here. A `b2://` / `hf://` source or a URL destination that *does*
-/// reach `transfer` is the public `net.transfer`-bridge scheme
-/// resolution (chapter 04), which is not implemented yet, so it returns
-/// [`ExecError::Unsupported`].
+/// The direction and the URL come from [`super::scheme::resolve`]: a
+/// scheme on `src` is a download (`https://` verbatim, `hf://`
+/// rewritten to its public resolve URL), a scheme on `dst` is an
+/// upload. Credential-carrying transfers never reach here — those route
+/// to the native CLIs over `sh.exec` one layer up (see
+/// [`super::lifecycle`], spec 02 §Dispatch routing) — and a `b2://`
+/// source fails with an error naming the endpoint no profile field
+/// declares, rather than a guessed host.
 pub fn transfer(src: &str, dst: &str) -> Result<TransferOutcome, ExecError> {
-    if src.starts_with("b2://") || src.starts_with("hf://") {
-        return Err(ExecError::Unsupported(format!(
-            "net.transfer '{src}': public b2:// / hf:// download over the \
-             net.transfer bridge (chapter 04 scheme resolution) is not implemented"
-        )));
+    match super::scheme::resolve("net_transfer", src, dst)? {
+        super::scheme::Transfer::Download { url } => download(&url, dst),
+        super::scheme::Transfer::Upload { url } => upload(src, &url),
     }
-    if dst.contains("://") {
-        return Err(ExecError::Unsupported(format!(
-            "net.transfer to '{dst}': upload over the net.transfer bridge \
-             (HTTP PUT) is not implemented"
-        )));
-    }
-    if !(src.starts_with("https://") || src.starts_with("http://")) {
-        return Err(ExecError::Unsupported(format!(
-            "net.transfer '{src}': only https:// download is implemented"
-        )));
-    }
+}
 
-    let request = ureq::get(src)
+/// GET `url`, streaming the body into the local `dst` path.
+fn download(url: &str, dst: &str) -> Result<TransferOutcome, ExecError> {
+    let request = ureq::get(url)
         .config()
         .http_status_as_error(false)
         .max_redirects(0)
@@ -332,6 +322,52 @@ pub fn transfer(src: &str, dst: &str) -> Result<TransferOutcome, ExecError> {
     Ok(TransferOutcome {
         bytes,
         dst: dst.to_string(),
+    })
+}
+
+/// PUT the local `src` file to `url`.
+///
+/// The body is read into memory under the same 16 MiB cap the download
+/// path streams against: `ureq`'s `send` takes the bytes, and a capped
+/// read keeps a mistyped `src` from pulling an arbitrarily large file
+/// into the provisioner. `content_type` is deferred (chapter 04
+/// §`net.transfer`), so the request carries the octet-stream default.
+fn upload(src: &str, url: &str) -> Result<TransferOutcome, ExecError> {
+    let file = std::fs::File::open(src).map_err(|err| ExecError::EffectFailed {
+        op: "net_transfer".to_string(),
+        message: format!("open '{src}': {err}"),
+    })?;
+    let body = read_capped(file, MAX_BYTES).map_err(|message| ExecError::EffectFailed {
+        op: "net_transfer".to_string(),
+        message,
+    })?;
+
+    let request = ureq::put(url)
+        .header("content-type", "application/octet-stream")
+        .config()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(Duration::from_secs_f64(DEFAULT_TIMEOUT_SEC)))
+        .build();
+
+    let response = request
+        .send(&body[..])
+        .map_err(|err| ExecError::EffectFailed {
+            op: "net_transfer".to_string(),
+            message: err.to_string(),
+        })?;
+
+    let status = response.status().as_u16();
+    if !(200..400).contains(&status) {
+        return Err(ExecError::EffectFailed {
+            op: "net_transfer".to_string(),
+            message: format!("upload responded with status {status}"),
+        });
+    }
+
+    Ok(TransferOutcome {
+        bytes: body.len() as u64,
+        dst: url.to_string(),
     })
 }
 
@@ -728,21 +764,28 @@ mod tests {
         );
     }
 
+    /// A public `b2://` source still cannot resolve — but the failure
+    /// now names the missing piece (the deployment's download endpoint)
+    /// and the way around it, instead of reading as a blanket
+    /// "not implemented" (chapter 04 §net.transfer).
     #[test]
-    fn transfer_rejects_a_b2_source_with_the_known_limitation_message() {
+    fn transfer_names_what_a_public_b2_source_is_missing() {
         let err = transfer("b2://bucket/model.safetensors", "/tmp/model.safetensors")
             .expect_err("b2:// source must be unsupported");
         let message = err.to_string();
         assert!(
-            message.contains("net.transfer bridge") && message.contains("not implemented"),
-            "expected the public-bridge KNOWN LIMITATION message, got: {message}"
+            message.contains("download endpoint") && message.contains("b2 CLI route"),
+            "expected the endpoint-gap message, got: {message}"
         );
     }
 
+    /// A `b2://` / `hf://` upload destination is CLI-routed by the
+    /// lifecycle layer, so one arriving here is a routing bug and says
+    /// so rather than attempting a PUT.
     #[test]
-    fn transfer_rejects_a_url_destination_as_an_unsupported_upload() {
-        let err = transfer("/workspace/out.bin", "https://example.com/upload")
-            .expect_err("URL destination (upload) must be unsupported");
-        assert!(err.to_string().contains("upload"));
+    fn transfer_rejects_a_cli_routed_upload_destination() {
+        let err = transfer("/workspace/out.bin", "hf://owner/repo/out.bin")
+            .expect_err("hf:// destination must not reach the bridge");
+        assert!(err.to_string().contains("CLI-routed"), "{err}");
     }
 }

@@ -72,6 +72,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::scheme::{self, parse_hf_uri, split_b2_uri};
 use super::{effects, ExecError};
 use crate::profile_ast::ProfileNode;
 
@@ -135,11 +136,14 @@ pub enum Step {
     /// Run `argv` via [`effects::sh_exec`]. In real mode a non-zero exit
     /// fails the op.
     Sh(Vec<String>),
-    /// Download `src` to `dst` via [`effects::transfer`].
+    /// Transfer `src` to `dst` via [`effects::transfer`], which reads
+    /// the direction off the two schemes: a URL `src` downloads into
+    /// the local `dst`, a URL `dst` uploads the local `src`
+    /// (chapter 04 §net.transfer).
     Transfer {
-        /// Source URI or path.
+        /// Source URL or local path.
         src: String,
-        /// Destination path (never a URI here — transfer only downloads).
+        /// Destination local path or URL.
         dst: String,
     },
     /// Poll `url` via [`effects::http_get`] until a 2xx response or
@@ -383,17 +387,14 @@ fn expand_sync_pull(
     revision: Option<&str>,
 ) -> Result<Vec<Step>, ExecError> {
     if env.is_empty() {
-        // Public download: `https://` streams to the destination file;
-        // a public `b2://` / `hf://` src would need the net.transfer
-        // bridge's scheme resolution (chapter 04), not implemented yet.
-        if src.starts_with("b2://") || src.starts_with("hf://") {
-            return Err(ExecError::Unsupported(format!(
-                "sync_pull '{src}': public b2:// / hf:// download over the \
-                 net.transfer bridge (chapter 04 scheme resolution) is not implemented"
-            )));
-        }
+        // Public download: the bridge's scheme resolution turns the
+        // source into the URL it will actually GET (chapter 04
+        // §net.transfer), so a public `hf://` pull streams to the
+        // destination file exactly as an `https://` one does. The step
+        // carries the resolved URL, which is what the dry-run trace and
+        // the report then show.
         return Ok(vec![Step::Transfer {
-            src: src.to_string(),
+            src: scheme::download_url("sync_pull", src, revision)?,
             dst: dst.to_string(),
         }]);
     }
@@ -491,60 +492,18 @@ fn expand_staging_push(
         }
         return Ok(vec![Step::Sh(argv)]);
     }
-    // `https://` dst is an HTTP PUT upload over the net.transfer bridge,
-    // which is not implemented yet.
-    Err(ExecError::Unsupported(format!(
-        "staging_push '{src}' -> '{dst}': upload over the net.transfer bridge \
-         (HTTP PUT) is not implemented"
-    )))
+    // An `https://` dst is an HTTP PUT over the net.transfer bridge; the
+    // step carries the pair unresolved and the bridge reads the
+    // direction off the schemes (chapter 04 §net.transfer).
+    Ok(vec![Step::Transfer {
+        src: src.to_string(),
+        dst: dst.to_string(),
+    }])
 }
 
-/// Split the remainder of a `b2://<bucket>/<path>` URI into its bucket
-/// and path components, both required non-empty (spec 02 `sync.pull` /
-/// `sync.push` route shape).
-fn split_b2_uri<'a>(rest: &'a str, op: &str, uri: &str) -> Result<(&'a str, &'a str), ExecError> {
-    match rest.split_once('/') {
-        Some((bucket, path)) if !bucket.is_empty() && !path.is_empty() => Ok((bucket, path)),
-        _ => Err(ExecError::EffectFailed {
-            op: op.to_string(),
-            message: format!("malformed b2:// URI (missing bucket or path): {uri}"),
-        }),
-    }
-}
-
-/// Parse the remainder of an `hf://` URI (everything after `hf://`) into
-/// its owner / repo / revision / trailing-path parts (spec 02 §Dispatch
-/// routing: `hf://<owner>/<repo>@<rev>/<path>` — the `@<rev>` suffix on
-/// the repo segment pins a revision; `@` is rejected in the owner
-/// segment). Ported from the POC `lua/lm/dispatch.lua` `parse_hf_uri`.
-fn parse_hf_uri(
-    rest: &str,
-    op: &str,
-    uri: &str,
-) -> Result<(String, String, Option<String>, Option<String>), ExecError> {
-    let fail = |message: String| ExecError::EffectFailed {
-        op: op.to_string(),
-        message,
-    };
-    let (owner, remainder) = rest
-        .split_once('/')
-        .ok_or_else(|| fail(format!("hf:// URI is missing an owner/repo segment: {uri}")))?;
-    if owner.contains('@') {
-        return Err(fail(format!(
-            "'@' is not allowed in the hf:// owner segment: {owner}"
-        )));
-    }
-    let (repo_and_rev, path_in_repo) = match remainder.split_once('/') {
-        Some((repo_and_rev, path)) if !path.is_empty() => (repo_and_rev, Some(path.to_string())),
-        Some((repo_and_rev, _)) => (repo_and_rev, None),
-        None => (remainder, None),
-    };
-    let (repo, rev) = match repo_and_rev.split_once('@') {
-        Some((repo, rev)) => (repo.to_string(), Some(rev.to_string())),
-        None => (repo_and_rev.to_string(), None),
-    };
-    Ok((owner.to_string(), repo, rev, path_in_repo))
-}
+// The `b2://` / `hf://` URI parsers and the public-download URL
+// templates live in [`super::scheme`] — one file per rule, so a template
+// revision (`04` §Stability marks them provisional) lands in one place.
 
 #[derive(Debug, Deserialize)]
 struct ModelItemSpec {
@@ -1472,10 +1431,56 @@ mod tests {
         let err = expand(&payload).expect_err("public b2:// (no env) must be unsupported");
         match err {
             ExecError::Unsupported(msg) => {
-                assert!(msg.contains("net.transfer bridge") && msg.contains("not implemented"));
+                assert!(
+                    msg.contains("download endpoint") && msg.contains("b2 CLI route"),
+                    "{msg}"
+                );
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// A public `hf://` pull resolves to the repo's public file URL and
+    /// streams over the bridge — the same step shape an `https://` pull
+    /// produces (chapter 04 §net.transfer).
+    #[test]
+    fn expand_sync_pull_resolves_a_public_hf_source_to_its_https_url() {
+        let ids = IdGen::new();
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: "hf://owner/repo/model.safetensors".to_string(),
+            dst: "/workspace/model.safetensors".to_string(),
+            env: Default::default(),
+            revision: None,
+        };
+        assert_eq!(
+            expand(&payload).expect("public hf:// resolves"),
+            vec![Step::Transfer {
+                src: "https://huggingface.co/owner/repo/resolve/main/model.safetensors".to_string(),
+                dst: "/workspace/model.safetensors".to_string(),
+            }],
+        );
+    }
+
+    /// The phase's `revision` reaches the resolved URL on the public
+    /// route, as it does on the CLI route's `--revision`.
+    #[test]
+    fn expand_sync_pull_pins_the_declared_revision_on_the_public_route() {
+        let ids = IdGen::new();
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: "hf://owner/repo/model.safetensors".to_string(),
+            dst: "/workspace/model.safetensors".to_string(),
+            env: Default::default(),
+            revision: Some("v2".to_string()),
+        };
+        assert_eq!(
+            expand(&payload).expect("public hf:// resolves"),
+            vec![Step::Transfer {
+                src: "https://huggingface.co/owner/repo/resolve/v2/model.safetensors".to_string(),
+                dst: "/workspace/model.safetensors".to_string(),
+            }],
+        );
     }
 
     #[test]
@@ -1753,7 +1758,10 @@ mod tests {
     }
 
     #[test]
-    fn expand_staging_push_https_dst_is_unsupported() {
+    /// An `https://` dst leaves the CLI routes behind and composes a
+    /// bridge transfer; the bridge reads the upload direction off the
+    /// schemes (chapter 04 §net.transfer).
+    fn expand_staging_push_https_dst_composes_a_bridge_upload() {
         let ids = IdGen::new();
         let payload = ProfileNode::StagingPush {
             id: node_id(&ids),
@@ -1762,16 +1770,13 @@ mod tests {
             env: Default::default(),
             revision: None,
         };
-        let err = expand(&payload).expect_err("https upload must be unsupported");
-        match err {
-            ExecError::Unsupported(msg) => {
-                assert!(
-                    msg.contains("HTTP PUT") && msg.contains("not implemented"),
-                    "{msg}"
-                );
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        assert_eq!(
+            expand(&payload).expect("https upload composes a transfer step"),
+            vec![Step::Transfer {
+                src: "/workspace/out.bin".to_string(),
+                dst: "https://example.com/out.bin".to_string(),
+            }],
+        );
     }
 
     #[test]

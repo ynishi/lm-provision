@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 use dsl_kit::{EngineError, NodeContext, NodeId, Op, OpRegistry, Path};
 
-use super::{audit, effects, lifecycle, report::StepReport, ExecContext, ExecError, ExecMode};
+use super::{
+    audit, effects, lifecycle, report::StepReport, scheme, ExecContext, ExecError, ExecMode,
+};
 use crate::profile_ast::{ProfileNode, ProfileValue};
 
 /// The seven direct ops with real effect wiring.
@@ -758,18 +760,33 @@ impl ProfileOp {
             return Err(self.variant_fail(node, "net.transfer", "NetTransfer"));
         };
         let (id, kind) = self.base(node);
-        // Destination is always a local path; source is HTTP-checked
-        // when it carries an `http(s)://` scheme (a download). Local
-        // sources are left to the effect layer's own routing.
-        if let Err(err) = self.ctx.path_policy.check(dst) {
-            self.push_transfer_failure(&id, &kind, src, dst, &err);
-            return Err(err);
-        }
-        if src.starts_with("http://") || src.starts_with("https://") {
-            if let Err(err) = self.ctx.http_policy.check(src) {
+        // Policy follows the direction and the *resolved* URL, not the
+        // field name and not the authored URI. Whichever side is remote
+        // goes through the http allowlist, whichever side is local goes
+        // through the path roots. Two things would otherwise slip: an
+        // upload's dst gated as if it were a path (an unlisted host
+        // receives the bytes), and an `hf://` src gated as if it had no
+        // scheme (the allowlist never sees the huggingface.co URL the
+        // download actually fetches). Chapter 05 L3, chapter 04
+        // §net.transfer.
+        let route = match scheme::resolve("net_transfer", src, dst) {
+            Ok(route) => route,
+            Err(err) => {
                 self.push_transfer_failure(&id, &kind, src, dst, &err);
                 return Err(err);
             }
+        };
+        let (local, remote) = match &route {
+            scheme::Transfer::Download { url } => (dst, url),
+            scheme::Transfer::Upload { url } => (src, url),
+        };
+        if let Err(err) = self.ctx.path_policy.check(local) {
+            self.push_transfer_failure(&id, &kind, src, dst, &err);
+            return Err(err);
+        }
+        if let Err(err) = self.ctx.http_policy.check(remote) {
+            self.push_transfer_failure(&id, &kind, src, dst, &err);
+            return Err(err);
         }
         audit::transfer(self.ctx.mode, &kind, src, dst);
         match self.ctx.mode {

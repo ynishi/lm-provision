@@ -570,6 +570,104 @@ fn sync_pull_demands_the_capability_of_the_route_its_payload_resolves_to() {
     );
 }
 
+/// Policy on a `net.transfer` follows the resolved route, not the field
+/// names (spec 04 §net.transfer): an upload's `dst` is the remote side,
+/// so it goes through the http allowlist rather than the path roots,
+/// and its local `src` goes through the path roots.
+#[test]
+fn a_net_transfer_upload_gates_its_destination_on_the_http_allowlist() {
+    fn upload(allowlist: Vec<String>, paths: Vec<String>) -> Result<(), String> {
+        let ids = IdGen::new();
+        let program = ProfileNode::Spec {
+            id: ids.node(),
+            name: "upload-policy".to_string(),
+            version: None,
+            description: None,
+            capabilities: vec!["net.transfer".to_string()],
+            env: std::collections::BTreeMap::new(),
+            env_secrets: Vec::new(),
+            paths,
+            http_allowlist: allowlist,
+            phases: vec![ProfileNode::NetTransfer {
+                id: ids.node(),
+                src: "/workspace/out.bin".to_string(),
+                dst: "https://example.com/out.bin".to_string(),
+            }],
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+            .expect("engine builds");
+        run_to_done(&mut engine).map(|_| ()).map_err(|err| {
+            err.source()
+                .map_or_else(|| err.to_string(), |source| source.to_string())
+        })
+    }
+
+    assert_eq!(
+        upload(
+            vec!["https://example.com".to_string()],
+            vec!["/workspace".to_string()]
+        ),
+        Ok(()),
+        "a listed host and a declared source root pass"
+    );
+    let unlisted = upload(Vec::new(), vec!["/workspace".to_string()])
+        .expect_err("an unlisted upload host must be denied");
+    assert!(
+        unlisted.contains("http_allowlist"),
+        "the denial should name the allowlist: {unlisted}"
+    );
+    let unrooted = upload(vec!["https://example.com".to_string()], Vec::new())
+        .expect_err("an undeclared source root must be denied");
+    assert!(
+        unrooted.contains("outside profile.paths"),
+        "the denial should name the path roots: {unrooted}"
+    );
+}
+
+/// An `hf://` source is gated on the URL it resolves to, not on the
+/// authored URI: the allowlist has to name `huggingface.co`, otherwise a
+/// profile could reach a host it never declared (spec 05 L3).
+#[test]
+fn a_public_hf_download_gates_on_the_resolved_host() {
+    fn pull(allowlist: Vec<String>) -> Result<(), String> {
+        let ids = IdGen::new();
+        let program = ProfileNode::Spec {
+            id: ids.node(),
+            name: "hf-policy".to_string(),
+            version: None,
+            description: None,
+            capabilities: vec!["net.transfer".to_string()],
+            env: std::collections::BTreeMap::new(),
+            env_secrets: Vec::new(),
+            paths: vec!["/workspace".to_string()],
+            http_allowlist: allowlist,
+            phases: vec![ProfileNode::NetTransfer {
+                id: ids.node(),
+                src: "hf://owner/repo/model.bin".to_string(),
+                dst: "/workspace/model.bin".to_string(),
+            }],
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+            .expect("engine builds");
+        run_to_done(&mut engine).map(|_| ()).map_err(|err| {
+            err.source()
+                .map_or_else(|| err.to_string(), |source| source.to_string())
+        })
+    }
+
+    assert_eq!(
+        pull(vec!["https://huggingface.co".to_string()]),
+        Ok(()),
+        "the resolved host is what the allowlist has to carry"
+    );
+    assert!(
+        pull(Vec::new()).is_err(),
+        "an empty allowlist must not let the resolved host through"
+    );
+}
+
 /// A `ShExec` referencing a secret that is not declared in
 /// `profile.env_secrets` fails at step time even under dry-run — spec 06
 /// §Resolution "dry-run resolves too": the decode path runs, so the

@@ -28,6 +28,7 @@ pub mod payload;
 pub mod policy;
 pub mod registry;
 pub mod report;
+pub(crate) mod scheme;
 
 /// Whether effects run for real or only render a dry-run trace.
 ///

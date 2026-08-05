@@ -181,9 +181,12 @@ Dispatch turns each planned step into one or more bridge invocations
 - Downloads (`sync.pull`, `net.transfer` download): `b2://` or
   `hf://` src **with a non-empty `env` table** routes to the native
   CLI over `sh.exec` so credentials flow through exec-time env
-  injection. Public `b2://` / `hf://` and `https://` stay on the
-  `net.transfer` bridge (scheme resolution in chapter 04). The two
-  CLI argv shapes:
+  injection. Public `hf://` and `https://` stay on the `net.transfer`
+  bridge, where an `hf://` source resolves to its public file URL
+  (chapter 04 §`net.transfer`). A public `b2://` source has no bridge
+  route: its download endpoint is deployment-specific and no profile
+  field declares one, so it fails with an error pointing at the
+  credential `env` route. The two CLI argv shapes:
 
   ```
   b2 download-file-by-name <bucket> <path> <dst>

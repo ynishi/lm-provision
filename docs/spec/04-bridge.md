@@ -168,12 +168,21 @@ those options are deferred, not withdrawn.
 
 ### `net.transfer` — `NetTransfer { src, dst }`
 
-- Policy: `dst` is always checked against `paths`; `src` is checked
-  against `http_allowlist` when it carries an `http://` / `https://`
-  scheme. Both run in both modes.
-- Effect: `http(s)://` source → GET streamed to the `dst` file (never
-  fully buffered, 16 MiB cap); on any failure the partial file is
-  removed. The report carries the byte count and destination.
+- Policy follows the **resolved route**, not the field names: the local
+  side goes through `paths` and the remote side through
+  `http_allowlist`, both in both modes. On a download that is `dst` and
+  the source URL; on an upload it is `src` and the destination URL.
+  The allowlist sees the URL the transfer will actually reach — an
+  `hf://` source is checked as its resolved `https://huggingface.co`
+  URL, not as the authored URI, so a profile cannot reach a host it
+  never declared.
+- Effect (download): GET streamed to the `dst` file (never fully
+  buffered, 16 MiB cap); on any failure the partial file is removed.
+  The report carries the byte count and destination.
+- Effect (upload): PUT of the local `src` file to the destination URL,
+  read under the same 16 MiB cap, sent as
+  `application/octet-stream`. The report carries the byte count and the
+  destination URL.
 - Credential-carrying transfers do not run here. `b2://` / `hf://`
   downloads and every upload are routed to the native CLIs over
   `sh.exec` by the lifecycle layer (chapter 02 §Dispatch routing), so
@@ -181,14 +190,22 @@ those options are deferred, not withdrawn.
   convention differs there: `hf download` takes a
   `--local-dir`, so on that route the phase's `dst` is a *directory*,
   not the file path this primitive writes.
-- A `b2://` / `hf://` source or a URL destination that *does* reach
-  this primitive is the public scheme-resolution surface
-  (`hf://<owner>/<repo>/<path>` →
-  `https://huggingface.co/<owner>/<repo>/resolve/main/<path>`;
-  `b2://<bucket>/<path>` → the deployment-configured public endpoint).
-  That resolution is **not implemented**: such a call fails with an
-  explicit unsupported-scheme error rather than a silent fallback.
-  `gs://` / `s3://` / `ftp://` / `file://` remain rejected schemes.
+- A `b2://` / `hf://` source that *does* reach this primitive is the
+  public scheme-resolution surface. `hf://<owner>/<repo>[@<rev>]/<path>`
+  resolves to
+  `https://huggingface.co/<owner>/<repo>/resolve/<rev>/<path>`, with
+  `main` when the URI pins no revision and the phase's own `revision`
+  filling in for an unpinned URI (a URL-carried revision still wins).
+  `b2://<bucket>/<path>` would resolve to the deployment's public
+  download endpoint, which is cluster- and account-specific and which
+  **no profile field declares**; rather than guess a host, that call
+  fails with an error naming the gap and pointing at the credential
+  `env` route, which does work. `gs://` / `s3://` / `ftp://` /
+  `file://` remain rejected schemes.
+- The resolution rules and their URL templates live in one module
+  (`exec::scheme`), read by both the direct op and the lifecycle layer's
+  `sync.pull` — the templates are provisional (below), so a revision
+  has one place to land.
 - Deferred: `headers`, `timeout_sec`, `max_bytes`, `sha256` verification,
   `content_type`, and `auth_bearer` (the second SecretRef acceptance
   point).
@@ -262,10 +279,11 @@ the pipe the spec-08 driver collects.
   but absent from the host environment →
   `secret '<NAME>' missing in host env` (fail-fast, also under
   dry-run).
-- Unsupported: a specified-but-unimplemented route (public `b2://` /
-  `hf://` scheme resolution, `net.transfer` upload, mount on a
-  non-Linux host) → an explicit unsupported error naming the route.
-  Never a silent skip and never a fabricated invocation.
+- Unsupported: a specified-but-unimplemented route (public `b2://`
+  scheme resolution, mount on a non-Linux host) → an explicit
+  unsupported error naming the route, and where one exists, the route
+  that does work. Never a silent skip and never a fabricated
+  invocation.
 - Effect failures: non-zero exit / transport / syscall → the step's
   report entry carries `ok = false` with the status and captured
   output. The step's externally visible effects may be partial —
@@ -310,17 +328,23 @@ the pipe the spec-08 driver collects.
 
 Ships in Phase F: `sh.exec` (argv + resolved env injection),
 `net.http_get`, `net.http_post`, `net.transfer` (https download with
-streaming and partial-file cleanup), `fs.write`, `mount.bind`,
+streaming and partial-file cleanup, public `hf://` source resolution,
+and https upload), `fs.write`, `mount.bind`,
 `mount.umount`, the env value nodes, and the trace log sink.
 
 Deferred with one-line reasons:
 
 - Per-primitive option sets listed above — the AST does not carry the
   fields yet; each is additive and changes no existing shape.
-- `net.transfer` public `b2://` / `hf://` scheme resolution and HTTP
+- ~~`net.transfer` public `b2://` / `hf://` scheme resolution and HTTP
   PUT upload — the credential-carrying paths already work through the
   CLI dispatch route, so the public bridge is not on the critical
-  path.
+  path.~~ Landed for `hf://` and for the PUT upload (§`net.transfer`
+  above). Public `b2://` stays deferred for a different reason than
+  effort: its download endpoint is deployment-specific and no profile
+  field declares one, so implementing it means adding that declaration
+  to the DSL surface (chapter 01) — a hash-visible change, and its own
+  decision.
 - ~~`fs.write` `content` as a secret — blocked on a dsl-kit scalar
   coercion for the `One` child slot.~~ Landed: dsl-kit 0.8 shipped the
   scalar shorthand (issue #14) and `content` is a value node now
