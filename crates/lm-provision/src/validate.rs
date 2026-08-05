@@ -173,6 +173,35 @@ pub enum ValidateError {
         name: String,
     },
 
+    /// A capability the run will require is not in the declared set
+    /// (check 9, spec 00 §Capability derivation `declared ⊇ derived`).
+    #[error(
+        "capability {capability:?} is required by this profile's phases \
+         but not declared in capabilities"
+    )]
+    UndeclaredCapability {
+        /// The capability the derivation found a demand for.
+        capability: &'static str,
+    },
+
+    /// A path the run will write to is covered by no declared `paths`
+    /// root (check 9).
+    #[error("{path:?} is written by this profile's phases but is covered by no paths root")]
+    UndeclaredPath {
+        /// The offending path.
+        path: String,
+    },
+
+    /// A URL the run will reach is covered by no `http_allowlist` entry
+    /// (check 9).
+    #[error(
+        "{url:?} is reached by this profile's phases but is covered by no http_allowlist entry"
+    )]
+    UndeclaredUrl {
+        /// The offending URL, already scheme-resolved.
+        url: String,
+    },
+
     /// A second `service.ready` follows the same `service.start`, so
     /// both would expand to the same `11_service_<N>_ready` step id
     /// (check 8, spec 02 §Canonical phase ordering).
@@ -244,9 +273,11 @@ pub enum ValidateError {
 pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     let ProfileNode::Spec {
         name,
+        capabilities,
         env,
         env_secrets,
         paths,
+        http_allowlist,
         phases,
         ..
     } = root
@@ -406,7 +437,54 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         }
     }
 
+    // Check 9: `declared ⊇ derived` for the three allowlist-shaped
+    // fields (spec 00 §Capability derivation). The walk runs over the
+    // normalized AST, so an implicitly inserted step's demand — the
+    // health poll's `net.http_get`, the paths it touches — counts even
+    // though the author never wrote the step. The comparison reuses the
+    // execution-time matchers, so "covered" means here exactly what it
+    // will mean at the gate.
+    let derived = crate::derive::derive(&crate::normalize::normalize(root));
+    if let Some(capability) = derived
+        .capabilities
+        .iter()
+        .find(|capability| !capabilities.iter().any(|d| d == *capability))
+    {
+        return Err(ValidateError::UndeclaredCapability {
+            capability: capability_literal(capability),
+        });
+    }
+    let path_policy = crate::exec::policy::PathPolicy::new(paths);
+    if let Some(path) = derived
+        .paths
+        .iter()
+        .find(|path| path_policy.check(path).is_err())
+    {
+        return Err(ValidateError::UndeclaredPath { path: path.clone() });
+    }
+    let http_policy = crate::exec::policy::HttpPolicy::new(http_allowlist);
+    if let Some(url) = derived
+        .urls
+        .iter()
+        .find(|url| http_policy.check(url).is_err())
+    {
+        return Err(ValidateError::UndeclaredUrl { url: url.clone() });
+    }
+
     Ok(())
+}
+
+/// Re-borrow a derived capability as the `&'static str` the error
+/// variant carries. Every derived capability is one of the frozen
+/// `KNOWN_CAPABILITIES` literals, so the lookup is total in practice;
+/// an unknown one degrades to a leaked-free placeholder rather than
+/// panicking.
+fn capability_literal(capability: &str) -> &'static str {
+    crate::exec::capgate::KNOWN_CAPABILITIES
+        .iter()
+        .find(|known| **known == capability)
+        .copied()
+        .unwrap_or("<unknown capability>")
 }
 
 // ---------------------------------------------------------------------
@@ -925,9 +1003,30 @@ mod tests {
     use super::*;
     use dsl_kit::IdGen;
 
-    /// Build a `Spec` root wrapping `phases`. `NodeId`s are opaque here.
+    /// Build a `Spec` root wrapping `phases`, with every declared list
+    /// wide open. `NodeId`s are opaque here.
+    ///
+    /// Check 9 (`declared ⊇ derived`) would otherwise fire in every
+    /// test that carries a phase, masking the check each one is about.
+    /// Its own coverage builds the `Spec` inline with the narrow lists
+    /// it wants to see denied.
     fn spec(name: &str, phases: Vec<ProfileNode>) -> ProfileNode {
-        spec_full(name, &[], &[], &[], phases)
+        let ids = IdGen::new();
+        ProfileNode::Spec {
+            id: ids.node(),
+            name: name.into(),
+            version: None,
+            description: None,
+            capabilities: crate::exec::capgate::KNOWN_CAPABILITIES
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+            env: BTreeMap::new(),
+            env_secrets: Vec::new(),
+            paths: vec!["/".to_string()],
+            http_allowlist: vec!["http://*".to_string(), "https://*".to_string()],
+            phases,
+        }
     }
 
     /// Build a `Spec` root with explicit declared lists. `env` names
@@ -955,16 +1054,26 @@ mod tests {
                 )
             })
             .collect();
+        // Capabilities / http_allowlist stay wide open and a catch-all
+        // root is appended after the caller's own entries, so check 9
+        // (`declared ⊇ derived`) never masks the check under test. The
+        // appended root keeps the caller's 1-based `paths` indices —
+        // what the check 5 assertions name — intact.
+        let mut declared_paths: Vec<String> = paths.iter().map(|s| (*s).to_string()).collect();
+        declared_paths.push("/".to_string());
         ProfileNode::Spec {
             id: ids.node(),
             name: name.into(),
             version: None,
             description: None,
-            capabilities: Vec::new(),
+            capabilities: crate::exec::capgate::KNOWN_CAPABILITIES
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
             env: env_map,
             env_secrets: env_secrets.iter().map(|s| (*s).to_string()).collect(),
-            paths: paths.iter().map(|s| (*s).to_string()).collect(),
-            http_allowlist: Vec::new(),
+            paths: declared_paths,
+            http_allowlist: vec!["http://*".to_string(), "https://*".to_string()],
             phases,
         }
     }
@@ -1627,6 +1736,138 @@ mod tests {
             validate(&neither),
             Err(ValidateError::PhaseShape(_))
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Check 9: declared ⊇ derived.
+    // -----------------------------------------------------------------
+
+    /// Build a `Spec` with exactly the declared lists given, so the
+    /// derivation has something to be denied by.
+    fn spec_declaring(
+        capabilities: &[&str],
+        paths: &[&str],
+        http_allowlist: &[&str],
+        phases: Vec<ProfileNode>,
+    ) -> ProfileNode {
+        let ids = IdGen::new();
+        ProfileNode::Spec {
+            id: ids.node(),
+            name: "declared".into(),
+            version: None,
+            description: None,
+            capabilities: capabilities.iter().map(|c| (*c).to_string()).collect(),
+            env: BTreeMap::new(),
+            env_secrets: Vec::new(),
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+            http_allowlist: http_allowlist.iter().map(|u| (*u).to_string()).collect(),
+            phases,
+        }
+    }
+
+    fn install(g: &IdGen) -> ProfileNode {
+        ProfileNode::ComfyUiInstall {
+            id: g.node(),
+            ref_name: "master".into(),
+            repo: None,
+        }
+    }
+
+    /// The case the derivation exists for: an author who wrote only
+    /// `comfyui.install` never wrote the health poll, so its
+    /// `net.http_get` is the entry they are least likely to declare —
+    /// and the one that would otherwise fail at the L4 gate mid-apply.
+    #[test]
+    fn a_capability_only_an_inserted_step_needs_is_still_required() {
+        let g = ids();
+        let node = spec_declaring(&["sh.exec"], &[], &["http://*"], vec![install(&g)]);
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::UndeclaredCapability {
+                capability: "net.http_get"
+            })
+        );
+    }
+
+    #[test]
+    fn declaring_everything_the_run_reaches_passes() {
+        let g = ids();
+        let node = spec_declaring(
+            &["sh.exec", "net.http_get"],
+            &[],
+            &["http://127.0.0.1:8188"],
+            vec![install(&g)],
+        );
+        assert_eq!(validate(&node), Ok(()));
+    }
+
+    /// The inserted poll's URL is derived too, so an allowlist that
+    /// does not cover it is a precondition error rather than a
+    /// mid-apply denial.
+    #[test]
+    fn an_undeclared_poll_host_is_rejected() {
+        let g = ids();
+        let node = spec_declaring(&["sh.exec", "net.http_get"], &[], &[], vec![install(&g)]);
+        assert!(
+            matches!(validate(&node), Err(ValidateError::UndeclaredUrl { .. })),
+            "{:?}",
+            validate(&node)
+        );
+    }
+
+    #[test]
+    fn a_destination_outside_the_declared_roots_is_rejected() {
+        let g = ids();
+        let node = spec_declaring(
+            &["net.transfer"],
+            &["/workspace"],
+            &["https://*"],
+            vec![ProfileNode::SyncPull {
+                id: g.node(),
+                src: "https://example.com/m.bin".into(),
+                dst: "/opt/m.bin".into(),
+                env: BTreeMap::new(),
+                revision: None,
+            }],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::UndeclaredPath {
+                path: "/opt/m.bin".into()
+            })
+        );
+    }
+
+    /// `models` writes under a built-in root the author never spells
+    /// out, so the derivation is the only thing that can surface it
+    /// before apply (spec 02 §Built-in path constants).
+    #[test]
+    fn a_built_in_models_root_must_be_declared_too() {
+        let g = ids();
+        let phase = ProfileNode::Models {
+            id: g.node(),
+            models_json: r#"[{"src":"https://example.com/a.bin","dst":"a.bin"}]"#.into(),
+        };
+        let denied = spec_declaring(
+            &["net.transfer"],
+            &["/workspace/other"],
+            &["https://*"],
+            vec![phase.clone()],
+        );
+        assert_eq!(
+            validate(&denied),
+            Err(ValidateError::UndeclaredPath {
+                path: "/workspace/ComfyUI/models/checkpoints/a.bin".into()
+            })
+        );
+
+        let allowed = spec_declaring(
+            &["net.transfer"],
+            &["/workspace/ComfyUI/models"],
+            &["https://*"],
+            vec![phase],
+        );
+        assert_eq!(validate(&allowed), Ok(()));
     }
 
     // -----------------------------------------------------------------

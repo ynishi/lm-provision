@@ -22,6 +22,7 @@ use crate::profile_ast::ProfileNode;
 
 pub mod audit;
 pub mod capgate;
+pub(crate) mod demand;
 pub mod effects;
 pub mod lifecycle;
 pub mod payload;

@@ -66,6 +66,25 @@ Checks, in order:
    stage). The unknown-kind and per-field requiredness walk the Lua
    port ran is subsumed by the typed enum.
 7. `service.start` names are unique across the profile.
+8. No two `service.ready` phases share a service index — a second one
+   under the same `service.start` would expand to a step id the first
+   already carries (chapter 02 §Canonical phase ordering).
+9. `declared ⊇ derived` for the three allowlist-shaped fields
+   (chapter 00 §Capability derivation). The stage expands the profile
+   the way apply will — implicit insertion applied, suppressed phases
+   dropped — walks the resulting steps, and asserts that every
+   capability they require appears in `capabilities`, every path they
+   write is covered by `paths`, and every URL they reach is covered by
+   `http_allowlist`. The demands come from the same mapping the
+   execution gates read, so this asserts something about the run that
+   will happen rather than a second reading of the catalog. Two
+   consequences worth stating: a phase the author never wrote counts
+   (the health poll inserted beside a `comfyui.install` brings its
+   `net.http_get` and its URL), and a destination the author never
+   spelled out counts too (`models` writes under a built-in path
+   constant, chapter 02 §Built-in path constants). A phase whose
+   expansion fails contributes nothing — it cannot run, and its own
+   error is the one worth reporting.
 
 Because the AST payload is still a projection of the full spec-02
 catalog (`custom_nodes` / `models` / `llm_models` carry an opaque JSON

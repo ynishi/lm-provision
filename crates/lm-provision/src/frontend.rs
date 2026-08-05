@@ -261,6 +261,12 @@ mod tests {
             "type": "Spec",
             "name": "env-demo",
             "env_secrets": ["HF_TOKEN"],
+            // The credential `env` routes this pull to the hf CLI, so
+            // the run demands `sh.exec` and writes under `/workspace` —
+            // both declared here for validate check 9
+            // (`declared ⊇ derived`).
+            "capabilities": ["sh.exec"],
+            "paths": ["/workspace"],
             "phases": [
                 {
                     "type": "SyncPull",

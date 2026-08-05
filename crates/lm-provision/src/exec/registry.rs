@@ -28,7 +28,7 @@ use std::sync::Arc;
 use dsl_kit::{EngineError, NodeContext, NodeId, Op, OpRegistry, Path};
 
 use super::{
-    audit, effects, lifecycle, report::StepReport, scheme, ExecContext, ExecError, ExecMode,
+    audit, demand, effects, lifecycle, report::StepReport, ExecContext, ExecError, ExecMode,
 };
 use crate::profile_ast::{ProfileNode, ProfileValue};
 
@@ -61,80 +61,6 @@ const LIFECYCLE_OPS: [&str; 15] = [
     "service_start",
     "service_ready",
 ];
-
-/// Capability a **direct** op requires.
-///
-/// The mapping is frozen against spec 02 §Catalog kinds (direct
-/// operations map 1:1 onto bridge primitives, so the demand is fixed by
-/// the op name). Lifecycle ops are absent here on purpose: their demand
-/// depends on the route their payload resolves to, and is derived from
-/// the expanded steps by [`step_capability`] instead (spec 02
-/// §Dispatch routing "What the L4 gate sees").
-fn required_capability(op: &str) -> Option<&'static str> {
-    match op {
-        "sh_exec" => Some("sh.exec"),
-        "fs_write" => Some("fs.write"),
-        "net_http_get" => Some("net.http_get"),
-        "net_http_post" => Some("net.http_post"),
-        "net_transfer" => Some("net.transfer"),
-        "mount_bind" => Some("mount.bind"),
-        "mount_umount" => Some("mount.umount"),
-        _ => None,
-    }
-}
-
-/// Whether `payload` carries an [`ProfileNode::EnvRef`] value node in
-/// any of its value slots — `fs.write` content, an `env` keyed slot, a
-/// header map, or a POST body.
-///
-/// `Spec.env` values are never `EnvRef` (a reference resolves *into*
-/// `Spec.env`; [`crate::validate`] check 4b rejects one there), so the
-/// phase payload is the only place the node can appear.
-fn payload_uses_env_ref(payload: &ProfileNode) -> bool {
-    fn is_ref(node: &ProfileNode) -> bool {
-        matches!(node, ProfileNode::EnvRef { .. })
-    }
-    fn any_ref<'a>(nodes: impl IntoIterator<Item = &'a ProfileNode>) -> bool {
-        nodes.into_iter().any(is_ref)
-    }
-
-    match payload {
-        ProfileNode::FsWrite { content, .. } => is_ref(content),
-        ProfileNode::SyncPull { env, .. }
-        | ProfileNode::StagingPush { env, .. }
-        | ProfileNode::ShExec { env, .. } => any_ref(env.values()),
-        ProfileNode::NetHttpGet { headers, .. } => any_ref(headers.values()),
-        ProfileNode::NetHttpPost { headers, body, .. } => {
-            any_ref(headers.values()) || body.as_deref().is_some_and(is_ref)
-        }
-        _ => false,
-    }
-}
-
-/// Capability one expanded lifecycle step demands, or `None` for a
-/// `Note` (which runs no effect).
-///
-/// This is the resolved demand of spec 02 §Dispatch routing "What the
-/// L4 gate sees": a `sync.pull` that routed to the native CLI demands
-/// `sh.exec` — not the `net.transfer` its kind carries when it stays on
-/// the bridge — and a `staging.push`, which is always CLI-routed,
-/// demands `sh.exec` unconditionally. Requiring the union of both
-/// routes up front would let a shell run under a profile that never
-/// asked for one.
-///
-/// The two HTTP polls (`comfyui_health` / `service_ready`) expand into a
-/// single `HttpPoll` step and therefore demand `net.http_get`, not
-/// `sh.exec` — the pid file they re-read between attempts is a
-/// provisioner-internal file read, not a bridge op (spec 02
-/// §Poll deadlines).
-fn step_capability(step: &lifecycle::Step) -> Option<&'static str> {
-    match step {
-        lifecycle::Step::Sh(_) => Some("sh.exec"),
-        lifecycle::Step::Transfer { .. } => Some("net.transfer"),
-        lifecycle::Step::HttpPoll { .. } => Some("net.http_get"),
-        lifecycle::Step::Note(_) => None,
-    }
-}
 
 /// Build the 22-op registry over a shared [`ExecContext`].
 pub fn profile_op_registry(ctx: Arc<ExecContext>) -> Arc<OpRegistry<ProfileValue>> {
@@ -184,13 +110,6 @@ impl ProfileOp {
             }
         };
 
-        if let Some(capability) = required_capability(self.name) {
-            if let Err(err) = self.ctx.gate.require(capability) {
-                self.record_phase_failure(node, &err);
-                return Err(err);
-            }
-        }
-
         // Dereferencing a `Spec.env` entry is its own effect, and the
         // one thing that makes `env.ref` a reachable capability rather
         // than a reserved key (spec 02 §Catalog kinds,
@@ -199,8 +118,8 @@ impl ProfileOp {
         // slot, a header, a POST body — rather than being spelled out
         // per kind, which would leave the same hole in every slot the
         // catalog's capability column does not mention.
-        if payload_uses_env_ref(payload) {
-            if let Err(err) = self.ctx.gate.require("env.ref") {
+        if let Some(capability) = demand::env_ref(payload) {
+            if let Err(err) = self.ctx.gate.require(capability) {
                 self.record_phase_failure(node, &err);
                 return Err(err);
             }
@@ -208,6 +127,40 @@ impl ProfileOp {
 
         if LIFECYCLE_OPS.contains(&self.name) {
             return self.run_lifecycle(node, payload);
+        }
+
+        // A direct op's demand is fixed by its payload, so both gates
+        // run here rather than inside each handler: the capability the
+        // L4 entry check requires and the allowlist targets the L3
+        // policies check, all before the handler sees the node
+        // (spec 05 §L3 / §L4). The same [`demand`] mapping is what
+        // [`crate::derive`] collects to assert `declared ⊇ derived` at
+        // validate time — one definition, two readers.
+        let demanded = match demand::direct(payload) {
+            Ok(demanded) => demanded,
+            Err(err) => {
+                self.push_policy_failure(node, payload, &err);
+                return Err(err);
+            }
+        };
+        if let Some(capability) = demanded.capability {
+            if let Err(err) = self.ctx.gate.require(capability) {
+                self.record_phase_failure(node, &err);
+                return Err(err);
+            }
+        }
+        // Policy runs in both modes (spec 07 "dry-run does policy").
+        for path in &demanded.paths {
+            if let Err(err) = self.ctx.path_policy.check(path) {
+                self.push_policy_failure(node, payload, &err);
+                return Err(err);
+            }
+        }
+        for url in &demanded.urls {
+            if let Err(err) = self.ctx.http_policy.check(url) {
+                self.push_policy_failure(node, payload, &err);
+                return Err(err);
+            }
         }
 
         match self.name {
@@ -298,6 +251,33 @@ impl ProfileOp {
         err
     }
 
+    /// Push the failing [`StepReport`] for a direct op denied by policy
+    /// (or by a route that does not resolve), carrying the same input
+    /// fields the op's own report would have shown.
+    ///
+    /// A direct op's report `op` label and its `kind` are the same
+    /// string (`self.base` reads both from the phase map), so the entry
+    /// is built once here instead of at each denial site.
+    fn push_policy_failure(&self, node: NodeId, payload: &ProfileNode, err: &ExecError) {
+        let (id, kind) = self.base(node);
+        let mut entry = StepReport::new(id, kind.clone(), kind);
+        match payload {
+            ProfileNode::FsWrite { path, .. } | ProfileNode::MountUmount { path, .. } => {
+                entry.path = Some(path.clone());
+            }
+            ProfileNode::NetHttpGet { url, .. } | ProfileNode::NetHttpPost { url, .. } => {
+                entry.url = Some(url.clone());
+            }
+            ProfileNode::NetTransfer { src, dst, .. } | ProfileNode::MountBind { src, dst, .. } => {
+                entry.src = Some(src.clone());
+                entry.dst = Some(dst.clone());
+            }
+            _ => {}
+        }
+        self.mark_fail(&mut entry, err);
+        self.push(entry);
+    }
+
     /// Apply the path / http policy to one expanded lifecycle step.
     ///
     /// A lifecycle phase reaches the same bridges a direct op does, so
@@ -314,19 +294,14 @@ impl ProfileOp {
     /// exempt: it is a provisioner-internal read, not a bridge op
     /// (spec 02 §Poll deadlines).
     fn check_step_policy(&self, step: &lifecycle::Step) -> Result<(), ExecError> {
-        match step {
-            lifecycle::Step::Transfer { src, dst } => {
-                let route = scheme::resolve("net_transfer", src, dst)?;
-                let (local, remote) = match &route {
-                    scheme::Transfer::Download { url } => (dst, url),
-                    scheme::Transfer::Upload { url } => (src, url),
-                };
-                self.ctx.path_policy.check(local)?;
-                self.ctx.http_policy.check(remote)
-            }
-            lifecycle::Step::HttpPoll { url, .. } => self.ctx.http_policy.check(url),
-            lifecycle::Step::Sh(_) | lifecycle::Step::Note(_) => Ok(()),
+        let demanded = demand::step(step)?;
+        for path in &demanded.paths {
+            self.ctx.path_policy.check(path)?;
         }
+        for url in &demanded.urls {
+            self.ctx.http_policy.check(url)?;
+        }
+        Ok(())
     }
 
     /// Compose a lifecycle op's steps, then render (dry-run) or execute
@@ -369,7 +344,14 @@ impl ProfileOp {
         // never executes its first (spec 02 §Dispatch routing "What the
         // L4 gate sees", spec 05 §L3 / §L4).
         for step in &steps {
-            if let Some(capability) = step_capability(step) {
+            let capability = match demand::step(step) {
+                Ok(demanded) => demanded.capability,
+                Err(err) => {
+                    self.record_phase_failure(node, &err);
+                    return Err(err);
+                }
+            };
+            if let Some(capability) = capability {
                 if let Err(err) = self.ctx.gate.require(capability) {
                     self.record_phase_failure(node, &err);
                     return Err(err);
@@ -531,14 +513,6 @@ impl ProfileOp {
             return Err(self.variant_fail(node, "fs.write", "FsWrite"));
         };
         let (id, kind) = self.base(node);
-        // Path policy runs in both modes (spec 07 "dry-run does policy").
-        if let Err(err) = self.ctx.path_policy.check(path) {
-            let mut entry = StepReport::new(id, kind, "fs.write");
-            entry.path = Some(path.clone());
-            self.mark_fail(&mut entry, &err);
-            self.push(entry);
-            return Err(err);
-        }
         // Resolve the content value node in both modes (spec 06
         // §Resolution "dry-run resolves too"): an undeclared or missing
         // secret fails a dry run identically to a real run. The label
@@ -612,13 +586,6 @@ impl ProfileOp {
             return Err(self.variant_fail(node, "net.http_get", "NetHttpGet"));
         };
         let (id, kind) = self.base(node);
-        if let Err(err) = self.ctx.http_policy.check(url) {
-            let mut entry = StepReport::new(id, kind, "net.http_get");
-            entry.url = Some(url.clone());
-            self.mark_fail(&mut entry, &err);
-            self.push(entry);
-            return Err(err);
-        }
         let resolved_headers = match self.ctx.env_policy.resolve(headers) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -693,10 +660,6 @@ impl ProfileOp {
             return Err(self.variant_fail(node, "net.http_post", "NetHttpPost"));
         };
         let (id, kind) = self.base(node);
-        if let Err(err) = self.ctx.http_policy.check(url) {
-            self.push_http_post_failure(&id, &kind, url, &err);
-            return Err(err);
-        }
         let resolved_headers = match self.ctx.env_policy.resolve(headers) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -794,34 +757,6 @@ impl ProfileOp {
             return Err(self.variant_fail(node, "net.transfer", "NetTransfer"));
         };
         let (id, kind) = self.base(node);
-        // Policy follows the direction and the *resolved* URL, not the
-        // field name and not the authored URI. Whichever side is remote
-        // goes through the http allowlist, whichever side is local goes
-        // through the path roots. Two things would otherwise slip: an
-        // upload's dst gated as if it were a path (an unlisted host
-        // receives the bytes), and an `hf://` src gated as if it had no
-        // scheme (the allowlist never sees the huggingface.co URL the
-        // download actually fetches). Chapter 05 L3, chapter 04
-        // §net.transfer.
-        let route = match scheme::resolve("net_transfer", src, dst) {
-            Ok(route) => route,
-            Err(err) => {
-                self.push_transfer_failure(&id, &kind, src, dst, &err);
-                return Err(err);
-            }
-        };
-        let (local, remote) = match &route {
-            scheme::Transfer::Download { url } => (dst, url),
-            scheme::Transfer::Upload { url } => (src, url),
-        };
-        if let Err(err) = self.ctx.path_policy.check(local) {
-            self.push_transfer_failure(&id, &kind, src, dst, &err);
-            return Err(err);
-        }
-        if let Err(err) = self.ctx.http_policy.check(remote) {
-            self.push_transfer_failure(&id, &kind, src, dst, &err);
-            return Err(err);
-        }
         audit::transfer(self.ctx.mode, &kind, src, dst);
         match self.ctx.mode {
             ExecMode::DryRun => {
@@ -885,16 +820,6 @@ impl ProfileOp {
             return Err(self.variant_fail(node, "mount.bind", "MountBind"));
         };
         let (id, kind) = self.base(node);
-        for target in [src, dst] {
-            if let Err(err) = self.ctx.path_policy.check(target) {
-                let mut entry = StepReport::new(id, kind, "mount.bind");
-                entry.src = Some(src.clone());
-                entry.dst = Some(dst.clone());
-                self.mark_fail(&mut entry, &err);
-                self.push(entry);
-                return Err(err);
-            }
-        }
         audit::mount_bind(self.ctx.mode, &kind, src, dst);
         match self.ctx.mode {
             ExecMode::DryRun => {
@@ -934,13 +859,6 @@ impl ProfileOp {
             return Err(self.variant_fail(node, "mount.umount", "MountUmount"));
         };
         let (id, kind) = self.base(node);
-        if let Err(err) = self.ctx.path_policy.check(path) {
-            let mut entry = StepReport::new(id, kind, "mount.umount");
-            entry.path = Some(path.clone());
-            self.mark_fail(&mut entry, &err);
-            self.push(entry);
-            return Err(err);
-        }
         audit::mount_umount(self.ctx.mode, &kind, path);
         match self.ctx.mode {
             ExecMode::DryRun => {

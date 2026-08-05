@@ -92,34 +92,25 @@ declares no `paths` cannot write any path **through the bridge write
 ops below**, and one that declares no `http_allowlist` cannot reach any
 URL.
 
-The path policy's reach is narrower than "every write the profile
-performs", and the difference is worth stating rather than leaving to
-be discovered.
+The path policy's reach is **every write that reaches a bridge**, and
+it does not depend on how the profile spelled the write.
 
-It is consulted by the **direct bridge ops that carry a path or a
-destination as a declared field**: `fs.write`, `net.transfer` (`dst`),
-`mount.bind` (`src` and `dst`), and `mount.umount` (chapter 04). Each
-checks at op entry, dry-run and real alike.
+It is consulted by the direct bridge ops that carry a path as a
+declared field — `fs.write`, `net.transfer`, `mount.bind` (`src` and
+`dst`), `mount.umount` (chapter 04) — and equally by the transfer
+sub-steps a lifecycle phase composes: a `sync.pull` writing outside
+`paths` is denied exactly as the `net.transfer` spelling of it would
+be. The targets are read off the resolved steps, so neither the field
+name nor the phase kind changes the answer. Each checks at op entry,
+dry-run and real alike.
 
-The transfer sub-steps a lifecycle phase composes do **not** currently
-pass through it — they reach the transfer effect directly when the
-lifecycle step executes. The two cases differ in how much that costs.
-`models` writes under a built-in path constant (chapter 02 §Built-in
-path constants), so an author cannot aim it anywhere: the missing check
-has no reachable escape. `sync.pull`'s `dst` is an author-written field
-(chapter 02), and validate only checks its *shape* — shell-safe,
-absolute, `..`-free (chapter 03 §validate check 6) — never against
-`paths`. The consequence, stated plainly: **a profile that declares
-`net.transfer` can download to any absolute path, whatever it declared
-in `paths`.** The path policy does not see that write.
-
-Neither case is a decided exemption. "Built-in paths are exempt" is not
-a rule this chapter states, and `sync.pull`'s `dst` is exactly the kind
-of author-written destination the policy exists for. Settling both
-belongs with the capability / path derivation work (chapter 00
-§Capability derivation), which has to enumerate the built-in constants
-anyway; until then this is an open item, recorded here rather than left
-to be discovered.
+The same targets are what validate asserts `paths` covers **before**
+apply (chapter 00 §Capability derivation): the walk runs over the
+expanded plan, so a `models` destination under a built-in path constant
+(chapter 02 §Built-in path constants) — a path the author never spells
+out — has to be declared like any other. What used to be an unstated
+exemption for built-in constants is now a stated requirement, and it
+surfaces as a precondition error rather than as a denial on the pod.
 
 `sh.exec` puts writes structurally out of reach: a subprocess — `git
 clone`, a CLI downloader, `pip install` — writes wherever the pod's

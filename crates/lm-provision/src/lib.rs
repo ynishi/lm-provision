@@ -51,6 +51,7 @@
 pub mod apply;
 pub mod canonical;
 pub mod cli;
+pub mod derive;
 pub mod exec;
 pub mod frontend;
 pub mod normalize;
