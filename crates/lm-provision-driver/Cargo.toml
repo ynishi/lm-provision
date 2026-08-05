@@ -17,7 +17,7 @@ name = "lm-provision-driver"
 path = "src/main.rs"
 
 [dependencies]
-lm-provision = { path = "../lm-provision", version = "0.2.0" }
+lm-provision = { path = "../lm-provision", version = "0.3.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
