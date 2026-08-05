@@ -70,7 +70,7 @@ mirror the bridge signatures, with non-core fields forwarded as
 | kind | payload | required capability |
 |---|---|---|
 | `sh.exec` | `argv` list\<string\> (non-empty); `opts` table (chapter 04 §sh.exec) | `sh.exec` |
-| `fs.write` | `path` string; `content` value node (bare string \| `EnvSecret` \| `EnvRef`, chapter 04 §`fs.write`); other fields → opts | `fs.write`, plus `env.ref` when `content` is an `EnvRef` node — reading a host environment variable into written content is its own effect |
+| `fs.write` | `path` string; `content` value node (bare string \| `EnvSecret` \| `EnvRef`, chapter 04 §`fs.write`); other fields → opts | `fs.write`, plus `env.ref` when `content` is an `EnvRef` node (§Shared vocabulary) |
 | `net.http_get` | `url` string; `headers` table\<string, string\|SecretRef\> optional (names shell-safe); `timeout_sec?` number (default 30) | `net.http_get` |
 | `net.http_post` | `url` string; `headers`, `timeout_sec?` as above; `body` value node \| `body_json` JSON string — **mutually exclusive**, and the content type follows from which one is declared (chapter 04 §`net.http_post`); `body_form` deferred | `net.http_post` |
 | `net.transfer` | `src`, `dst` strings — the direction is read off the schemes: a remote scheme on `src` is a download, one on `dst` is an upload, and a scheme on both or on neither is a validate-stage reject; other fields → opts | `net.transfer`, or `sh.exec` when routed (§Dispatch routing) |
@@ -119,8 +119,9 @@ Rules:
   opens an index of its own instead of inheriting 0, so it cannot
   collide with the readiness step of the first declared service.
   Duplicate `service.start` names are a validate-stage error, and so
-  is any profile whose expansion would emit two steps carrying the
-  same id (§Stability makes ids load-bearing).
+  is a second `service.ready` under the same `service.start`: both
+  would carry `11_service_<N>_ready`, and unlike a shared bucket id
+  that number is what tells two services apart.
 - Implicit insertion: when `comfyui.install` is present, whichever of
   `comfyui.restart` / `comfyui.health` the profile did not declare is
   inserted. The guard is per phase, not "neither was declared" — a
@@ -140,12 +141,17 @@ Rules:
   (chapter 04) and runs for real. Only an *unrecognized* kind degrades
   to a no-op (§Unknown kinds).
 
-The ids are labels, not sort keys. `3a_python_version_check` precedes
+The ids name slots, not steps, and they are not sort keys. Two phases
+of one kind share a bucket and therefore share an id — what tells them
+apart is their position. `3a_python_version_check` precedes
 `3_python_deps` in this order but follows it in a byte comparison, and
 `10_` / `11_` sort ahead of `1_`; no zero padding repairs that. The
 order is carried by the position of each step in the emitted list —
 the plan stamps it as a 1-based `index` field — so a consumer that
-re-sorts steps by id silently reorders the plan.
+re-sorts steps by id, or keys a map on the id, silently loses the
+plan. The one id that identifies a single step is the service pair's:
+`11_service_<N>_start` / `_ready` carry a per-service number, which is
+why the numbering rule above has to keep it unique.
 
 ### Unknown kinds
 
@@ -418,8 +424,13 @@ equality of the set literal is the contract.
 
   Every other key in that set is demanded by at least one row of the
   catalog above; `mount.volume_attach` is the single reserved
-  exception. `env.ref` is demanded by an `fs.write` whose content is
-  an `EnvRef` node, which is what keeps it reachable.
+  exception. `env.ref` is the one demand that does not follow from the
+  kind: dereferencing a `Spec.env` entry is an effect of its own, so
+  **any phase carrying an `EnvRef` value node demands it** — in
+  `fs.write` content, in an `env` keyed slot, in a header map, or in a
+  POST body — on top of whatever its kind requires. Spelling it per
+  kind instead would leave the same hole in every slot the capability
+  column does not mention.
 
 ### Authoring support
 
@@ -461,9 +472,9 @@ choices (§Spawn-and-poll invocations).
 - Route shape violations (`sync.*` src/dst schemes, missing bucket or
   path, `..` traversal): validate-stage reject.
 - Duplicate `service.start` name: validate-stage reject.
-- Two expanded steps carrying the same id: validate-stage reject
-  (§Canonical phase ordering — ids are what hashes and report entries
-  are keyed on).
+- A second `service.ready` under the same `service.start` (both would
+  expand to `11_service_<N>_ready`): validate-stage reject
+  (§Canonical phase ordering).
 - A `models` element with neither `dst` nor `name`, and a
   `net.transfer` whose direction is not fixed by a scheme on exactly
   one side: validate-stage reject.

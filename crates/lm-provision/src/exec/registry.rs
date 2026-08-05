@@ -13,10 +13,12 @@
 //!   (spec 07 "dry-run does policy"), rejecting targets that fall
 //!   outside the profile's declared `paths` / `http_allowlist`.
 //! - **lifecycle 15 ops** delegate to [`lifecycle::expand`]
-//!   for step composition, then render each step in `DryRun` and execute
-//!   each step (via [`lifecycle::execute_step`])
-//!   in `Real`. A single per-op log line joins the per-step summaries
-//!   with `; `, preserving the direct-op shape (`"<op> ..."`).
+//!   for step composition, enforce the capability each expanded step
+//!   resolves to ([`step_capability`]) before running any of them, then
+//!   render each step in `DryRun` and execute each step (via
+//!   [`lifecycle::execute_step`]) in `Real`. A single per-op log line
+//!   joins the per-step summaries with `; `, preserving the direct-op
+//!   shape (`"<op> ..."`).
 //!
 //! An [`ExecError`] from any step surfaces as
 //! [`EngineError::EvalFailed`], carrying the node at which it happened.
@@ -58,15 +60,14 @@ const LIFECYCLE_OPS: [&str; 15] = [
     "service_ready",
 ];
 
-/// Capability an op requires, or `None` for a marker op (`sync_push`).
+/// Capability a **direct** op requires.
 ///
-/// The mapping is frozen against spec 02 §Catalog kinds: a lifecycle op
-/// requires the capability of the effect it expands into (spec 05 §L4).
-/// The two HTTP polls (`comfyui_health` / `service_ready`) expand into a
-/// single `HttpPoll` step and therefore require `net.http_get`, not
-/// `sh.exec` — the pid file they re-read between attempts is a
-/// provisioner-internal file read, not a bridge op (spec 02
-/// §Poll deadlines).
+/// The mapping is frozen against spec 02 §Catalog kinds (direct
+/// operations map 1:1 onto bridge primitives, so the demand is fixed by
+/// the op name). Lifecycle ops are absent here on purpose: their demand
+/// depends on the route their payload resolves to, and is derived from
+/// the expanded steps by [`step_capability`] instead (spec 02
+/// §Dispatch routing "What the L4 gate sees").
 fn required_capability(op: &str) -> Option<&'static str> {
     match op {
         "sh_exec" => Some("sh.exec"),
@@ -76,19 +77,60 @@ fn required_capability(op: &str) -> Option<&'static str> {
         "net_transfer" => Some("net.transfer"),
         "mount_bind" => Some("mount.bind"),
         "mount_umount" => Some("mount.umount"),
-        "system_apt"
-        | "comfyui_install"
-        | "python_version_check"
-        | "python_deps"
-        | "custom_nodes"
-        | "llm_models"
-        | "post_install"
-        | "comfyui_restart"
-        | "service_start" => Some("sh.exec"),
-        "comfyui_health" | "service_ready" => Some("net.http_get"),
-        "sync_pull" | "staging_push" | "models" => Some("net.transfer"),
-        "sync_push" => None,
         _ => None,
+    }
+}
+
+/// Whether `payload` carries an [`ProfileNode::EnvRef`] value node in
+/// any of its value slots — `fs.write` content, an `env` keyed slot, a
+/// header map, or a POST body.
+///
+/// `Spec.env` values are never `EnvRef` (a reference resolves *into*
+/// `Spec.env`; [`crate::validate`] check 4b rejects one there), so the
+/// phase payload is the only place the node can appear.
+fn payload_uses_env_ref(payload: &ProfileNode) -> bool {
+    fn is_ref(node: &ProfileNode) -> bool {
+        matches!(node, ProfileNode::EnvRef { .. })
+    }
+    fn any_ref<'a>(nodes: impl IntoIterator<Item = &'a ProfileNode>) -> bool {
+        nodes.into_iter().any(is_ref)
+    }
+
+    match payload {
+        ProfileNode::FsWrite { content, .. } => is_ref(content),
+        ProfileNode::SyncPull { env, .. }
+        | ProfileNode::StagingPush { env, .. }
+        | ProfileNode::ShExec { env, .. } => any_ref(env.values()),
+        ProfileNode::NetHttpGet { headers, .. } => any_ref(headers.values()),
+        ProfileNode::NetHttpPost { headers, body, .. } => {
+            any_ref(headers.values()) || body.as_deref().is_some_and(is_ref)
+        }
+        _ => false,
+    }
+}
+
+/// Capability one expanded lifecycle step demands, or `None` for a
+/// `Note` (which runs no effect).
+///
+/// This is the resolved demand of spec 02 §Dispatch routing "What the
+/// L4 gate sees": a `sync.pull` that routed to the native CLI demands
+/// `sh.exec` — not the `net.transfer` its kind carries when it stays on
+/// the bridge — and a `staging.push`, which is always CLI-routed,
+/// demands `sh.exec` unconditionally. Requiring the union of both
+/// routes up front would let a shell run under a profile that never
+/// asked for one.
+///
+/// The two HTTP polls (`comfyui_health` / `service_ready`) expand into a
+/// single `HttpPoll` step and therefore demand `net.http_get`, not
+/// `sh.exec` — the pid file they re-read between attempts is a
+/// provisioner-internal file read, not a bridge op (spec 02
+/// §Poll deadlines).
+fn step_capability(step: &lifecycle::Step) -> Option<&'static str> {
+    match step {
+        lifecycle::Step::Sh(_) => Some("sh.exec"),
+        lifecycle::Step::Transfer { .. } => Some("net.transfer"),
+        lifecycle::Step::HttpPoll { .. } => Some("net.http_get"),
+        lifecycle::Step::Note(_) => None,
     }
 }
 
@@ -142,6 +184,21 @@ impl ProfileOp {
 
         if let Some(capability) = required_capability(self.name) {
             if let Err(err) = self.ctx.gate.require(capability) {
+                self.record_phase_failure(node, &err);
+                return Err(err);
+            }
+        }
+
+        // Dereferencing a `Spec.env` entry is its own effect, and the
+        // one thing that makes `env.ref` a reachable capability rather
+        // than a reserved key (spec 02 §Catalog kinds,
+        // §Shared vocabulary). The demand follows the `EnvRef` value
+        // node wherever it sits — `fs.write` content, an `env` keyed
+        // slot, a header, a POST body — rather than being spelled out
+        // per kind, which would leave the same hole in every slot the
+        // catalog's capability column does not mention.
+        if payload_uses_env_ref(payload) {
+            if let Err(err) = self.ctx.gate.require("env.ref") {
                 self.record_phase_failure(node, &err);
                 return Err(err);
             }
@@ -272,6 +329,21 @@ impl ProfileOp {
                 return Err(err);
             }
         };
+
+        // The gate sees the *resolved* demand: expansion is pure, so the
+        // route is known before any step runs, and every step's
+        // capability is required up front — a phase whose second step
+        // would be denied never executes its first (spec 02
+        // §Dispatch routing "What the L4 gate sees").
+        for step in &steps {
+            let Some(capability) = step_capability(step) else {
+                continue;
+            };
+            if let Err(err) = self.ctx.gate.require(capability) {
+                self.record_phase_failure(node, &err);
+                return Err(err);
+            }
+        }
 
         let mut renders = Vec::with_capacity(steps.len());
         for (index, step) in steps.iter().enumerate() {

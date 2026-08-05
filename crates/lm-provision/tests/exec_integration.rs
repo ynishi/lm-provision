@@ -407,7 +407,9 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
 /// `staging_push` to an `hf://` dst now composes a concrete
 /// `hf upload` step (spec 02 §Dispatch routing); a dry run
 /// renders the CLI trace without touching the network. The upload is
-/// always CLI-routed regardless of `env` (04-bridge §net.transfer).
+/// always CLI-routed regardless of `env` (04-bridge §net.transfer), so
+/// the capability it demands is `sh.exec` — the resolved route's, not
+/// the kind's (spec 02 §Dispatch routing "What the L4 gate sees").
 #[test]
 fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
     let ids = IdGen::new();
@@ -416,7 +418,7 @@ fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
         name: "staging-push".to_string(),
         version: None,
         description: None,
-        capabilities: vec!["net.transfer".to_string()],
+        capabilities: vec!["sh.exec".to_string()],
         env: std::collections::BTreeMap::new(),
         env_secrets: Vec::new(),
         paths: Vec::new(),
@@ -446,6 +448,125 @@ fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
             && log[0].contains("main"),
         "dry-run trace should carry the upload argv: {}",
         log[0]
+    );
+}
+
+/// The gate sees the route, not the kind: a `staging.push` is always
+/// CLI-routed, so a profile granting only `net.transfer` — the
+/// capability its *kind* carries in the catalog table — is denied
+/// before the shell runs (spec 02 §Dispatch routing "What the L4 gate
+/// sees"). Granting the union of both routes up front would let a
+/// shell run under a profile that never asked for one.
+#[test]
+fn staging_push_is_denied_when_only_net_transfer_is_granted() {
+    let ids = IdGen::new();
+    let program = ProfileNode::Spec {
+        id: ids.node(),
+        name: "staging-push-ungated".to_string(),
+        version: None,
+        description: None,
+        capabilities: vec!["net.transfer".to_string()],
+        env: std::collections::BTreeMap::new(),
+        env_secrets: Vec::new(),
+        paths: Vec::new(),
+        http_allowlist: Vec::new(),
+        phases: vec![ProfileNode::StagingPush {
+            id: ids.node(),
+            src: "/workspace/out.bin".to_string(),
+            dst: "hf://owner/repo/artifact.bin".to_string(),
+            env: Default::default(),
+            revision: None,
+        }],
+    };
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine =
+        create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log)).expect("engine builds");
+    let err = run_to_done(&mut engine).expect_err("the CLI-routed upload demands sh.exec");
+    let source = err
+        .source()
+        .expect("EvalFailed carries the ExecError source")
+        .to_string();
+    assert!(
+        source.contains("sh.exec"),
+        "the denial should name the capability the resolved route needs: {source}"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing runs once the gate denies the phase"
+    );
+}
+
+/// A `sync.pull` moves between the two demands with its payload: an
+/// `https://` src stays on the bridge and needs `net.transfer`, while
+/// an `hf://` src with a credential `env` routes to the CLI and needs
+/// `sh.exec` (spec 02 §Dispatch routing "What the L4 gate sees").
+#[test]
+fn sync_pull_demands_the_capability_of_the_route_its_payload_resolves_to() {
+    /// `bridge` picks the `https://` src (net.transfer route) over the
+    /// credential-`env` `hf://` src (CLI route); `capability` is the
+    /// profile's single declared capability.
+    fn pull(bridge: bool, capability: &str) -> Result<(), String> {
+        let ids = IdGen::new();
+        let mut env = std::collections::BTreeMap::new();
+        if !bridge {
+            env.insert(
+                "HF_TOKEN".to_string(),
+                ProfileNode::EnvLiteral {
+                    id: ids.node(),
+                    value: "credential-value".to_string(),
+                },
+            );
+        }
+        let src = if bridge {
+            "https://example.com/model.bin"
+        } else {
+            "hf://owner/repo/model.bin"
+        };
+        let program = ProfileNode::Spec {
+            id: ids.node(),
+            name: "sync-pull-route".to_string(),
+            version: None,
+            description: None,
+            capabilities: vec![capability.to_string()],
+            env: std::collections::BTreeMap::new(),
+            env_secrets: Vec::new(),
+            paths: vec!["/workspace".to_string()],
+            http_allowlist: vec!["https://example.com".to_string()],
+            phases: vec![ProfileNode::SyncPull {
+                id: ids.node(),
+                src: src.to_string(),
+                dst: "/workspace/model.bin".to_string(),
+                env,
+                revision: None,
+            }],
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = create_profile_engine(&program, ExecMode::DryRun, Arc::clone(&log))
+            .expect("engine builds");
+        run_to_done(&mut engine).map(|_| ()).map_err(|err| {
+            err.source()
+                .map_or_else(|| err.to_string(), |source| source.to_string())
+        })
+    }
+
+    assert_eq!(
+        pull(true, "net.transfer"),
+        Ok(()),
+        "an https:// pull stays on the net.transfer bridge"
+    );
+    assert!(
+        pull(true, "sh.exec").is_err(),
+        "a bridge pull must not pass on sh.exec alone"
+    );
+    assert_eq!(
+        pull(false, "sh.exec"),
+        Ok(()),
+        "a credential env moves the pull onto the CLI route"
+    );
+    assert!(
+        pull(false, "net.transfer").is_err(),
+        "the CLI route must not pass on the kind's net.transfer alone"
     );
 }
 

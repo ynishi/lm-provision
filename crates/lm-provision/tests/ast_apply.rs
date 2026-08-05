@@ -590,7 +590,10 @@ fn env_ref_resolves_through_spec_env_and_redacts_correctly() {
     let profile = json!({
         "type": "Spec",
         "name": "env-ref-demo",
-        "capabilities": ["sh.exec", "fs.write"],
+        // The `sh.exec` phase dereferences two `Spec.env` entries, so
+        // `env.ref` joins the effects it declares (spec 02
+        // §Shared vocabulary).
+        "capabilities": ["sh.exec", "fs.write", "env.ref"],
         "paths": [dir_str],
         "env_secrets": ["ENV_REF_SECRET_TOKEN"],
         "env": {
@@ -807,7 +810,10 @@ fn fs_write_secret_and_ref_content_resolve_and_never_leak_on_the_transcript() {
     let profile = json!({
         "type": "Spec",
         "name": "fs-content-demo",
-        "capabilities": ["fs.write"],
+        // `env.ref` joins `fs.write` because the second phase's content
+        // is an `EnvRef`: reading a host environment variable into the
+        // written bytes is its own effect (spec 02 §Catalog kinds).
+        "capabilities": ["fs.write", "env.ref"],
         "paths": [dir_str],
         "env_secrets": ["FS_CONTENT_SECRET_TOKEN"],
         "env": {

@@ -85,6 +85,19 @@ const URI_ROUTE_SCHEMES: &[&str] = &["b2", "hf", "https"];
 /// `sync.push`).
 const POD_ID_PLACEHOLDER: &str = "{pod_id}";
 
+/// The one `models` element field pair check 6 reads: the destination
+/// file name is spelled `dst` or `name`, and an element carrying
+/// neither has nowhere to download to (02 §Catalog kinds `models`).
+/// The rest of the element shape belongs to the expansion site
+/// (`crate::exec::lifecycle`), which owns the full `ModelItemSpec`.
+#[derive(serde::Deserialize)]
+struct ModelItemShape {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    dst: Option<String>,
+}
+
 /// A validate-stage rejection (first violation only,
 /// 03-pipeline-stage-artifacts.md §validate). Each `Display` string
 /// carries the same information the legacy Lua message did; the `ir.`
@@ -158,6 +171,20 @@ pub enum ValidateError {
         index: usize,
         /// The duplicated service name.
         name: String,
+    },
+
+    /// A second `service.ready` follows the same `service.start`, so
+    /// both would expand to the same `11_service_<N>_ready` step id
+    /// (check 8, spec 02 §Canonical phase ordering).
+    #[error(
+        "phases[{index}]: a second service.ready follows the same service.start; \
+         both would expand to step id 11_service_{service_index}_ready"
+    )]
+    DuplicateServiceReady {
+        /// 1-based position of the offending phase.
+        index: usize,
+        /// The service index both readiness steps would carry.
+        service_index: u32,
     },
 
     /// An `env`-map [`ProfileNode::EnvSecret`] value names a secret that
@@ -340,6 +367,42 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
                     name: name.clone(),
                 });
             }
+        }
+    }
+
+    // Check 8: no two `service.ready` phases share a service index.
+    // This mirrors the plan stage's numbering (`crate::plan`): a start
+    // opens an index, the ready that follows takes it, and a ready with
+    // no start before it opens one of its own. The one way two steps
+    // can still collide on `11_service_<N>_ready` is a second ready
+    // under the same start, which is what this rejects — ids are what
+    // hashes and report entries key on (spec 02 §Stability).
+    let mut next_service_index: u32 = 0;
+    let mut current_service_index: Option<u32> = None;
+    let mut readied: HashSet<u32> = HashSet::new();
+    for (idx, phase) in phases.iter().enumerate() {
+        match phase {
+            ProfileNode::ServiceStart { .. } => {
+                current_service_index = Some(next_service_index);
+                next_service_index += 1;
+            }
+            ProfileNode::ServiceReady { .. } => {
+                let service_index = match current_service_index {
+                    Some(index) => index,
+                    None => {
+                        let index = next_service_index;
+                        next_service_index += 1;
+                        index
+                    }
+                };
+                if !readied.insert(service_index) {
+                    return Err(ValidateError::DuplicateServiceReady {
+                        index: idx + 1,
+                        service_index,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
@@ -604,6 +667,44 @@ fn check_phase(
         // free-form — a literal is never shell-safety-checked.
         ProfileNode::FsWrite { content, .. } => {
             check_single_value(content, "content", env_secrets, declared_env_keys, index)
+        }
+        // A `models` element names its destination file with `dst` or
+        // `name`; with neither there is no path to download to, and the
+        // failure belongs in the precondition class rather than
+        // mid-apply (spec 02 §Catalog kinds / §Error surface). A
+        // `models_json` that does not parse stays an apply-time op
+        // failure — that shape is authored input, and the parse error
+        // carries a better message from the expansion site.
+        ProfileNode::Models { models_json, .. } => {
+            let Ok(items) = serde_json::from_str::<Vec<ModelItemShape>>(models_json) else {
+                return Ok(());
+            };
+            for (i, item) in items.iter().enumerate() {
+                if item.dst.is_none() && item.name.is_none() {
+                    return Err(ValidateError::PhaseShape(format!(
+                        "phases[{index}].models[{}]: one of dst / name is required",
+                        i + 1
+                    )));
+                }
+            }
+            Ok(())
+        }
+        // `net.transfer` carries no direction field: a remote scheme on
+        // `src` is a download, one on `dst` is an upload, and a scheme
+        // on both or on neither leaves the direction underdetermined
+        // (spec 02 §Catalog kinds / §Dispatch routing).
+        ProfileNode::NetTransfer { src, dst, .. } => {
+            match (src.contains("://"), dst.contains("://")) {
+                (true, false) | (false, true) => Ok(()),
+                (true, true) => Err(ValidateError::PhaseShape(format!(
+                    "phases[{index}]: src and dst both carry a scheme, so the \
+                     transfer direction is undetermined"
+                ))),
+                (false, false) => Err(ValidateError::PhaseShape(format!(
+                    "phases[{index}]: neither src nor dst carries a scheme, so the \
+                     transfer direction is undetermined"
+                ))),
+            }
         }
         // Every remaining variant carries no `shell_safe`-marked field,
         // no route shape, and no `env` slot (`hooks.post_install.script`
@@ -1360,6 +1461,172 @@ mod tests {
                 "phases[1].src: is not shell-safe".into()
             ))
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Check 8: service readiness ids stay unique.
+    // -----------------------------------------------------------------
+
+    /// Build a `service.start` phase named `name`.
+    fn start(g: &IdGen, name: &str) -> ProfileNode {
+        ProfileNode::ServiceStart {
+            id: g.node(),
+            name: name.into(),
+            platform_kind: "vllm".into(),
+            model: None,
+            port: None,
+            dtype: None,
+            tensor_parallel_size: None,
+            extra_args: vec![],
+        }
+    }
+
+    /// Build a `service.ready` phase named `name`.
+    fn ready(g: &IdGen, name: &str) -> ProfileNode {
+        ProfileNode::ServiceReady {
+            id: g.node(),
+            name: name.into(),
+            check_url: "http://x/health".into(),
+            timeout_sec: None,
+        }
+    }
+
+    #[test]
+    fn a_second_ready_under_one_start_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![start(&g, "svc"), ready(&g, "svc"), ready(&g, "svc-again")],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::DuplicateServiceReady {
+                index: 3,
+                service_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn one_ready_per_start_passes() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![
+                start(&g, "a"),
+                ready(&g, "a"),
+                start(&g, "b"),
+                ready(&g, "b"),
+            ],
+        );
+        assert_eq!(validate(&node), Ok(()));
+    }
+
+    /// A resume profile polling two servers an earlier apply started
+    /// carries two readies and no start; each opens its own index, so
+    /// neither the plan nor this check sees a collision.
+    #[test]
+    fn consecutive_orphan_readies_pass() {
+        let g = ids();
+        let node = spec("demo", vec![ready(&g, "one"), ready(&g, "two")]);
+        assert_eq!(validate(&node), Ok(()));
+    }
+
+    // -----------------------------------------------------------------
+    // Check 6: models element destination, net.transfer direction.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_models_element_without_dst_or_name_is_rejected() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![ProfileNode::Models {
+                id: g.node(),
+                models_json: r#"[{"src":"https://example.com/a.bin","subdir":"loras"}]"#.into(),
+            }],
+        );
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::PhaseShape(
+                "phases[1].models[1]: one of dst / name is required".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_models_element_naming_its_destination_passes() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![ProfileNode::Models {
+                id: g.node(),
+                models_json: r#"[{"src":"https://example.com/a.bin","name":"a.bin"}]"#.into(),
+            }],
+        );
+        assert_eq!(validate(&node), Ok(()));
+    }
+
+    /// A `models_json` that does not parse stays an apply-time op
+    /// failure — the expansion site owns that message.
+    #[test]
+    fn an_unparsable_models_json_is_left_to_the_expansion_site() {
+        let g = ids();
+        let node = spec(
+            "demo",
+            vec![ProfileNode::Models {
+                id: g.node(),
+                models_json: "not json".into(),
+            }],
+        );
+        assert_eq!(validate(&node), Ok(()));
+    }
+
+    #[test]
+    fn net_transfer_needs_a_scheme_on_exactly_one_side() {
+        let g = ids();
+        let download = spec(
+            "demo",
+            vec![ProfileNode::NetTransfer {
+                id: g.node(),
+                src: "https://example.com/a.bin".into(),
+                dst: "/workspace/a.bin".into(),
+            }],
+        );
+        assert_eq!(validate(&download), Ok(()));
+
+        let upload = spec(
+            "demo",
+            vec![ProfileNode::NetTransfer {
+                id: g.node(),
+                src: "/workspace/a.bin".into(),
+                dst: "https://example.com/a.bin".into(),
+            }],
+        );
+        assert_eq!(validate(&upload), Ok(()));
+
+        let both = spec(
+            "demo",
+            vec![ProfileNode::NetTransfer {
+                id: g.node(),
+                src: "https://example.com/a.bin".into(),
+                dst: "b2://bucket/a.bin".into(),
+            }],
+        );
+        assert!(matches!(validate(&both), Err(ValidateError::PhaseShape(_))));
+
+        let neither = spec(
+            "demo",
+            vec![ProfileNode::NetTransfer {
+                id: g.node(),
+                src: "/workspace/a.bin".into(),
+                dst: "/workspace/b.bin".into(),
+            }],
+        );
+        assert!(matches!(
+            validate(&neither),
+            Err(ValidateError::PhaseShape(_))
+        ));
     }
 
     // -----------------------------------------------------------------

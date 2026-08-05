@@ -67,7 +67,12 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
     let mut zz: Vec<(&'static str, Value)> = Vec::new();
 
     let mut next_service_index: u32 = 0;
-    let mut current_service_index: u32 = 0;
+    // `None` until a `service.start` opens an index. A `service.ready`
+    // that no start precedes — the resume profile of spec 02 §Poll
+    // deadlines — opens an index of its own rather than inheriting 0,
+    // so it cannot collide with the readiness step of the first
+    // declared service (spec 02 §Canonical phase ordering).
+    let mut current_service_index: Option<u32> = None;
 
     for phase in phases {
         match phase {
@@ -87,7 +92,7 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
             ProfileNode::ServiceStart { .. } => {
                 let idx = next_service_index;
                 next_service_index += 1;
-                current_service_index = idx;
+                current_service_index = Some(idx);
                 service_steps.push((
                     format!("11_service_{idx}_start"),
                     kind_of(phase),
@@ -95,7 +100,14 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
                 ));
             }
             ProfileNode::ServiceReady { .. } => {
-                let idx = current_service_index;
+                let idx = match current_service_index {
+                    Some(idx) => idx,
+                    None => {
+                        let idx = next_service_index;
+                        next_service_index += 1;
+                        idx
+                    }
+                };
                 service_steps.push((
                     format!("11_service_{idx}_ready"),
                     kind_of(phase),
@@ -996,6 +1008,79 @@ mod tests {
                 "11_service_1_start",
                 "11_service_1_ready",
             ],
+        );
+    }
+
+    /// An orphan `service.ready` opens an index of its own, so the
+    /// service declared after it keeps a readiness id no other step
+    /// carries (spec 02 §Canonical phase ordering). Before this rule
+    /// the orphan inherited 0 and collided with the first declared
+    /// service's readiness step.
+    #[test]
+    fn an_orphan_ready_does_not_collide_with_the_first_declared_service() {
+        let g = ids();
+        let plan = expand(&spec(
+            "demo",
+            vec![
+                ProfileNode::ServiceReady {
+                    id: g.node(),
+                    name: "resumed".into(),
+                    check_url: "http://resumed/health".into(),
+                    timeout_sec: None,
+                },
+                ProfileNode::ServiceStart {
+                    id: g.node(),
+                    name: "svc-a".into(),
+                    platform_kind: "vllm".into(),
+                    model: None,
+                    port: None,
+                    dtype: None,
+                    tensor_parallel_size: None,
+                    extra_args: vec![],
+                },
+                ProfileNode::ServiceReady {
+                    id: g.node(),
+                    name: "svc-a".into(),
+                    check_url: "http://a/health".into(),
+                    timeout_sec: None,
+                },
+            ],
+        ));
+        assert_eq!(
+            step_ids(&plan),
+            vec![
+                "11_service_0_ready",
+                "11_service_1_start",
+                "11_service_1_ready",
+            ],
+        );
+    }
+
+    /// Two orphan readies — a resume profile polling two servers an
+    /// earlier apply started — each open their own index.
+    #[test]
+    fn consecutive_orphan_readies_take_separate_indices() {
+        let g = ids();
+        let plan = expand(&spec(
+            "demo",
+            vec![
+                ProfileNode::ServiceReady {
+                    id: g.node(),
+                    name: "one".into(),
+                    check_url: "http://one/health".into(),
+                    timeout_sec: None,
+                },
+                ProfileNode::ServiceReady {
+                    id: g.node(),
+                    name: "two".into(),
+                    check_url: "http://two/health".into(),
+                    timeout_sec: None,
+                },
+            ],
+        ));
+        assert_eq!(
+            step_ids(&plan),
+            vec!["11_service_0_ready", "11_service_1_ready"],
         );
     }
 
