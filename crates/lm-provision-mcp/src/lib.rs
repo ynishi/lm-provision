@@ -17,9 +17,9 @@
 //!   own host (10 §Inputs), and none of the three touches a bridge or
 //!   a pod (07-cli.md §Invocation: "none (read-only)").
 //! - **Driver-mediated** ([`apply_tool`], [`ledger_tools`]): `lm_apply`
-//!   runs the full chapter 08 protocol against
-//!   [`lm_provision_driver::local_exec::LocalExecTransport`] (the MVP
-//!   transport this crate wires) and appends the result to the
+//!   runs the full chapter 08 protocol against the
+//!   [`lm_provision_driver::transport::Transport`] its `pod_id`
+//!   resolves to (see [`targets`]) and appends the result to the
 //!   append-only ledger (09 §Ledger); `lm_ledger_list` /
 //!   `lm_ledger_get` read that same ledger back.
 //!
@@ -29,9 +29,18 @@
 //! are deliberately `rmcp`-free and directly testable at the function
 //! level (task instruction), independent of any MCP transport.
 //! [`config`] resolves the server's deployment configuration (binary
-//! path, staging directory, ledger path — 10 §Inputs: "Pod transport
-//! configuration ... is server deployment configuration, not tool
-//! arguments") once at startup.
+//! path, default staging directory, ledger path, pod target registry)
+//! once at startup.
+//!
+//! ## Pod targets ([`targets`])
+//!
+//! `lm_apply`'s `pod_id` selects where the apply runs: [`server`]
+//! resolves it against the startup-loaded [`targets::TargetRegistry`]
+//! and hands the resulting transport to [`apply_tool::lm_apply`]. An
+//! unregistered `pod_id` fails before any effect, so a ledger row's
+//! `pod_id` names a destination the server was actually configured for
+//! rather than an unchecked string. Pod connection details are server
+//! deployment configuration, never tool arguments.
 //!
 //! ## Secrets (10 §Inputs)
 //!
@@ -50,3 +59,4 @@ pub mod ledger_tools;
 pub mod pipeline;
 pub mod profile_host;
 pub mod server;
+pub mod targets;

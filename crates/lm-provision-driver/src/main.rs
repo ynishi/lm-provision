@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
-use lm_provision_driver::ssh::SshTransport;
+use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
 
 #[derive(Parser)]
 #[command(
@@ -43,8 +43,13 @@ enum Command {
 
 #[derive(Args)]
 struct ApplyArgs {
-    /// SSH target as [user@]host:port (user defaults to root).
-    #[arg(long = "ssh")]
+    /// SSH target as `[user@]host:port` (user defaults to
+    /// [`DEFAULT_SSH_USER`]).
+    ///
+    /// The `--help` text is built from that constant rather than
+    /// spelling the default a second time, so the documented default
+    /// and [`parse_ssh_target`]'s fallback cannot drift apart.
+    #[arg(long = "ssh", help = ssh_help())]
     ssh: String,
 
     /// Identity file — explicit, no default-key fallback.
@@ -61,7 +66,7 @@ struct ApplyArgs {
     artifact: Option<PathBuf>,
 
     /// Remote directory the binary / profile land in.
-    #[arg(long = "remote-dir", default_value = "/root")]
+    #[arg(long = "remote-dir", default_value = DEFAULT_REMOTE_DIR)]
     remote_dir: PathBuf,
 
     /// Ledger pod_id context; defaults to the SSH host.
@@ -143,12 +148,15 @@ fn run_apply(args: ApplyArgs) -> ExitCode {
             // report on stdout, transcript on stderr.
             eprint!("{}", output.collected.stderr);
             println!("{}", output.collected.report);
-            let ok = output.collected.report["ok"] == serde_json::Value::Bool(true);
-            if ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
+            // 09 §Error surface's "do not swallow" is discharged here:
+            // the session hands a failed step-5 append back as a
+            // warning (it will not throw the report away), and this is
+            // the caller that has to make the missing row visible.
+            if let Some(warning) = &output.ledger_warning {
+                eprintln!("error: ledger append failed: {warning}");
             }
+            let ok = output.collected.report["ok"] == serde_json::Value::Bool(true);
+            ExitCode::from(exit_status(ok, output.ledger_warning.as_deref()))
         }
         Err(err) => {
             eprintln!("error: {err}");
@@ -157,12 +165,37 @@ fn run_apply(args: ApplyArgs) -> ExitCode {
     }
 }
 
-/// `[user@]host:port` (user defaults to root; port is mandatory —
-/// RunPod maps a per-pod external port, there is no useful default).
+/// The exit code a completed session maps to: `0` only when the apply
+/// reported `ok` **and** step 5 recorded it.
+///
+/// An unrecorded apply is not a success to report as one (09 §Error
+/// surface: "an apply is not 'unrecorded-successful' — drivers must
+/// treat append failure as an operational error to retry"), so a
+/// `ledger_warning` costs the zero exit even when the report itself is
+/// `ok`. The report still goes to stdout: an operator retrying the
+/// append needs to know what it was.
+fn exit_status(report_ok: bool, ledger_warning: Option<&str>) -> u8 {
+    if report_ok && ledger_warning.is_none() {
+        0
+    } else {
+        1
+    }
+}
+
+/// `--ssh` help text, built from [`DEFAULT_SSH_USER`] so the CLI's
+/// documented default is the same value [`parse_ssh_target`] falls
+/// back to.
+fn ssh_help() -> String {
+    format!("SSH target as [user@]host:port (user defaults to {DEFAULT_SSH_USER})")
+}
+
+/// `[user@]host:port` (user defaults to [`DEFAULT_SSH_USER`]; port is
+/// mandatory — RunPod maps a per-pod external port, there is no useful
+/// default).
 fn parse_ssh_target(target: &str) -> Result<(String, String, u16), String> {
     let (user, rest) = match target.split_once('@') {
         Some((user, rest)) => (user.to_string(), rest),
-        None => ("root".to_string(), target),
+        None => (DEFAULT_SSH_USER.to_string(), target),
     };
     let (host, port) = rest
         .split_once(':')
@@ -187,7 +220,40 @@ fn default_ledger_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ssh_target;
+    use super::{exit_status, parse_ssh_target, ssh_help, Cli, Command, PathBuf};
+    use clap::Parser as _;
+    use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
+
+    /// The CLI's two "default" spellings — `--remote-dir`'s clap
+    /// default and `--ssh`'s user fallback — must be the very
+    /// constants the SSH transport publishes, not copies of them: the
+    /// MCP pod target registry fills the same two holes from the same
+    /// source, and a drifting copy here would put a driver session and
+    /// a registry entry on different remote directories / users while
+    /// both claim the "default".
+    #[test]
+    fn cli_defaults_are_the_shared_ssh_constants() {
+        let cli = Cli::parse_from([
+            "lm-provision-driver",
+            "apply",
+            "--ssh",
+            "1.2.3.4:22",
+            "--key",
+            "/k",
+            "--profile",
+            "profile.json",
+            "--skip-install",
+        ]);
+        let Command::Apply(args) = cli.command;
+        assert_eq!(args.remote_dir, PathBuf::from(DEFAULT_REMOTE_DIR));
+
+        let (user, _, _) = parse_ssh_target("1.2.3.4:22").expect("host:port parses");
+        assert_eq!(user, DEFAULT_SSH_USER);
+        assert!(
+            ssh_help().contains(DEFAULT_SSH_USER),
+            "--help must document the same default it applies"
+        );
+    }
 
     #[test]
     fn parse_ssh_target_accepts_user_host_port_and_defaults_root() {
@@ -206,5 +272,21 @@ mod tests {
         assert!(parse_ssh_target("1.2.3.4").is_err());
         assert!(parse_ssh_target("1.2.3.4:abc").is_err());
         assert!(parse_ssh_target("root@:22").is_err());
+    }
+
+    /// The session no longer fails when step 5's append fails — it
+    /// returns the report plus a warning. This is where that warning
+    /// stops being swallowable: an `ok` report whose ledger row is
+    /// missing exits `1`, so a caller scripting the driver sees the
+    /// unrecorded apply without having to parse stderr.
+    #[test]
+    fn an_ok_report_with_a_failed_ledger_append_still_exits_nonzero() {
+        assert_eq!(exit_status(true, None), 0);
+        assert_eq!(exit_status(true, Some("ledger i/o error: no such file")), 1);
+        assert_eq!(exit_status(false, None), 1);
+        assert_eq!(
+            exit_status(false, Some("ledger i/o error: no such file")),
+            1
+        );
     }
 }
