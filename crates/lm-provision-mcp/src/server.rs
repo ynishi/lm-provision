@@ -95,7 +95,7 @@ fn join_error(err: tokio::task::JoinError) -> McpError {
 }
 
 /// `lm_apply`'s body, without `rmcp`: resolve the `pod_id` against the
-/// pod target registry, then run the driver protocol against whatever
+/// pod target registry, then run one driver session against whatever
 /// transport that entry denotes.
 ///
 /// Split out from the `#[tool]` method (which is a thin wrapper over
@@ -104,9 +104,16 @@ fn join_error(err: tokio::task::JoinError) -> McpError {
 /// [`apply_tool::lm_apply`] takes an already-resolved transport, and an
 /// unregistered `pod_id` has none to pass.
 ///
-/// Both failure modes are 10 §Error surface's precondition class — an
-/// unknown `pod_id` and a missing secret are equally "the call cannot
-/// start" — so both map to `invalid_params`.
+/// Both arms map to `invalid_params`. An unknown `pod_id` is squarely
+/// 10 §Error surface's precondition class, and so is most of what
+/// [`apply_tool::ApplyToolError`] wraps (a profile that does not
+/// validate, a secret the server's environment does not hold) — "the
+/// call cannot start". A transport-class failure inside the session
+/// (08 §Error surface: driver-side, retryable) is not the same thing
+/// and MCP has a code for it; it is folded in here only because
+/// nothing downstream distinguishes them yet. The distinction survives
+/// in the error value ([`apply_tool::ApplyToolError::Session`]), which
+/// is what a later refinement would match on.
 fn handle_lm_apply(
     registry: &TargetRegistry,
     binary_path: &Path,

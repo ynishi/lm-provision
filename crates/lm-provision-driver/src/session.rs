@@ -10,6 +10,13 @@
 //! connection, an in-process profile hash (the operator host cannot
 //! run the musl artifact it is about to push), and the ledger append
 //! duty (step 5).
+//!
+//! Step 5 is the one step whose failure does not fail the session: the
+//! apply has already run by then, so the append failure is reported as
+//! [`SessionOutput::ledger_warning`] alongside the collected report
+//! rather than in place of it. 09 §Error surface's "do not swallow" is
+//! then the caller's duty — every caller of [`run`] must surface that
+//! string (the CLI prints it and exits non-zero).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -65,6 +72,21 @@ pub struct SessionOutput {
     pub collected: CollectedApply,
     /// Whether step 5 appended a ledger row.
     pub ledger_appended: bool,
+    /// Why step 5 did not append, when it was supposed to — `Some` iff
+    /// `ledger_appended` is `false` *and* the plan asked for an append.
+    ///
+    /// A failed append does not fail the session: by the time step 5
+    /// runs the apply has already happened on the pod, and returning
+    /// `Err` here would discard the one record of what it did, leaving
+    /// a caller with neither the report nor a way to reconstruct it.
+    /// 09 §Error surface's "an apply is not 'unrecorded-successful' —
+    /// drivers must treat append failure as an operational error to
+    /// retry, not swallow" is met by handing the failure back next to
+    /// the output rather than by throwing the output away; **not
+    /// swallowing it is the caller's duty** — surfacing this string is
+    /// what makes the missing row visible (the CLI prints it and exits
+    /// non-zero; `lm_apply` returns it as `ledger_warning`).
+    pub ledger_warning: Option<String>,
 }
 
 /// Session-level failures. Transport-class errors stay retryable per
@@ -116,11 +138,10 @@ pub enum SessionError {
     /// a host crash, never a normal apply failure).
     #[error("collected stdout did not parse as a report: {0}")]
     ReportParse(#[source] serde_json::Error),
-
-    /// Step 5's append failed (09 §Error surface: retry, do not
-    /// swallow — the apply is not "unrecorded-successful").
-    #[error("ledger append failed: {0}")]
-    Ledger(#[from] ledger::LedgerError),
+    // Step 5's append failure is deliberately *not* a variant here: it
+    // happens after the pod-side apply, so failing the session would
+    // discard the collected report. It travels back as
+    // [`SessionOutput::ledger_warning`] instead.
 }
 
 /// Run one driver session (08 §Session steps 0-5) against `transport`.
@@ -193,27 +214,30 @@ pub fn run(
     };
 
     // Step 5 ledger (gate: ledger = None). A validate-only session
-    // records nothing — no apply happened.
-    let ledger_appended = match (&plan.ledger, plan.mode) {
+    // records nothing — no apply happened. A failed append leaves a
+    // warning next to the output instead of replacing it (see
+    // [`SessionOutput::ledger_warning`]).
+    let (ledger_appended, ledger_warning) = match (&plan.ledger, plan.mode) {
         (Some(path), InvokeMode::Apply | InvokeMode::DryRun) => {
-            ledger::append(
-                path,
-                &LedgerRow {
-                    pod_id: pod_id.to_string(),
-                    profile_hash: local_hash,
-                    report,
-                    collected_at: collected.collected_at.clone(),
-                },
-            )?;
-            true
+            let row = LedgerRow {
+                pod_id: pod_id.to_string(),
+                profile_hash: local_hash,
+                report,
+                collected_at: collected.collected_at.clone(),
+            };
+            match ledger::append(path, &row) {
+                Ok(()) => (true, None),
+                Err(err) => (false, Some(err.to_string())),
+            }
         }
-        _ => false,
+        _ => (false, None),
     };
 
     Ok(SessionOutput {
         paths,
         collected,
         ledger_appended,
+        ledger_warning,
     })
 }
 

@@ -148,17 +148,37 @@ fn run_apply(args: ApplyArgs) -> ExitCode {
             // report on stdout, transcript on stderr.
             eprint!("{}", output.collected.stderr);
             println!("{}", output.collected.report);
-            let ok = output.collected.report["ok"] == serde_json::Value::Bool(true);
-            if ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
+            // 09 §Error surface's "do not swallow" is discharged here:
+            // the session hands a failed step-5 append back as a
+            // warning (it will not throw the report away), and this is
+            // the caller that has to make the missing row visible.
+            if let Some(warning) = &output.ledger_warning {
+                eprintln!("error: ledger append failed: {warning}");
             }
+            let ok = output.collected.report["ok"] == serde_json::Value::Bool(true);
+            ExitCode::from(exit_status(ok, output.ledger_warning.as_deref()))
         }
         Err(err) => {
             eprintln!("error: {err}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// The exit code a completed session maps to: `0` only when the apply
+/// reported `ok` **and** step 5 recorded it.
+///
+/// An unrecorded apply is not a success to report as one (09 §Error
+/// surface: "an apply is not 'unrecorded-successful' — drivers must
+/// treat append failure as an operational error to retry"), so a
+/// `ledger_warning` costs the zero exit even when the report itself is
+/// `ok`. The report still goes to stdout: an operator retrying the
+/// append needs to know what it was.
+fn exit_status(report_ok: bool, ledger_warning: Option<&str>) -> u8 {
+    if report_ok && ledger_warning.is_none() {
+        0
+    } else {
+        1
     }
 }
 
@@ -200,7 +220,7 @@ fn default_ledger_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ssh_target, ssh_help, Cli, Command, PathBuf};
+    use super::{exit_status, parse_ssh_target, ssh_help, Cli, Command, PathBuf};
     use clap::Parser as _;
     use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
 
@@ -252,5 +272,21 @@ mod tests {
         assert!(parse_ssh_target("1.2.3.4").is_err());
         assert!(parse_ssh_target("1.2.3.4:abc").is_err());
         assert!(parse_ssh_target("root@:22").is_err());
+    }
+
+    /// The session no longer fails when step 5's append fails — it
+    /// returns the report plus a warning. This is where that warning
+    /// stops being swallowable: an `ok` report whose ledger row is
+    /// missing exits `1`, so a caller scripting the driver sees the
+    /// unrecorded apply without having to parse stderr.
+    #[test]
+    fn an_ok_report_with_a_failed_ledger_append_still_exits_nonzero() {
+        assert_eq!(exit_status(true, None), 0);
+        assert_eq!(exit_status(true, Some("ledger i/o error: no such file")), 1);
+        assert_eq!(exit_status(false, None), 1);
+        assert_eq!(
+            exit_status(false, Some("ledger i/o error: no such file")),
+            1
+        );
     }
 }
