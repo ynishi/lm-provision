@@ -30,6 +30,21 @@ use sha2::{Digest as _, Sha256};
 
 use crate::transport::{ExecOutput, PodPaths, Transport, TransportError};
 
+/// Remote user assumed when a caller does not name one (08 §Session
+/// contract `ConnectionSpec`: "user (default root)" — RunPod pods run
+/// as `root`).
+///
+/// The literal lives next to the transport it configures so the
+/// driver CLI's `--ssh` fallback and any other caller that fills the
+/// same hole (the MCP server's pod target registry) read one value
+/// rather than repeating the string.
+pub const DEFAULT_SSH_USER: &str = "root";
+
+/// Remote directory uploads land in when a caller does not name one
+/// (the driver CLI's `--remote-dir` default). Same single-source
+/// rationale as [`DEFAULT_SSH_USER`].
+pub const DEFAULT_REMOTE_DIR: &str = "/root";
+
 /// SSH connection spec (08 §Session contract `ConnectionSpec`).
 #[derive(Debug, Clone)]
 pub struct SshTransport {

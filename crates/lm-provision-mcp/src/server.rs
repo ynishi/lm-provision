@@ -15,7 +15,7 @@
 //! transport / precondition errors surface through the MCP error
 //! channel, not embedded in a success payload).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -23,10 +23,11 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::apply_tool::{self, ApplyArgs};
+use crate::apply_tool::{self, ApplyArgs, ApplyOutput};
 use crate::config::Config;
 use crate::ledger_tools;
 use crate::pipeline;
+use crate::targets::TargetRegistry;
 
 /// `lm_validate` / `lm_hash` / `lm_plan` request shape (10 §Tool set: a
 /// single `profile_path` string argument, shared by all three).
@@ -43,7 +44,10 @@ pub struct ProfilePathParams {
 pub struct ApplyParams {
     /// Path to the profile file, visible to this MCP server's host.
     pub profile_path: String,
-    /// Driver-provided provisioning context (09 §Ledger `pod_id`).
+    /// Driver-provided provisioning context (09 §Ledger `pod_id`), and
+    /// the key resolved in the pod target registry to decide where the
+    /// apply runs ([`crate::targets`]). Connection details are server
+    /// configuration; they are deliberately not arguments here.
     pub pod_id: String,
     /// Decode + policy + secret resolution only, no effects. Defaults
     /// to `false` (10 §Tool set).
@@ -88,6 +92,33 @@ fn precondition_error(message: impl Into<String>) -> McpError {
 /// to an MCP internal error.
 fn join_error(err: tokio::task::JoinError) -> McpError {
     McpError::internal_error(err.to_string(), None)
+}
+
+/// `lm_apply`'s body, without `rmcp`: resolve the `pod_id` against the
+/// pod target registry, then run the driver protocol against whatever
+/// transport that entry denotes.
+///
+/// Split out from the `#[tool]` method (which is a thin wrapper over
+/// it) so the "unregistered `pod_id` produces no effect" case is
+/// testable at the function level. It cannot be tested one layer down:
+/// [`apply_tool::lm_apply`] takes an already-resolved transport, and an
+/// unregistered `pod_id` has none to pass.
+///
+/// Both failure modes are 10 §Error surface's precondition class — an
+/// unknown `pod_id` and a missing secret are equally "the call cannot
+/// start" — so both map to `invalid_params`.
+fn handle_lm_apply(
+    registry: &TargetRegistry,
+    binary_path: &Path,
+    ledger_path: &Path,
+    args: ApplyArgs<'_>,
+) -> Result<ApplyOutput, McpError> {
+    let transport = registry
+        .resolve(args.pod_id)
+        .map_err(|err| precondition_error(err.to_string()))?
+        .to_transport();
+    apply_tool::lm_apply(transport.as_ref(), binary_path, ledger_path, args)
+        .map_err(|err| precondition_error(err.to_string()))
 }
 
 /// The MCP server handler (10-mcp.md). Deployment configuration
@@ -152,10 +183,13 @@ impl LmProvisionServer {
 
     /// `lm_apply` (10 §Tool set: `profile_path`, `pod_id`,
     /// `dry_run=false`; backing surface 08 upload/invoke/collect).
+    /// `pod_id` selects the destination through the pod target registry
+    /// ([`crate::targets`]); an unregistered one fails before any
+    /// effect.
     #[tool(
-        description = "Run the full push-driver protocol (upload/invoke/collect) against the \
-                        MVP local-exec transport, then append the result to the apply ledger \
-                        (08/09-mcp.md)."
+        description = "Run the full push-driver protocol (upload/invoke/collect) against the pod \
+                        the given pod_id is registered for, then append the result to the apply \
+                        ledger (08/09-mcp.md). An unregistered pod_id is rejected."
     )]
     async fn lm_apply(
         &self,
@@ -168,20 +202,19 @@ impl LmProvisionServer {
         let config = self.config.clone();
         let profile_path = PathBuf::from(profile_path);
         let output = tokio::task::spawn_blocking(move || {
-            apply_tool::lm_apply(
+            handle_lm_apply(
+                &config.targets,
+                &config.binary_path,
+                &config.ledger_path,
                 ApplyArgs {
                     profile_path: &profile_path,
                     pod_id: &pod_id,
                     dry_run,
                 },
-                &config.binary_path,
-                &config.staging_dir,
-                &config.ledger_path,
             )
         })
         .await
-        .map_err(join_error)?
-        .map_err(|err| precondition_error(err.to_string()))?;
+        .map_err(join_error)??;
         let value = serde_json::to_value(output)
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
         json_result(value)
@@ -247,6 +280,84 @@ impl ServerHandler for LmProvisionServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use lm_provision_driver::ledger::{self, LedgerRow};
+    use rmcp::model::ErrorCode;
+
+    use crate::targets::{RegistrySource, TargetRegistry};
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lm-provision-mcp-server-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
+    }
+
+    /// An unregistered `pod_id` is rejected as a precondition failure
+    /// and nothing runs: no upload, no invoke, and — the observable
+    /// part — no ledger row. A `pod_id` that resolves to nothing must
+    /// not be able to leave a record claiming an apply happened.
+    ///
+    /// The `binary_path` / `profile_path` here point at files that do
+    /// not exist: if the rejection ever stopped happening first, the
+    /// call would fail for a different reason, which the message
+    /// assertion catches.
+    #[test]
+    fn an_unregistered_pod_id_is_rejected_before_any_effect() {
+        let ledger_path = temp_path("unknown-pod-ledger").with_extension("jsonl");
+        ledger::append(
+            &ledger_path,
+            &LedgerRow {
+                pod_id: "dev-local".to_string(),
+                profile_hash: "0".repeat(64),
+                report: serde_json::json!({ "ok": true }),
+                collected_at: "2026-08-06T00:00:00Z".to_string(),
+            },
+        )
+        .expect("seed the ledger with one row");
+        let before = ledger::list(&ledger_path)
+            .expect("ledger is readable")
+            .len();
+
+        let registry = TargetRegistry::load(
+            RegistrySource::FromFile(PathBuf::from("/etc/lm-provision/targets.json")),
+            r#"{ "targets": [ { "pod_id": "dev-local", "kind": "local-exec" } ] }"#,
+            Path::new("/tmp/lm-provision-staging"),
+        )
+        .expect("registry loads");
+
+        let err = handle_lm_apply(
+            &registry,
+            Path::new("/nonexistent/lm-provision"),
+            &ledger_path,
+            ApplyArgs {
+                profile_path: Path::new("/nonexistent/profile.json"),
+                pod_id: "pod-not-registered",
+                dry_run: true,
+            },
+        )
+        .expect_err("an unregistered pod_id must not reach the driver protocol");
+
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("pod-not-registered") && err.message.contains("dev-local"),
+            "the client must be told which pod_id failed and which are registered: {}",
+            err.message
+        );
+        assert_eq!(
+            ledger::list(&ledger_path)
+                .expect("ledger is readable")
+                .len(),
+            before,
+            "a rejected pod_id must not append a ledger row"
+        );
+
+        std::fs::remove_file(&ledger_path).ok();
+    }
 
     /// Smoke test (task instruction): the `#[tool_router]` macro must
     /// generate schema entries for exactly the six tools 10 §Tool set
