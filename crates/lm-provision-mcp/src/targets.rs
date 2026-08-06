@@ -37,6 +37,7 @@ use lm_provision_driver::local_exec::LocalExecTransport;
 use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
 use lm_provision_driver::transport::Transport;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 /// Where a [`TargetRegistry`]'s contents came from, carried so an error
 /// can name the file an operator has to edit.
@@ -71,13 +72,21 @@ impl fmt::Display for RegistrySource {
 ///
 /// An array, not a `pod_id`-keyed object: a duplicate key in an object
 /// is silently resolved last-wins by any JSON decoder, which would put
-/// an unchecked destination *inside* the registry. Entries are held as
-/// raw [`serde_json::Value`] for one decoding step only, so a failing
-/// entry can still be named by its `pod_id` in the error.
+/// an unchecked destination *inside* the registry.
+///
+/// The same hole exists one level in, and is closed the same way.
+/// Entries are held as [`RawValue`] — the entry's JSON text, undecoded —
+/// rather than [`serde_json::Value`], because building a `Value` means
+/// building a map, and a map collapses a repeated `"host"` within one
+/// entry last-wins before `TargetSpec` ever sees it. Keeping the text
+/// lets [`serde_json::from_str`] drive the derived `Deserialize`
+/// directly, which rejects a repeated field as `duplicate field`. The
+/// text is also still readable for the `pod_id` an error has to name
+/// (see [`declared_pod_id`]).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryFile {
-    targets: Vec<serde_json::Value>,
+    targets: Vec<Box<RawValue>>,
 }
 
 /// One registry entry as written in the file — decode only.
@@ -344,13 +353,10 @@ impl TargetRegistry {
         for entry in file.targets {
             // Read the id before decoding the entry, so a decode
             // failure can still say which entry failed.
-            let declared_pod_id = entry
-                .get("pod_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
+            let label_pod_id = declared_pod_id(entry.get());
             let spec: TargetSpec =
-                serde_json::from_value(entry).map_err(|error| TargetLoadError::Decode {
-                    pod_id: declared_pod_id,
+                serde_json::from_str(entry.get()).map_err(|error| TargetLoadError::Decode {
+                    pod_id: label_pod_id,
                     registry: source.clone(),
                     error,
                 })?;
@@ -387,6 +393,25 @@ impl TargetRegistry {
                 registered: self.targets.iter().map(|(id, _)| id.clone()).collect(),
             })
     }
+}
+
+/// Read an entry's `pod_id` out of its raw JSON text, for labelling an
+/// error only.
+///
+/// Deliberately best-effort and deliberately not the decode path: it
+/// goes through [`serde_json::Value`], so a repeated `"pod_id"` is read
+/// last-wins here. That is harmless because the entry is decoded
+/// separately in [`TargetRegistry::load`], where the repetition is a
+/// `duplicate field` failure — this function only picks the name that
+/// failure is reported under. Returns `None` when the entry is not an
+/// object, or has no string `pod_id`, in which case
+/// [`entry_label`] names the file instead of inventing an id.
+fn declared_pod_id(raw_entry: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw_entry)
+        .ok()?
+        .get("pod_id")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Name what failed in a [`TargetLoadError::Decode`] message: the
@@ -493,6 +518,60 @@ mod tests {
                 "message should name the entry and the file: {message}"
             );
         }
+    }
+
+    /// A key written twice inside one entry declares two values for one
+    /// field. Decoding the entry from its raw text (rather than from a
+    /// `Value`, whose map would keep only the last one) makes serde
+    /// reject it, so neither of the two declarations is silently
+    /// preferred.
+    #[test]
+    fn a_repeated_key_within_one_entry_is_a_decode_error_that_names_the_entry() {
+        let err = load(
+            r#"{ "targets": [
+                { "pod_id": "pod-1", "kind": "ssh", "host": "a.example.com",
+                  "host": "b.example.com", "port": 22, "key_path": "/path/to/key" }
+            ] }"#,
+        )
+        .expect_err("two hosts for one entry is not one destination");
+
+        assert!(
+            matches!(err, TargetLoadError::Decode { pod_id: Some(ref id), .. } if id == "pod-1"),
+            "expected a Decode naming pod-1, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("duplicate field") && message.contains("host"),
+            "the message should say which field was declared twice: {message}"
+        );
+        assert!(
+            message.contains("pod-1") && message.contains(REGISTRY_PATH),
+            "message should name the entry and the file: {message}"
+        );
+    }
+
+    /// The registry key itself is not exempt: a repeated `pod_id` is
+    /// the same `duplicate field` failure. The label the error is
+    /// reported under is read last-wins, since that read is only there
+    /// to name the entry and takes no part in accepting it.
+    #[test]
+    fn a_repeated_pod_id_within_one_entry_is_a_decode_error_labelled_last_wins() {
+        let err = load(
+            r#"{ "targets": [
+                { "pod_id": "pod-1", "kind": "local-exec", "pod_id": "pod-2" }
+            ] }"#,
+        )
+        .expect_err("two ids for one entry is not one registration");
+
+        assert!(
+            matches!(err, TargetLoadError::Decode { pod_id: Some(ref id), .. } if id == "pod-2"),
+            "expected a Decode labelled with the last-wins id, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("duplicate field") && message.contains("pod_id"),
+            "the message should say which field was declared twice: {message}"
+        );
     }
 
     /// A malformed top level has no entry to name, and says so instead
