@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.4.0] - 2026-08-06
+
+### Added
+
 - **Pod target registry (`lm-provision-mcp`).** `LM_PROVISION_TARGETS`
   points at a JSON file naming every pod the server may provision, and
   `lm_apply` resolves its `pod_id` against it. Entries are an array —
