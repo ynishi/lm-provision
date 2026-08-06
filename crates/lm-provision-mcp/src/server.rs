@@ -94,6 +94,42 @@ fn join_error(err: tokio::task::JoinError) -> McpError {
     McpError::internal_error(err.to_string(), None)
 }
 
+/// Record an `lm_apply` failure in full, and hand the client the part
+/// of it that is addressed to a client
+/// ([`apply_tool::ApplyToolError::client_message`]).
+///
+/// The two duties are one function so they cannot drift apart: the
+/// redaction is only acceptable *because* the full error is written to
+/// the server's log in the same breath. `main` initializes tracing on
+/// stderr, so an operator watching the server sees the `ssh` / `scp` or
+/// pod-side stderr this message drops — nothing is lost, only
+/// readdressed.
+///
+/// # Why the event is `ERROR` and must stay there
+///
+/// The level is not a severity judgement; it is what makes the sentence
+/// above true. `main` builds its subscriber from
+/// `EnvFilter::from_default_env()`, and `tracing-subscriber` documents
+/// that when `RUST_LOG` is unset, empty, or wholly invalid it injects a
+/// default directive enabling **the `ERROR` level only**. `RUST_LOG`
+/// unset is the ordinary state of a stdio MCP server spawned by its
+/// client: nothing in this repo sets it, and no operator action is
+/// required to run the server. At `WARN` this event would therefore be
+/// dropped by default, and the client would be handed
+/// "(see server log)" pointing at a line that was never written — the
+/// dropped detail destroyed rather than readdressed.
+///
+/// So: lowering this to `warn!`/`info!`/`debug!` silently voids
+/// [`apply_tool::ApplyToolError::client_message`]'s justification. If
+/// the level is ever to be lowered, `main`'s filter has to grow a
+/// default directive of its own first (e.g.
+/// `EnvFilter::builder().with_default_directive(LevelFilter::WARN.into())`),
+/// so that the operator's copy still exists without `RUST_LOG`.
+fn log_and_map_apply_error(err: &apply_tool::ApplyToolError, pod_id: &str) -> McpError {
+    tracing::error!(pod_id, error = %err, "lm_apply failed");
+    precondition_error(err.client_message(pod_id))
+}
+
 /// `lm_apply`'s body, without `rmcp`: resolve the `pod_id` against the
 /// pod target registry, then run one driver session against whatever
 /// transport that entry denotes.
@@ -114,6 +150,16 @@ fn join_error(err: tokio::task::JoinError) -> McpError {
 /// nothing downstream distinguishes them yet. The distinction survives
 /// in the error value ([`apply_tool::ApplyToolError::Session`]), which
 /// is what a later refinement would match on.
+///
+/// The two arms differ in how much of the error the client is shown.
+/// [`TargetResolveError`] is already written for this audience — it
+/// names the `pod_id`, the registry, and the registered ids, and
+/// nothing about how to reach a pod ([`crate::targets`]) — so its
+/// message travels as-is. A session failure can relay an external
+/// process's stderr, so it goes through
+/// [`log_and_map_apply_error`] instead.
+///
+/// [`TargetResolveError`]: crate::targets::TargetResolveError
 fn handle_lm_apply(
     registry: &TargetRegistry,
     binary_path: &Path,
@@ -125,7 +171,7 @@ fn handle_lm_apply(
         .map_err(|err| precondition_error(err.to_string()))?
         .to_transport();
     apply_tool::lm_apply(transport.as_ref(), binary_path, ledger_path, args)
-        .map_err(|err| precondition_error(err.to_string()))
+        .map_err(|err| log_and_map_apply_error(&err, args.pod_id))
 }
 
 /// The MCP server handler (10-mcp.md). Deployment configuration
@@ -288,10 +334,20 @@ impl ServerHandler for LmProvisionServer {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
     use lm_provision_driver::ledger::{self, LedgerRow};
+    use lm_provision_driver::transport::{ExecOutput, PodPaths, Transport, TransportError};
     use rmcp::model::ErrorCode;
 
     use crate::targets::{RegistrySource, TargetRegistry};
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "{}/../lm-provision/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -363,6 +419,235 @@ mod tests {
             "a rejected pod_id must not append a ledger row"
         );
 
+        std::fs::remove_file(&ledger_path).ok();
+    }
+
+    /// How a [`FailingTransport`] fails: the two session failures that
+    /// relay an external process's own output back to this layer.
+    enum Failure {
+        /// A transport call fails carrying the text `ssh` / `scp` write
+        /// on their own stderr (`driver/src/ssh.rs` embeds it verbatim).
+        Transport(String),
+        /// The pod's own `hash` invocation exits non-zero with this
+        /// stderr.
+        RemoteHash {
+            /// The remote exit code.
+            exit_code: i32,
+            /// The remote stderr.
+            stderr: String,
+        },
+    }
+
+    /// A [`Transport`] rigged to fail in one chosen way, so a test can
+    /// hold a *real* [`apply_tool::ApplyToolError`] that carries
+    /// external-process text — the only kind of error worth asserting
+    /// redaction on.
+    ///
+    /// It is not reachable through [`handle_lm_apply`], which builds its
+    /// transport from a registry entry — so the two tests below enter at
+    /// [`log_and_map_apply_error`] to exercise the *mapping* against a
+    /// chosen failure. That the mapping is actually wired into
+    /// `handle_lm_apply` is a separate claim, asserted by
+    /// `handle_lm_apply_redacts_a_transport_failure_from_a_registered_pod`
+    /// through a real `local-exec` entry.
+    struct FailingTransport {
+        failure: Failure,
+    }
+
+    impl FailingTransport {
+        /// Either fail the upload outright, or let it land at `dest` so
+        /// the session reaches the remote `hash` invocation.
+        fn upload_to(&self, dest: &str) -> Result<PathBuf, TransportError> {
+            match &self.failure {
+                Failure::Transport(stderr) => {
+                    Err(TransportError::Io(std::io::Error::other(stderr.clone())))
+                }
+                Failure::RemoteHash { .. } => Ok(PathBuf::from(dest)),
+            }
+        }
+    }
+
+    impl Transport for FailingTransport {
+        fn dest_binary(&self, _local_binary: &Path) -> Result<PathBuf, TransportError> {
+            self.upload_to("/pod/lm-provision")
+        }
+
+        fn dest_profile(&self, _local_profile: &Path) -> Result<PathBuf, TransportError> {
+            self.upload_to("/pod/profile.json")
+        }
+
+        fn ensure_binary(&self, _local_binary: &Path) -> Result<PathBuf, TransportError> {
+            self.upload_to("/pod/lm-provision")
+        }
+
+        fn place_profile(&self, _local_profile: &Path) -> Result<PathBuf, TransportError> {
+            self.upload_to("/pod/profile.json")
+        }
+
+        fn exec(
+            &self,
+            _paths: &PodPaths,
+            _args: &[String],
+            _env: &BTreeMap<String, String>,
+        ) -> Result<ExecOutput, TransportError> {
+            match &self.failure {
+                Failure::Transport(stderr) => {
+                    Err(TransportError::Io(std::io::Error::other(stderr.clone())))
+                }
+                Failure::RemoteHash { exit_code, stderr } => Ok(ExecOutput {
+                    stdout: String::new(),
+                    stderr: stderr.clone(),
+                    exit_code: Some(*exit_code),
+                }),
+            }
+        }
+    }
+
+    /// Run an apply that is rigged to fail, and hand back the error the
+    /// session produced.
+    fn failed_apply(failure: Failure) -> apply_tool::ApplyToolError {
+        apply_tool::lm_apply(
+            &FailingTransport { failure },
+            Path::new("/nonexistent/lm-provision"),
+            &temp_path("redacted-ledger").with_extension("jsonl"),
+            ApplyArgs {
+                profile_path: &fixture("apply-sh-fs.json"),
+                pod_id: "test-pod-1",
+                dry_run: true,
+            },
+        )
+        .expect_err("the transport is rigged to fail")
+    }
+
+    /// A failure while connecting must not tell the client where it was
+    /// connecting to. `ssh` / `scp` name the host, the user, and the
+    /// identity file in their own standard phrasing, and the driver
+    /// relays that stderr verbatim — which is right for the CLI operator
+    /// who wrote the registry, and wrong for an MCP client that was
+    /// never given the connection in the first place.
+    ///
+    /// The `pod_id` does travel: the client passed it in, so it is not a
+    /// new disclosure, and it is what makes the message actionable.
+    #[test]
+    fn a_transport_failure_names_the_pod_and_nothing_about_the_connection() {
+        let err = failed_apply(Failure::Transport(
+            "scp /local/lm-provision -> /root/lm-provision exited with Some(1): \
+             root@pod.example.com: Permission denied (publickey)."
+                .to_string(),
+        ));
+
+        let mapped = log_and_map_apply_error(&err, "test-pod-1");
+        assert_eq!(mapped.code, ErrorCode::INVALID_PARAMS);
+        for connection_detail in ["pod.example.com", "root@", "publickey"] {
+            assert!(
+                !mapped.message.contains(connection_detail),
+                "the client must not be told '{connection_detail}': {}",
+                mapped.message
+            );
+        }
+        assert!(
+            mapped.message.contains("test-pod-1"),
+            "the client must be told which pod failed: {}",
+            mapped.message
+        );
+
+        // The other half of the trade: the operator's copy is intact,
+        // which is what makes dropping it from the client's copy
+        // acceptable (`log_and_map_apply_error` logs exactly this).
+        let logged = err.to_string();
+        for connection_detail in ["pod.example.com", "root@", "publickey"] {
+            assert!(
+                logged.contains(connection_detail),
+                "the server-side error must keep '{connection_detail}': {logged}"
+            );
+        }
+    }
+
+    /// The pod's own stderr is the same problem one layer further in:
+    /// unit 2 put the remote `hash` exit code on the failure path, so
+    /// whatever that invocation printed now reaches the client. The
+    /// exit code survives — it is a number the pod chose, not something
+    /// it said about its own filesystem.
+    #[test]
+    fn a_remote_hash_failure_keeps_the_exit_code_and_drops_the_pod_stderr() {
+        let err = failed_apply(Failure::RemoteHash {
+            exit_code: 127,
+            stderr: "/root/lm-provision: not found".to_string(),
+        });
+
+        let mapped = log_and_map_apply_error(&err, "test-pod-1");
+        assert!(
+            !mapped.message.contains("/root/lm-provision"),
+            "the pod's stderr must not travel: {}",
+            mapped.message
+        );
+        assert!(
+            mapped.message.contains("127") && mapped.message.contains("test-pod-1"),
+            "the exit code and the pod are what the client can act on: {}",
+            mapped.message
+        );
+
+        let logged = err.to_string();
+        assert!(
+            logged.contains("/root/lm-provision") && logged.contains("127"),
+            "the server-side error must keep the pod's stderr: {logged}"
+        );
+    }
+
+    /// The redaction has to be *wired in*, not merely available: this
+    /// enters where a tool call does. A registered `local-exec` entry
+    /// plus a `binary_path` that does not exist fails inside
+    /// `ensure_binary` (`driver/src/local_exec.rs`'s `fs::copy`), which
+    /// is a `SessionError::Transport` — the same class as an `ssh`
+    /// failure, reached without inventing a transport.
+    ///
+    /// The assertion distinguishes the two mappings: the pre-unit form
+    /// (`precondition_error(err.to_string())`) yields "apply session
+    /// failed: transport error: i/o error: ...", which the negative
+    /// assertion below rejects.
+    #[test]
+    fn handle_lm_apply_redacts_a_transport_failure_from_a_registered_pod() {
+        let staging_dir = temp_path("wired-redaction-staging");
+        let ledger_path = temp_path("wired-redaction-ledger").with_extension("jsonl");
+        let registry_json = serde_json::json!({
+            "targets": [
+                { "pod_id": "dev-local", "kind": "local-exec", "staging_dir": staging_dir }
+            ]
+        })
+        .to_string();
+        let registry = TargetRegistry::load(
+            RegistrySource::FromFile(PathBuf::from("/etc/lm-provision/targets.json")),
+            &registry_json,
+            Path::new("/this-default-must-not-be-used"),
+        )
+        .expect("registry loads");
+
+        let err = handle_lm_apply(
+            &registry,
+            Path::new("/nonexistent/lm-provision"),
+            &ledger_path,
+            ApplyArgs {
+                profile_path: &fixture("apply-sh-fs.json"),
+                pod_id: "dev-local",
+                dry_run: true,
+            },
+        )
+        .expect_err("a binary that does not exist cannot be staged");
+
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("transport error (see server log)")
+                && err.message.contains("dev-local"),
+            "the tool call must return the redacted form: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("i/o error"),
+            "the underlying transport text must not travel: {}",
+            err.message
+        );
+
+        std::fs::remove_dir_all(&staging_dir).ok();
         std::fs::remove_file(&ledger_path).ok();
     }
 

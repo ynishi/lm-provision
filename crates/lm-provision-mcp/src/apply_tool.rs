@@ -129,6 +129,71 @@ pub enum ApplyToolError {
     Session(#[from] SessionError),
 }
 
+impl ApplyToolError {
+    /// The message this failure may be shown to an MCP client as, for a
+    /// call that named `pod_id`.
+    ///
+    /// It exists because the audience changes at this boundary. An MCP
+    /// error is read by an AI client, while three [`SessionError`]
+    /// variants carry the output of an external process verbatim:
+    /// [`SessionError::Transport`] relays `ssh` / `scp` stderr (which
+    /// names the host, the user, and the identity file in its own
+    /// standard phrasing — `<user>@<host>: Permission denied
+    /// (publickey).`), [`SessionError::RemoteHash`] relays the pod's own
+    /// stderr, and [`SessionError::IntegrityMismatch`]'s `remote` is the
+    /// pod's stdout, trimmed and otherwise unchecked — and that variant
+    /// is constructed *precisely when* the value is not the digest it
+    /// was supposed to be, so "it is a hash" is false on the only path
+    /// that shows it to anyone. Those are exactly the connection details
+    /// [`crate::targets`] keeps out of the tool arguments, so handing
+    /// them back through the error channel would reintroduce them by
+    /// another route.
+    ///
+    /// Every variant is matched explicitly, with no wildcard arm. A
+    /// variant added to [`SessionError`] later is then a compile error
+    /// here rather than a silent relay of whatever it carries: the
+    /// classification above is a claim this function has to keep making,
+    /// not a default it can fall through.
+    ///
+    /// Only the *client-facing* string is narrowed. [`Display`] still
+    /// carries everything, and [`crate::server`] logs it at `ERROR` —
+    /// an operator reading the server log loses nothing.
+    ///
+    /// [`Display`]: std::fmt::Display
+    pub fn client_message(&self, pod_id: &str) -> String {
+        let detail = match self {
+            // The class and the pod are actionable; the relayed `ssh` /
+            // `scp` text is not, to this reader.
+            Self::Session(SessionError::Transport(_)) => {
+                "transport error (see server log)".to_string()
+            }
+            // The exit code is a number the pod chose, not something it
+            // said about its own configuration, so it survives.
+            Self::Session(SessionError::RemoteHash { exit_code, .. }) => format!(
+                "the pod's own hash invocation exited {exit_code:?} \
+                 (stderr in server log)"
+            ),
+            // `local` is this server's own in-process digest, so it is
+            // safe and it is the value the caller can compare against
+            // (`lm_hash` returns the same number). `remote` is whatever
+            // the pod printed — unbounded, unvalidated, and by
+            // construction *not* the digest — so it stays in the log.
+            Self::Session(SessionError::IntegrityMismatch { local, .. }) => format!(
+                "profile integrity mismatch: the pod did not answer the expected \
+                 hash {local} (its answer is in the server log)"
+            ),
+            // A missing secret's *name*, a profile that did not validate
+            // on this host, a serde position — none of them are
+            // external-process output, and all of them tell the caller
+            // what to change.
+            Self::Session(err @ SessionError::Profile(_)) => err.to_string(),
+            Self::Session(err @ SessionError::SecretMissing(_)) => err.to_string(),
+            Self::Session(err @ SessionError::ReportParse(_)) => err.to_string(),
+        };
+        format!("apply against pod '{pod_id}' failed: {detail}")
+    }
+}
+
 /// Run `lm_apply` end to end: one driver session (08 §Session steps
 /// 0-5) against `transport`, recording the collected apply in
 /// `ledger_path`.
@@ -611,6 +676,57 @@ mod tests {
         );
 
         std::fs::remove_file(&profile_path).ok();
+    }
+
+    /// The variants that carry no external-process output keep their
+    /// full message: a secret's *name* is what the caller declared (06
+    /// §Error surface's literal form, not the value), and a profile
+    /// rejection is this server's own validate result. Narrowing those
+    /// too would cost the client the one thing it can act on.
+    #[test]
+    fn client_message_keeps_the_detail_of_variants_that_relay_no_external_output() {
+        let missing_secret =
+            ApplyToolError::Session(SessionError::SecretMissing("HF_TOKEN".to_string()));
+        let message = missing_secret.client_message("test-pod-1");
+        assert!(message.contains("HF_TOKEN"), "{message}");
+        assert!(message.contains("test-pod-1"), "{message}");
+
+        let profile = ApplyToolError::Session(SessionError::Profile(
+            "path 'workspace/models' is not absolute".to_string(),
+        ));
+        let message = profile.client_message("test-pod-1");
+        assert!(message.contains("workspace/models"), "{message}");
+        assert!(message.contains("test-pod-1"), "{message}");
+    }
+
+    /// The third relay path. `remote` is the pod's stdout after a
+    /// `trim()` and nothing else (`driver/src/session.rs`), and this
+    /// variant exists *because* it was not the expected digest — so
+    /// whatever a version-skewed binary or a chatty shell init printed
+    /// is what would travel. `local` is this server's own computation
+    /// and stays: it is what the caller compares against.
+    #[test]
+    fn client_message_drops_the_pod_authored_side_of_an_integrity_mismatch() {
+        let err = ApplyToolError::Session(SessionError::IntegrityMismatch {
+            local: "a".repeat(64),
+            remote: "bash: /etc/profile.d/pod.sh: cannot open /root/.ssh/id_ed25519".to_string(),
+        });
+
+        let message = err.client_message("test-pod-1");
+        assert!(
+            !message.contains("/root/.ssh/id_ed25519") && !message.contains("pod.sh"),
+            "the pod's answer must not travel: {message}"
+        );
+        assert!(
+            message.contains(&"a".repeat(64)) && message.contains("test-pod-1"),
+            "the locally computed hash and the pod are what the client can act on: {message}"
+        );
+
+        let logged = err.to_string();
+        assert!(
+            logged.contains("/root/.ssh/id_ed25519"),
+            "the server-side error must keep what the pod answered: {logged}"
+        );
     }
 
     /// The apply already ran on the pod by the time the ledger append
