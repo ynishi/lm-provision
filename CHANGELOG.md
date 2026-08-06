@@ -9,13 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pod target registry (`lm-provision-mcp`).** `LM_PROVISION_TARGETS`
+  points at a JSON file naming every pod the server may provision, and
+  `lm_apply` resolves its `pod_id` against it. Entries are an array —
+  a `pod_id`-keyed object would let a duplicate key resolve last-wins,
+  which is the unchecked-destination shape the registry exists to
+  remove. Two kinds: `ssh` (the connection fields mirror spec 08
+  §Session contract's `ConnectionSpec`) and `local-exec`. `port` is
+  mandatory and non-zero, `key_path` is mandatory (spec 08 refuses to
+  fall back to a default key), `user` defaults to `root` and
+  `remote_dir` to `/root`; unknown fields are rejected so a misspelled
+  `keypath` cannot leave a documented default silently in force. Paths
+  are literal — neither `~` nor environment variables are expanded.
+- **`DEFAULT_SSH_USER` / `DEFAULT_REMOTE_DIR` (`lm-provision-driver`).**
+  The two ConnectionSpec defaults are now named constants the CLI and
+  the registry both read.
+
 ### Changed
+
+- **Breaking (`lm_apply` resolves `pod_id` before it runs anything).**
+  `pod_id` used to select nothing: every call ran against the same
+  local staging directory while the ledger stamped whatever pod the
+  caller named, so a row recorded an unchecked claim rather than an
+  observed destination (spec 09 §Ledger). A `pod_id` with no registry
+  entry is now a precondition error — no effect runs and no ledger row
+  is written. **Deployments must supply `LM_PROVISION_TARGETS`**: with
+  it unset the registry is empty and every apply fails. A path that is
+  set but unreadable or malformed fails startup instead of degrading to
+  "every pod is unknown".
+- **Breaking (`lm_apply` runs the session contract).** The MCP path
+  moved from the 2026-07 three-step middle onto `session::run` (spec 08
+  §Session steps 0-5). The profile is now validated before the first
+  transport call, so a profile that loads but fails validation is a
+  precondition error rather than a pod-side report.
+- **Breaking (a failed ledger append no longer discards the apply).**
+  `SessionOutput` carries `ledger_warning` and the session returns the
+  collected report either way; spec 09 §Error surface asks that the
+  record not be swallowed, not that the outcome be thrown away. The
+  duty to surface it moved to the caller: `lm-provision-driver` prints
+  the warning to stderr and exits 1 even on an ok report, and the MCP
+  server keeps returning `ledger_appended: false` alongside it.
+- **MCP error messages no longer carry connection details.** A failure
+  that crosses to the client keeps its class, the `pod_id`, and this
+  server's own values (the local digest, a missing secret's name, a
+  validation message) and drops what the pod or `ssh` authored. The
+  full text is logged at ERROR on the server instead. The CLI is
+  unchanged — the operator who wrote the registry still gets the raw
+  `ssh` / `scp` diagnostic.
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+- **The MCP server no longer executes the provisioner binary.** Hashing
+  the profile used to spawn the uploaded artifact locally, but that
+  artifact is the `x86_64-unknown-linux-musl` build meant for the pod
+  (spec 08 §Inputs) — a macOS server cannot run it, so the path could
+  not work outside a test that substituted a host-native build. The
+  session contract's in-process hash replaces it.
+- **A repeated key inside one registry entry is rejected.** Entries
+  were held as `serde_json::Value`, and building a `Value` builds a
+  map, so a second `"host"` in the same entry collapsed last-wins
+  before the entry was ever validated. Entries now keep their undecoded
+  JSON text, and the repeat is a `duplicate field` decode error naming
+  the entry.
 
 ### Security
 
