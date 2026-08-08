@@ -20,6 +20,7 @@ use dsl_kit::NodeId;
 
 use crate::profile_ast::ProfileNode;
 
+pub(crate) mod assert;
 pub mod audit;
 pub mod capgate;
 pub(crate) mod demand;

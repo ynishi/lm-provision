@@ -87,16 +87,28 @@ pub fn encode(node: &ProfileNode) -> String {
     out
 }
 
-/// SHA-256 of the [`encode`] bytes, lowercase hex, no prefix (64 chars).
-pub fn hash(node: &ProfileNode) -> String {
-    let bytes = encode(node);
-    let digest = Sha256::digest(bytes.as_bytes());
+/// SHA-256 of `bytes` rendered as hex.
+///
+/// Contract: **lowercase, zero-padded, exactly 64 chars, no prefix.**
+/// Every byte contributes two characters, so a digest byte below `0x10`
+/// keeps its leading zero.
+///
+/// This is the crate's single implementation of that rendering; callers
+/// that need a content digest go through here rather than writing
+/// another `{:02x}` loop.
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(64);
     for byte in digest {
         // `format!("{byte:02x}")` guarantees two lowercase hex chars.
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
+}
+
+/// SHA-256 of the [`encode`] bytes, lowercase hex, no prefix (64 chars).
+pub fn hash(node: &ProfileNode) -> String {
+    hex_sha256(encode(node).as_bytes())
 }
 
 // ---------------------------------------------------------------------
@@ -876,6 +888,10 @@ mod tests {
         );
         assert_eq!(encode(&empty_spec(&gen, "p")), expected_bytes);
         // sha256("{...}") — computed from expected_bytes.
+        // Deliberately inline rather than calling `hex_sha256`: this is
+        // the independent implementation the pin is checked against, and
+        // routing it through the helper would turn it into a copy of the
+        // code under test.
         let computed = {
             let d = Sha256::digest(expected_bytes.as_bytes());
             let mut s = String::with_capacity(64);

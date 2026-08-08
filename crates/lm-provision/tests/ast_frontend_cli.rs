@@ -57,6 +57,36 @@ fn hash_of_json_profile_prints_lowercase_hex_and_exits_zero() {
     assert_hex64(hex);
 }
 
+/// Pins one whole profile's digest to a literal, so a change to the
+/// canonical encoder or to the hex rendering in
+/// [`lm_provision::canonical::hash`] cannot pass unnoticed. The parity
+/// tests elsewhere in the suite compare two frontends against each
+/// other, so a hash function that changes *uniformly* still satisfies
+/// them; this test is the one that does not move.
+///
+/// The literal was captured **before** the `canonical.rs` hex-extraction
+/// edit that lands alongside this test:
+///
+/// - parent sha: `e91bed8bd7b0aa1440e49b6d3f564695009d8707`
+/// - how: this test was first added with a deliberately mismatched
+///   literal and run with `canonical.rs` still untouched; the assertion
+///   failure carried the digest.
+/// - equivalent command, from the repo root at that sha:
+///   `cargo run -p lm-provision -- hash crates/lm-provision/tests/fixtures/ast/valid.json`
+///
+/// The fixture is `tests/fixtures/ast/valid.json` (profile `demo-ast`),
+/// not the sibling `tests/fixtures/valid.json` (profile `demo-valid`).
+#[test]
+fn hash_of_the_ast_valid_json_profile_is_pinned_to_a_literal_digest() {
+    let (code, stdout, stderr) = run_hash(&fixture("ast/valid.json"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim_end(),
+        "740ec7843b0161b7310de5bcc6776a4c7d89ec6e7430974a706578c3961eedeb",
+        "the demo-ast profile's digest must not move",
+    );
+}
+
 #[test]
 fn hash_of_text_profile_prints_lowercase_hex_and_exits_zero() {
     let (code, stdout, stderr) = run_hash(&fixture("ast/valid.txt"));

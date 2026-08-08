@@ -39,3 +39,4 @@ dsl-kit-parse = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+tokio = { workspace = true }
