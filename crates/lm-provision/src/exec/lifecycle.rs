@@ -67,8 +67,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+use tokio::time::sleep;
 
 use serde::Deserialize;
 
@@ -973,6 +974,13 @@ impl From<ExecError> for StepFailure {
 /// On failure the error travels with whatever the step observed first
 /// ([`StepFailure`]); callers that only need the error take
 /// [`StepFailure::error`].
+///
+/// Two of the four step kinds reach an async effect (`transfer` streams
+/// a file, `http_poll` reads a URL), and the registry that calls this
+/// sits behind `dsl_kit::Op::apply`, which is synchronous. Those two are
+/// therefore driven through [`effects::block_on_effect`] here rather
+/// than making the whole step surface async for the two kinds — `sh` and
+/// `note` — that have nothing to await.
 pub fn execute_step(
     step: &Step,
     op: &str,
@@ -981,7 +989,7 @@ pub fn execute_step(
     match step {
         Step::Sh(argv) => execute_sh(argv, op, env),
         Step::Transfer { src, dst } => {
-            let outcome = effects::transfer(src, dst)?;
+            let outcome = effects::block_on_effect(op, effects::transfer(src, dst))?;
             Ok(StepResult {
                 summary: format!(
                     "transfer src={src} dst={} bytes={}",
@@ -997,12 +1005,15 @@ pub fn execute_step(
             timeout_sec,
             pid_file,
             log_path,
-        } => execute_http_poll(
-            url,
-            *timeout_sec,
-            pid_file.as_deref(),
-            log_path.as_deref(),
+        } => effects::block_on_effect(
             op,
+            execute_http_poll(
+                url,
+                *timeout_sec,
+                pid_file.as_deref(),
+                log_path.as_deref(),
+                op,
+            ),
         ),
         Step::Note(message) => Ok(StepResult::summary_only(format!("note \"{message}\""))),
     }
@@ -1106,7 +1117,7 @@ fn log_tail(log_path: &str) -> String {
     }
 }
 
-fn execute_http_poll(
+async fn execute_http_poll(
     url: &str,
     timeout_sec: u64,
     pid_file: Option<&str>,
@@ -1121,6 +1132,7 @@ fn execute_http_poll(
         op,
         Path::new(PROC_ROOT),
     )
+    .await
 }
 
 /// [`execute_http_poll`] with the procfs root injected (tests supply a
@@ -1143,7 +1155,7 @@ fn execute_http_poll(
 /// a couple of seconds wide, while the crash this exists for (an
 /// engine failing to `bind()` after its import phase) happens tens of
 /// seconds in, comfortably inside the armed window.
-fn execute_http_poll_in(
+async fn execute_http_poll_in(
     url: &str,
     timeout_sec: u64,
     pid_file: Option<&str>,
@@ -1163,7 +1175,7 @@ fn execute_http_poll_in(
     // per-probe one.
     let probe_opts = effects::HttpOpts::default();
     loop {
-        match effects::http_get(url, &probe_opts) {
+        match effects::http_get(url, &probe_opts).await {
             Ok(outcome) => {
                 if (200..300).contains(&outcome.status) {
                     return Ok(StepResult {
@@ -1215,7 +1227,7 @@ fn execute_http_poll_in(
             }
             .into());
         }
-        sleep(Duration::from_secs(HTTP_POLL_INTERVAL_SEC));
+        sleep(Duration::from_secs(HTTP_POLL_INTERVAL_SEC)).await;
     }
 }
 
@@ -2674,8 +2686,8 @@ mod tests {
     /// mid-wait, so the poll fails on the next iteration rather than
     /// spending its whole deadline on a socket nobody is listening on.
     /// The launch log travels with the failure.
-    #[test]
-    fn a_poll_fails_at_once_when_a_launch_it_saw_running_disappears() {
+    #[tokio::test]
+    async fn a_poll_fails_at_once_when_a_launch_it_saw_running_disappears() {
         let dir = scratch_dir("died");
         let proc_root = dir.join("proc");
         let procfs_entry = proc_root.join("31337");
@@ -2710,6 +2722,7 @@ mod tests {
             "service_ready",
             &proc_root,
         )
+        .await
         .expect_err("a launch that died during the wait must fail the poll");
 
         assert!(
@@ -2742,8 +2755,8 @@ mod tests {
     /// Reporting that as a death would fail a profile that never
     /// launched anything, so the poll falls through to its ordinary
     /// timeout.
-    #[test]
-    fn a_stale_pid_file_never_becomes_a_death_verdict() {
+    #[tokio::test]
+    async fn a_stale_pid_file_never_becomes_a_death_verdict() {
         let dir = scratch_dir("stale");
         let proc_root = dir.join("proc");
         // No procfs entry for the pid: dead from the very first probe.
@@ -2761,6 +2774,7 @@ mod tests {
             "service_ready",
             &proc_root,
         )
+        .await
         .expect_err("an unreachable URL still fails the poll");
         match &failure.error {
             ExecError::EffectFailed { op, message } => {
@@ -2780,8 +2794,8 @@ mod tests {
     /// The same stale pid file does not stand between a resume poll and
     /// a server that is already up: the URL answering is the whole
     /// verdict.
-    #[test]
-    fn a_stale_pid_file_does_not_block_a_resume_poll_from_passing() {
+    #[tokio::test]
+    async fn a_stale_pid_file_does_not_block_a_resume_poll_from_passing() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -2810,6 +2824,7 @@ mod tests {
             "service_ready",
             &proc_root,
         )
+        .await
         .expect("a running server must pass regardless of a stale pid file");
         assert_eq!(result.status, 200);
 
@@ -2820,8 +2835,8 @@ mod tests {
     /// Without a pid file the poll behaves exactly as it did before the
     /// liveness check existed: it waits out its deadline and reports a
     /// timeout.
-    #[test]
-    fn a_poll_without_a_pid_file_still_reports_a_timeout() {
+    #[tokio::test]
+    async fn a_poll_without_a_pid_file_still_reports_a_timeout() {
         let failure = execute_http_poll_in(
             "http://127.0.0.1:1/health",
             0,
@@ -2830,6 +2845,7 @@ mod tests {
             "comfyui_health",
             Path::new("/nonexistent-proc"),
         )
+        .await
         .expect_err("an unreachable URL must fail the poll");
         match &failure.error {
             ExecError::EffectFailed { op, message } => {
@@ -2847,8 +2863,8 @@ mod tests {
     /// A live launch that answers 2xx succeeds — the liveness probe
     /// only runs on iterations where the server did not answer, so a
     /// ready server is never second-guessed.
-    #[test]
-    fn a_poll_succeeds_when_the_server_answers_while_its_pid_is_live() {
+    #[tokio::test]
+    async fn a_poll_succeeds_when_the_server_answers_while_its_pid_is_live() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -2879,6 +2895,7 @@ mod tests {
             "service_ready",
             &proc_root,
         )
+        .await
         .expect("a live server answering 200 must pass");
         assert_eq!(result.status, 200);
 
@@ -2895,8 +2912,8 @@ mod tests {
     /// without `/proc` reads every pid as dead), so the fatal branch is
     /// covered against an injected root by
     /// `a_poll_fails_at_once_when_a_launch_it_saw_running_disappears`.
-    #[test]
-    fn the_real_poll_entry_point_reads_liveness_from_the_host_procfs() {
+    #[tokio::test]
+    async fn the_real_poll_entry_point_reads_liveness_from_the_host_procfs() {
         let dir = scratch_dir("real-proc");
         let pid_file = dir.join("svc.pid");
         // Above every platform's pid_max, so no process can hold it.
@@ -2909,6 +2926,7 @@ mod tests {
             None,
             "service_ready",
         )
+        .await
         .expect_err("an unreachable URL must fail the poll");
         let message = failure.error.to_string();
         assert!(message.contains("timed out after 0s"), "{message}");

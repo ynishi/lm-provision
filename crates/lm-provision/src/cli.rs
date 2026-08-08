@@ -244,8 +244,30 @@ fn run_plan(profile: &Path) -> ExitCode {
 ///   "printed on both success and step failure"), and the report's own
 ///   `error` string is echoed to stderr as the "final error line" 07
 ///   §Error surface's literal form calls for (`"apply failed: <message>"`).
+///
+/// The tokio runtime the effect layer needs is built **here**, at the
+/// one entry point that needs it, rather than by putting `#[tokio::main]`
+/// on `main`: `validate` / `hash` / `plan` run no effects, and giving
+/// them a runtime they never use would make every subcommand pay for
+/// `apply`'s requirement. A failure to build one is a precondition
+/// failure like any other — nothing is printed to stdout (07 §Error
+/// surface).
 fn run_apply(profile: &Path, dry_run: bool) -> ExitCode {
-    let report_json = match crate::apply::run_apply_ast(profile, dry_run) {
+    // This `block_on` is the only one in the process: the engine is
+    // driven by `dsl_kit::drive_async` from here down, and a phase on
+    // the `Call` route is awaited rather than blocked on.
+    //
+    // Multi-threaded on purpose all the same: the ops that have not
+    // moved onto the `Call` route yet drive their async effect from the
+    // synchronous `Op::apply` seam (`exec::effects::block_on_effect`),
+    // which blocks its own worker and needs a sibling to keep the
+    // reactor turning. `Runtime::new` is the multi-threaded builder with
+    // every driver enabled.
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => return print_failure("apply", err),
+    };
+    let report_json = match runtime.block_on(crate::apply::run_apply_ast(profile, dry_run)) {
         Ok(report_json) => report_json,
         Err(err) => return print_failure("apply", err),
     };

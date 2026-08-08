@@ -24,10 +24,12 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 assert_cmd = "2"
 nix = { version = "0.29", default-features = false, features = ["signal", "process", "mount"] }
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+# `default-features = false` is load-bearing: reqwest's default TLS backend is
+# native-tls (OpenSSL), which breaks the static musl build. rustls only.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 jiff = "0.1"
 rmcp = { version = "2", features = ["server", "transport-io", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "fs", "time", "signal"] }
 schemars = "1"
 dsl-kit = "0.8"
 dsl-kit-macros = "0.8"

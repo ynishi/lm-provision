@@ -8,6 +8,12 @@
 //! carrying the AST exec layer's own step structure — one entry per
 //! direct-op phase, one per lifecycle sub-step, with honest `note` steps
 //! (see `lm_provision::exec::report`).
+//!
+//! `run_apply_ast` is `async` and its effect layer blocks the calling
+//! thread on the current runtime, so the in-process tests take
+//! `#[tokio::test(flavor = "multi_thread")]` — the flavour the CLI entry
+//! point builds. The tests that go through the binary instead
+//! (`assert_cmd`) exercise that wiring itself and stay synchronous.
 
 use std::path::PathBuf;
 
@@ -76,8 +82,8 @@ fn step_kinds(artifact: &Value) -> Vec<String> {
 // Dry-run report shape (envelope field names + AST step structure).
 // ---------------------------------------------------------------------
 
-#[test]
-fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
     let profile = json!({
         "type": "Spec",
         "name": "ast-apply-demo",
@@ -92,6 +98,7 @@ fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
     let path = write_json_profile("shape", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, true)
+        .await
         .expect("dry-run apply over a valid profile should produce a report");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -128,8 +135,8 @@ fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
     std::fs::remove_file(&path).ok();
 }
 
-#[test]
-fn lifecycle_note_step_is_honest_never_dispatch_pending() {
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_note_step_is_honest_never_dispatch_pending() {
     let profile = json!({
         "type": "Spec",
         "name": "note-demo",
@@ -140,8 +147,9 @@ fn lifecycle_note_step_is_honest_never_dispatch_pending() {
     });
     let path = write_json_profile("note", &profile);
 
-    let report_json =
-        lm_provision::apply::run_apply_ast(&path, true).expect("dry-run apply should succeed");
+    let report_json = lm_provision::apply::run_apply_ast(&path, true)
+        .await
+        .expect("dry-run apply should succeed");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
     let ops = step_ops(&report);
@@ -164,8 +172,8 @@ fn lifecycle_note_step_is_honest_never_dispatch_pending() {
 // Real-mode end-to-end (harmless effects only).
 // ---------------------------------------------------------------------
 
-#[test]
-fn real_mode_runs_sh_exec_and_fs_write_for_real() {
+#[tokio::test(flavor = "multi_thread")]
+async fn real_mode_runs_sh_exec_and_fs_write_for_real() {
     let dir = temp_stem("real-effects");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let target = dir.join("out.txt");
@@ -185,6 +193,7 @@ fn real_mode_runs_sh_exec_and_fs_write_for_real() {
     let path = write_json_profile("real", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("real-mode apply over a harmless profile should succeed");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -219,8 +228,8 @@ fn real_mode_runs_sh_exec_and_fs_write_for_real() {
 /// these entries were strictly less informative than a direct op's
 /// (spec 09 §Apply report: the per-op field table applies to lifecycle
 /// sub-steps too).
-#[test]
-fn real_mode_lifecycle_substeps_carry_their_observations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn real_mode_lifecycle_substeps_carry_their_observations() {
     // `hooks.post_install` composes exactly one `sh.exec` sub-step out
     // of the script, so the assertion targets a lifecycle entry rather
     // than a direct op.
@@ -235,6 +244,7 @@ fn real_mode_lifecycle_substeps_carry_their_observations() {
     let path = write_json_profile("lifecycle-observations", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("a post_install echo should apply cleanly");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
     assert_eq!(report["ok"], json!(true));
@@ -271,8 +281,8 @@ fn real_mode_lifecycle_substeps_carry_their_observations() {
 /// The same entries under `--dry-run` carry inputs but **no**
 /// observations — nothing ran, so a status/stdout there would be
 /// fabricated.
-#[test]
-fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
     let profile = json!({
         "type": "Spec",
         "name": "lifecycle-dry",
@@ -283,8 +293,9 @@ fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
     });
     let path = write_json_profile("lifecycle-dry", &profile);
 
-    let report_json =
-        lm_provision::apply::run_apply_ast(&path, true).expect("dry-run apply succeeds");
+    let report_json = lm_provision::apply::run_apply_ast(&path, true)
+        .await
+        .expect("dry-run apply succeeds");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
     let step = &report["steps"].as_array().unwrap()[0];
@@ -302,8 +313,8 @@ fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
 // Fail-fast step collection + the legacy error form.
 // ---------------------------------------------------------------------
 
-#[test]
-fn a_failing_step_is_collected_and_stops_the_run() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_step_is_collected_and_stops_the_run() {
     let profile = json!({
         "type": "Spec",
         "name": "fail-demo",
@@ -316,6 +327,7 @@ fn a_failing_step_is_collected_and_stops_the_run() {
     let path = write_json_profile("fail", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("a step failure is captured in-report, not returned as Err");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -343,8 +355,8 @@ fn a_failing_step_is_collected_and_stops_the_run() {
 /// direct op: the exit code and the captured output that accompanied the
 /// failure belong in structured fields, not only quoted inside the
 /// `reason` text (spec 09 §Apply report).
-#[test]
-fn a_failing_lifecycle_substep_carries_its_partial_observation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_lifecycle_substep_carries_its_partial_observation() {
     let profile = json!({
         "type": "Spec",
         "name": "lifecycle-fail-observations",
@@ -357,6 +369,7 @@ fn a_failing_lifecycle_substep_carries_its_partial_observation() {
     let path = write_json_profile("lifecycle-fail-observations", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("a step failure is captured in-report, not returned as Err");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -394,8 +407,8 @@ fn a_failing_lifecycle_substep_carries_its_partial_observation() {
 /// --version` and calling itself advisory let a mismatch pass silently;
 /// the assert script fails the step, and the interpreter's real version
 /// reaches the report through the captured stderr.
-#[test]
-fn python_version_check_fails_the_run_on_a_mismatch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn python_version_check_fails_the_run_on_a_mismatch() {
     let profile = json!({
         "type": "Spec",
         "name": "version-mismatch",
@@ -408,6 +421,7 @@ fn python_version_check_fails_the_run_on_a_mismatch() {
     let path = write_json_profile("version-mismatch", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("a step failure is captured in-report");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -427,6 +441,206 @@ fn python_version_check_fails_the_run_on_a_mismatch() {
         "the assert message names the mismatch: {step}"
     );
 
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------
+// The two `net.transfer` routes agree (DC 8).
+//
+// The point of moving one op at a time onto dsl-kit's `Call` /
+// `AsyncEffectResolver` surface is that the move is *checkable*: the same
+// profile driven through the legacy `net_transfer` op and through the new
+// `Call` route has to produce the same report. This is the check.
+// ---------------------------------------------------------------------
+
+/// Serve `payload` to the first `serves` connections, so two apply runs
+/// can hit the **same** URL — a second server would take a second port,
+/// and the port is in the report (`steps[].src`).
+fn twice_serving_server(
+    payload: &'static str,
+    serves: usize,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        for _ in 0..serves {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_transfer_routes_produce_the_same_report() {
+    use lm_provision::exec::registry::TransferRoute;
+
+    let payload = "the-weight-behind-the-url";
+    let (base_url, server) = twice_serving_server(payload, 2);
+
+    let dir = temp_stem("transfer-routes");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let target = dir.join("weight.bin");
+    let target_str = target.to_string_lossy().into_owned();
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "transfer-routes",
+        "capabilities": ["net.transfer"],
+        "paths": [dir_str],
+        "http_allowlist": [base_url],
+        "phases": [
+            { "type": "NetTransfer", "src": format!("{base_url}/weight.bin"), "dst": target_str }
+        ]
+    });
+    let path = write_json_profile("transfer-routes", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, TransferRoute::Op)
+            .await
+            .expect("the op route produces a report"),
+    )
+    .expect("report is JSON");
+    assert_eq!(via_op["ok"], json!(true), "op route: {via_op}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the op route wrote the destination"),
+        payload
+    );
+    std::fs::remove_file(&target).ok();
+
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, TransferRoute::Call)
+            .await
+            .expect("the call route produces a report"),
+    )
+    .expect("report is JSON");
+    assert_eq!(via_call["ok"], json!(true), "call route: {via_call}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the call route wrote the destination"),
+        payload,
+        "the resolver ran the effect for real, not a rendering of it"
+    );
+
+    assert_eq!(
+        via_op, via_call,
+        "the two routes must be indistinguishable in the report"
+    );
+    // …and the report is the one a transfer writes, not an empty run.
+    let step = &via_call["steps"].as_array().expect("steps")[0];
+    assert_eq!(step["op"], json!("net.transfer"));
+    assert_eq!(step["bytes"], json!(payload.len()));
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+    server.join().expect("server thread joins");
+}
+
+/// Dry-run agrees too: the `Call` route renders the same trace entry the
+/// op does and reaches no effect — the resolver honours [`ExecMode`], it
+/// is not "the route that always transfers".
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_transfer_routes_agree_under_dry_run_and_reach_no_effect() {
+    use lm_provision::exec::registry::TransferRoute;
+
+    let dir = temp_stem("transfer-routes-dry");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let target = dir.join("weight.bin");
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "transfer-routes-dry",
+        "capabilities": ["net.transfer"],
+        "paths": [dir_str],
+        // Deliberately unreachable: a dry run must not connect.
+        "http_allowlist": ["http://127.0.0.1:1"],
+        "phases": [
+            { "type": "NetTransfer",
+              "src": "http://127.0.0.1:1/weight.bin",
+              "dst": target.to_string_lossy() }
+        ]
+    });
+    let path = write_json_profile("transfer-routes-dry", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, TransferRoute::Op)
+            .await
+            .expect("op route dry run"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, TransferRoute::Call)
+            .await
+            .expect("call route dry run"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(via_op["ok"], json!(true), "{via_op}");
+    assert_eq!(via_op, via_call, "dry-run reports must agree too");
+    assert_eq!(via_call["steps"][0]["dry_run"], json!(true));
+    assert!(!target.exists(), "a dry run touches no destination");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+/// A capability the profile never declared must be denied on **both**
+/// routes. A `Call` bypasses `Op::apply`, so the resolver carries the L4
+/// gate and the L3 allowlists itself; without that the new route would be
+/// a hole only it has.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_call_route_is_gated_exactly_as_the_op_route_is() {
+    use lm_provision::exec::registry::TransferRoute;
+
+    let dir = temp_stem("transfer-routes-denied");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "transfer-routes-denied",
+        // `net.transfer` is *not* declared.
+        "capabilities": ["sh.exec"],
+        "paths": [dir_str],
+        "http_allowlist": ["http://127.0.0.1:1"],
+        "phases": [
+            { "type": "NetTransfer",
+              "src": "http://127.0.0.1:1/weight.bin",
+              "dst": dir.join("weight.bin").to_string_lossy() }
+        ]
+    });
+    let path = write_json_profile("transfer-routes-denied", &profile);
+
+    for route in [TransferRoute::Op, TransferRoute::Call] {
+        let report: Value = serde_json::from_str(
+            &lm_provision::apply::run_apply_ast_routed(&path, false, route)
+                .await
+                .expect("a denial is captured in-report"),
+        )
+        .expect("report is JSON");
+        assert_eq!(report["ok"], json!(false), "{route:?}: {report}");
+        assert!(
+            report["error"]
+                .as_str()
+                .expect("error line")
+                .contains("net.transfer"),
+            "{route:?} names the undeclared capability: {report}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_file(&path).ok();
 }
 

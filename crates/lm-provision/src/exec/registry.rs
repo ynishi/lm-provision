@@ -22,15 +22,40 @@
 //!
 //! An [`ExecError`] from any step surfaces as
 //! [`EngineError::EvalFailed`], carrying the node at which it happened.
+//!
+//! ## Two routes for `net.transfer`
+//!
+//! [`Op::apply`] is a `fn`, so an op handler cannot await — and dsl-kit
+//! says so itself: "Ops never suspend: effects belong in `Call`
+//! children" (`dsl_kit::Op`'s doc). [`TransferRoute`] is the host-side
+//! switch between the two shapes a `net.transfer` phase can take:
+//!
+//! - [`TransferRoute::Op`] — the node stays an `Apply` over the
+//!   `net_transfer` op, which drives the async effect from the
+//!   synchronous seam ([`effects::block_on_effect`]). This is the route
+//!   every other async-effect-bearing op still takes.
+//! - [`TransferRoute::Call`] — [`ProfileCallAst`] reclassifies the node
+//!   as a dsl-kit `Call`, so the engine suspends on it and the host's
+//!   `AsyncEffectResolver` ([`crate::apply`]) awaits
+//!   [`effects::transfer`] directly. No `block_on` is involved.
+//!
+//! Both routes run the same gate (L4) and the same `paths` /
+//! `http_allowlist` policies (L3) **before** the effect, and write the
+//! same [`StepReport`] fields, so the same profile can be run through
+//! both and the two reports compared.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use dsl_kit::{EngineError, NodeContext, NodeId, Op, OpRegistry, Path};
+use dsl_kit::{
+    Ast, EngineError, LoopDecision, NodeContext, NodeId, NodeKind, Op, OpRegistry, OwnedDerivedAst,
+    Path, SuspendReason,
+};
 
 use super::{
     audit, demand, effects, lifecycle, report::StepReport, ExecContext, ExecError, ExecMode,
 };
-use crate::profile_ast::{ProfileNode, ProfileValue};
+use crate::profile_ast::{ProfileAst, ProfileNode, ProfileSemantics, ProfileValue};
 
 /// The seven direct ops with real effect wiring.
 const DIRECT_OPS: [&str; 7] = [
@@ -184,45 +209,23 @@ impl ProfileOp {
 
     /// Push `line` onto the shared log and return it as the op's value.
     fn record(&self, line: String) -> ProfileValue {
-        self.ctx.log.lock().unwrap().push(line.clone());
-        ProfileValue::Success(line)
-    }
-
-    /// Whether this run is a dry run.
-    fn dry(&self) -> bool {
-        self.ctx.mode == ExecMode::DryRun
+        record_line(&self.ctx, line)
     }
 
     /// Append a structured step report entry.
     fn push(&self, entry: StepReport) {
-        self.ctx.reports.lock().unwrap().push(entry);
+        push_report(&self.ctx, entry);
     }
 
     /// The `(<phase_index>_<kind>, kind)` base for `node`'s report entry.
-    /// Falls back to a `n<node-id>` id for a node the phase map does not
-    /// know (never expected for a registered op).
     fn base(&self, node: NodeId) -> (String, String) {
-        let (index, kind) = self.ctx.phase_meta_of(node);
-        if index == 0 {
-            (format!("n{}", node.0), kind)
-        } else {
-            (format!("{index}_{kind}"), kind)
-        }
+        report_base(&self.ctx, node)
     }
 
-    /// Flip a report entry to the failed state, stamping the reason and
-    /// (under dry-run) the `dry_run` marker. `status` stays at its
-    /// default `-1` unless the caller already set a more specific code
-    /// (e.g. a non-zero process exit).
+    /// Flip a report entry to the failed state (see
+    /// [`mark_report_failed`]).
     fn mark_fail(&self, entry: &mut StepReport, err: &ExecError) {
-        entry.ok = false;
-        if entry.status == 0 {
-            entry.status = -1;
-        }
-        entry.reason = Some(err.to_string());
-        if self.dry() {
-            entry.dry_run = Some(true);
-        }
+        mark_report_failed(&self.ctx, entry, err);
     }
 
     /// Record a phase-level failure that happened before (or instead of)
@@ -611,16 +614,17 @@ impl ProfileOp {
             }
             ExecMode::Real => {
                 let opts = effects::HttpOpts::new(resolved_headers, *timeout_sec);
-                let outcome = match effects::http_get(url, &opts) {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        let mut entry = StepReport::new(id, kind, "net.http_get");
-                        entry.url = Some(url.clone());
-                        self.mark_fail(&mut entry, &err);
-                        self.push(entry);
-                        return Err(err);
-                    }
-                };
+                let outcome =
+                    match effects::block_on_effect("net_http_get", effects::http_get(url, &opts)) {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            let mut entry = StepReport::new(id, kind, "net.http_get");
+                            entry.url = Some(url.clone());
+                            self.mark_fail(&mut entry, &err);
+                            self.push(entry);
+                            return Err(err);
+                        }
+                    };
                 let value =
                     self.record(format!("net_http_get url={url} status={}", outcome.status));
                 let mut entry = StepReport::new(id, kind, "net.http_get");
@@ -734,7 +738,10 @@ impl ProfileOp {
             }
             ExecMode::Real => {
                 let opts = effects::HttpOpts::new(resolved_headers, *timeout_sec);
-                let outcome = match effects::http_post(url, &body_bytes, &content_type, &opts) {
+                let outcome = match effects::block_on_effect(
+                    "net_http_post",
+                    effects::http_post(url, &body_bytes, &content_type, &opts),
+                ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         self.push_http_post_failure(&id, &kind, url, &err);
@@ -769,13 +776,14 @@ impl ProfileOp {
                 Ok(value)
             }
             ExecMode::Real => {
-                let outcome = match effects::transfer(src, dst) {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        self.push_transfer_failure(&id, &kind, src, dst, &err);
-                        return Err(err);
-                    }
-                };
+                let outcome =
+                    match effects::block_on_effect("net_transfer", effects::transfer(src, dst)) {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            self.push_transfer_failure(&id, &kind, src, dst, &err);
+                            return Err(err);
+                        }
+                    };
                 let value = self.record(format!(
                     "net_transfer src={src} dst={} bytes={}",
                     outcome.dst, outcome.bytes
@@ -804,11 +812,7 @@ impl ProfileOp {
 
     /// Push a failed `net.transfer` report carrying the declared src/dst.
     fn push_transfer_failure(&self, id: &str, kind: &str, src: &str, dst: &str, err: &ExecError) {
-        let mut entry = StepReport::new(id.to_string(), kind.to_string(), "net.transfer");
-        entry.src = Some(src.to_string());
-        entry.dst = Some(dst.to_string());
-        self.mark_fail(&mut entry, err);
-        self.push(entry);
+        push_transfer_failure_report(&self.ctx, id, kind, src, dst, err);
     }
 
     fn run_mount_bind(
@@ -1011,4 +1015,327 @@ fn to_engine_error(node: NodeId, err: ExecError) -> EngineError {
         at: NodeContext::at(node, Path::root().push(node)),
         source: Box::new(err),
     }
+}
+
+// ---------------------------------------------------------------------
+// Report plumbing shared by both routes
+//
+// The `Op` route reaches these through [`ProfileOp`]'s methods, the
+// `Call` route through [`resolve_call`]. One definition each, so the
+// two routes cannot drift into writing differently shaped entries.
+// ---------------------------------------------------------------------
+
+/// Push `line` onto the shared trace log and return it as the value the
+/// phase produces.
+fn record_line(ctx: &ExecContext, line: String) -> ProfileValue {
+    ctx.log.lock().unwrap().push(line.clone());
+    ProfileValue::Success(line)
+}
+
+/// Append a structured step report entry.
+fn push_report(ctx: &ExecContext, entry: StepReport) {
+    ctx.reports.lock().unwrap().push(entry);
+}
+
+/// The `(<phase_index>_<kind>, kind)` base for `node`'s report entry.
+/// Falls back to a `n<node-id>` id for a node the phase map does not
+/// know (never expected for a registered op or a routed phase).
+fn report_base(ctx: &ExecContext, node: NodeId) -> (String, String) {
+    let (index, kind) = ctx.phase_meta_of(node);
+    if index == 0 {
+        (format!("n{}", node.0), kind)
+    } else {
+        (format!("{index}_{kind}"), kind)
+    }
+}
+
+/// Flip a report entry to the failed state, stamping the reason and
+/// (under dry-run) the `dry_run` marker. `status` stays at its default
+/// `-1` unless the caller already set a more specific code (e.g. a
+/// non-zero process exit).
+fn mark_report_failed(ctx: &ExecContext, entry: &mut StepReport, err: &ExecError) {
+    entry.ok = false;
+    if entry.status == 0 {
+        entry.status = -1;
+    }
+    entry.reason = Some(err.to_string());
+    if ctx.mode == ExecMode::DryRun {
+        entry.dry_run = Some(true);
+    }
+}
+
+/// Push a failed `net.transfer` report carrying the declared src/dst.
+fn push_transfer_failure_report(
+    ctx: &ExecContext,
+    id: &str,
+    kind: &str,
+    src: &str,
+    dst: &str,
+    err: &ExecError,
+) {
+    let mut entry = StepReport::new(id.to_string(), kind.to_string(), "net.transfer");
+    entry.src = Some(src.to_string());
+    entry.dst = Some(dst.to_string());
+    mark_report_failed(ctx, &mut entry, err);
+    push_report(ctx, entry);
+}
+
+// ---------------------------------------------------------------------
+// The `Call` route
+// ---------------------------------------------------------------------
+
+/// The `CallSpec::label` a suspended `net.transfer` carries.
+pub const TRANSFER_CALL_LABEL: &str = "net.transfer";
+
+/// Which shape a `net.transfer` phase takes in the engine (module doc
+/// §Two routes for `net.transfer`).
+///
+/// A host-side switch, deliberately not a profile field: the profile's
+/// bytes — and therefore its hash — say nothing about how the host
+/// chooses to drive the effect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransferRoute {
+    /// `Apply` over the `net_transfer` op; the op runs the effect.
+    #[default]
+    Op,
+    /// dsl-kit `Call`; the host's async resolver runs the effect.
+    Call,
+}
+
+/// The effect-side failure a host resolver reports back through
+/// `Stepper::resolve` (dsl-kit requires `Clone + Error + Send + Sync`,
+/// which [`ExecError`] is not — it is carried as its rendered text, and
+/// the machine-readable detail is already in the step's report entry).
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{0}")]
+pub struct CallError(String);
+
+impl From<&ExecError> for CallError {
+    fn from(err: &ExecError) -> Self {
+        CallError(err.to_string())
+    }
+}
+
+/// The [`ProfileNode`] AST projected for the engine, with the nodes the
+/// host has chosen to route through a `Call` reclassified.
+///
+/// It wraps [`ProfileAst`] rather than replacing it: every other node
+/// keeps the classification `#[derive(DslExec)]` gave it, and the
+/// profile's own bytes are untouched, so `hash` / `canonical` are
+/// unaffected by which route the host picked.
+pub struct ProfileCallAst {
+    /// The unmodified derived projection.
+    inner: ProfileAst,
+    /// `NodeId -> Call` overrides applied on top of `inner`.
+    calls: HashMap<NodeId, NodeKind>,
+}
+
+impl ProfileCallAst {
+    /// Project `root`, reclassifying every `net.transfer` phase as a
+    /// `Call` when `route` is [`TransferRoute::Call`].
+    ///
+    /// The node declares `label = "net.transfer"` and
+    /// `payload = { "src": …, "dst": … }`.
+    ///
+    /// **Only the label reaches the host.** dsl-kit-core 0.8.0 spawns a
+    /// `Call` leaf with `serde_json::Value::Null` in place of the
+    /// declared payload [`dsl-kit-core-0.8.0/src/engine.rs:1385-1387`],
+    /// so a resolver cannot read `src` / `dst` off the suspension. The
+    /// payload is declared here anyway — it is what the node *means*,
+    /// and it is what the resolver will read once the engine carries it
+    /// — while [`resolve_call`] recovers the two fields the way every
+    /// other leaf payload in this crate is recovered, through
+    /// [`super::payload`]'s `NodeId -> ProfileNode` map (see that
+    /// module's doc: dsl-kit does not hand leaf payloads to
+    /// [`Op::apply`] either).
+    pub fn new(root: &ProfileNode, route: TransferRoute) -> Self {
+        let inner = OwnedDerivedAst::new(root, ProfileSemantics);
+        let mut calls = HashMap::new();
+        if route == TransferRoute::Call {
+            for (id, node) in super::payload::build_payload_map(root) {
+                if let ProfileNode::NetTransfer { src, dst, .. } = node {
+                    calls.insert(
+                        id,
+                        NodeKind::Call {
+                            label: TRANSFER_CALL_LABEL.to_string(),
+                            payload: serde_json::json!({ "src": src, "dst": dst }),
+                        },
+                    );
+                }
+            }
+        }
+        Self { inner, calls }
+    }
+}
+
+impl Ast for ProfileCallAst {
+    type Value = ProfileValue;
+    type Delta = ();
+    type EffectError = CallError;
+    type Cursor = ();
+
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+
+    fn node_kind(&self, id: NodeId) -> NodeKind {
+        match self.calls.get(&id) {
+            Some(kind) => kind.clone(),
+            None => self.inner.node_kind(id),
+        }
+    }
+
+    fn unit_value(&self) -> ProfileValue {
+        self.inner.unit_value()
+    }
+
+    fn truthy(&self, value: &ProfileValue) -> Option<bool> {
+        self.inner.truthy(value)
+    }
+
+    fn continue_loop(&self, node: NodeId, last: &ProfileValue, iteration: usize) -> LoopDecision {
+        self.inner.continue_loop(node, last, iteration)
+    }
+
+    fn bind_delta(&self, name: &str, value: &ProfileValue) -> Option<()> {
+        self.inner.bind_delta(name, value)
+    }
+
+    fn lookup(&self, delta: &(), name: &str) -> Option<ProfileValue> {
+        self.inner.lookup(delta, name)
+    }
+
+    fn literal(&self, node: NodeId) -> Option<ProfileValue> {
+        self.inner.literal(node)
+    }
+}
+
+/// Resolve one suspended `Call` for the host.
+///
+/// `node` is the AST node that suspended (`Pending::at.node`), which is
+/// what labels the step's report entry — a routed phase keeps the id and
+/// kind it would have had on the `Op` route.
+///
+/// The gate and both policies run **here, before the effect**, in the
+/// same order [`ProfileOp::dispatch`] runs them: a `Call` bypasses
+/// `Op::apply` entirely, so a resolver that skipped them would be a hole
+/// in the L3 / L4 enforcement (spec 05) that only the new route has.
+pub async fn resolve_call(
+    ctx: &ExecContext,
+    node: NodeId,
+    reason: &SuspendReason,
+) -> Result<ProfileValue, CallError> {
+    let SuspendReason::Call { spec } = reason else {
+        return Err(CallError(format!(
+            "the suspension at n{} is not a Call ({reason}); the host resolves Call effects only",
+            node.0
+        )));
+    };
+    if spec.label != TRANSFER_CALL_LABEL {
+        return Err(CallError(format!(
+            "no host resolver is registered for the call '{}'",
+            spec.label
+        )));
+    }
+    // `spec.payload` is `Null` on dsl-kit-core 0.8.0 regardless of what
+    // the node declared (see [`ProfileCallAst::new`]), so the effect's
+    // inputs come from the payload map — the same recovery `Op::apply`
+    // does, which is also what keeps the two routes reading one source
+    // of truth.
+    let Some(ProfileNode::NetTransfer { src, dst, .. }) = ctx.payloads.get(&node) else {
+        let err = ExecError::PayloadVariant {
+            node: node.0,
+            expected: "NetTransfer",
+        };
+        let (id, kind) = report_base(ctx, node);
+        let mut entry = StepReport::new(id, kind, TRANSFER_CALL_LABEL);
+        mark_report_failed(ctx, &mut entry, &err);
+        push_report(ctx, entry);
+        return Err(CallError::from(&err));
+    };
+    resolve_transfer(ctx, node, src, dst).await
+}
+
+/// The `Call`-route twin of [`ProfileOp::run_transfer`]: gate → policy →
+/// audit → effect, writing the same report entry either branch of the
+/// `Op` route would.
+async fn resolve_transfer(
+    ctx: &ExecContext,
+    node: NodeId,
+    src: &str,
+    dst: &str,
+) -> Result<ProfileValue, CallError> {
+    let (id, kind) = report_base(ctx, node);
+
+    if let Err(err) = check_transfer_demand(ctx, node, src, dst) {
+        push_transfer_failure_report(ctx, &id, &kind, src, dst, &err);
+        return Err(CallError::from(&err));
+    }
+
+    audit::transfer(ctx.mode, &kind, src, dst);
+    match ctx.mode {
+        ExecMode::DryRun => {
+            let value = record_line(ctx, format!("net_transfer src={src} dst={dst}"));
+            let mut entry = StepReport::new(id, kind, "net.transfer");
+            entry.src = Some(src.to_string());
+            entry.dst = Some(dst.to_string());
+            entry.dry_run = Some(true);
+            push_report(ctx, entry);
+            Ok(value)
+        }
+        ExecMode::Real => {
+            // No lock is held across this await: `record_line` /
+            // `push_report` take the report and log mutexes for the
+            // duration of one push, after the transfer has finished.
+            let outcome = match effects::transfer(src, dst).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    push_transfer_failure_report(ctx, &id, &kind, src, dst, &err);
+                    return Err(CallError::from(&err));
+                }
+            };
+            let value = record_line(
+                ctx,
+                format!(
+                    "net_transfer src={src} dst={} bytes={}",
+                    outcome.dst, outcome.bytes
+                ),
+            );
+            let mut entry = StepReport::new(id, kind, "net.transfer");
+            entry.src = Some(src.to_string());
+            entry.dst = Some(outcome.dst.clone());
+            entry.bytes = Some(outcome.bytes);
+            push_report(ctx, entry);
+            Ok(value)
+        }
+    }
+}
+
+/// The L4 capability check and both L3 allowlists for a routed
+/// `net.transfer`, derived through the same [`demand::direct`] the `Op`
+/// route uses — one mapping, so both routes answer to exactly the same
+/// declarations.
+fn check_transfer_demand(
+    ctx: &ExecContext,
+    node: NodeId,
+    src: &str,
+    dst: &str,
+) -> Result<(), ExecError> {
+    let payload = ProfileNode::NetTransfer {
+        id: node,
+        src: src.to_string(),
+        dst: dst.to_string(),
+    };
+    let demanded = demand::direct(&payload)?;
+    if let Some(capability) = demanded.capability {
+        ctx.gate.require(capability)?;
+    }
+    // Policy runs in both modes (spec 07 "dry-run does policy").
+    for path in &demanded.paths {
+        ctx.path_policy.check(path)?;
+    }
+    for url in &demanded.urls {
+        ctx.http_policy.check(url)?;
+    }
+    Ok(())
 }

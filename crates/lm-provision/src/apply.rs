@@ -8,10 +8,18 @@
 //! the apply report artifact (09 §Outputs "Apply report"), returned as a
 //! JSON string.
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::exec::{report, ExecMode};
+use dsl_kit::{
+    AsyncEffectResolver, BreakpointSet, DriveOutcome, Engine, Pending, ReducerRegistry,
+    SuspendReason,
+};
+
+use crate::exec::registry::{CallError, ProfileCallAst, TransferRoute};
+use crate::exec::{registry, report, ExecContext, ExecMode};
+use crate::profile_ast::ProfileValue;
 
 /// Errors raised before or while running the AST-path apply pipeline
 /// ([`run_apply_ast`]).
@@ -60,7 +68,37 @@ pub enum AstApplyError {
 /// the first failing step ends the run, is included as the last `steps`
 /// entry, and its reason drives the envelope's `error` line; no later
 /// step is reached.
-pub fn run_apply_ast(profile: &Path, dry_run: bool) -> Result<String, AstApplyError> {
+///
+/// # Runtime
+///
+/// **`async`, and a multi-threaded tokio runtime must be driving it.**
+/// The effect layer's HTTP routes are async ([`crate::exec::effects`]).
+/// A phase routed through [`TransferRoute::Call`] suspends and is
+/// awaited by [`TransferResolver`] below — nothing blocks. Every other
+/// async-effect-bearing op is still an `Op`, and `dsl_kit`'s
+/// `Op::apply` is not `async`, so those drive their future from the
+/// synchronous seam ([`crate::exec::effects::block_on_effect`]), which
+/// needs a sibling worker to keep the reactor turning.
+///
+/// The runtime itself is built once, at the CLI entry point
+/// ([`crate::cli`]).
+pub async fn run_apply_ast(profile: &Path, dry_run: bool) -> Result<String, AstApplyError> {
+    run_apply_ast_routed(profile, dry_run, TransferRoute::default()).await
+}
+
+/// [`run_apply_ast`] with the `net.transfer` route named explicitly.
+///
+/// `route` selects which shape a `net.transfer` phase takes in the
+/// engine — the legacy `net_transfer` op, or a dsl-kit `Call` resolved
+/// by [`TransferResolver`] (see [`crate::exec::registry`]'s module doc).
+/// It changes nothing else: the same profile run through both routes
+/// produces the same report, which is what makes moving one op at a time
+/// checkable.
+pub async fn run_apply_ast_routed(
+    profile: &Path,
+    dry_run: bool,
+    route: TransferRoute,
+) -> Result<String, AstApplyError> {
     // Canonical order, implicit insertion, and suppression are applied
     // to the AST before the engine sees it, so apply runs exactly the
     // steps the plan artifact renders (`02` §Canonical phase ordering,
@@ -74,9 +112,16 @@ pub fn run_apply_ast(profile: &Path, dry_run: bool) -> Result<String, AstApplyEr
     };
 
     let log = Arc::new(Mutex::new(Vec::new()));
-    let (mut engine, reports) =
-        crate::profile_ast::create_profile_engine_collecting(&root, mode, log)?;
-    let run_result = drive(&mut engine);
+    let ctx = Arc::new(ExecContext::from_root(&root, mode, log)?);
+    let reports = ctx.reports_handle();
+    let mut engine = Engine::new_with_ops(
+        ProfileCallAst::new(&root, route),
+        Arc::new(ReducerRegistry::new()),
+        registry::profile_op_registry(Arc::clone(&ctx)),
+    )
+    .expect("Engine initialization should succeed");
+    let mut resolver = TransferResolver { ctx };
+    let run_result = drive(&mut engine, &mut resolver).await;
 
     let steps = reports.lock().unwrap().clone();
     let profile_name = match &root {
@@ -106,25 +151,58 @@ pub fn run_apply_ast(profile: &Path, dry_run: bool) -> Result<String, AstApplyEr
     Ok(serde_json::to_string_pretty(&envelope)?)
 }
 
+/// The host's async effect backend: one `Call` at a time, awaited.
+///
+/// dsl-kit's own words for the shape this implements — "Async is a host
+/// concern" (`dsl_kit::Stepper`), "Runtime-neutral — this crate never
+/// touches an executor" (`dsl_kit::AsyncEffectResolver`). Whatever
+/// runtime polls [`drive`] below is the backend; nothing here reaches
+/// for one.
+struct TransferResolver {
+    /// The same context the op registry holds, so a resolved call writes
+    /// its report entry into the run's collection.
+    ctx: Arc<ExecContext>,
+}
+
+impl AsyncEffectResolver<ProfileCallAst> for TransferResolver {
+    fn resolve(
+        &mut self,
+        pending: &Pending,
+    ) -> impl Future<Output = Result<ProfileValue, CallError>> + Send {
+        // Everything the effect needs is copied out of the suspension
+        // here, so the returned future borrows neither `self` nor
+        // `pending`.
+        let ctx = Arc::clone(&self.ctx);
+        let node = pending.at.node;
+        let reason: SuspendReason = pending.reason.clone();
+        async move { registry::resolve_call(&ctx, node, &reason).await }
+    }
+}
+
 /// Drive the engine to completion, returning `Ok(())` on `Done` or the
 /// rendered engine error on the first failing step (the per-step report
 /// already carries the machine-readable detail).
-fn drive(engine: &mut dsl_kit::Engine<crate::profile_ast::ProfileAst>) -> Result<(), String> {
-    use dsl_kit::{StepOutcome, Stepper};
-
-    let mut steps = 0u32;
-    loop {
-        match engine.step() {
-            Ok(outcome) => {
-                if matches!(outcome, StepOutcome::Done(_)) {
-                    return Ok(());
-                }
-            }
-            Err(err) => return Err(err.to_string()),
-        }
-        steps += 1;
-        if steps > 100_000 {
-            return Err("apply exec exceeded the step limit".to_string());
-        }
+///
+/// `dsl_kit::drive_async` is the loop: it re-steps the engine, hands
+/// each suspended `Call` to `resolver`, and feeds the result back. The
+/// hand-rolled loop this replaces ignored `StepOutcome::Blocked` and
+/// span until its own step ceiling, so a suspension was a hang rather
+/// than an effect.
+///
+/// No breakpoints are registered, so a `Break` can only mean a
+/// suspension the resolver is not meant to answer (`Cooperative` /
+/// `User`); the engine emits none, and it is reported rather than
+/// silently treated as completion.
+async fn drive(
+    engine: &mut Engine<ProfileCallAst>,
+    resolver: &mut TransferResolver,
+) -> Result<(), String> {
+    match dsl_kit::drive_async(engine, resolver, &BreakpointSet::new()).await {
+        Ok(DriveOutcome::Done(_)) => Ok(()),
+        Ok(DriveOutcome::Break { at }) => Err(format!(
+            "apply halted on {} suspension(s) the host does not resolve",
+            at.len()
+        )),
+        Err(err) => Err(err.to_string()),
     }
 }

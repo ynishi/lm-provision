@@ -861,8 +861,14 @@ fn sh_exec_injects_a_declared_secret_into_the_child_in_real_mode() {
 /// `200` on the first request, so the poll loop succeeds immediately
 /// (no sleep). Uses the raw-TCP mock server pattern from the effects
 /// module test.
-#[test]
-fn comfyui_health_polls_a_local_server_when_executing_effects() {
+///
+/// Real mode drives an async effect, which blocks its thread on the
+/// current runtime — hence the multi-threaded flavour (see
+/// `lm_provision::exec::effects::block_on_effect`). Every other test in
+/// this file either stays in dry run or runs a synchronous effect, so
+/// they need no runtime at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn comfyui_health_polls_a_local_server_when_executing_effects() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -1436,9 +1442,10 @@ fn declaring_both_body_forms_fails_the_step_even_without_validate() {
 
 /// Real mode: the declared headers and the `body_json` document reach
 /// the wire, with `Content-Type: application/json` derived from the body
-/// form (spec 04 §`net.http_post`).
-#[test]
-fn http_post_real_mode_sends_the_declared_headers_and_json_body() {
+/// form (spec 04 §`net.http_post`). Multi-threaded for the same reason
+/// as `comfyui_health_polls_a_local_server_when_executing_effects`.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_post_real_mode_sends_the_declared_headers_and_json_body() {
     let (url, allow, handle) = one_shot_server();
     let ids = IdGen::new();
     let program = ProfileNode::Spec {
