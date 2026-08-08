@@ -135,15 +135,31 @@ async fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A dry-run `models` step reaches the report saying **what would
-/// decide whether it is skipped, and that nothing decided it**.
+/// A dry-run `models` step reaches the report with **the condition's
+/// answer**, not a description of the condition.
 ///
-/// The two failure modes this pins down are the ones Chef's why-run
-/// mode is criticised for and the ones a skip that says nothing
-/// produces: claiming the step "would run" when the answer was never
-/// looked for, and claiming it was skipped without saying on what.
+/// This is the end-to-end half of the move: a lifecycle step is its own
+/// `Call` node, so the dry-run arm runs in the host's async resolver and
+/// the (async) evaluator is reachable from it. Before that, the note
+/// here was a static sentence about the profile — equally true whatever
+/// the host looked like.
+///
+/// **Both entries name a destination that is not there**, and the
+/// report says so per step: `Unsatisfied`, i.e. "this transfers". The
+/// second one declares a `sha256` whose conjunct is `NotChecked` (a dry
+/// run does not read the file), and the fold still answers `Unsatisfied`
+/// — which is what makes a dry run able to say "this transfers" about a
+/// digest-carrying entry at all.
+///
+/// The *other* answer a present destination gets (`NotChecked` —
+/// undecided, because deciding it would mean reading the whole file) is
+/// pinned in `exec::lifecycle`'s
+/// `a_dry_run_answers_the_condition_and_tells_the_two_apart`, for the
+/// same reason the skip tests live there: a `models` phase composes its
+/// destination under the built-in `/workspace/ComfyUI/models` root,
+/// which a test cannot create.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_dry_run_models_step_reports_its_condition_as_undecided() {
+async fn a_dry_run_models_step_reports_the_conditions_answer() {
     let digest = "a".repeat(64);
     let profile = json!({
         "type": "Spec",
@@ -154,7 +170,8 @@ async fn a_dry_run_models_step_reports_its_condition_as_undecided() {
         "phases": [{
             "type": "Models",
             "models_json": format!(
-                r#"[{{"src":"https://example.com/a.bin","dst":"a.bin","subdir":"lora","sha256":"{digest}"}}]"#
+                r#"[{{"src":"https://example.com/a.bin","dst":"a.bin","subdir":"lora"}},
+                     {{"src":"https://example.com/b.bin","dst":"b.bin","subdir":"lora","sha256":"{digest}"}}]"#
             ),
         }]
     });
@@ -165,27 +182,50 @@ async fn a_dry_run_models_step_reports_its_condition_as_undecided() {
         .expect("a dry run touches nothing and reports");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
-    let steps = report["steps"].as_array().expect("steps is an array");
-    assert_eq!(steps.len(), 1);
-    let step = &steps[0];
-    assert_eq!(step["op"], json!("net.transfer"));
-    assert_eq!(step["dry_run"], json!(true));
+    // One report entry per composed step — the phase is a `Seq` over two
+    // `Call` nodes now, and each suspended on its own.
     assert_eq!(
-        step["dst"],
+        step_ids(&report),
+        vec!["1_models_1", "1_models_2"],
+        "{report}"
+    );
+    let steps = report["steps"].as_array().expect("steps is an array");
+    for step in steps {
+        assert_eq!(step["op"], json!("net.transfer"));
+        assert_eq!(step["dry_run"], json!(true));
+    }
+
+    // (1) No digest declared: existence alone, and it is answerable in a
+    // dry run.
+    assert_eq!(
+        steps[0]["dst"],
         json!("/workspace/ComfyUI/models/lora/a.bin"),
         "the composed destination, which is also what the condition looks at",
     );
-
-    let note = step["note"]
+    let note = steps[0]["note"]
         .as_str()
-        .expect("the condition reaches the report");
+        .expect("the condition's answer reaches the report");
+    assert_eq!(
+        note, "would transfer, not done: exists(/workspace/ComfyUI/models/lora/a.bin)=unsatisfied",
+        "an answer, not a description of what would decide it",
+    );
+
+    // (2) A digest declared: its conjunct stays unread, and the
+    // conjunction is still decided by existence.
+    let note = steps[1]["note"]
+        .as_str()
+        .expect("the condition's answer reaches the report");
     assert!(
-        note.starts_with("skip undecided: not evaluated in a dry run"),
-        "a dry run must not claim the step would run: {note}",
+        note.starts_with("would transfer, not done: "),
+        "a declared digest does not make an absent file undecided: {note}",
     );
     assert!(
-        note.contains("exists(/workspace/ComfyUI/models/lora/a.bin)") && note.contains(&digest),
-        "…and must say what would decide it: {note}",
+        note.contains("exists(/workspace/ComfyUI/models/lora/b.bin)=unsatisfied")
+            && note.contains(&format!(
+                "sha256(/workspace/ComfyUI/models/lora/b.bin)={digest}"
+            ))
+            && note.contains("=not-checked"),
+        "…and both conjuncts' answers are in the note: {note}",
     );
 
     std::fs::remove_file(&path).ok();

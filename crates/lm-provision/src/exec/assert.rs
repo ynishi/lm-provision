@@ -439,9 +439,8 @@ pub enum DigestReading {
 /// does not scale here: later stages add command exit codes, command
 /// output and mount state, so per-observation parameters would grow one
 /// argument per predicate and the evaluator would end up knowing all of
-/// them. With one trait the evaluator only knows `O: Observe`. Methods
-/// are `async fn` in trait (RPITIT) and dispatch stays static, so no
-/// `async_trait` and no `dyn` is involved.
+/// them. With one trait the evaluator only knows `O: Observe`. Dispatch
+/// stays static, so no `async_trait` and no `dyn` is involved.
 ///
 /// The `Err` side is [`CheckError`] — the *answer* type — not
 /// `crate::exec::ExecError`. A failed observation is mapped straight to
@@ -453,25 +452,49 @@ pub enum DigestReading {
 /// read in one go or in chunks. Those belong to the design of the
 /// individual Asserts. This stage only fixes that the answers come back
 /// in a form the model can receive.
-//
-// `async_fn_in_trait` warns that a `Send` bound cannot be added later
-// without breaking implementors. It is not added *now* because nothing
-// requires it: dispatch is static (`eval<O: Observe>`), and the future
-// is awaited on the thread that created it — `block_in_place` +
-// `Handle::block_on` at the synchronous `Op::apply` seam. A `Send`
-// bound would start constraining implementors for a capability no
-// caller has asked for. What would ask for it is moving an observation
-// onto `tokio::spawn` to abandon one that never returns; the design
-// routes that case to a driver on the far side of a transport instead
-// (§3.2d), so the bound is being deferred rather than overlooked.
-#[allow(async_fn_in_trait)]
+///
+/// ## Why the futures are `Send`
+///
+/// The methods are written as RPITIT with an explicit `+ Send` rather
+/// than as `async fn`, which is the shape an `async fn` in a trait
+/// cannot promise.
+///
+/// **This bound was deliberately left out when the model was written**,
+/// and the reason it recorded was that nothing required it: dispatch is
+/// static, and the future was awaited on the thread that created it —
+/// `block_in_place` + `Handle::block_on` at the synchronous `Op::apply`
+/// seam. Adding it would have constrained every implementor for a
+/// capability no caller had asked for. The case that was expected to
+/// ask for it was moving an observation onto `tokio::spawn` to abandon
+/// one that never returns, and the design routes that to a driver on
+/// the far side of a transport instead (§3.2d) — so the bound was
+/// deferred rather than overlooked.
+///
+/// **A different caller asked.** Evaluating an Assert now happens inside
+/// a host effect resolver, because a lifecycle step is a dsl-kit `Call`
+/// node ([`crate::exec::steps`]) rather than a loop inside one
+/// `Op::apply`. dsl-kit's `AsyncEffectResolver::resolve` requires the
+/// future it returns to be `Send`
+/// (`dsl-kit-core-0.11.0/src/drive.rs:75-81`), and a future that awaits
+/// [`eval`] is only `Send` if these observations are. Without the bound
+/// an Assert simply cannot be evaluated on the `Call` route at all — in
+/// real mode as much as in a dry run.
+///
+/// So the bound is here on evidence, not on speculation: it is the
+/// price of the Assert model being usable from where the effects
+/// actually run. Nothing else moved with it — the value range, the fold
+/// table, the result tree, the leaf contract and the entity trait are
+/// unchanged.
 pub trait Observe {
     /// Whether a file is at `path`.
-    async fn file_exists(&self, path: &Path) -> Result<bool, CheckError>;
+    fn file_exists(&self, path: &Path) -> impl Future<Output = Result<bool, CheckError>> + Send;
 
     /// The content digest of the file at `path`, lowercase hex (see
     /// [`crate::digest::hex_sha256`] for the rendering contract).
-    async fn file_digest(&self, path: &Path) -> Result<DigestReading, CheckError>;
+    fn file_digest(
+        &self,
+        path: &Path,
+    ) -> impl Future<Output = Result<DigestReading, CheckError>> + Send;
 }
 
 // ---------------------------------------------------------------------
@@ -507,7 +530,12 @@ pub trait Observe {
 /// concept in two and force conversions at the step wiring. **The
 /// composition carries no mode-specific rule**: each basic predicate
 /// answers `NotChecked` for itself and [`fold_all`] folds as usual.
-pub async fn eval<O: Observe>(assert: &Assert, mode: ExecMode, obs: &O) -> AssertNode {
+///
+/// `O: Sync` (with the `Send` futures [`Observe`] requires) is what
+/// makes the returned future `Send`, which is what lets an evaluation
+/// happen inside a host effect resolver — see [`Observe`]'s
+/// §Why the futures are `Send`.
+pub async fn eval<O: Observe + Sync>(assert: &Assert, mode: ExecMode, obs: &O) -> AssertNode {
     match assert {
         Assert::FileExists { path } => {
             // Existence is a cheap observation, so it is evaluated in
@@ -578,11 +606,16 @@ pub async fn eval<O: Observe>(assert: &Assert, mode: ExecMode, obs: &O) -> Asser
 /// the recursion has to go through a pointer. This boxes the *future*
 /// only; `Observe` is still resolved statically through `O`, so no
 /// `dyn` enters the observation path.
-fn eval_boxed<'a, O: Observe>(
+///
+/// The box carries `+ Send`, which is the one place the whole
+/// evaluation's `Send`-ness is actually decided: a `dyn Future` erases
+/// auto traits, so an unannotated box would make [`eval`] non-`Send`
+/// however `Send` its parts were.
+fn eval_boxed<'a, O: Observe + Sync>(
     assert: &'a Assert,
     mode: ExecMode,
     obs: &'a O,
-) -> Pin<Box<dyn Future<Output = AssertNode> + 'a>> {
+) -> Pin<Box<dyn Future<Output = AssertNode> + Send + 'a>> {
     Box::pin(eval(assert, mode, obs))
 }
 

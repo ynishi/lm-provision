@@ -552,8 +552,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_json_parse_build_and_engine_execution() {
+    /// Multi-threaded flavour because a lifecycle phase on the
+    /// synchronous engine driver hands each step to
+    /// `exec::effects::block_on_effect` — in **both** modes now, since a
+    /// dry run answers the step's condition and observing the host is
+    /// async (see [`create_profile_engine`]'s §Runtime).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_json_parse_build_and_engine_execution() {
         let id_gen = IdGen::new();
 
         // Complete JSON Profile containing lifecycle and direct operation phases

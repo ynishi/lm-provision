@@ -228,8 +228,18 @@ fn real_mode_runs_sh_exec_and_summarises_the_result() {
 /// asserts that the previous placeholder trace line
 /// (`"(lifecycle: wiring pending)"`) never appears — the wiring is
 /// real now.
-#[test]
-fn dry_run_traces_every_traceable_lifecycle_op() {
+/// Multi-threaded flavour, and this is the shared reason for every
+/// lifecycle test in this file: **a lifecycle phase on the synchronous
+/// engine driver hands each step to `block_on_effect`, in both modes.**
+///
+/// Dry run used to need no runtime because it only rendered text. It
+/// now *answers* each step's completion condition, and observing the
+/// host is async (`exec::lifecycle::dry_run_step`) — so the same seam
+/// real mode always crossed is crossed here too. `apply` does not pay
+/// this: there a lifecycle step is a `Call` node and its resolver
+/// awaits it on the runtime already driving the engine.
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_traces_every_traceable_lifecycle_op() {
     use std::net::TcpListener;
 
     // Bind an ephemeral port for the two HttpPoll steps
@@ -417,8 +427,10 @@ fn dry_run_traces_every_traceable_lifecycle_op() {
 /// always CLI-routed regardless of `env` (04-bridge §net.transfer), so
 /// the capability it demands is `sh.exec` — the resolved route's, not
 /// the kind's (spec 02 §Dispatch routing "What the L4 gate sees").
-#[test]
-fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
+/// Multi-threaded flavour: see
+/// `dry_run_traces_every_traceable_lifecycle_op`.
+#[tokio::test(flavor = "multi_thread")]
+async fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
     let ids = IdGen::new();
     let program = ProfileNode::Spec {
         id: ids.node(),
@@ -508,8 +520,10 @@ fn staging_push_is_denied_when_only_net_transfer_is_granted() {
 /// `https://` src stays on the bridge and needs `net.transfer`, while
 /// an `hf://` src with a credential `env` routes to the CLI and needs
 /// `sh.exec` (spec 02 §Dispatch routing "What the L4 gate sees").
-#[test]
-fn sync_pull_demands_the_capability_of_the_route_its_payload_resolves_to() {
+/// Multi-threaded flavour: see
+/// `dry_run_traces_every_traceable_lifecycle_op`.
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_pull_demands_the_capability_of_the_route_its_payload_resolves_to() {
     /// `bridge` picks the `https://` src (net.transfer route) over the
     /// credential-`env` `hf://` src (CLI route); `capability` is the
     /// profile's single declared capability.
@@ -680,8 +694,10 @@ fn a_public_hf_download_gates_on_the_resolved_host() {
 /// `paths` / `http_allowlist` exactly as the `net.transfer` spelling
 /// is, and a poll's URL is gated like any other bridge GET. Both fire
 /// in dry-run, before any effect.
-#[test]
-fn lifecycle_steps_answer_to_the_path_and_http_allowlists() {
+/// Multi-threaded flavour: see
+/// `dry_run_traces_every_traceable_lifecycle_op`.
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_steps_answer_to_the_path_and_http_allowlists() {
     fn run(phase: ProfileNode, paths: Vec<String>, allowlist: Vec<String>) -> Result<(), String> {
         let ids = IdGen::new();
         let program = ProfileNode::Spec {
@@ -864,9 +880,11 @@ fn sh_exec_injects_a_declared_secret_into_the_child_in_real_mode() {
 ///
 /// Real mode drives an async effect, which blocks its thread on the
 /// current runtime — hence the multi-threaded flavour (see
-/// `lm_provision::exec::effects::block_on_effect`). Every other test in
-/// this file either stays in dry run or runs a synchronous effect, so
-/// they need no runtime at all.
+/// `lm_provision::exec::effects::block_on_effect`). The lifecycle tests
+/// in this file need one for the same reason, in dry run too (see
+/// `dry_run_traces_every_traceable_lifecycle_op`); the direct-op tests
+/// that stay in dry run or run a synchronous effect need no runtime at
+/// all.
 #[tokio::test(flavor = "multi_thread")]
 async fn comfyui_health_polls_a_local_server_when_executing_effects() {
     use std::io::{Read, Write};
@@ -938,8 +956,10 @@ async fn comfyui_health_polls_a_local_server_when_executing_effects() {
 /// poll re-reads is a provisioner-internal read, not a bridge op.
 /// Dry-run is enough to prove both halves: the gate is an entry check
 /// that fires before any effect.
-#[test]
-fn http_poll_lifecycle_ops_are_gated_on_net_http_get_not_sh_exec() {
+/// Multi-threaded flavour: see
+/// `dry_run_traces_every_traceable_lifecycle_op`.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_poll_lifecycle_ops_are_gated_on_net_http_get_not_sh_exec() {
     let poll_profile = |capabilities: Vec<String>| {
         let ids = IdGen::new();
         ProfileNode::Spec {

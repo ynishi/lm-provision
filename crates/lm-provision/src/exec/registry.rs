@@ -12,13 +12,13 @@
 //!   additionally consult [`policy`](super::policy) in both modes
 //!   (spec 07 "dry-run does policy"), rejecting targets that fall
 //!   outside the profile's declared `paths` / `http_allowlist`.
-//! - **lifecycle 15 ops** delegate to [`lifecycle::expand`]
-//!   for step composition, enforce the capability each expanded step
-//!   resolves to ([`step_capability`]) before running any of them, then
-//!   render each step in `DryRun` and execute each step (via
-//!   [`lifecycle::execute_step`]) in `Real`. A single per-op log line
-//!   joins the per-step summaries with `; `, preserving the direct-op
-//!   shape (`"<op> ..."`).
+//! - **lifecycle 15 ops** no longer run here. Their steps are composed
+//!   before the engine starts and projected onto engine nodes — one
+//!   `Call` per step ([`super::steps`]) — so the phase is a `Seq` and
+//!   each step suspends on its own, resolved by
+//!   [`resolve_lifecycle_step`]. A lifecycle phase reaches its op only
+//!   when the projection left it there: its expansion failed, or it
+//!   composed no steps at all.
 //!
 //! An [`ExecError`] from any step surfaces as
 //! [`EngineError::EvalFailed`], carrying the node at which it happened.
@@ -48,9 +48,12 @@
 //! so the same profile can be run through both and the two reports
 //! compared.
 //!
-//! A **lifecycle** phase is not routable this way: one `Op::apply` runs
-//! a whole composed step list rather than a single effect, so those two
-//! async step kinds stay on the seam.
+//! A **lifecycle** phase has no such switch. It was not routable while
+//! one `Op::apply` ran a whole composed step list; now that the list is
+//! engine nodes, every lifecycle step is a `Call` and there is no second
+//! shape to choose between. [`EffectRoute`] stays what it always was —
+//! the switch for the three single-effect network phases — and the two
+//! seams the lifecycle step kinds used to need are gone with them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,7 +80,11 @@ const DIRECT_OPS: [&str; 7] = [
 ];
 
 /// The fifteen lifecycle ops handled through [`lifecycle::expand`].
-const LIFECYCLE_OPS: [&str; 15] = [
+///
+/// `pub(crate)` so [`super::steps`] can pin its variant → op-name map
+/// against this list; the two are written out separately and nothing
+/// else would stop them drifting.
+pub(crate) const LIFECYCLE_OPS: [&str; 15] = [
     "system_apt",
     "comfyui_install",
     "python_version_check",
@@ -270,52 +277,41 @@ impl ProfileOp {
         push_policy_failure_report(&self.ctx, node, payload, err);
     }
 
-    /// Apply the path / http policy to one expanded lifecycle step.
+    /// Compose a lifecycle op's steps and run each one, on the
+    /// **synchronous** engine driver.
     ///
-    /// A lifecycle phase reaches the same bridges a direct op does, so
-    /// it answers to the same allowlists (spec 05 §L3): a `sync.pull`
-    /// writing outside `paths` or a `comfyui.health` polling a host
-    /// outside `http_allowlist` is denied exactly as the direct
-    /// `net.transfer` / `net.http_get` spelling of it would be. The
-    /// targets are read off the resolved step, mirroring
-    /// [`step_capability`]'s treatment of the demand.
+    /// This is not the route `apply` takes. There a lifecycle phase is a
+    /// `Seq` of per-step `Call` nodes ([`super::steps`]) and
+    /// [`resolve_lifecycle_step`] awaits each one. But
+    /// [`crate::profile_ast::create_profile_engine`] builds an engine
+    /// straight over the derived AST and drives it with a synchronous
+    /// `Stepper` — the MCP debugger host and the exec integration tests
+    /// — and a synchronous stepper cannot resolve a `Call`. On that
+    /// driver a lifecycle phase is still an `Apply`, and this is what
+    /// runs it.
     ///
-    /// `Sh` steps carry no policy target — `sh.exec` is outside the
-    /// path layer by design (spec 04 §`sh.exec`) — and a `Note` runs no
-    /// effect at all. The pid file an `HttpPoll` re-reads is likewise
-    /// exempt: it is a provisioner-internal read, not a bridge op
-    /// (spec 02 §Poll deadlines).
-    fn check_step_policy(&self, step: &lifecycle::Step) -> Result<(), ExecError> {
-        let demanded = demand::step(step)?;
-        for path in &demanded.paths {
-            self.ctx.path_policy.check(path)?;
-        }
-        for url in &demanded.urls {
-            self.ctx.http_policy.check(url)?;
-        }
-        Ok(())
-    }
-
-    /// Compose a lifecycle op's steps, then render (dry-run) or execute
-    /// (real) each one. Each sub-step becomes its own report entry
-    /// (`<phase_index>_<kind>_<n>`, labelled with the effect it runs);
-    /// the per-op trace log line is still the joined summary, unchanged.
+    /// So the seam stays here, for the same reason the three network
+    /// phases keep theirs: **it belongs to the synchronous driver, not
+    /// to lifecycle**. One [`effects::block_on_effect`] per step, over
+    /// the whole of [`lifecycle::run_step`] — the same function the
+    /// resolver awaits, in the same mode — so the two drivers cannot
+    /// answer a step differently. It goes when that driver does.
     ///
-    /// The phase's `env` keyed slot (present on `sync.pull` /
-    /// `staging.push`) is resolved once through the
-    /// [`EnvPolicy`](super::policy::EnvPolicy) — in **both** modes
-    /// (spec 06 §Resolution "dry-run resolves too"), so an undeclared or
-    /// missing secret fails a dry run identically — and injected into the
-    /// composed [`lifecycle::Step::Sh`] steps. Fail-fast: a failing
-    /// sub-step is recorded and stops the phase, so its predecessors
-    /// remain in the report but no later sub-step is reached.
+    /// The order is the one this function has always had: the phase's
+    /// `env` keyed slot resolves through the
+    /// [`EnvPolicy`](super::policy::EnvPolicy) first — in **both** modes
+    /// (spec 06 §Resolution "dry-run resolves too") — then the
+    /// expansion, then both gates over *every* composed step, so a phase
+    /// whose second step would be denied never executes its first
+    /// (spec 02 §Dispatch routing, spec 05 §L3 / §L4). Fail-fast: a
+    /// failing sub-step is recorded and stops the phase.
     fn run_lifecycle(
         &self,
         node: NodeId,
         payload: &ProfileNode,
     ) -> Result<ProfileValue, ExecError> {
         let (base_id, kind) = self.base(node);
-        let env = match self.resolve_phase_env(payload) {
+        let env = match resolve_phase_env(&self.ctx, payload) {
             Ok(env) => env,
             Err(err) => {
                 self.record_phase_failure(node, &err);
@@ -329,100 +325,28 @@ impl ProfileOp {
                 return Err(err);
             }
         };
-
-        // Both gates see the *resolved* steps: expansion is pure, so the
-        // route is known before anything runs, and the whole phase is
-        // checked up front — a phase whose second step would be denied
-        // never executes its first (spec 02 §Dispatch routing "What the
-        // L4 gate sees", spec 05 §L3 / §L4).
-        for step in &steps {
-            let capability = match demand::step(step) {
-                Ok(demanded) => demanded.capability,
-                Err(err) => {
-                    self.record_phase_failure(node, &err);
-                    return Err(err);
-                }
-            };
-            if let Some(capability) = capability {
-                if let Err(err) = self.ctx.gate.require(capability) {
-                    self.record_phase_failure(node, &err);
-                    return Err(err);
-                }
-            }
-            if let Err(err) = self.check_step_policy(step) {
-                self.record_phase_failure(node, &err);
-                return Err(err);
-            }
-        }
+        check_lifecycle_steps(&self.ctx, node, &steps)?;
 
         let mut renders = Vec::with_capacity(steps.len());
         for (index, step) in steps.iter().enumerate() {
             let sub_id = format!("{base_id}_{}", index + 1);
-            let op = step_effect_op(step);
             // Audit before the sub-step runs. Env keys go through the
-            // redaction helper (spec 09 §Audit log); the resolved
-            // values from the phase's `env` map never reach the event.
+            // redaction helper (spec 09 §Audit log); the resolved values
+            // from the phase's `env` map never reach the event.
             audit_lifecycle_step(self.ctx.mode, &kind, step, &env);
-            match self.ctx.mode {
-                ExecMode::DryRun => {
-                    renders.push(lifecycle::render_dry(step, &env));
-                    let mut entry = StepReport::new(sub_id, kind.clone(), op);
-                    apply_step_input_fields(&mut entry, step);
-                    // A step that would be skipped on a condition says
-                    // what the condition is and that a dry run did not
-                    // answer it — never that it "would run", which is
-                    // the over-report Chef's why-run mode is criticised
-                    // for (design §3.7).
-                    if let Some(note) = lifecycle::skip_undecided_note(step) {
-                        entry.note = Some(note);
-                    }
-                    // A `note` sub-step is inert in either mode, matching
-                    // the legacy `dispatch_pending` skip's lack of a
-                    // `dry_run` marker; effect-bearing sub-steps carry it.
-                    if !matches!(step, lifecycle::Step::Note(_)) {
-                        entry.dry_run = Some(true);
-                    }
-                    self.push(entry);
-                }
-                ExecMode::Real => match lifecycle::execute_step(step, self.name, &env) {
-                    Ok(result) => {
-                        let mut entry = StepReport::new(sub_id, kind.clone(), op);
-                        apply_step_input_fields(&mut entry, step);
-                        apply_step_result_fields(&mut entry, &result);
-                        self.push(entry);
-                        renders.push(result.summary);
-                    }
-                    Err(failure) => {
-                        let mut entry = StepReport::new(sub_id, kind.clone(), op);
-                        apply_step_input_fields(&mut entry, step);
-                        // The partial observation lands *before*
-                        // `mark_fail`, which only substitutes `-1` when
-                        // no more specific status is already there — so
-                        // a non-zero exit code survives.
-                        apply_step_result_fields(&mut entry, &failure.observed);
-                        self.mark_fail(&mut entry, &failure.error);
-                        self.push(entry);
-                        return Err(failure.error);
-                    }
-                },
-            }
+            let run = effects::block_on_effect(
+                self.name,
+                lifecycle::run_step(step, self.name, &env, self.ctx.mode),
+            );
+            renders.push(record_lifecycle_step(
+                &self.ctx,
+                sub_id,
+                kind.clone(),
+                step,
+                run,
+            )?);
         }
         Ok(self.record(format!("{} {}", self.name, renders.join("; "))))
-    }
-
-    /// Resolve the phase's `env` keyed slot into a concrete `name →
-    /// value` map (empty for phases without an `env` field). Fail-fast on
-    /// an undeclared or missing secret.
-    fn resolve_phase_env(
-        &self,
-        payload: &ProfileNode,
-    ) -> Result<std::collections::BTreeMap<String, String>, ExecError> {
-        match payload {
-            ProfileNode::SyncPull { env, .. } | ProfileNode::StagingPush { env, .. } => {
-                self.ctx.env_policy.resolve(env)
-            }
-            _ => Ok(std::collections::BTreeMap::new()),
-        }
     }
 
     fn run_sh_exec(&self, node: NodeId, payload: &ProfileNode) -> Result<ProfileValue, ExecError> {
@@ -1105,6 +1029,167 @@ fn push_policy_failure_report(
     push_report(ctx, entry);
 }
 
+/// Resolve a phase's `env` keyed slot into a concrete `name → value`
+/// map (empty for phases without an `env` field). Fail-fast on an
+/// undeclared or missing secret, in **both** modes (spec 06 §Resolution
+/// "dry-run resolves too").
+fn resolve_phase_env(
+    ctx: &ExecContext,
+    payload: &ProfileNode,
+) -> Result<std::collections::BTreeMap<String, String>, ExecError> {
+    match payload {
+        ProfileNode::SyncPull { env, .. } | ProfileNode::StagingPush { env, .. } => {
+            ctx.env_policy.resolve(env)
+        }
+        _ => Ok(std::collections::BTreeMap::new()),
+    }
+}
+
+/// Apply the path / http policy to one expanded lifecycle step.
+///
+/// A lifecycle phase reaches the same bridges a direct op does, so it
+/// answers to the same allowlists (spec 05 §L3): a `sync.pull` writing
+/// outside `paths` or a `comfyui.health` polling a host outside
+/// `http_allowlist` is denied exactly as the direct `net.transfer` /
+/// `net.http_get` spelling of it would be. The targets are read off the
+/// resolved step.
+///
+/// `Sh` steps carry no policy target — `sh.exec` is outside the path
+/// layer by design (spec 04 §`sh.exec`) — and a `Note` runs no effect at
+/// all. The pid file an `HttpPoll` re-reads is likewise exempt: it is a
+/// provisioner-internal read, not a bridge op (spec 02 §Poll deadlines).
+fn check_step_policy(ctx: &ExecContext, step: &lifecycle::Step) -> Result<(), ExecError> {
+    let demanded = demand::step(step)?;
+    for path in &demanded.paths {
+        ctx.path_policy.check(path)?;
+    }
+    for url in &demanded.urls {
+        ctx.http_policy.check(url)?;
+    }
+    Ok(())
+}
+
+/// The L4 capability and both L3 allowlists of **every** composed step
+/// of a phase, run before any of them executes.
+///
+/// A phase whose second step would be denied never executes its first
+/// (spec 02 §Dispatch routing "What the L4 gate sees", spec 05
+/// §L3 / §L4). On the synchronous driver that falls out of checking the
+/// list up front. On the `Call` route the engine hands the steps over
+/// one at a time, so checking only the arriving step would let step 1
+/// run and deny step 2 afterwards — the property would be quietly lost.
+/// [`resolve_lifecycle_step`] therefore runs this whole check at *each*
+/// step, which restores it: step 1 is refused for step 2's denial. The
+/// check is pure and reads a handful of declarations, so repeating it
+/// costs nothing and cannot answer differently between steps.
+///
+/// A denial reports itself at the *phase* node, so callers have nothing
+/// to push.
+fn check_lifecycle_steps(
+    ctx: &ExecContext,
+    phase: NodeId,
+    steps: &[lifecycle::Step],
+) -> Result<(), ExecError> {
+    for step in steps {
+        let capability = match demand::step(step) {
+            Ok(demanded) => demanded.capability,
+            Err(err) => {
+                record_phase_failure_report(ctx, phase, &err);
+                return Err(err);
+            }
+        };
+        if let Some(capability) = capability {
+            if let Err(err) = ctx.gate.require(capability) {
+                record_phase_failure_report(ctx, phase, &err);
+                return Err(err);
+            }
+        }
+        if let Err(err) = check_step_policy(ctx, step) {
+            record_phase_failure_report(ctx, phase, &err);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Everything a lifecycle phase has to answer for before any of its
+/// steps runs, for the `Call` route: the `env.ref` capability, the phase
+/// `env` resolution, and [`check_lifecycle_steps`].
+///
+/// The synchronous driver reaches the same three in the same order —
+/// `env.ref` in [`ProfileOp::dispatch`], then the two inside
+/// [`ProfileOp::run_lifecycle`] — so the two drivers deny the same
+/// profiles with the same report entry.
+fn lifecycle_preflight(
+    ctx: &ExecContext,
+    phase: NodeId,
+    payload: &ProfileNode,
+    steps: &[lifecycle::Step],
+) -> Result<std::collections::BTreeMap<String, String>, ExecError> {
+    if let Some(capability) = demand::env_ref(payload) {
+        if let Err(err) = ctx.gate.require(capability) {
+            record_phase_failure_report(ctx, phase, &err);
+            return Err(err);
+        }
+    }
+    let env = match resolve_phase_env(ctx, payload) {
+        Ok(env) => env,
+        Err(err) => {
+            record_phase_failure_report(ctx, phase, &err);
+            return Err(err);
+        }
+    };
+    check_lifecycle_steps(ctx, phase, steps)?;
+    Ok(env)
+}
+
+/// Write one lifecycle step's report entry from what running it
+/// produced, and return its trace-log summary.
+///
+/// **Both drivers land here**, which is what keeps a step's report entry
+/// independent of which one ran it: the same id, the same `op` label,
+/// the same declared-input fields, the same observations, the same
+/// `dry_run` marker rule, the same note.
+fn record_lifecycle_step(
+    ctx: &ExecContext,
+    sub_id: String,
+    kind: String,
+    step: &lifecycle::Step,
+    run: Result<lifecycle::StepRun, lifecycle::StepFailure>,
+) -> Result<String, ExecError> {
+    let mut entry = StepReport::new(sub_id, kind, step_effect_op(step));
+    apply_step_input_fields(&mut entry, step);
+    match run {
+        Ok(lifecycle::StepRun::Dry(decided)) => {
+            if let Some(note) = decided.note {
+                entry.note = Some(note);
+            }
+            // A `note` sub-step is inert in either mode, matching the
+            // legacy `dispatch_pending` skip's lack of a `dry_run`
+            // marker; effect-bearing sub-steps carry it.
+            if !matches!(step, lifecycle::Step::Note(_)) {
+                entry.dry_run = Some(true);
+            }
+            push_report(ctx, entry);
+            Ok(decided.summary)
+        }
+        Ok(lifecycle::StepRun::Real(result)) => {
+            apply_step_result_fields(&mut entry, &result);
+            push_report(ctx, entry);
+            Ok(result.summary)
+        }
+        Err(failure) => {
+            // The partial observation lands *before* the failure mark,
+            // which only substitutes `-1` when no more specific status
+            // is already there — so a non-zero exit code survives.
+            apply_step_result_fields(&mut entry, &failure.observed);
+            mark_report_failed(ctx, &mut entry, &failure.error);
+            push_report(ctx, entry);
+            Err(failure.error)
+        }
+    }
+}
+
 /// Resolve a `net.http_post`'s request body into `(bytes, content type,
 /// the audit's name for its form)`.
 ///
@@ -1163,6 +1248,15 @@ pub const HTTP_GET_CALL_LABEL: &str = "net.http_get";
 /// The `CallSpec::label` a suspended `net.http_post` carries.
 pub const HTTP_POST_CALL_LABEL: &str = "net.http_post";
 
+/// The `CallSpec::label` a suspended **lifecycle step** carries.
+///
+/// One label for all fifteen ops and all four step shapes: what the
+/// resolver needs in order to run the step is the step itself, which it
+/// reaches through [`super::steps::StepPlan`], not through the label. A
+/// label per op would name the phase twice (the payload already does)
+/// and a label per step shape would name the effect twice.
+pub const LIFECYCLE_STEP_CALL_LABEL: &str = "lifecycle.step";
+
 /// Which shape the single-effect network phases take in the engine
 /// (module doc §Two routes for the single-effect ops).
 ///
@@ -1197,35 +1291,178 @@ impl From<&ExecError> for CallError {
     }
 }
 
-/// The [`ProfileNode`] AST projected for the engine, with the nodes the
-/// host has chosen to route through a `Call` reclassified.
+/// The [`ProfileNode`] AST projected for the engine, with two kinds of
+/// node reclassified on top of the derived one.
 ///
 /// It wraps [`ProfileAst`] rather than replacing it: every other node
 /// keeps the classification `#[derive(DslExec)]` gave it, and the
 /// profile's own bytes are untouched, so `hash` / `canonical` are
-/// unaffected by which route the host picked.
+/// unaffected by any of this.
+///
+/// - a **routable network phase**, when `route` is
+///   [`EffectRoute::Call`] — an `Apply` becomes a `Call` ([`call_kind`]);
+/// - a **lifecycle phase**, always — an `Apply` becomes a `Seq` over one
+///   synthetic `Call` node per composed step ([`super::steps`]). The
+///   step nodes exist only here and in the [`StepPlan`](super::steps::StepPlan)
+///   both sides read, so they carry no payload of their own; the
+///   resolver reaches everything through the phase they name.
 pub struct ProfileCallAst {
     /// The unmodified derived projection.
     inner: ProfileAst,
-    /// `NodeId -> Call` overrides applied on top of `inner`.
-    calls: HashMap<NodeId, NodeKind>,
+    /// `NodeId -> NodeKind` overrides applied on top of `inner`.
+    overrides: HashMap<NodeId, NodeKind>,
 }
 
 impl ProfileCallAst {
     /// Project `root`, reclassifying every routable phase
     /// ([`call_kind`]) as a `Call` when `route` is
-    /// [`EffectRoute::Call`].
-    pub fn new(root: &ProfileNode, route: EffectRoute) -> Self {
+    /// [`EffectRoute::Call`], and every projected lifecycle phase
+    /// (`plan`) as a `Seq` of per-step `Call`s.
+    ///
+    /// `plan` has to be the same [`StepPlan`](super::steps::StepPlan) the
+    /// [`ExecContext`] holds: it is where the synthetic node ids come
+    /// from, and a resolver handed one of them looks it up there.
+    /// Building a second plan would hand out the same ids by
+    /// construction, but nothing would keep it doing so — one plan, two
+    /// readers.
+    ///
+    /// **The children are a `Seq`, not a `Par`.** A phase's steps are
+    /// still run in written order, which is the whole basis on which a
+    /// partial apply is readable (design §2). What changed is that the
+    /// order is now the *engine's*, over independent child nodes, rather
+    /// than a loop inside one op — so a later stage swaps this one
+    /// constructor call for a `Par` and changes nothing else.
+    pub fn new(root: &ProfileNode, route: EffectRoute, plan: &super::steps::StepPlan) -> Self {
         let inner = OwnedDerivedAst::new(root, ProfileSemantics);
-        let mut calls = HashMap::new();
+        let mut overrides = HashMap::new();
         if route == EffectRoute::Call {
             for (id, node) in super::payload::build_payload_map(root) {
                 if let Some(kind) = call_kind(&node) {
-                    calls.insert(id, kind);
+                    overrides.insert(id, kind);
                 }
             }
         }
-        Self { inner, calls }
+        for (phase_id, phase) in plan.projected_phases() {
+            let total = phase.steps.len();
+            let Some(payload) = plan_phase_payload(root, phase_id) else {
+                continue;
+            };
+            for (offset, step) in phase.steps.iter().enumerate() {
+                overrides.insert(
+                    phase.nodes[offset],
+                    NodeKind::Call {
+                        label: LIFECYCLE_STEP_CALL_LABEL.to_string(),
+                        payload: lifecycle_step_payload(payload, step, offset + 1, total),
+                    },
+                );
+            }
+            overrides.insert(
+                phase_id,
+                NodeKind::Seq {
+                    children: phase.nodes.clone(),
+                },
+            );
+        }
+        Self { inner, overrides }
+    }
+}
+
+/// The declared phase node `phase_id` names, looked up under `root`.
+fn plan_phase_payload(root: &ProfileNode, phase_id: NodeId) -> Option<&ProfileNode> {
+    let ProfileNode::Spec { phases, .. } = root else {
+        return None;
+    };
+    use dsl_kit::DslNode as _;
+    phases.iter().find(|phase| phase.node_id() == phase_id)
+}
+
+/// What a suspended lifecycle step declares to an observer.
+///
+/// The same rule the two HTTP calls follow, applied to a step: **names,
+/// addresses and shapes — never a value that must not be observed.**
+/// Since dsl-kit-core 0.11.0 a `CallSpec::payload` travels verbatim to
+/// the host and surfaces as `PendingProjection.payload`, readable by any
+/// MCP client watching the suspension, so what a step may put here is
+/// decided by spec 09 §Audit log rather than by convenience.
+///
+/// For a lifecycle step that means:
+///
+/// - a [`lifecycle::Step::Sh`] declares its **composed argv** and, when
+///   the phase has an `env` keyed slot, the **names** of the variables
+///   injected into it — never a resolved value. The argv is composed
+///   from payload fields that are already in the profile's own bytes and
+///   in the `plan` artifact (`apt-get install …`, a `git clone` URL, a
+///   `hooks.post_install` script), so it discloses nothing the profile
+///   did not already say; the resolved secrets reach the child process's
+///   environment and nothing else;
+/// - a [`lifecycle::Step::Transfer`] declares `src` / `dst`, exactly as
+///   the direct `net.transfer` call does;
+/// - a [`lifecycle::Step::HttpPoll`] declares the URL it polls and its
+///   deadline. It carries no headers at all — a poll sends none — so the
+///   header-value question the HTTP calls have to answer does not arise;
+/// - a [`lifecycle::Step::Note`] declares its message, which is
+///   host-composed text about what was *not* run.
+///
+/// The step's `done` is deliberately absent: it is derived from the
+/// destination, which is already here, and printing the condition twice
+/// would only widen the surface.
+fn lifecycle_step_payload(
+    phase: &ProfileNode,
+    step: &lifecycle::Step,
+    index: usize,
+    total: usize,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "phase".to_string(),
+        serde_json::Value::from(crate::plan::kind_of(phase)),
+    );
+    map.insert("step".to_string(), serde_json::Value::from(index));
+    map.insert("of".to_string(), serde_json::Value::from(total));
+    map.insert(
+        "effect".to_string(),
+        serde_json::Value::from(step_effect_op(step)),
+    );
+    match step {
+        lifecycle::Step::Sh(argv) => {
+            map.insert("argv".to_string(), serde_json::json!(argv));
+            let names = phase_env_names(phase);
+            if !names.is_empty() {
+                map.insert("env_names".to_string(), serde_json::json!(names));
+            }
+        }
+        lifecycle::Step::Transfer { src, dst, .. } => {
+            map.insert("src".to_string(), serde_json::Value::from(src.clone()));
+            map.insert("dst".to_string(), serde_json::Value::from(dst.clone()));
+        }
+        lifecycle::Step::HttpPoll {
+            url, timeout_sec, ..
+        } => {
+            map.insert("url".to_string(), serde_json::Value::from(url.clone()));
+            map.insert(
+                "timeout_sec".to_string(),
+                serde_json::Value::from(*timeout_sec),
+            );
+        }
+        lifecycle::Step::Note(message) => {
+            map.insert(
+                "message".to_string(),
+                serde_json::Value::from(message.clone()),
+            );
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// The **names** in a phase's `env` keyed slot (spec 09
+/// names-not-values). Empty for the thirteen lifecycle kinds that have
+/// no such slot.
+fn phase_env_names(phase: &ProfileNode) -> Vec<&String> {
+    match phase {
+        ProfileNode::SyncPull { env, .. } | ProfileNode::StagingPush { env, .. } => {
+            env.keys().collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1315,7 +1552,7 @@ impl Ast for ProfileCallAst {
     }
 
     fn node_kind(&self, id: NodeId) -> NodeKind {
-        match self.calls.get(&id) {
+        match self.overrides.get(&id) {
             Some(kind) => kind.clone(),
             None => self.inner.node_kind(id),
         }
@@ -1342,6 +1579,14 @@ impl Ast for ProfileCallAst {
     }
 
     fn literal(&self, node: NodeId) -> Option<ProfileValue> {
+        // A synthetic step node exists only in the override table, so
+        // the inner projection has nothing under that id. The engine
+        // only asks a `Lit` for its literal and never asks a `Call`, but
+        // an override is the one id where "ask the inner AST" is not a
+        // question it can answer, so it is answered here.
+        if self.overrides.contains_key(&node) {
+            return None;
+        }
         self.inner.literal(node)
     }
 }
@@ -1367,6 +1612,12 @@ pub async fn resolve_call(
             node.0
         )));
     };
+    // A lifecycle step is answered before the payload lookup below: its
+    // node is synthetic, so there is no `ProfileNode` under that id. Its
+    // inputs are the phase's, reached through the step plan.
+    if spec.label == LIFECYCLE_STEP_CALL_LABEL {
+        return resolve_lifecycle_step(ctx, node).await;
+    }
     // `spec.payload` is `Null` on dsl-kit-core 0.8.0 regardless of what
     // the node declared (see [`call_kind`]), so the effect's inputs come
     // from the payload map — the same recovery `Op::apply` does, which
@@ -1384,6 +1635,66 @@ pub async fn resolve_call(
             "no host resolver is registered for the call '{other}'"
         ))),
     }
+}
+
+/// Resolve one suspended **lifecycle step**.
+///
+/// This is where a lifecycle op runs now. The phase composed its steps
+/// before the engine started ([`super::steps`]); the engine walks them
+/// as a `Seq` and suspends on each, and this awaits the one it is given.
+///
+/// What it writes is what the `Op` route wrote, deliberately: the same
+/// `<phase_index>_<kind>_<n>` report id (taken from the *phase*, not
+/// from the synthetic node), the same `op` label, the same input and
+/// observation fields. Fail-fast still holds — a failing step's entry is
+/// the last one in the report and the engine stops — because the engine
+/// stops on the first `Err` a resolver returns.
+///
+/// The difference from [`ProfileOp::run_lifecycle`] is **only how the
+/// step is reached**: there a synchronous `Op::apply` hands
+/// [`lifecycle::run_step`] to [`effects::block_on_effect`], here it is
+/// awaited. Same function, same mode, same report writer
+/// ([`record_lifecycle_step`]) — so the answer a step gives does not
+/// depend on which driver is turning the engine.
+async fn resolve_lifecycle_step(
+    ctx: &ExecContext,
+    node: NodeId,
+) -> Result<ProfileValue, CallError> {
+    let Some((phase_steps, step_ref, step)) = ctx.step_plan.locate(node) else {
+        return Err(CallError(format!(
+            "n{} is labelled '{LIFECYCLE_STEP_CALL_LABEL}' but the step plan does not \
+             project it; the AST and the plan disagree",
+            node.0
+        )));
+    };
+    let phase = step_ref.phase;
+    let Some(payload) = ctx.payloads.get(&phase) else {
+        let err = ExecError::PayloadMissing(phase.0);
+        record_phase_failure_report(ctx, phase, &err);
+        return Err(CallError::from(&err));
+    };
+
+    // The gate and both policies run here, before the effect, over the
+    // *whole* phase — see [`lifecycle_preflight`] for why every step
+    // pays for every other step's denial. They report their own failure
+    // at the phase node, so there is nothing to push here.
+    let env = lifecycle_preflight(ctx, phase, payload, &phase_steps.steps)
+        .map_err(|err| CallError::from(&err))?;
+
+    let (base_id, kind) = report_base(ctx, phase);
+    let sub_id = format!("{base_id}_{}", step_ref.index);
+    let op = phase_steps.op;
+    // Audit before the step runs (spec 09 §Audit log). Env keys go
+    // through the redaction helper; the resolved values never reach the
+    // event.
+    audit_lifecycle_step(ctx.mode, &kind, step, &env);
+    // No lock is held across this await: `record_line` / `push_report`
+    // take their mutexes for the duration of one push, after the step
+    // has finished.
+    let run = lifecycle::run_step(step, op, &env, ctx.mode).await;
+    let summary =
+        record_lifecycle_step(ctx, sub_id, kind, step, run).map_err(|err| CallError::from(&err))?;
+    Ok(record_line(ctx, format!("{op} {summary}")))
 }
 
 /// Report and render a routed phase whose payload is not the variant its
@@ -1794,8 +2105,11 @@ mod tests {
             ],
         };
 
-        let on_op = ProfileCallAst::new(&root, EffectRoute::Op);
-        let on_call = ProfileCallAst::new(&root, EffectRoute::Call);
+        // No lifecycle phase here, so the plan projects nothing and the
+        // routing under test is the network phases' alone.
+        let plan = crate::exec::steps::StepPlan::build(&root);
+        let on_op = ProfileCallAst::new(&root, EffectRoute::Op, &plan);
+        let on_call = ProfileCallAst::new(&root, EffectRoute::Call, &plan);
         let expected = [
             TRANSFER_CALL_LABEL,
             HTTP_GET_CALL_LABEL,

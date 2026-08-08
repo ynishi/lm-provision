@@ -73,12 +73,14 @@ pub enum AstApplyError {
 ///
 /// **`async`, and a multi-threaded tokio runtime must be driving it.**
 /// The effect layer's HTTP routes are async ([`crate::exec::effects`]).
-/// A phase routed through [`EffectRoute::Call`] suspends and is awaited
-/// by [`EffectResolver`] below — nothing blocks. Every other
-/// async-effect-bearing op is still an `Op`, and `dsl_kit`'s
-/// `Op::apply` is not `async`, so those drive their future from the
-/// synchronous seam ([`crate::exec::effects::block_on_effect`]), which
-/// needs a sibling worker to keep the reactor turning.
+/// A phase routed through [`EffectRoute::Call`], and **every lifecycle
+/// step** (which is a `Call` node of its own,
+/// [`crate::exec::steps`]), suspends and is awaited by
+/// [`EffectResolver`] below — nothing blocks. What still needs a sibling
+/// worker is the three network phases' legacy [`EffectRoute::Op`]
+/// branch: `dsl_kit`'s `Op::apply` is not `async`, so those drive their
+/// future from the synchronous seam
+/// ([`crate::exec::effects::block_on_effect`]).
 ///
 /// The runtime itself is built once, at the CLI entry point
 /// ([`crate::cli`]).
@@ -114,8 +116,13 @@ pub async fn run_apply_ast_routed(
     let log = Arc::new(Mutex::new(Vec::new()));
     let ctx = Arc::new(ExecContext::from_root(&root, mode, log)?);
     let reports = ctx.reports_handle();
+    // One step plan, two readers: the AST declares the per-step nodes it
+    // projects and the resolver looks a suspended one back up. Building
+    // a second plan here would hand out the same ids by construction,
+    // but nothing would keep it doing so.
+    let ast = ProfileCallAst::new(&root, route, &ctx.step_plan);
     let mut engine = Engine::new_with_ops(
-        ProfileCallAst::new(&root, route),
+        ast,
         Arc::new(ReducerRegistry::new()),
         registry::profile_op_registry(Arc::clone(&ctx)),
     )

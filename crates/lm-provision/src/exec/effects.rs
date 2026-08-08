@@ -62,16 +62,26 @@
 //! resolves them through an `AsyncEffectResolver`; the three
 //! single-effect network phases (`net.transfer` / `net.http_get` /
 //! `net.http_post`) have that route now (see [`super::registry`]'s
-//! module doc and [`crate::apply`]), and reach [`transfer`] /
-//! [`http_get`] / [`http_post`] by `await`, not through here.
+//! module doc and [`crate::apply`]), and so does **every lifecycle
+//! step** ([`super::steps`]). All of them reach [`transfer`] /
+//! [`http_get`] / [`sh_exec`] by `await`, not through here.
 //!
-//! The five call sites left are of two kinds. Three are the routed
-//! phases' own legacy [`super::registry::EffectRoute::Op`] branches,
-//! kept **on purpose**: a route the host can no longer take is a route
-//! the two-routes-agree regression can no longer compare, so the seam
-//! stays until the `Op` route is retired for good. The other two are the
-//! async lifecycle step kinds, which have not moved — one `Op::apply`
-//! there runs a whole composed step list rather than a single effect.
+//! **The four call sites left all belong to the synchronous engine
+//! driver**, which is the thing that cannot await — not to any
+//! particular phase:
+//!
+//! - three are the routed network phases' legacy
+//!   [`super::registry::EffectRoute::Op`] branches, kept on purpose so
+//!   the two-routes-agree regression still has a route to compare;
+//! - one is a lifecycle step run from `ProfileOp::run_lifecycle`, which
+//!   is what `crate::profile_ast::create_profile_engine` reaches: that
+//!   engine is driven by a synchronous `Stepper` (the MCP debugger host,
+//!   the exec integration tests), and a synchronous stepper cannot
+//!   resolve a `Call`, so a lifecycle phase stays an `Apply` there.
+//!
+//! The count therefore tracks **how much still runs on the synchronous
+//! driver**, and goes to zero when that driver does — not when any
+//! individual phase moves.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -259,12 +269,12 @@ pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError>
 ///
 /// `dsl_kit::Op::apply` is a `fn`, not an `async fn`, so an op cannot
 /// await. Rather than spread that seam over every call site, it lives
-/// here: the five remaining callers (the `net_http_get` /
-/// `net_http_post` / `net_transfer` ops in [`super::registry`], which
-/// are the legacy [`super::registry::EffectRoute::Op`] branch of three
-/// phases that also have a `Call` route, and the two async lifecycle
-/// step kinds in [`super::lifecycle`]) hand their future to this
-/// function.
+/// here: the four remaining callers — the `net_http_get` /
+/// `net_http_post` / `net_transfer` ops in [`super::registry`] (the
+/// legacy [`super::registry::EffectRoute::Op`] branch of three phases
+/// that also have a `Call` route), and one per lifecycle step in
+/// `ProfileOp::run_lifecycle` — hand their future to this function. All
+/// four are the synchronous engine driver; see the module doc.
 ///
 /// **A caller with more than one thing to await hands over one future
 /// covering all of it**, rather than calling this once per await. The

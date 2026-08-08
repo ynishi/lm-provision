@@ -896,17 +896,17 @@ fn missing_model_note(name: &str, platform_kind: &str) -> Step {
     ))
 }
 
-/// Render one step for the dry-run trace log.
+/// Render one step for the dry-run trace log, **without** answering its
+/// condition.
 ///
-/// Used by the registry to build a single per-op log line
-/// (`"<op> <step_1>; <step_2>; ..."`) without touching the filesystem
-/// or network. `env` is the phase's resolved env-injection map (empty
-/// for env-less ops); a [`Step::Sh`] renders its *key* names only —
-/// resolved values are never logged (spec 06 opacity).
+/// `env` is the phase's resolved env-injection map (empty for env-less
+/// ops); a [`Step::Sh`] renders its *key* names only — resolved values
+/// are never logged (spec 06 opacity).
 ///
-/// A step carrying a `done` renders the condition, unevaluated, and
-/// says so — see [`skip_undecided_note`] for why a dry run does not
-/// answer it.
+/// A step's `done` is deliberately absent from this rendering: a dry run
+/// now *evaluates* it, and what it answered belongs with the answer.
+/// [`dry_run_step`] is the whole dry-run rendering; this is the half of
+/// it that describes the step itself.
 pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
     match step {
         Step::Sh(argv) if env.is_empty() => format!("sh argv={argv:?}"),
@@ -914,19 +914,7 @@ pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
             "sh argv={argv:?} env_keys={:?}",
             env.keys().collect::<Vec<_>>()
         ),
-        Step::Transfer {
-            src,
-            dst,
-            done: None,
-        } => format!("transfer src={src} dst={dst}"),
-        Step::Transfer {
-            src,
-            dst,
-            done: Some(done),
-        } => format!(
-            "transfer src={src} dst={dst} skip_if={} (undecided: not evaluated in a dry run)",
-            assert::describe(done)
-        ),
+        Step::Transfer { src, dst, .. } => format!("transfer src={src} dst={dst}"),
         Step::HttpPoll {
             url,
             timeout_sec,
@@ -1055,41 +1043,37 @@ impl From<ExecError> for StepFailure {
 /// ([`StepFailure`]); callers that only need the error take
 /// [`StepFailure::error`].
 ///
-/// Two of the four step kinds reach an async effect (`transfer` streams
-/// a file, `http_poll` reads a URL), and the registry that calls this
-/// sits behind `dsl_kit::Op::apply`, which is synchronous. Those two are
-/// therefore driven through [`effects::block_on_effect`] here rather
-/// than making the whole step surface async for the two kinds — `sh` and
-/// `note` — that have nothing to await.
-pub fn execute_step(
+/// **`async`, and with no [`effects::block_on_effect`] under it.** Two
+/// of the four step kinds reach an async effect (`transfer` streams a
+/// file, `http_poll` reads a URL), and while a whole composed step list
+/// ran inside one `dsl_kit::Op::apply` — a synchronous trait method —
+/// those two had to be driven from that seam. They no longer are: a
+/// lifecycle step is its own `Call` node ([`super::steps`]), so the host
+/// resolver awaits this directly and the two seams that used to sit here
+/// are gone.
+pub async fn execute_step(
     step: &Step,
     op: &str,
     env: &BTreeMap<String, String>,
 ) -> Result<StepResult, StepFailure> {
     match step {
         Step::Sh(argv) => execute_sh(argv, op, env),
-        Step::Transfer { src, dst, done } => {
-            // One `block_on_effect` for the whole step, not one per
-            // await: the assert evaluation and the transfer share this
-            // seam, so wiring the skip in did not add a second place
-            // where the synchronous `Op::apply` boundary is crossed.
-            effects::block_on_effect(op, transfer_unless_done(src, dst, done.as_ref()))
-        }
+        Step::Transfer { src, dst, done } => transfer_unless_done(src, dst, done.as_ref()).await,
         Step::HttpPoll {
             url,
             timeout_sec,
             pid_file,
             log_path,
-        } => effects::block_on_effect(
-            op,
+        } => {
             execute_http_poll(
                 url,
                 *timeout_sec,
                 pid_file.as_deref(),
                 log_path.as_deref(),
                 op,
-            ),
-        ),
+            )
+            .await
+        }
         Step::Note(message) => Ok(StepResult::summary_only(format!("note \"{message}\""))),
     }
 }
@@ -1150,35 +1134,125 @@ async fn transfer_unless_done(
     })
 }
 
-/// The report note for a step whose `done` a dry run did not answer.
+/// What a dry run has to say about one step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DryStep {
+    /// Trace-log summary fragment.
+    pub summary: String,
+    /// The report note, present exactly when the step had a condition
+    /// and therefore an answer to report.
+    pub note: Option<String>,
+}
+
+/// Render one step for a dry run, **evaluating its `done`**.
 ///
-/// **A dry run does not evaluate the condition at all here**, so this
-/// states the condition and that the skip is undecided rather than
-/// reporting an outcome.
+/// This is where a dry run stopped being a static description. It used
+/// to print the condition and call the skip undecided — a sentence about
+/// the profile, equally true whatever the host looked like. The model
+/// always allowed better: [`assert::Assert::FileExists`] is a cheap
+/// observation and answers under
+/// [`ExecMode::DryRun`](super::ExecMode::DryRun), which is the same call
+/// Ansible's `creates` guard makes in check mode (design §3.7). What
+/// stood in the way was the wiring — the evaluator is async and the
+/// dry-run arm sat behind the synchronous `dsl_kit::Op::apply` — and
+/// that is what [`super::steps`] removed.
 ///
-/// The model would allow more: [`assert::Assert::FileExists`] is a
-/// cheap observation and answers under
-/// [`ExecMode::DryRun`](super::ExecMode::DryRun) — Ansible's `creates`
-/// guard is evaluated in check mode for the same reason (design §3.7).
-/// What stops it is the wiring, not the model: the evaluator is async,
-/// the registry's dry-run arm is reached through the synchronous
-/// `dsl_kit::Op::apply`, and crossing that boundary means a
-/// [`effects::block_on_effect`] call site. The real path already has
-/// one to share ([`transfer_unless_done`]); the dry-run path would need
-/// a new one, and spreading that seam is the thing the seam's own
-/// existence is meant to prevent.
+/// So the four answers a step can get are now all real:
 ///
-/// The honest consequence, which the note states rather than hides: a
-/// dry run says what would decide the skip, not what it decided.
-pub fn skip_undecided_note(step: &Step) -> Option<String> {
-    match step {
-        Step::Transfer {
-            done: Some(done), ..
-        } => Some(format!(
-            "skip undecided: not evaluated in a dry run; would skip if {}",
-            assert::describe(done)
-        )),
-        _ => None,
+/// | answer | what a dry run says |
+/// |---|---|
+/// | `Satisfied` | would skip: the destination is already what was asked for |
+/// | `Unsatisfied` | **would transfer**: the destination is not there |
+/// | `NotChecked` | undecided: the digest is not read in a dry run |
+/// | `CheckFailed` | undecided: the condition itself could not be read |
+///
+/// The middle two are the point. A `models` entry whose destination is
+/// absent answers `Unsatisfied` even though its digest conjunct is
+/// `NotChecked`, because the fold gives `Unsatisfied` priority — so one
+/// item in a phase can say "this transfers" while the next says "this is
+/// undecided", from the same profile, in the same run.
+///
+/// The whole evaluated tree reaches the note, not just the top answer:
+/// the fold hides a `CheckFailed` under an `Unsatisfied` sibling, and
+/// the tree is what exists to undo that (design §3.2b').
+pub async fn dry_run_step(step: &Step, env: &BTreeMap<String, String>) -> DryStep {
+    let Step::Transfer {
+        src,
+        dst,
+        done: Some(done),
+    } = step
+    else {
+        return DryStep {
+            summary: render_dry(step, env),
+            note: None,
+        };
+    };
+    let node = assert::eval(done, ExecMode::DryRun, &LocalObserve).await;
+    let verdict = dry_run_verdict(node.outcome());
+    let condition = assert::describe_execution(done, &node);
+    DryStep {
+        summary: format!("transfer src={src} dst={dst} {verdict}: {condition}"),
+        note: Some(format!("{verdict}: {condition}")),
+    }
+}
+
+/// What running one step produced, in whichever mode it ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepRun {
+    /// A dry run: the step was rendered and its condition answered.
+    Dry(DryStep),
+    /// A real run: the step's effect happened.
+    Real(StepResult),
+}
+
+/// Run one step in `mode` — **the one entry point both engine drivers
+/// use**.
+///
+/// There are two drivers, and they reach an effect differently:
+///
+/// - [`crate::apply`] drives the engine with `drive_async`, and a
+///   lifecycle step is a `Call` node ([`super::steps`]), so its resolver
+///   `await`s this directly;
+/// - [`crate::profile_ast::create_profile_engine`] drives the engine
+///   with a synchronous `Stepper` (the MCP debugger host and the exec
+///   integration tests), where a lifecycle phase is still an `Apply` and
+///   `dsl_kit::Op::apply` cannot await — so that one hands this whole
+///   future to [`effects::block_on_effect`], once per step.
+///
+/// Both therefore run **the same function**, in both modes. That is the
+/// point of it existing: a dry run that answers a step's `done` and a
+/// real run that skips on it must not depend on which driver is turning
+/// the engine.
+pub async fn run_step(
+    step: &Step,
+    op: &str,
+    env: &BTreeMap<String, String>,
+    mode: ExecMode,
+) -> Result<StepRun, StepFailure> {
+    match mode {
+        ExecMode::DryRun => Ok(StepRun::Dry(dry_run_step(step, env).await)),
+        ExecMode::Real => execute_step(step, op, env).await.map(StepRun::Real),
+    }
+}
+
+/// How a dry run words each of the four answers.
+///
+/// Only `Satisfied` skips, so the other three all say "would transfer" —
+/// the same safe direction [`transfer_unless_done`] takes. They are
+/// still worded apart: "the destination is not there" and "the condition
+/// could not be read" are different pieces of news for whoever reads the
+/// plan, and collapsing them is the granularity this model exists to get
+/// away from.
+fn dry_run_verdict(outcome: &assert::AssertOutcome) -> &'static str {
+    match outcome {
+        assert::AssertOutcome::Satisfied => "would skip, already done",
+        assert::AssertOutcome::Unsatisfied => "would transfer, not done",
+        assert::AssertOutcome::NotChecked => {
+            "undecided (not evaluated in a dry run), would transfer"
+        }
+        assert::AssertOutcome::CheckFailed(_) => {
+            "undecided (the condition could not be read), would transfer"
+        }
     }
 }
 
@@ -3154,14 +3228,15 @@ mod tests {
     // execute_step: a failing step carries its partial observation.
     // -------------------------------------------------------------
 
-    #[test]
-    fn a_non_zero_sh_exit_carries_its_exit_code_and_captured_output() {
+    #[tokio::test]
+    async fn a_non_zero_sh_exit_carries_its_exit_code_and_captured_output() {
         let step = Step::Sh(vec![
             "sh".into(),
             "-c".into(),
             "echo out-before-failing; echo err-before-failing 1>&2; exit 7".into(),
         ]);
         let failure = execute_step(&step, "post_install", &BTreeMap::new())
+            .await
             .expect_err("a non-zero exit is a step failure");
 
         // The error still names the op, as before.
@@ -3265,8 +3340,8 @@ mod tests {
     /// the declared digest already satisfied and skips — and says which
     /// parts of the condition were true when it did.
     ///
-    /// Multi-threaded flavour because the step drives an async effect
-    /// through `block_on_effect`, which blocks its worker.
+    /// Multi-threaded flavour because the transfer's own client wants a
+    /// reactor turning beside it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_declared_digest_skips_the_second_transfer() {
         const BODY: &[u8] = b"model weights";
@@ -3276,12 +3351,16 @@ mod tests {
         let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
         let env = BTreeMap::new();
 
-        let first = execute_step(&step, "models", &env).expect("the first apply downloads");
+        let first = execute_step(&step, "models", &env)
+            .await
+            .expect("the first apply downloads");
         assert_eq!(first.bytes, Some(BODY.len() as u64));
         assert_eq!(served.load(Ordering::SeqCst), 1);
         assert_eq!(fs::read(&dst).expect("destination written"), BODY);
 
-        let second = execute_step(&step, "models", &env).expect("the second apply skips");
+        let second = execute_step(&step, "models", &env)
+            .await
+            .expect("the second apply skips");
         assert_eq!(
             served.load(Ordering::SeqCst),
             1,
@@ -3317,10 +3396,13 @@ mod tests {
         let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
         let env = BTreeMap::new();
 
-        execute_step(&step, "models", &env).expect("the first apply downloads");
+        execute_step(&step, "models", &env)
+            .await
+            .expect("the first apply downloads");
         fs::write(&dst, b"truncated or tampered").expect("overwrite the destination");
 
         let second = execute_step(&step, "models", &env)
+            .await
             .expect("a mismatching destination must be downloaded again");
         assert_eq!(served.load(Ordering::SeqCst), 2);
         assert_eq!(second.bytes, Some(BODY.len() as u64));
@@ -3354,7 +3436,9 @@ mod tests {
         let (url, served) = serving_local_server(BODY);
         let step = transfer_step(&url, &dst, None);
 
-        let result = execute_step(&step, "models", &BTreeMap::new()).expect("the step decides");
+        let result = execute_step(&step, "models", &BTreeMap::new())
+            .await
+            .expect("the step decides");
 
         assert_eq!(served.load(Ordering::SeqCst), 0, "nothing was downloaded");
         let note = result.note.expect("a skipped step carries a note");
@@ -3367,44 +3451,97 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A dry run states the condition and that it did not answer it.
-    /// It must not claim the step would run, nor that it would be
-    /// skipped — the digest is not read, so neither is known.
-    #[test]
-    fn a_dry_run_states_the_condition_and_leaves_the_skip_undecided() {
-        let dst = std::path::Path::new("/workspace/ComfyUI/models/lora/a.bin");
+    /// **A dry run now answers the condition**, and the two answers it
+    /// can give about a `sha256`-carrying entry are different sentences
+    /// about the host — which is the whole point of evaluating it.
+    ///
+    /// Both entries here declare a digest, so the digest conjunct is
+    /// `NotChecked` in both. What separates them is existence:
+    ///
+    /// - the absent destination folds to `Unsatisfied` — **this one
+    ///   transfers**, and a dry run can say so;
+    /// - the present destination folds to `NotChecked` — undecided,
+    ///   because deciding it would mean reading the whole file.
+    #[tokio::test]
+    async fn a_dry_run_answers_the_condition_and_tells_the_two_apart() {
+        let dir = scratch_dir("dry-run-verdicts");
+        let present = dir.join("present.safetensors");
+        let absent = dir.join("absent.safetensors");
+        fs::write(&present, b"weights").expect("write the present destination");
         let digest = crate::digest::hex_sha256(b"weights");
-        let step = transfer_step("https://ex/a.bin", dst, Some(digest.clone()));
+        let no_env = BTreeMap::new();
 
-        let rendered = render_dry(&step, &BTreeMap::new());
+        let will_transfer = dry_run_step(
+            &transfer_step("https://ex/a.bin", &absent, Some(digest.clone())),
+            &no_env,
+        )
+        .await;
+        let note = will_transfer.note.expect("a step with a condition answers");
+        assert!(
+            note.starts_with("would transfer, not done: "),
+            "an absent destination is decided, not undecided: {note}",
+        );
+        assert!(
+            note.contains(&format!("exists({})=unsatisfied", absent.display()))
+                && note.contains("=not-checked"),
+            "the existence conjunct decided it while the digest stayed unread: {note}",
+        );
+
+        let undecided = dry_run_step(
+            &transfer_step("https://ex/b.bin", &present, Some(digest.clone())),
+            &no_env,
+        )
+        .await;
+        let note = undecided.note.expect("a step with a condition answers");
+        assert!(
+            note.starts_with("undecided (not evaluated in a dry run), would transfer: "),
+            "a present destination cannot be decided without reading it: {note}",
+        );
+        assert!(
+            note.contains(&format!("exists({})=satisfied", present.display()))
+                && note.contains(&digest),
+            "…and says what it did see, and what it would have compared: {note}",
+        );
+
+        // Without a digest the condition is existence alone, which *is*
+        // answerable in a dry run — so a present destination is a
+        // decided skip rather than an undecided one.
+        let decided_skip =
+            dry_run_step(&transfer_step("https://ex/c.bin", &present, None), &no_env).await;
         assert_eq!(
-            rendered,
-            format!(
-                "transfer src=https://ex/a.bin dst={} \
-                 skip_if=all[exists({}), sha256({})={digest}] \
-                 (undecided: not evaluated in a dry run)",
-                dst.display(),
-                dst.display(),
-                dst.display(),
+            decided_skip.note.as_deref(),
+            Some(
+                format!(
+                    "would skip, already done: exists({})=satisfied",
+                    present.display()
+                )
+                .as_str()
             ),
         );
 
-        let note = skip_undecided_note(&step).expect("a step with a condition notes it");
-        assert!(note.starts_with("skip undecided: "), "{note}");
-        assert!(
-            note.contains(&digest),
-            "the digest that would decide: {note}"
+        // A step with no condition has no answer to report.
+        assert_eq!(
+            dry_run_step(
+                &Step::Transfer {
+                    src: "s".into(),
+                    dst: "d".into(),
+                    done: None,
+                },
+                &no_env,
+            )
+            .await,
+            DryStep {
+                summary: "transfer src=s dst=d".to_string(),
+                note: None,
+            },
+        );
+        assert_eq!(
+            dry_run_step(&Step::Sh(vec!["ls".into()]), &no_env)
+                .await
+                .note,
+            None
         );
 
-        assert_eq!(
-            skip_undecided_note(&Step::Transfer {
-                src: "s".into(),
-                dst: "d".into(),
-                done: None,
-            }),
-            None,
-            "a step with no condition has nothing undecided to report",
-        );
-        assert_eq!(skip_undecided_note(&Step::Sh(vec!["ls".into()])), None);
+        fs::remove_dir_all(&dir).ok();
     }
 }

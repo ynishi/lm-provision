@@ -19,6 +19,13 @@
 //! [`lifecycle`] is where the two meet the execution path: a step that
 //! carries a `done` has it evaluated before the effect runs, and a
 //! satisfied one is reported as skipped rather than re-run.
+//!
+//! [`steps`] is what puts a lifecycle phase's composed steps *into the
+//! engine*: one `Call` node per step, so the host resolves each by
+//! `await` instead of driving a whole step list from the synchronous
+//! `Op::apply` seam. That is also what lets a dry run answer a step's
+//! `done` — the evaluator is async, and on this route there is nothing
+//! synchronous between it and the engine.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,6 +46,7 @@ pub mod policy;
 pub mod registry;
 pub mod report;
 pub(crate) mod scheme;
+pub mod steps;
 
 /// Whether effects run for real or only render a dry-run trace.
 ///
@@ -162,6 +170,14 @@ pub struct ExecContext {
     /// `NodeId -> ProfileNode` payload lookup (dsl-kit does not pass leaf
     /// payloads into [`dsl_kit::Op::apply`]).
     pub payloads: Arc<HashMap<NodeId, ProfileNode>>,
+    /// Every lifecycle phase's composed steps, projected onto engine
+    /// node ids ([`steps::StepPlan`]).
+    ///
+    /// Shared with the AST projection so that both sides read the *same*
+    /// synthetic ids: [`registry::ProfileCallAst`] declares the nodes,
+    /// and [`registry::resolve_call`] is handed one of them back and
+    /// looks the step up here.
+    pub step_plan: Arc<steps::StepPlan>,
     /// Shared execution log (trace lines / result summaries). Preserved
     /// verbatim — the AST apply report is built from [`reports`](Self::reports)
     /// instead, so the trace log's shape is unchanged.
@@ -239,6 +255,10 @@ impl ExecContext {
         let http_policy = policy::HttpPolicy::new(&http_allowlist);
         let env_policy = policy::EnvPolicy::new(&env_secrets, &spec_env);
         let payloads = Arc::new(payload::build_payload_map(root));
+        // Every lifecycle phase's expansion runs here, once, before the
+        // engine takes a step (see [`steps`]'s module doc for why the
+        // decode's failure position is fixed at this point).
+        let step_plan = Arc::new(steps::StepPlan::build(root));
 
         // Label every top-level phase with its 1-based declaration index
         // and kind string (reused from the plan stage to avoid a second
@@ -261,6 +281,7 @@ impl ExecContext {
             http_policy,
             env_policy,
             payloads,
+            step_plan,
             log,
             reports: Arc::new(Mutex::new(Vec::new())),
             phase_meta: Arc::new(phase_meta),
