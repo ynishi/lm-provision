@@ -445,12 +445,13 @@ async fn python_version_check_fails_the_run_on_a_mismatch() {
 }
 
 // ---------------------------------------------------------------------
-// The two `net.transfer` routes agree (DC 8).
+// The two routes agree (DC 8), for each moved op.
 //
 // The point of moving one op at a time onto dsl-kit's `Call` /
 // `AsyncEffectResolver` surface is that the move is *checkable*: the same
-// profile driven through the legacy `net_transfer` op and through the new
-// `Call` route has to produce the same report. This is the check.
+// profile driven through the legacy op and through the new `Call` route
+// has to produce the same report. These are the checks — one pair (real
+// + dry-run) per moved op, plus the shared gate check below.
 // ---------------------------------------------------------------------
 
 /// Serve `payload` to the first `serves` connections, so two apply runs
@@ -484,7 +485,7 @@ fn twice_serving_server(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn both_net_transfer_routes_produce_the_same_report() {
-    use lm_provision::exec::registry::TransferRoute;
+    use lm_provision::exec::registry::EffectRoute;
 
     let payload = "the-weight-behind-the-url";
     let (base_url, server) = twice_serving_server(payload, 2);
@@ -508,7 +509,7 @@ async fn both_net_transfer_routes_produce_the_same_report() {
     let path = write_json_profile("transfer-routes", &profile);
 
     let via_op: Value = serde_json::from_str(
-        &lm_provision::apply::run_apply_ast_routed(&path, false, TransferRoute::Op)
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Op)
             .await
             .expect("the op route produces a report"),
     )
@@ -521,7 +522,7 @@ async fn both_net_transfer_routes_produce_the_same_report() {
     std::fs::remove_file(&target).ok();
 
     let via_call: Value = serde_json::from_str(
-        &lm_provision::apply::run_apply_ast_routed(&path, false, TransferRoute::Call)
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Call)
             .await
             .expect("the call route produces a report"),
     )
@@ -552,7 +553,7 @@ async fn both_net_transfer_routes_produce_the_same_report() {
 /// is not "the route that always transfers".
 #[tokio::test(flavor = "multi_thread")]
 async fn both_net_transfer_routes_agree_under_dry_run_and_reach_no_effect() {
-    use lm_provision::exec::registry::TransferRoute;
+    use lm_provision::exec::registry::EffectRoute;
 
     let dir = temp_stem("transfer-routes-dry");
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -575,13 +576,13 @@ async fn both_net_transfer_routes_agree_under_dry_run_and_reach_no_effect() {
     let path = write_json_profile("transfer-routes-dry", &profile);
 
     let via_op: Value = serde_json::from_str(
-        &lm_provision::apply::run_apply_ast_routed(&path, true, TransferRoute::Op)
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Op)
             .await
             .expect("op route dry run"),
     )
     .expect("report is JSON");
     let via_call: Value = serde_json::from_str(
-        &lm_provision::apply::run_apply_ast_routed(&path, true, TransferRoute::Call)
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Call)
             .await
             .expect("call route dry run"),
     )
@@ -596,13 +597,209 @@ async fn both_net_transfer_routes_agree_under_dry_run_and_reach_no_effect() {
     std::fs::remove_file(&path).ok();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_http_get_routes_produce_the_same_report() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let (base_url, server) = twice_serving_server("pong", 2);
+    let url = format!("{base_url}/ping");
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-get-routes",
+        "capabilities": ["net.http_get"],
+        "http_allowlist": [base_url],
+        "phases": [
+            {
+                "type": "NetHttpGet",
+                "url": url,
+                // A header the resolver has to resolve for itself: the
+                // `Call` route bypasses `Op::apply`, so it carries the
+                // header pipe too, not just the request.
+                "headers": { "Accept": { "type": "EnvLiteral", "value": "text/plain" } },
+                "timeout_sec": 5
+            }
+        ]
+    });
+    let path = write_json_profile("http-get-routes", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Op)
+            .await
+            .expect("the op route produces a report"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Call)
+            .await
+            .expect("the call route produces a report"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(via_op["ok"], json!(true), "op route: {via_op}");
+    assert_eq!(via_call["ok"], json!(true), "call route: {via_call}");
+    assert_eq!(
+        via_op, via_call,
+        "the two routes must be indistinguishable in the report"
+    );
+    // …and the report is the one a request writes, not an empty run: the
+    // resolver reached the server and reported its status.
+    let step = &via_call["steps"].as_array().expect("steps")[0];
+    assert_eq!(step["op"], json!("net.http_get"));
+    assert_eq!(step["status"], json!(200));
+
+    std::fs::remove_file(&path).ok();
+    server.join().expect("server thread joins");
+}
+
+/// Dry-run agrees too, against a deliberately unreachable URL: a run that
+/// reports `ok` proves the resolver honours [`ExecMode`] rather than
+/// being "the route that always requests".
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_http_get_routes_agree_under_dry_run_and_reach_no_effect() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-get-routes-dry",
+        "capabilities": ["net.http_get"],
+        // Deliberately unreachable: a dry run must not connect.
+        "http_allowlist": ["http://127.0.0.1:1"],
+        "phases": [
+            { "type": "NetHttpGet", "url": "http://127.0.0.1:1/ping" }
+        ]
+    });
+    let path = write_json_profile("http-get-routes-dry", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Op)
+            .await
+            .expect("op route dry run"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Call)
+            .await
+            .expect("call route dry run"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(
+        via_op["ok"],
+        json!(true),
+        "a dry run reaches no effect, so the unreachable URL is fine: {via_op}"
+    );
+    assert_eq!(via_op, via_call, "dry-run reports must agree too");
+    assert_eq!(via_call["steps"][0]["dry_run"], json!(true));
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_http_post_routes_produce_the_same_report() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let (base_url, server) = twice_serving_server("accepted", 2);
+    let url = format!("{base_url}/v1/echo");
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-post-routes",
+        "capabilities": ["net.http_post"],
+        "http_allowlist": [base_url],
+        "phases": [
+            {
+                "type": "NetHttpPost",
+                "url": url,
+                "headers": { "Accept": { "type": "EnvLiteral", "value": "text/plain" } },
+                // The body form the resolver has to resolve for itself.
+                "body_json": "{\"n\":1}",
+                "timeout_sec": 5
+            }
+        ]
+    });
+    let path = write_json_profile("http-post-routes", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Op)
+            .await
+            .expect("the op route produces a report"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Call)
+            .await
+            .expect("the call route produces a report"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(via_op["ok"], json!(true), "op route: {via_op}");
+    assert_eq!(via_call["ok"], json!(true), "call route: {via_call}");
+    assert_eq!(
+        via_op, via_call,
+        "the two routes must be indistinguishable in the report"
+    );
+    let step = &via_call["steps"].as_array().expect("steps")[0];
+    assert_eq!(step["op"], json!("net.http_post"));
+    assert_eq!(step["status"], json!(200));
+
+    std::fs::remove_file(&path).ok();
+    server.join().expect("server thread joins");
+}
+
+/// The `net.http_post` twin of the GET dry-run check, with the body
+/// resolved (and reported by its form, never its content) in both routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_http_post_routes_agree_under_dry_run_and_reach_no_effect() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-post-routes-dry",
+        "capabilities": ["net.http_post"],
+        // Deliberately unreachable: a dry run must not connect.
+        "http_allowlist": ["http://127.0.0.1:1"],
+        "phases": [
+            {
+                "type": "NetHttpPost",
+                "url": "http://127.0.0.1:1/v1/echo",
+                "body": { "type": "EnvLiteral", "value": "payload" }
+            }
+        ]
+    });
+    let path = write_json_profile("http-post-routes-dry", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Op)
+            .await
+            .expect("op route dry run"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Call)
+            .await
+            .expect("call route dry run"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(
+        via_op["ok"],
+        json!(true),
+        "a dry run reaches no effect, so the unreachable URL is fine: {via_op}"
+    );
+    assert_eq!(via_op, via_call, "dry-run reports must agree too");
+    assert_eq!(via_call["steps"][0]["dry_run"], json!(true));
+
+    std::fs::remove_file(&path).ok();
+}
+
 /// A capability the profile never declared must be denied on **both**
 /// routes. A `Call` bypasses `Op::apply`, so the resolver carries the L4
 /// gate and the L3 allowlists itself; without that the new route would be
 /// a hole only it has.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_call_route_is_gated_exactly_as_the_op_route_is() {
-    use lm_provision::exec::registry::TransferRoute;
+    use lm_provision::exec::registry::EffectRoute;
 
     let dir = temp_stem("transfer-routes-denied");
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -623,7 +820,7 @@ async fn the_call_route_is_gated_exactly_as_the_op_route_is() {
     });
     let path = write_json_profile("transfer-routes-denied", &profile);
 
-    for route in [TransferRoute::Op, TransferRoute::Call] {
+    for route in [EffectRoute::Op, EffectRoute::Call] {
         let report: Value = serde_json::from_str(
             &lm_provision::apply::run_apply_ast_routed(&path, false, route)
                 .await
@@ -642,6 +839,84 @@ async fn the_call_route_is_gated_exactly_as_the_op_route_is() {
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_file(&path).ok();
+}
+
+/// The same for the two HTTP ops, on both of their gates: the L4
+/// capability the profile never declared, and the L3 `http_allowlist` the
+/// URL falls outside of. Both must deny on both routes, in real mode and
+/// under dry run (spec 07 "dry-run does policy").
+#[tokio::test(flavor = "multi_thread")]
+async fn the_call_route_gates_the_http_ops_exactly_as_the_op_route_does() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    // (a) `net.http_get` / `net.http_post` undeclared: L4.
+    // (b) declared, but the URL is outside `http_allowlist`: L3.
+    let cases = [
+        (
+            "http-get-undeclared",
+            json!(["sh.exec"]),
+            json!(["http://127.0.0.1:1"]),
+            json!({ "type": "NetHttpGet", "url": "http://127.0.0.1:1/ping" }),
+            "net.http_get",
+        ),
+        (
+            "http-post-undeclared",
+            json!(["sh.exec"]),
+            json!(["http://127.0.0.1:1"]),
+            json!({ "type": "NetHttpPost", "url": "http://127.0.0.1:1/echo" }),
+            "net.http_post",
+        ),
+        (
+            "http-get-off-allowlist",
+            json!(["net.http_get"]),
+            json!(["http://127.0.0.1:1"]),
+            json!({ "type": "NetHttpGet", "url": "http://127.0.0.2:1/ping" }),
+            "http://127.0.0.2:1/ping",
+        ),
+        (
+            "http-post-off-allowlist",
+            json!(["net.http_post"]),
+            json!(["http://127.0.0.1:1"]),
+            json!({ "type": "NetHttpPost", "url": "http://127.0.0.2:1/echo" }),
+            "http://127.0.0.2:1/echo",
+        ),
+    ];
+
+    for (label, capabilities, http_allowlist, phase, named) in cases {
+        let profile = json!({
+            "type": "Spec",
+            "name": label,
+            "capabilities": capabilities,
+            "http_allowlist": http_allowlist,
+            "phases": [phase]
+        });
+        let path = write_json_profile(label, &profile);
+
+        for dry_run in [false, true] {
+            for route in [EffectRoute::Op, EffectRoute::Call] {
+                let report: Value = serde_json::from_str(
+                    &lm_provision::apply::run_apply_ast_routed(&path, dry_run, route)
+                        .await
+                        .expect("a denial is captured in-report"),
+                )
+                .expect("report is JSON");
+                assert_eq!(
+                    report["ok"],
+                    json!(false),
+                    "{label} {route:?} dry_run={dry_run}: {report}"
+                );
+                assert!(
+                    report["error"]
+                        .as_str()
+                        .expect("error line")
+                        .contains(named),
+                    "{label} {route:?} dry_run={dry_run} names {named}: {report}"
+                );
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
 }
 
 // ---------------------------------------------------------------------

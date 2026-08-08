@@ -23,26 +23,34 @@
 //! An [`ExecError`] from any step surfaces as
 //! [`EngineError::EvalFailed`], carrying the node at which it happened.
 //!
-//! ## Two routes for `net.transfer`
+//! ## Two routes for the single-effect ops
 //!
 //! [`Op::apply`] is a `fn`, so an op handler cannot await — and dsl-kit
 //! says so itself: "Ops never suspend: effects belong in `Call`
-//! children" (`dsl_kit::Op`'s doc). [`TransferRoute`] is the host-side
-//! switch between the two shapes a `net.transfer` phase can take:
+//! children" (`dsl_kit::Op`'s doc). [`EffectRoute`] is the host-side
+//! switch between the two shapes the three single-effect network phases
+//! (`net.transfer` / `net.http_get` / `net.http_post`) can take:
 //!
-//! - [`TransferRoute::Op`] — the node stays an `Apply` over the
-//!   `net_transfer` op, which drives the async effect from the
-//!   synchronous seam ([`effects::block_on_effect`]). This is the route
-//!   every other async-effect-bearing op still takes.
-//! - [`TransferRoute::Call`] — [`ProfileCallAst`] reclassifies the node
-//!   as a dsl-kit `Call`, so the engine suspends on it and the host's
-//!   `AsyncEffectResolver` ([`crate::apply`]) awaits
-//!   [`effects::transfer`] directly. No `block_on` is involved.
+//! - [`EffectRoute::Op`] — the node stays an `Apply` over the
+//!   `net_transfer` / `net_http_get` / `net_http_post` op, which drives
+//!   the async effect from the synchronous seam
+//!   ([`effects::block_on_effect`]).
+//! - [`EffectRoute::Call`] — [`ProfileCallAst`] reclassifies the node as
+//!   a dsl-kit `Call`, so the engine suspends on it and the host's
+//!   `AsyncEffectResolver` ([`crate::apply`]) awaits the effect
+//!   ([`effects::transfer`] / [`effects::http_get`] /
+//!   [`effects::http_post`]) directly. No `block_on` is involved.
 //!
 //! Both routes run the same gate (L4) and the same `paths` /
-//! `http_allowlist` policies (L3) **before** the effect, and write the
-//! same [`StepReport`] fields, so the same profile can be run through
-//! both and the two reports compared.
+//! `http_allowlist` policies (L3) **before** the effect — one
+//! [`check_routed_demand`] mirroring the pre-handler block of
+//! [`ProfileOp::dispatch`] — and write the same [`StepReport`] fields,
+//! so the same profile can be run through both and the two reports
+//! compared.
+//!
+//! A **lifecycle** phase is not routable this way: one `Op::apply` runs
+//! a whole composed step list rather than a single effect, so those two
+//! async step kinds stay on the seam.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -233,10 +241,7 @@ impl ProfileOp {
     /// unrouted op. The report entry carries the phase kind as its `op`
     /// (no effect was reached to name a more specific one).
     fn record_phase_failure(&self, node: NodeId, err: &ExecError) {
-        let (id, kind) = self.base(node);
-        let mut entry = StepReport::new(id, kind.clone(), kind);
-        self.mark_fail(&mut entry, err);
-        self.push(entry);
+        record_phase_failure_report(&self.ctx, node, err);
     }
 
     /// Build a failing report for a direct-op payload-variant mismatch,
@@ -262,23 +267,7 @@ impl ProfileOp {
     /// string (`self.base` reads both from the phase map), so the entry
     /// is built once here instead of at each denial site.
     fn push_policy_failure(&self, node: NodeId, payload: &ProfileNode, err: &ExecError) {
-        let (id, kind) = self.base(node);
-        let mut entry = StepReport::new(id, kind.clone(), kind);
-        match payload {
-            ProfileNode::FsWrite { path, .. } | ProfileNode::MountUmount { path, .. } => {
-                entry.path = Some(path.clone());
-            }
-            ProfileNode::NetHttpGet { url, .. } | ProfileNode::NetHttpPost { url, .. } => {
-                entry.url = Some(url.clone());
-            }
-            ProfileNode::NetTransfer { src, dst, .. } | ProfileNode::MountBind { src, dst, .. } => {
-                entry.src = Some(src.clone());
-                entry.dst = Some(dst.clone());
-            }
-            _ => {}
-        }
-        self.mark_fail(&mut entry, err);
-        self.push(entry);
+        push_policy_failure_report(&self.ctx, node, payload, err);
     }
 
     /// Apply the path / http policy to one expanded lifecycle step.
@@ -592,10 +581,7 @@ impl ProfileOp {
         let resolved_headers = match self.ctx.env_policy.resolve(headers) {
             Ok(resolved) => resolved,
             Err(err) => {
-                let mut entry = StepReport::new(id, kind, "net.http_get");
-                entry.url = Some(url.clone());
-                self.mark_fail(&mut entry, &err);
-                self.push(entry);
+                push_http_failure_report(&self.ctx, &id, &kind, "net.http_get", url, &err);
                 return Err(err);
             }
         };
@@ -618,10 +604,14 @@ impl ProfileOp {
                     match effects::block_on_effect("net_http_get", effects::http_get(url, &opts)) {
                         Ok(outcome) => outcome,
                         Err(err) => {
-                            let mut entry = StepReport::new(id, kind, "net.http_get");
-                            entry.url = Some(url.clone());
-                            self.mark_fail(&mut entry, &err);
-                            self.push(entry);
+                            push_http_failure_report(
+                                &self.ctx,
+                                &id,
+                                &kind,
+                                "net.http_get",
+                                url,
+                                &err,
+                            );
                             return Err(err);
                         }
                     };
@@ -673,48 +663,14 @@ impl ProfileOp {
         };
         // Resolve the body in both modes, like `fs.write`'s content:
         // a dry run that passes proves the secret plumbing.
-        let (body_bytes, content_type, body_source) = match (body, body_json) {
-            // Both forms declared. Validate rejects this, but `apply`
-            // does not run validate first (spec 07 §Invocation), so the
-            // rule is re-checked here rather than silently resolved by
-            // an invented precedence — the two name different bodies
-            // *and* different content types.
-            (Some(_), Some(_)) => {
-                let err = ExecError::EffectFailed {
-                    op: "net_http_post".to_string(),
-                    message: "body and body_json are mutually exclusive".to_string(),
-                };
-                self.push_http_post_failure(&id, &kind, url, &err);
-                return Err(err);
-            }
-            (Some(body), None) => {
-                let source = format!("body:{}", value_source(body));
-                let resolved = match self.ctx.env_policy.resolve_one(body) {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
-                        self.push_http_post_failure(&id, &kind, url, &err);
-                        return Err(err);
-                    }
-                };
-                (
-                    resolved.into_bytes(),
-                    "application/octet-stream".to_string(),
-                    source,
-                )
-            }
-            (None, Some(body_json)) => (
-                body_json.clone().into_bytes(),
-                "application/json".to_string(),
-                "body_json".to_string(),
-            ),
-            // Neither form declared: the pre-field behaviour, an empty
-            // octet-stream body.
-            (None, None) => (
-                Vec::new(),
-                "application/octet-stream".to_string(),
-                "none".to_string(),
-            ),
-        };
+        let (body_bytes, content_type, body_source) =
+            match resolve_post_body(&self.ctx, body.as_deref(), body_json.as_ref()) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    self.push_http_post_failure(&id, &kind, url, &err);
+                    return Err(err);
+                }
+            };
         audit::http_post(
             self.ctx.mode,
             &kind,
@@ -804,10 +760,7 @@ impl ProfileOp {
     /// entry is built here once rather than at each of them — the
     /// sibling of [`push_transfer_failure`](Self::push_transfer_failure).
     fn push_http_post_failure(&self, id: &str, kind: &str, url: &str, err: &ExecError) {
-        let mut entry = StepReport::new(id.to_string(), kind.to_string(), "net.http_post");
-        entry.url = Some(url.to_string());
-        self.mark_fail(&mut entry, err);
-        self.push(entry);
+        push_http_failure_report(&self.ctx, id, kind, "net.http_post", url, err);
     }
 
     /// Push a failed `net.transfer` report carrying the declared src/dst.
@@ -1080,6 +1033,112 @@ fn push_transfer_failure_report(
     push_report(ctx, entry);
 }
 
+/// Push a failed `net.http_get` / `net.http_post` report (named by `op`)
+/// carrying the declared URL — the HTTP sibling of
+/// [`push_transfer_failure_report`]. Both ops have several pre-effect
+/// failure points (header resolution, body resolution, the request
+/// itself), and both routes reach all of them.
+fn push_http_failure_report(
+    ctx: &ExecContext,
+    id: &str,
+    kind: &str,
+    op: &str,
+    url: &str,
+    err: &ExecError,
+) {
+    let mut entry = StepReport::new(id.to_string(), kind.to_string(), op);
+    entry.url = Some(url.to_string());
+    mark_report_failed(ctx, &mut entry, err);
+    push_report(ctx, entry);
+}
+
+/// Record a phase-level failure that happened before (or instead of) any
+/// effect ran — a payload lookup miss or a capability denial. The report
+/// entry carries the phase kind as its `op` (no effect was reached to
+/// name a more specific one).
+fn record_phase_failure_report(ctx: &ExecContext, node: NodeId, err: &ExecError) {
+    let (id, kind) = report_base(ctx, node);
+    let mut entry = StepReport::new(id, kind.clone(), kind);
+    mark_report_failed(ctx, &mut entry, err);
+    push_report(ctx, entry);
+}
+
+/// Push the failing [`StepReport`] for a direct phase denied by policy,
+/// carrying the same input fields the phase's own report would show.
+///
+/// A direct phase's report `op` label and its `kind` are the same string
+/// ([`report_base`] reads both from the phase map), so the entry is built
+/// once here instead of at each denial site.
+fn push_policy_failure_report(
+    ctx: &ExecContext,
+    node: NodeId,
+    payload: &ProfileNode,
+    err: &ExecError,
+) {
+    let (id, kind) = report_base(ctx, node);
+    let mut entry = StepReport::new(id, kind.clone(), kind);
+    match payload {
+        ProfileNode::FsWrite { path, .. } | ProfileNode::MountUmount { path, .. } => {
+            entry.path = Some(path.clone());
+        }
+        ProfileNode::NetHttpGet { url, .. } | ProfileNode::NetHttpPost { url, .. } => {
+            entry.url = Some(url.clone());
+        }
+        ProfileNode::NetTransfer { src, dst, .. } | ProfileNode::MountBind { src, dst, .. } => {
+            entry.src = Some(src.clone());
+            entry.dst = Some(dst.clone());
+        }
+        _ => {}
+    }
+    mark_report_failed(ctx, &mut entry, err);
+    push_report(ctx, entry);
+}
+
+/// Resolve a `net.http_post`'s request body into `(bytes, content type,
+/// the audit's name for its form)`.
+///
+/// Shared by both routes, and run in **both** modes — like `fs.write`'s
+/// content, a dry run that passes proves the secret plumbing (spec 06
+/// §Resolution "dry-run resolves too").
+///
+/// Declaring both forms is rejected here. Validate rejects it too, but
+/// `apply` does not run validate first (spec 07 §Invocation), so the rule
+/// is re-checked rather than silently resolved by an invented precedence
+/// — the two name different bodies *and* different content types.
+/// Declaring neither is the pre-field behaviour, an empty octet-stream
+/// body.
+fn resolve_post_body(
+    ctx: &ExecContext,
+    body: Option<&ProfileNode>,
+    body_json: Option<&String>,
+) -> Result<(Vec<u8>, String, String), ExecError> {
+    match (body, body_json) {
+        (Some(_), Some(_)) => Err(ExecError::EffectFailed {
+            op: "net_http_post".to_string(),
+            message: "body and body_json are mutually exclusive".to_string(),
+        }),
+        (Some(body), None) => {
+            let source = format!("body:{}", value_source(body));
+            let resolved = ctx.env_policy.resolve_one(body)?;
+            Ok((
+                resolved.into_bytes(),
+                "application/octet-stream".to_string(),
+                source,
+            ))
+        }
+        (None, Some(body_json)) => Ok((
+            body_json.clone().into_bytes(),
+            "application/json".to_string(),
+            "body_json".to_string(),
+        )),
+        (None, None) => Ok((
+            Vec::new(),
+            "application/octet-stream".to_string(),
+            "none".to_string(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------
 // The `Call` route
 // ---------------------------------------------------------------------
@@ -1087,15 +1146,26 @@ fn push_transfer_failure_report(
 /// The `CallSpec::label` a suspended `net.transfer` carries.
 pub const TRANSFER_CALL_LABEL: &str = "net.transfer";
 
-/// Which shape a `net.transfer` phase takes in the engine (module doc
-/// §Two routes for `net.transfer`).
+/// The `CallSpec::label` a suspended `net.http_get` carries.
+pub const HTTP_GET_CALL_LABEL: &str = "net.http_get";
+
+/// The `CallSpec::label` a suspended `net.http_post` carries.
+pub const HTTP_POST_CALL_LABEL: &str = "net.http_post";
+
+/// Which shape the single-effect network phases take in the engine
+/// (module doc §Two routes for the single-effect ops).
 ///
 /// A host-side switch, deliberately not a profile field: the profile's
 /// bytes — and therefore its hash — say nothing about how the host
 /// chooses to drive the effect.
+///
+/// One switch for the three ops rather than one per op: they are the
+/// same shape, and a per-op knob would describe nothing but a
+/// half-migrated host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TransferRoute {
-    /// `Apply` over the `net_transfer` op; the op runs the effect.
+pub enum EffectRoute {
+    /// `Apply` over the phase's own op; the op runs the effect from the
+    /// synchronous seam.
     #[default]
     Op,
     /// dsl-kit `Call`; the host's async resolver runs the effect.
@@ -1131,40 +1201,92 @@ pub struct ProfileCallAst {
 }
 
 impl ProfileCallAst {
-    /// Project `root`, reclassifying every `net.transfer` phase as a
-    /// `Call` when `route` is [`TransferRoute::Call`].
-    ///
-    /// The node declares `label = "net.transfer"` and
-    /// `payload = { "src": …, "dst": … }`.
-    ///
-    /// **Only the label reaches the host.** dsl-kit-core 0.8.0 spawns a
-    /// `Call` leaf with `serde_json::Value::Null` in place of the
-    /// declared payload [`dsl-kit-core-0.8.0/src/engine.rs:1385-1387`],
-    /// so a resolver cannot read `src` / `dst` off the suspension. The
-    /// payload is declared here anyway — it is what the node *means*,
-    /// and it is what the resolver will read once the engine carries it
-    /// — while [`resolve_call`] recovers the two fields the way every
-    /// other leaf payload in this crate is recovered, through
-    /// [`super::payload`]'s `NodeId -> ProfileNode` map (see that
-    /// module's doc: dsl-kit does not hand leaf payloads to
-    /// [`Op::apply`] either).
-    pub fn new(root: &ProfileNode, route: TransferRoute) -> Self {
+    /// Project `root`, reclassifying every routable phase
+    /// ([`call_kind`]) as a `Call` when `route` is
+    /// [`EffectRoute::Call`].
+    pub fn new(root: &ProfileNode, route: EffectRoute) -> Self {
         let inner = OwnedDerivedAst::new(root, ProfileSemantics);
         let mut calls = HashMap::new();
-        if route == TransferRoute::Call {
+        if route == EffectRoute::Call {
             for (id, node) in super::payload::build_payload_map(root) {
-                if let ProfileNode::NetTransfer { src, dst, .. } = node {
-                    calls.insert(
-                        id,
-                        NodeKind::Call {
-                            label: TRANSFER_CALL_LABEL.to_string(),
-                            payload: serde_json::json!({ "src": src, "dst": dst }),
-                        },
-                    );
+                if let Some(kind) = call_kind(&node) {
+                    calls.insert(id, kind);
                 }
             }
         }
         Self { inner, calls }
+    }
+}
+
+/// The `Call` a routable phase declares, or `None` for a node that stays
+/// on its op.
+///
+/// **Only the label reaches the host.** dsl-kit-core 0.8.0 spawns a
+/// `Call` leaf with `serde_json::Value::Null` in place of the declared
+/// payload [`dsl-kit-core-0.8.0/src/engine.rs:1385-1387`], so a resolver
+/// cannot read the effect's inputs off the suspension. The payload is
+/// declared here anyway — it is what the node *means*, and it is what
+/// the resolver will read once the engine carries it — while
+/// [`resolve_call`] recovers the fields the way every other leaf payload
+/// in this crate is recovered, through [`super::payload`]'s
+/// `NodeId -> ProfileNode` map (see that module's doc: dsl-kit does not
+/// hand leaf payloads to [`Op::apply`] either).
+///
+/// A header value and a request body are deliberately **not** declared:
+/// they resolve through the
+/// [`EnvPolicy`](super::policy::EnvPolicy) and reach the request and
+/// nothing else, so the two HTTP calls declare header *names* and the
+/// body's *form* — the same names-not-values rule the audit transcript
+/// follows (spec 09 §Audit log).
+fn call_kind(node: &ProfileNode) -> Option<NodeKind> {
+    match node {
+        ProfileNode::NetTransfer { src, dst, .. } => Some(NodeKind::Call {
+            label: TRANSFER_CALL_LABEL.to_string(),
+            payload: serde_json::json!({ "src": src, "dst": dst }),
+        }),
+        ProfileNode::NetHttpGet {
+            url,
+            headers,
+            timeout_sec,
+            ..
+        } => Some(NodeKind::Call {
+            label: HTTP_GET_CALL_LABEL.to_string(),
+            payload: serde_json::json!({
+                "url": url,
+                "header_names": headers.keys().collect::<Vec<_>>(),
+                "timeout_sec": timeout_sec,
+            }),
+        }),
+        ProfileNode::NetHttpPost {
+            url,
+            headers,
+            body,
+            body_json,
+            timeout_sec,
+            ..
+        } => Some(NodeKind::Call {
+            label: HTTP_POST_CALL_LABEL.to_string(),
+            payload: serde_json::json!({
+                "url": url,
+                "header_names": headers.keys().collect::<Vec<_>>(),
+                "body": declared_body_form(body.as_deref(), body_json.as_ref()),
+                "timeout_sec": timeout_sec,
+            }),
+        }),
+        _ => None,
+    }
+}
+
+/// Which body form a `net.http_post` declared, named as the audit names
+/// it. `"body+body_json"` is the mutually exclusive pair
+/// [`resolve_post_body`] rejects — declared honestly rather than
+/// silently resolved to one of the two.
+fn declared_body_form(body: Option<&ProfileNode>, body_json: Option<&String>) -> &'static str {
+    match (body, body_json) {
+        (Some(_), Some(_)) => "body+body_json",
+        (Some(_), None) => "body",
+        (None, Some(_)) => "body_json",
+        (None, None) => "none",
     }
 }
 
@@ -1231,29 +1353,43 @@ pub async fn resolve_call(
             node.0
         )));
     };
-    if spec.label != TRANSFER_CALL_LABEL {
-        return Err(CallError(format!(
-            "no host resolver is registered for the call '{}'",
-            spec.label
-        )));
-    }
     // `spec.payload` is `Null` on dsl-kit-core 0.8.0 regardless of what
-    // the node declared (see [`ProfileCallAst::new`]), so the effect's
-    // inputs come from the payload map — the same recovery `Op::apply`
-    // does, which is also what keeps the two routes reading one source
-    // of truth.
-    let Some(ProfileNode::NetTransfer { src, dst, .. }) = ctx.payloads.get(&node) else {
-        let err = ExecError::PayloadVariant {
-            node: node.0,
-            expected: "NetTransfer",
-        };
-        let (id, kind) = report_base(ctx, node);
-        let mut entry = StepReport::new(id, kind, TRANSFER_CALL_LABEL);
-        mark_report_failed(ctx, &mut entry, &err);
-        push_report(ctx, entry);
+    // the node declared (see [`call_kind`]), so the effect's inputs come
+    // from the payload map — the same recovery `Op::apply` does, which
+    // is also what keeps the two routes reading one source of truth.
+    let Some(payload) = ctx.payloads.get(&node) else {
+        let err = ExecError::PayloadMissing(node.0);
+        record_phase_failure_report(ctx, node, &err);
         return Err(CallError::from(&err));
     };
-    resolve_transfer(ctx, node, src, dst).await
+    match spec.label.as_str() {
+        TRANSFER_CALL_LABEL => resolve_transfer(ctx, node, payload).await,
+        HTTP_GET_CALL_LABEL => resolve_http_get(ctx, node, payload).await,
+        HTTP_POST_CALL_LABEL => resolve_http_post(ctx, node, payload).await,
+        other => Err(CallError(format!(
+            "no host resolver is registered for the call '{other}'"
+        ))),
+    }
+}
+
+/// Report and render a routed phase whose payload is not the variant its
+/// label names — an AST/host wiring bug rather than a profile-author
+/// error, and the `Call`-route twin of [`ProfileOp::variant_fail`].
+fn payload_variant_failure(
+    ctx: &ExecContext,
+    node: NodeId,
+    op: &str,
+    expected: &'static str,
+) -> CallError {
+    let err = ExecError::PayloadVariant {
+        node: node.0,
+        expected,
+    };
+    let (id, kind) = report_base(ctx, node);
+    let mut entry = StepReport::new(id, kind, op);
+    mark_report_failed(ctx, &mut entry, &err);
+    push_report(ctx, entry);
+    CallError::from(&err)
 }
 
 /// The `Call`-route twin of [`ProfileOp::run_transfer`]: gate → policy →
@@ -1262,15 +1398,22 @@ pub async fn resolve_call(
 async fn resolve_transfer(
     ctx: &ExecContext,
     node: NodeId,
-    src: &str,
-    dst: &str,
+    payload: &ProfileNode,
 ) -> Result<ProfileValue, CallError> {
+    let ProfileNode::NetTransfer { src, dst, .. } = payload else {
+        return Err(payload_variant_failure(
+            ctx,
+            node,
+            TRANSFER_CALL_LABEL,
+            "NetTransfer",
+        ));
+    };
     let (id, kind) = report_base(ctx, node);
 
-    if let Err(err) = check_transfer_demand(ctx, node, src, dst) {
-        push_transfer_failure_report(ctx, &id, &kind, src, dst, &err);
-        return Err(CallError::from(&err));
-    }
+    // The gate and both policies report their own denial (the entry the
+    // `Op` route's `dispatch` would have written), so there is nothing
+    // to push here.
+    check_routed_demand(ctx, node, payload).map_err(|err| CallError::from(&err))?;
 
     audit::transfer(ctx.mode, &kind, src, dst);
     match ctx.mode {
@@ -1311,31 +1454,349 @@ async fn resolve_transfer(
     }
 }
 
-/// The L4 capability check and both L3 allowlists for a routed
-/// `net.transfer`, derived through the same [`demand::direct`] the `Op`
-/// route uses — one mapping, so both routes answer to exactly the same
-/// declarations.
-fn check_transfer_demand(
+/// The `Call`-route twin of [`ProfileOp::run_http_get`]: gate → policy →
+/// header resolution → audit → effect, writing the same report entry
+/// either branch of the `Op` route would.
+async fn resolve_http_get(
     ctx: &ExecContext,
     node: NodeId,
-    src: &str,
-    dst: &str,
-) -> Result<(), ExecError> {
-    let payload = ProfileNode::NetTransfer {
-        id: node,
-        src: src.to_string(),
-        dst: dst.to_string(),
+    payload: &ProfileNode,
+) -> Result<ProfileValue, CallError> {
+    let ProfileNode::NetHttpGet {
+        url,
+        headers,
+        timeout_sec,
+        ..
+    } = payload
+    else {
+        return Err(payload_variant_failure(
+            ctx,
+            node,
+            HTTP_GET_CALL_LABEL,
+            "NetHttpGet",
+        ));
     };
-    let demanded = demand::direct(&payload)?;
+    let (id, kind) = report_base(ctx, node);
+
+    check_routed_demand(ctx, node, payload).map_err(|err| CallError::from(&err))?;
+
+    // Resolved in both modes, exactly as the op resolves it: a dry run
+    // that passes proves the header plumbing (spec 06 §Resolution).
+    let resolved_headers = match ctx.env_policy.resolve(headers) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            push_http_failure_report(ctx, &id, &kind, "net.http_get", url, &err);
+            return Err(CallError::from(&err));
+        }
+    };
+    audit::http_get(ctx.mode, &kind, url, &resolved_headers);
+    match ctx.mode {
+        ExecMode::DryRun => {
+            let value = record_line(
+                ctx,
+                format!(
+                    "net_http_get url={url}{}",
+                    render_http_request(&resolved_headers, *timeout_sec)
+                ),
+            );
+            let mut entry = StepReport::new(id, kind, "net.http_get");
+            entry.url = Some(url.clone());
+            entry.dry_run = Some(true);
+            push_report(ctx, entry);
+            Ok(value)
+        }
+        ExecMode::Real => {
+            let opts = effects::HttpOpts::new(resolved_headers, *timeout_sec);
+            // No lock is held across this await (see
+            // [`resolve_transfer`]'s note).
+            let outcome = match effects::http_get(url, &opts).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    push_http_failure_report(ctx, &id, &kind, "net.http_get", url, &err);
+                    return Err(CallError::from(&err));
+                }
+            };
+            let value = record_line(
+                ctx,
+                format!("net_http_get url={url} status={}", outcome.status),
+            );
+            let mut entry = StepReport::new(id, kind, "net.http_get");
+            entry.url = Some(url.clone());
+            entry.status = i64::from(outcome.status);
+            push_report(ctx, entry);
+            Ok(value)
+        }
+    }
+}
+
+/// The `Call`-route twin of [`ProfileOp::run_http_post`]: gate → policy →
+/// header + body resolution → audit → effect, writing the same report
+/// entry either branch of the `Op` route would.
+async fn resolve_http_post(
+    ctx: &ExecContext,
+    node: NodeId,
+    payload: &ProfileNode,
+) -> Result<ProfileValue, CallError> {
+    let ProfileNode::NetHttpPost {
+        url,
+        headers,
+        body,
+        body_json,
+        timeout_sec,
+        ..
+    } = payload
+    else {
+        return Err(payload_variant_failure(
+            ctx,
+            node,
+            HTTP_POST_CALL_LABEL,
+            "NetHttpPost",
+        ));
+    };
+    let (id, kind) = report_base(ctx, node);
+
+    check_routed_demand(ctx, node, payload).map_err(|err| CallError::from(&err))?;
+
+    let resolved_headers = match ctx.env_policy.resolve(headers) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            push_http_failure_report(ctx, &id, &kind, "net.http_post", url, &err);
+            return Err(CallError::from(&err));
+        }
+    };
+    let (body_bytes, content_type, body_source) =
+        match resolve_post_body(ctx, body.as_deref(), body_json.as_ref()) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                push_http_failure_report(ctx, &id, &kind, "net.http_post", url, &err);
+                return Err(CallError::from(&err));
+            }
+        };
+    audit::http_post(
+        ctx.mode,
+        &kind,
+        url,
+        &resolved_headers,
+        &body_source,
+        body_bytes.len() as u64,
+    );
+    match ctx.mode {
+        ExecMode::DryRun => {
+            let value = record_line(
+                ctx,
+                format!(
+                    "net_http_post url={url}{} body={body_source} body_bytes={}",
+                    render_http_request(&resolved_headers, *timeout_sec),
+                    body_bytes.len(),
+                ),
+            );
+            let mut entry = StepReport::new(id, kind, "net.http_post");
+            entry.url = Some(url.clone());
+            entry.dry_run = Some(true);
+            push_report(ctx, entry);
+            Ok(value)
+        }
+        ExecMode::Real => {
+            let opts = effects::HttpOpts::new(resolved_headers, *timeout_sec);
+            // No lock is held across this await (see
+            // [`resolve_transfer`]'s note).
+            let outcome = match effects::http_post(url, &body_bytes, &content_type, &opts).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    push_http_failure_report(ctx, &id, &kind, "net.http_post", url, &err);
+                    return Err(CallError::from(&err));
+                }
+            };
+            let value = record_line(
+                ctx,
+                format!("net_http_post url={url} status={}", outcome.status),
+            );
+            let mut entry = StepReport::new(id, kind, "net.http_post");
+            entry.url = Some(url.clone());
+            entry.status = i64::from(outcome.status);
+            push_report(ctx, entry);
+            Ok(value)
+        }
+    }
+}
+
+/// The `env.ref` gate, the L4 capability check and both L3 allowlists for
+/// a routed phase — the same [`demand`] mapping, in the same order, and
+/// writing the same failing report entry as the pre-handler block of
+/// [`ProfileOp::dispatch`].
+///
+/// A `Call` bypasses `Op::apply` entirely, so a resolver that skipped
+/// this would be a hole in the L3 / L4 enforcement (spec 05) that only
+/// the new route has. One definition, so the two routes answer to
+/// exactly the same declarations.
+fn check_routed_demand(
+    ctx: &ExecContext,
+    node: NodeId,
+    payload: &ProfileNode,
+) -> Result<(), ExecError> {
+    if let Some(capability) = demand::env_ref(payload) {
+        if let Err(err) = ctx.gate.require(capability) {
+            record_phase_failure_report(ctx, node, &err);
+            return Err(err);
+        }
+    }
+    let demanded = match demand::direct(payload) {
+        Ok(demanded) => demanded,
+        Err(err) => {
+            push_policy_failure_report(ctx, node, payload, &err);
+            return Err(err);
+        }
+    };
     if let Some(capability) = demanded.capability {
-        ctx.gate.require(capability)?;
+        if let Err(err) = ctx.gate.require(capability) {
+            record_phase_failure_report(ctx, node, &err);
+            return Err(err);
+        }
     }
     // Policy runs in both modes (spec 07 "dry-run does policy").
     for path in &demanded.paths {
-        ctx.path_policy.check(path)?;
+        if let Err(err) = ctx.path_policy.check(path) {
+            push_policy_failure_report(ctx, node, payload, &err);
+            return Err(err);
+        }
     }
     for url in &demanded.urls {
-        ctx.http_policy.check(url)?;
+        if let Err(err) = ctx.http_policy.check(url) {
+            push_policy_failure_report(ctx, node, payload, &err);
+            return Err(err);
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsl_kit::IdGen;
+
+    /// Which phases the host can route, pinned directly.
+    ///
+    /// The end-to-end "both routes agree" regressions
+    /// (`tests/ast_apply.rs`) compare two reports, and two reports agree
+    /// vacuously when the `Call` route was never taken — a phase this
+    /// function forgot would make them green while proving nothing. So
+    /// the reclassification itself is asserted here, at the one place
+    /// that decides it.
+    #[test]
+    fn the_three_single_effect_phases_are_the_routable_ones() {
+        let ids = IdGen::new();
+        let label = |node: &ProfileNode| match call_kind(node) {
+            Some(NodeKind::Call { label, .. }) => Some(label),
+            _ => None,
+        };
+
+        assert_eq!(
+            label(&ProfileNode::NetTransfer {
+                id: ids.node(),
+                src: "https://example.com/a.bin".into(),
+                dst: "/workspace/a.bin".into(),
+            })
+            .as_deref(),
+            Some(TRANSFER_CALL_LABEL)
+        );
+        assert_eq!(
+            label(&ProfileNode::NetHttpGet {
+                id: ids.node(),
+                url: "https://example.com/ping".into(),
+                headers: Default::default(),
+                timeout_sec: None,
+            })
+            .as_deref(),
+            Some(HTTP_GET_CALL_LABEL)
+        );
+        assert_eq!(
+            label(&ProfileNode::NetHttpPost {
+                id: ids.node(),
+                url: "https://example.com/echo".into(),
+                headers: Default::default(),
+                body: None,
+                body_json: None,
+                timeout_sec: None,
+            })
+            .as_deref(),
+            Some(HTTP_POST_CALL_LABEL)
+        );
+
+        // A lifecycle phase and a non-network direct op stay on their op.
+        assert!(call_kind(&ProfileNode::SystemApt {
+            id: ids.node(),
+            packages: vec!["git".into()],
+        })
+        .is_none());
+        assert!(call_kind(&ProfileNode::ShExec {
+            id: ids.node(),
+            argv: vec!["true".into()],
+            env: Default::default(),
+        })
+        .is_none());
+    }
+
+    /// …and the reclassification reaches the AST the engine reads: the
+    /// same node is an `Apply` on the `Op` route and a `Call` on the
+    /// `Call` route.
+    #[test]
+    fn the_route_decides_the_node_kind_the_engine_sees() {
+        let ids = IdGen::new();
+        let phase_ids = [ids.node(), ids.node(), ids.node()];
+        let root = ProfileNode::Spec {
+            id: ids.node(),
+            name: "routing".into(),
+            version: None,
+            description: None,
+            capabilities: vec![
+                "net.transfer".into(),
+                "net.http_get".into(),
+                "net.http_post".into(),
+            ],
+            env: Default::default(),
+            env_secrets: Vec::new(),
+            paths: vec!["/workspace".into()],
+            http_allowlist: vec!["https://example.com".into()],
+            phases: vec![
+                ProfileNode::NetTransfer {
+                    id: phase_ids[0],
+                    src: "https://example.com/a.bin".into(),
+                    dst: "/workspace/a.bin".into(),
+                },
+                ProfileNode::NetHttpGet {
+                    id: phase_ids[1],
+                    url: "https://example.com/ping".into(),
+                    headers: Default::default(),
+                    timeout_sec: None,
+                },
+                ProfileNode::NetHttpPost {
+                    id: phase_ids[2],
+                    url: "https://example.com/echo".into(),
+                    headers: Default::default(),
+                    body: None,
+                    body_json: None,
+                    timeout_sec: None,
+                },
+            ],
+        };
+
+        let on_op = ProfileCallAst::new(&root, EffectRoute::Op);
+        let on_call = ProfileCallAst::new(&root, EffectRoute::Call);
+        let expected = [
+            TRANSFER_CALL_LABEL,
+            HTTP_GET_CALL_LABEL,
+            HTTP_POST_CALL_LABEL,
+        ];
+        for (id, expected) in phase_ids.into_iter().zip(expected) {
+            assert!(
+                !matches!(on_op.node_kind(id), NodeKind::Call { .. }),
+                "n{}: the op route leaves the derived classification alone",
+                id.0
+            );
+            match on_call.node_kind(id) {
+                NodeKind::Call { label, .. } => assert_eq!(label, expected, "n{}", id.0),
+                other => panic!("n{}: expected a Call, got {other:?}", id.0),
+            }
+        }
+    }
 }

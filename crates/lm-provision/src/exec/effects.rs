@@ -59,11 +59,19 @@
 //!
 //! It is a **residue**, not the design. dsl-kit's own answer is that
 //! "effects belong in `Call` children" (`dsl_kit::Op`) and that the host
-//! resolves them through an `AsyncEffectResolver`; `net.transfer` has
-//! that route now (see [`super::registry`]'s module doc and
-//! [`crate::apply`]), and reaches [`transfer`] by `await`, not through
-//! here. The five call sites still on the seam are the ones whose ops
-//! have not moved yet.
+//! resolves them through an `AsyncEffectResolver`; the three
+//! single-effect network phases (`net.transfer` / `net.http_get` /
+//! `net.http_post`) have that route now (see [`super::registry`]'s
+//! module doc and [`crate::apply`]), and reach [`transfer`] /
+//! [`http_get`] / [`http_post`] by `await`, not through here.
+//!
+//! The five call sites left are of two kinds. Three are the routed
+//! phases' own legacy [`super::registry::EffectRoute::Op`] branches,
+//! kept **on purpose**: a route the host can no longer take is a route
+//! the two-routes-agree regression can no longer compare, so the seam
+//! stays until the `Op` route is retired for good. The other two are the
+//! async lifecycle step kinds, which have not moved — one `Op::apply`
+//! there runs a whole composed step list rather than a single effect.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -251,10 +259,12 @@ pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError>
 ///
 /// `dsl_kit::Op::apply` is a `fn`, not an `async fn`, so an op cannot
 /// await. Rather than spread that seam over every call site, it lives
-/// here: the five remaining callers (`net_http_get` / `net_http_post` /
-/// `net_transfer`'s legacy [`super::registry::TransferRoute::Op`] branch
-/// in [`super::registry`], and the two async lifecycle step kinds in
-/// [`super::lifecycle`]) hand their future to this function.
+/// here: the five remaining callers (the `net_http_get` /
+/// `net_http_post` / `net_transfer` ops in [`super::registry`], which
+/// are the legacy [`super::registry::EffectRoute::Op`] branch of three
+/// phases that also have a `Call` route, and the two async lifecycle
+/// step kinds in [`super::lifecycle`]) hand their future to this
+/// function.
 ///
 /// Nothing on the `Call` route comes through here: a suspended effect is
 /// awaited by the host resolver ([`crate::apply`]) on the runtime that

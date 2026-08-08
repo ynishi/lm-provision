@@ -17,7 +17,7 @@ use dsl_kit::{
     SuspendReason,
 };
 
-use crate::exec::registry::{CallError, ProfileCallAst, TransferRoute};
+use crate::exec::registry::{CallError, EffectRoute, ProfileCallAst};
 use crate::exec::{registry, report, ExecContext, ExecMode};
 use crate::profile_ast::ProfileValue;
 
@@ -73,8 +73,8 @@ pub enum AstApplyError {
 ///
 /// **`async`, and a multi-threaded tokio runtime must be driving it.**
 /// The effect layer's HTTP routes are async ([`crate::exec::effects`]).
-/// A phase routed through [`TransferRoute::Call`] suspends and is
-/// awaited by [`TransferResolver`] below — nothing blocks. Every other
+/// A phase routed through [`EffectRoute::Call`] suspends and is awaited
+/// by [`EffectResolver`] below — nothing blocks. Every other
 /// async-effect-bearing op is still an `Op`, and `dsl_kit`'s
 /// `Op::apply` is not `async`, so those drive their future from the
 /// synchronous seam ([`crate::exec::effects::block_on_effect`]), which
@@ -83,21 +83,21 @@ pub enum AstApplyError {
 /// The runtime itself is built once, at the CLI entry point
 /// ([`crate::cli`]).
 pub async fn run_apply_ast(profile: &Path, dry_run: bool) -> Result<String, AstApplyError> {
-    run_apply_ast_routed(profile, dry_run, TransferRoute::default()).await
+    run_apply_ast_routed(profile, dry_run, EffectRoute::default()).await
 }
 
-/// [`run_apply_ast`] with the `net.transfer` route named explicitly.
+/// [`run_apply_ast`] with the single-effect ops' route named explicitly.
 ///
-/// `route` selects which shape a `net.transfer` phase takes in the
-/// engine — the legacy `net_transfer` op, or a dsl-kit `Call` resolved
-/// by [`TransferResolver`] (see [`crate::exec::registry`]'s module doc).
-/// It changes nothing else: the same profile run through both routes
-/// produces the same report, which is what makes moving one op at a time
-/// checkable.
+/// `route` selects which shape a `net.transfer` / `net.http_get` /
+/// `net.http_post` phase takes in the engine — the legacy op, or a
+/// dsl-kit `Call` resolved by [`EffectResolver`] (see
+/// [`crate::exec::registry`]'s module doc). It changes nothing else: the
+/// same profile run through both routes produces the same report, which
+/// is what makes moving one op at a time checkable.
 pub async fn run_apply_ast_routed(
     profile: &Path,
     dry_run: bool,
-    route: TransferRoute,
+    route: EffectRoute,
 ) -> Result<String, AstApplyError> {
     // Canonical order, implicit insertion, and suppression are applied
     // to the AST before the engine sees it, so apply runs exactly the
@@ -120,7 +120,7 @@ pub async fn run_apply_ast_routed(
         registry::profile_op_registry(Arc::clone(&ctx)),
     )
     .expect("Engine initialization should succeed");
-    let mut resolver = TransferResolver { ctx };
+    let mut resolver = EffectResolver { ctx };
     let run_result = drive(&mut engine, &mut resolver).await;
 
     let steps = reports.lock().unwrap().clone();
@@ -158,13 +158,13 @@ pub async fn run_apply_ast_routed(
 /// touches an executor" (`dsl_kit::AsyncEffectResolver`). Whatever
 /// runtime polls [`drive`] below is the backend; nothing here reaches
 /// for one.
-struct TransferResolver {
+struct EffectResolver {
     /// The same context the op registry holds, so a resolved call writes
     /// its report entry into the run's collection.
     ctx: Arc<ExecContext>,
 }
 
-impl AsyncEffectResolver<ProfileCallAst> for TransferResolver {
+impl AsyncEffectResolver<ProfileCallAst> for EffectResolver {
     fn resolve(
         &mut self,
         pending: &Pending,
@@ -195,7 +195,7 @@ impl AsyncEffectResolver<ProfileCallAst> for TransferResolver {
 /// silently treated as completion.
 async fn drive(
     engine: &mut Engine<ProfileCallAst>,
-    resolver: &mut TransferResolver,
+    resolver: &mut EffectResolver,
 ) -> Result<(), String> {
     match dsl_kit::drive_async(engine, resolver, &BreakpointSet::new()).await {
         Ok(DriveOutcome::Done(_)) => Ok(()),
