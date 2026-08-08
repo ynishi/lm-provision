@@ -368,6 +368,14 @@ impl ProfileOp {
                     renders.push(lifecycle::render_dry(step, &env));
                     let mut entry = StepReport::new(sub_id, kind.clone(), op);
                     apply_step_input_fields(&mut entry, step);
+                    // A step that would be skipped on a condition says
+                    // what the condition is and that a dry run did not
+                    // answer it — never that it "would run", which is
+                    // the over-report Chef's why-run mode is criticised
+                    // for (design §3.7).
+                    if let Some(note) = lifecycle::skip_undecided_note(step) {
+                        entry.note = Some(note);
+                    }
                     // A `note` sub-step is inert in either mode, matching
                     // the legacy `dispatch_pending` skip's lack of a
                     // `dry_run` marker; effect-bearing sub-steps carry it.
@@ -894,7 +902,7 @@ fn audit_lifecycle_step(
 ) {
     match step {
         lifecycle::Step::Sh(argv) => audit::sh_exec(mode, kind, argv, env),
-        lifecycle::Step::Transfer { src, dst } => audit::transfer(mode, kind, src, dst),
+        lifecycle::Step::Transfer { src, dst, .. } => audit::transfer(mode, kind, src, dst),
         lifecycle::Step::HttpPoll {
             url, timeout_sec, ..
         } => audit::http_poll(mode, kind, url, *timeout_sec),
@@ -921,7 +929,7 @@ fn step_effect_op(step: &lifecycle::Step) -> &'static str {
 fn apply_step_input_fields(entry: &mut StepReport, step: &lifecycle::Step) {
     match step {
         lifecycle::Step::Sh(argv) => entry.argv = Some(argv.clone()),
-        lifecycle::Step::Transfer { src, dst } => {
+        lifecycle::Step::Transfer { src, dst, .. } => {
             entry.src = Some(src.clone());
             entry.dst = Some(dst.clone());
         }
@@ -958,6 +966,9 @@ fn apply_step_result_fields(entry: &mut StepReport, result: &lifecycle::StepResu
     }
     if result.dst.is_some() {
         entry.dst = result.dst.clone();
+    }
+    if result.note.is_some() {
+        entry.note = result.note.clone();
     }
 }
 

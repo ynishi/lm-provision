@@ -6,26 +6,27 @@
 //! evaluate" are different things and are not folded together. Hence the
 //! four-valued [`AssertOutcome`].
 //!
-//! **This module does not decide what any particular Assert means.**
+//! **The model does not decide what any particular Assert means.**
 //! "What does a finished `ModelFile` / `Service` / `Checkout` look like"
-//! is a separate design question, handled per entity in later stages.
-//! What lives here is only the type, the value range, the composition,
-//! the evaluator, and the two basic predicates needed to show that the
-//! composition works at all.
+//! is a separate design question, answered per entity. The model half
+//! of this module is the type, the value range, the composition, the
+//! evaluator and the two basic predicates; the entity half — currently
+//! [`Done`] and its one implementor [`ModelFile`] — sits at the bottom
+//! of the file and is what the lifecycle layer actually consumes.
 //!
 //! ## Scope boundary
 //!
-//! Everything here is `pub(crate)` — the item *and* the module path (see
-//! [`crate::exec`]). Nothing reaches the AST, the canonical encoding,
-//! validation or the plan artifact, so a profile's public surface and
-//! its hash are unaffected. Assert becomes author-visible in a later
-//! stage.
+//! The model was `pub(crate)` while nothing consumed it. It is public
+//! now because one entity has been wired end to end: `models` derives a
+//! `done` from [`ModelFile`], the lifecycle layer evaluates it before
+//! transferring, and [`crate::canonical::encode_assert`] gives it
+//! deterministic bytes.
 //!
-//! Because no caller exists yet, the items below carry item-level
-//! `#[allow(dead_code)]`. That is deliberate: a module-level blanket
-//! allow would let a stale one survive unnoticed once callers arrive,
-//! whereas item-level allows go stale one by one and keep the incentive
-//! to remove them.
+//! **Nothing here is author-visible yet.** A profile cannot write a
+//! `done:` of its own — every `done` is derived from the phase kind —
+//! so no `ProfileNode` carries an `Assert` and no profile's hash moves.
+//! The author-facing form is settled once three entities exist, so that
+//! it is not shaped by this one (design §5).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -60,8 +61,7 @@ use crate::exec::ExecMode;
 ///
 /// **The range is four. A fifth variant is not added.**
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum AssertOutcome {
+pub enum AssertOutcome {
     /// The condition holds.
     Satisfied,
     /// The condition does not hold.
@@ -90,16 +90,14 @@ pub(crate) enum AssertOutcome {
 /// Deliberately not named `Reason`: `crate::exec::report::StepReport`
 /// already has a free-form `reason` field in this same module tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct CheckError {
+pub struct CheckError {
     category: CheckErrorCategory,
     detail: String,
 }
 
-#[allow(dead_code)]
 impl CheckError {
     /// Build a failure answer from a category and its detail.
-    pub(crate) fn new(category: CheckErrorCategory, detail: impl Into<String>) -> Self {
+    pub fn new(category: CheckErrorCategory, detail: impl Into<String>) -> Self {
         Self {
             category,
             detail: detail.into(),
@@ -107,31 +105,34 @@ impl CheckError {
     }
 
     /// The coarse classification.
-    pub(crate) fn category(&self) -> CheckErrorCategory {
+    pub fn category(&self) -> CheckErrorCategory {
         self.category
     }
 
     /// The observation-derived detail.
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
 
 /// The coarse classification carried by a [`CheckError`].
 ///
-/// **The set is deliberately open here.** This stage contains no code
-/// that inspects an errno — the only [`Observe`] implementations it has
-/// are fixed-response ones used by tests — so closing the set now would
-/// mean the stage that actually writes the observations inherits a
-/// guess. What this stage fixes is the *shape*: a category plus a
-/// detail. The category set and the errno mapping close where the
-/// observations are implemented.
+/// **The set is still one variant, now on evidence rather than on a
+/// deferral.** The two file observations
+/// ([`crate::exec::observe::LocalObserve`]) split their outcomes three
+/// ways — present, absent, and *anything else* — and only the third
+/// reaches a `CheckError`. Whether the file was unreadable, on a
+/// broken mount, or blocked by permissions changes the detail string,
+/// not what the caller does about it: the skip decision treats them
+/// alike and the report prints the detail. A second category earns its
+/// place when a caller would branch on it.
 //
-// 段 B/C で決める: which categories exist, and which errno / transport
-// failure lands in which one.
+// 段 B/C で決める: command exit codes, mount state and HTTP status are
+// observed on the far side of a transport, where "the observation did
+// not come back" is plausibly a different answer from "the observed
+// side said no". That is the shape that would split this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum CheckErrorCategory {
+pub enum CheckErrorCategory {
     /// The observation could not be carried out at all (the observed
     /// side refused or broke).
     Unobservable,
@@ -149,7 +150,7 @@ pub(crate) enum CheckErrorCategory {
 /// An involution. `Assert` has no `Not` variant in this stage — only
 /// the mapping on the value range is decided here, because leaving the
 /// image open would force the range or the fold table back open later.
-#[allow(dead_code)]
+#[allow(dead_code)] // No `Not` variant exists yet; the image is fixed, not used.
 pub(crate) fn not(outcome: AssertOutcome) -> AssertOutcome {
     match outcome {
         AssertOutcome::Satisfied => AssertOutcome::Unsatisfied,
@@ -177,8 +178,8 @@ mod nonempty {
     /// inline head would make both types infinitely sized. Keeping the
     /// indirection here rather than at the two use sites keeps their
     /// declarations reading as the plain recursive shapes they are.
-    #[derive(Debug, PartialEq, Eq)]
-    pub(crate) struct NonEmpty<T> {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NonEmpty<T> {
         head: Box<T>,
         tail: Vec<T>,
     }
@@ -186,7 +187,7 @@ mod nonempty {
     impl<T> NonEmpty<T> {
         /// The only constructor. A head is mandatory, so an empty value
         /// cannot be expressed.
-        pub(crate) fn new(head: T, tail: Vec<T>) -> Self {
+        pub fn new(head: T, tail: Vec<T>) -> Self {
             Self {
                 head: Box::new(head),
                 tail,
@@ -198,12 +199,12 @@ mod nonempty {
         /// This exists so that no caller has to write
         /// `iter().next().expect(..)` — a panic path on the inside of a
         /// type whose whole point is that the empty case is gone.
-        pub(crate) fn head(&self) -> &T {
+        pub fn head(&self) -> &T {
             &self.head
         }
 
         /// Head first, then the tail in order.
-        pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        pub fn iter(&self) -> impl Iterator<Item = &T> {
             std::iter::once(self.head()).chain(self.tail.iter())
         }
 
@@ -212,7 +213,7 @@ mod nonempty {
         /// Without it the evaluator could not turn a `NonEmpty<Assert>`
         /// into a `NonEmpty<AssertOutcome>` and would need a panic path
         /// to rebuild one.
-        pub(crate) fn map<U>(&self, f: impl Fn(&T) -> U) -> NonEmpty<U> {
+        pub fn map<U>(&self, f: impl Fn(&T) -> U) -> NonEmpty<U> {
             NonEmpty {
                 head: Box::new(f(self.head())),
                 tail: self.tail.iter().map(f).collect(),
@@ -230,7 +231,7 @@ mod nonempty {
     // surface this comment guards.
 }
 
-pub(crate) use nonempty::NonEmpty;
+pub use nonempty::NonEmpty;
 
 /// A condition about the host, as an expression.
 ///
@@ -242,9 +243,8 @@ pub(crate) use nonempty::NonEmpty;
 ///
 /// `Not` / `ForEach` / `Any` are not here. They arrive when a kind
 /// needs them.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) enum Assert {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Assert {
     /// There is a file at `path`.
     ///
     /// **What that means is deliberately not settled here** — whether a
@@ -257,7 +257,7 @@ pub(crate) enum Assert {
     },
 
     /// The file at `path` has content digest `expected_sha256`
-    /// (lowercase hex, see [`crate::canonical::hex_sha256`]).
+    /// (lowercase hex, see [`crate::digest::hex_sha256`]).
     ///
     /// Same boundary as [`Assert::FileExists`]: how the content is read
     /// is the observation's business, not the model's.
@@ -298,7 +298,6 @@ pub(crate) enum Assert {
 /// 1 and 3 can be tested from inside the crate rather than by
 /// manufacturing an EACCES on the host (`chmod 000` is a no-op for root
 /// and is unreliable in CI containers).
-#[allow(dead_code)]
 pub(crate) fn fold_all(children: &NonEmpty<AssertOutcome>) -> AssertOutcome {
     let mut saw_unsatisfied = false;
     let mut saw_not_checked = false;
@@ -349,8 +348,7 @@ pub(crate) fn fold_all(children: &NonEmpty<AssertOutcome>) -> AssertOutcome {
 /// Ids are per execution, not per step: nothing short-circuits, so N
 /// leaves means N observations and N separate records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-pub(crate) struct AssertExecutionId(u64);
+pub struct AssertExecutionId(u64);
 
 /// Process-wide source of [`AssertExecutionId`]s.
 //
@@ -378,8 +376,7 @@ impl AssertExecutionId {
 /// rebuilds on the result side exactly the empty conjunction the
 /// expression side removed by typing.
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum AssertNode {
+pub enum AssertNode {
     /// A basic predicate's execution.
     Leaf {
         /// This execution's id.
@@ -398,13 +395,24 @@ pub(crate) enum AssertNode {
     },
 }
 
-#[allow(dead_code)]
 impl AssertNode {
     /// The projection down to a single answer.
-    pub(crate) fn outcome(&self) -> &AssertOutcome {
+    pub fn outcome(&self) -> &AssertOutcome {
         match self {
             AssertNode::Leaf { outcome, .. } | AssertNode::All { outcome, .. } => outcome,
         }
+    }
+
+    /// True iff this execution answered [`AssertOutcome::Satisfied`] —
+    /// the one outcome that lets a caller skip the work.
+    ///
+    /// Named as a question rather than exposed as a comparison so that
+    /// the safe direction is the easy one to write: everything that is
+    /// not `Satisfied` (including `NotChecked` and `CheckFailed`) means
+    /// "do the work", and a caller writing `!= Unsatisfied` by hand
+    /// would get that backwards.
+    pub fn is_satisfied(&self) -> bool {
+        matches!(self.outcome(), AssertOutcome::Satisfied)
     }
 }
 
@@ -414,8 +422,7 @@ impl AssertNode {
 
 /// What an observation of a file's content digest found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum DigestReading {
+pub enum DigestReading {
     /// There is no file to read.
     Absent,
     /// There is one, with this lowercase-hex SHA-256.
@@ -446,13 +453,24 @@ pub(crate) enum DigestReading {
 /// read in one go or in chunks. Those belong to the design of the
 /// individual Asserts. This stage only fixes that the answers come back
 /// in a form the model can receive.
-#[allow(dead_code)]
-pub(crate) trait Observe {
+//
+// `async_fn_in_trait` warns that a `Send` bound cannot be added later
+// without breaking implementors. It is not added *now* because nothing
+// requires it: dispatch is static (`eval<O: Observe>`), and the future
+// is awaited on the thread that created it — `block_in_place` +
+// `Handle::block_on` at the synchronous `Op::apply` seam. A `Send`
+// bound would start constraining implementors for a capability no
+// caller has asked for. What would ask for it is moving an observation
+// onto `tokio::spawn` to abandon one that never returns; the design
+// routes that case to a driver on the far side of a transport instead
+// (§3.2d), so the bound is being deferred rather than overlooked.
+#[allow(async_fn_in_trait)]
+pub trait Observe {
     /// Whether a file is at `path`.
     async fn file_exists(&self, path: &Path) -> Result<bool, CheckError>;
 
     /// The content digest of the file at `path`, lowercase hex (see
-    /// [`crate::canonical::hex_sha256`] for the rendering contract).
+    /// [`crate::digest::hex_sha256`] for the rendering contract).
     async fn file_digest(&self, path: &Path) -> Result<DigestReading, CheckError>;
 }
 
@@ -489,8 +507,7 @@ pub(crate) trait Observe {
 /// concept in two and force conversions at the step wiring. **The
 /// composition carries no mode-specific rule**: each basic predicate
 /// answers `NotChecked` for itself and [`fold_all`] folds as usual.
-#[allow(dead_code)]
-pub(crate) async fn eval<O: Observe>(assert: &Assert, mode: ExecMode, obs: &O) -> AssertNode {
+pub async fn eval<O: Observe>(assert: &Assert, mode: ExecMode, obs: &O) -> AssertNode {
     match assert {
         Assert::FileExists { path } => {
             // Existence is a cheap observation, so it is evaluated in
@@ -569,6 +586,193 @@ fn eval_boxed<'a, O: Observe>(
     Box::pin(eval(assert, mode, obs))
 }
 
+// ---------------------------------------------------------------------
+// (7) Rendering — what a report and a dry-run trace print
+// ---------------------------------------------------------------------
+
+impl AssertOutcome {
+    /// The one-word spelling used in traces and report notes.
+    ///
+    /// A `CheckFailed` carries its detail: the whole reason the variant
+    /// exists is that a report must show what broke, and a bare
+    /// `check-failed` would be the `(skipped due to not_if)` granularity
+    /// this model was built to get away from (design §3.2b).
+    pub fn label(&self) -> String {
+        match self {
+            AssertOutcome::Satisfied => "satisfied".to_string(),
+            AssertOutcome::Unsatisfied => "unsatisfied".to_string(),
+            AssertOutcome::NotChecked => "not-checked".to_string(),
+            AssertOutcome::CheckFailed(error) => {
+                format!("check-failed({:?}: {})", error.category(), error.detail())
+            }
+        }
+    }
+}
+
+/// The condition itself, with no answers: `exists(/p) and sha256(/p)=…`.
+///
+/// Used where there is nothing to evaluate — the dry-run trace, which
+/// states what *would* decide the skip.
+pub fn describe(assert: &Assert) -> String {
+    let mut out = String::new();
+    write_assert(assert, None, &mut out);
+    out
+}
+
+/// The condition annotated with what each subterm answered.
+///
+/// This is what a skipped step reports. Printing only the top answer
+/// would hide exactly what the fold hides — a `CheckFailed` sitting
+/// under an `Unsatisfied` sibling — which is why the evaluator returns
+/// a tree in the first place (design §3.2b').
+pub fn describe_execution(assert: &Assert, node: &AssertNode) -> String {
+    let mut out = String::new();
+    write_assert(assert, Some(node), &mut out);
+    out
+}
+
+/// Render `assert`, annotating each subterm with the matching node's
+/// answer when one is supplied.
+///
+/// The two trees have the same shape by construction ([`eval`] builds
+/// the node from the expression), so the zip always lines up. A
+/// mismatch would mean the caller paired an expression with a foreign
+/// execution; rather than panic on that, the annotation is dropped for
+/// the offending subterm and the expression still prints.
+fn write_assert(assert: &Assert, node: Option<&AssertNode>, out: &mut String) {
+    match assert {
+        Assert::FileExists { path } => {
+            out.push_str(&format!("exists({})", path.display()));
+        }
+        Assert::FileDigest {
+            path,
+            expected_sha256,
+        } => {
+            out.push_str(&format!("sha256({})={expected_sha256}", path.display()));
+        }
+        Assert::All(children) => {
+            let child_nodes = match node {
+                Some(AssertNode::All { children, .. }) => Some(children),
+                _ => None,
+            };
+            out.push_str("all[");
+            for (index, child) in children.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                let child_node = child_nodes.and_then(|nodes| nodes.iter().nth(index));
+                write_assert(child, child_node, out);
+            }
+            out.push(']');
+        }
+    }
+    if let Some(node) = node {
+        out.push('=');
+        out.push_str(&node.outcome().label());
+    }
+}
+
+// ---------------------------------------------------------------------
+// (8) Entities — what a finished thing looks like
+// ---------------------------------------------------------------------
+
+/// A host-side thing that knows what its own completion looks like.
+///
+/// Implementors are built from a phase payload, and the lifecycle layer
+/// asks for the `done` rather than assembling an `Assert` at each call
+/// site — so "what does a finished X look like" is answered once per
+/// kind of thing, not once per kind of phase (design §3.4: the payoff
+/// is the conjunctions that recur across kinds).
+///
+/// Whether the next two entities fit this shape, one line each:
+///
+/// - **`Checkout`** (段 2: dir exists ∧ ref matches, shared by
+///   `comfyui.install` and `custom_nodes`) — fits: it needs a command
+///   exit-code predicate that does not exist yet, but that is a new
+///   [`Assert`] variant, not a change to this signature.
+/// - **`Service`** (段 3: pid alive ∧ cmdline matches ∧ 2xx, shared by
+///   `comfyui.restart` and `service.start`) — fits: the launch argv it
+///   compares against is constructor input, exactly as `sha256` is
+///   here, and the poll that waits for it is the step's execution
+///   strategy rather than part of the condition (design §3.2c).
+///
+/// The signature is deliberately infallible (`-> Assert`, not
+/// `-> Result<Assert, _>`). A payload too underspecified to say what
+/// finished means — `service.start` on an unrecognised platform — has
+/// no entity constructed for it at all; the absence lives at the
+/// construction site, where it can be seen, rather than inside a
+/// method that would have to invent an error for it.
+pub trait Done {
+    /// What has to hold for this thing to be finished.
+    fn done(&self) -> Assert;
+}
+
+/// One file a `models` phase downloads.
+///
+/// Its identity is the destination path plus, when the profile declares
+/// one, the content digest (design §3.6: a content-addressed file can
+/// put the digest *in* its identity, so "present but different" is a
+/// different thing rather than the same thing in a different state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFile {
+    dst: PathBuf,
+    sha256: Option<String>,
+}
+
+impl ModelFile {
+    /// A model file at `dst`, optionally identified by content.
+    ///
+    /// `sha256` is the profile's declared digest, lowercase hex; `None`
+    /// is a profile that named no digest, not a digest that is unknown
+    /// yet.
+    pub fn new(dst: impl Into<PathBuf>, sha256: Option<String>) -> Self {
+        Self {
+            dst: dst.into(),
+            sha256: sha256.map(|hex| hex.to_ascii_lowercase()),
+        }
+    }
+}
+
+impl Done for ModelFile {
+    /// Present, and — when the profile declared a digest — holding that
+    /// content.
+    ///
+    /// **Without a digest this is a single predicate, not a
+    /// one-element conjunction.** `All` is for composing; wrapping a
+    /// lone predicate in it would add a subterm that says nothing, and
+    /// the model does not require every `done` to be a conjunction
+    /// (`NonEmpty` means "not empty", not "at least two").
+    ///
+    /// With a digest, the existence conjunct is *not* redundant even
+    /// though [`Assert::FileDigest`] already answers `Unsatisfied` for
+    /// an absent file. It is what makes a dry run informative: the
+    /// digest is not read under [`ExecMode::DryRun`], so on its own the
+    /// answer would be `NotChecked` whatever the host looks like,
+    /// whereas the conjunction still answers `Unsatisfied` — "this will
+    /// transfer" — when the file is simply not there.
+    ///
+    /// Existence is deliberately the weaker half: a half-written file
+    /// from an interrupted download exists. A profile that declares a
+    /// digest is protected from that; one that does not has asked for
+    /// existence and gets it (design §3.3: an entity type does not fix
+    /// its own assert).
+    fn done(&self) -> Assert {
+        let exists = Assert::FileExists {
+            path: self.dst.clone(),
+        };
+        match &self.sha256 {
+            None => exists,
+            Some(expected_sha256) => Assert::All(NonEmpty::new(
+                exists,
+                vec![Assert::FileDigest {
+                    path: self.dst.clone(),
+                    expected_sha256: expected_sha256.clone(),
+                }],
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,8 +836,8 @@ mod tests {
             match self.at(path) {
                 HostFile::Absent => Ok(DigestReading::Absent),
                 HostFile::Readable(content) => Ok(DigestReading::Present(
-                    // The crate's single hex-rendering implementation.
-                    crate::canonical::hex_sha256(content.as_bytes()),
+                    // The crate's single content-digest implementation.
+                    crate::digest::hex_sha256(content.as_bytes()),
                 )),
                 HostFile::Unobservable => Err(unobservable()),
             }
@@ -647,7 +851,7 @@ mod tests {
     }
 
     fn digest_of(content: &str) -> String {
-        crate::canonical::hex_sha256(content.as_bytes())
+        crate::digest::hex_sha256(content.as_bytes())
     }
 
     fn digest(path: &str, expected: &str) -> Assert {
@@ -1081,6 +1285,107 @@ mod tests {
     // -----------------------------------------------------------------
     // The Not image
     // -----------------------------------------------------------------
+
+    // -----------------------------------------------------------------
+    // The one entity: ModelFile
+    // -----------------------------------------------------------------
+
+    /// A profile that declared no digest gets a bare predicate — no
+    /// conjunction wrapping one child.
+    #[test]
+    fn a_model_file_without_a_digest_is_a_single_predicate() {
+        let done = ModelFile::new("/models/checkpoints/a.safetensors", None).done();
+        assert_eq!(
+            done,
+            Assert::FileExists {
+                path: PathBuf::from("/models/checkpoints/a.safetensors"),
+            },
+            "existence alone is the whole condition, not All[existence]",
+        );
+        assert!(
+            !matches!(done, Assert::All(_)),
+            "a lone predicate must not be wrapped in a conjunction",
+        );
+    }
+
+    /// With a digest the condition is existence ∧ content, in that
+    /// order — the order the fold's tie-break and the trace both read.
+    #[test]
+    fn a_model_file_with_a_digest_conjoins_existence_and_content() {
+        let done = ModelFile::new("/models/loras/b.safetensors", Some("ABCDEF".to_string())).done();
+        assert_eq!(
+            done,
+            Assert::All(NonEmpty::new(
+                Assert::FileExists {
+                    path: PathBuf::from("/models/loras/b.safetensors"),
+                },
+                vec![Assert::FileDigest {
+                    path: PathBuf::from("/models/loras/b.safetensors"),
+                    // Declared uppercase, compared lowercase: the
+                    // rendering contract is lowercase hex, and a
+                    // profile spelling it the other way must not fail
+                    // forever against a digest that can never match.
+                    expected_sha256: "abcdef".to_string(),
+                }],
+            )),
+        );
+    }
+
+    /// The reason the existence conjunct is not redundant: a dry run
+    /// does not read the digest, so on the digest alone every answer
+    /// would be `NotChecked`. The conjunction still says `Unsatisfied`
+    /// — "this will transfer" — for a file that is simply absent.
+    #[tokio::test]
+    async fn a_dry_run_still_decides_a_model_file_that_is_not_there() {
+        let done = ModelFile::new("/target", Some(digest_of("weights"))).done();
+
+        let absent = FakeHost::new(&[("/target", HostFile::Absent)]);
+        assert_eq!(
+            eval(&done, ExecMode::DryRun, &absent).await.outcome(),
+            &AssertOutcome::Unsatisfied,
+            "an absent file is decided in a dry run: the transfer will happen",
+        );
+
+        let present = FakeHost::new(&[("/target", HostFile::Readable("weights"))]);
+        assert_eq!(
+            eval(&done, ExecMode::DryRun, &present).await.outcome(),
+            &AssertOutcome::NotChecked,
+            "a present file is undecided in a dry run: the digest was not read",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Rendering
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn describe_prints_the_condition_without_answers() {
+        let done = ModelFile::new("/w/a.bin", Some("abc".to_string())).done();
+        assert_eq!(
+            describe(&done),
+            "all[exists(/w/a.bin), sha256(/w/a.bin)=abc]"
+        );
+    }
+
+    /// The annotated form carries every subterm's answer, including one
+    /// the top-level projection drops.
+    #[tokio::test]
+    async fn describe_execution_keeps_an_answer_the_projection_hides() {
+        let host = FakeHost::new(&[("/a", HostFile::Absent), ("/b", HostFile::Unobservable)]);
+        let assert = Assert::All(NonEmpty::new(exists("/a"), vec![exists("/b")]));
+
+        let node = eval(&assert, ExecMode::Real, &host).await;
+        let rendered = describe_execution(&assert, &node);
+
+        assert_eq!(
+            rendered,
+            format!(
+                "all[exists(/a)=unsatisfied, exists(/b)=check-failed(Unobservable: \
+                 {UNOBSERVABLE_DETAIL})]=unsatisfied"
+            ),
+            "the check failure the top answer drops is still printed",
+        );
+    }
 
     #[test]
     fn not_swaps_satisfied_and_unsatisfied_and_fixes_the_other_two() {

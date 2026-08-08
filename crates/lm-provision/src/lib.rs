@@ -28,6 +28,9 @@
 //!   are sorted, phase order preserved.
 //! - [`plan`] — the AST plan stage: expand a profile into the plan
 //!   artifact (03-pipeline-stage-artifacts.md §plan).
+//! - [`digest`] — the crate's single SHA-256 implementation, shared by
+//!   the profile hash, the Assert model's content predicate, and the
+//!   driver's `ensure-binary` check.
 //! - [`exec`] — the mlua-free execution layer: the capability gate, the
 //!   declaration-derived path / HTTP / secret policies, the pure-Rust
 //!   effect implementations, and the per-step report builder
@@ -52,6 +55,7 @@ pub mod apply;
 pub mod canonical;
 pub mod cli;
 pub mod derive;
+pub mod digest;
 pub mod exec;
 pub mod frontend;
 pub mod normalize;

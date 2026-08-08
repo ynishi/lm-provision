@@ -90,13 +90,20 @@ pub(crate) fn direct(payload: &ProfileNode) -> Result<Demand, ExecError> {
 /// outside the path layer by design (spec 04 §`sh.exec`). The pid file a
 /// poll re-reads is likewise absent — a provisioner-internal read, not a
 /// bridge op (spec 02 §Poll deadlines).
+///
+/// A step's `done` adds no demand either, for the same reason as the
+/// pid file: evaluating it reads the provisioner's own filesystem
+/// rather than calling a bridge op, and it reads only the destination
+/// the transfer is already gated on. A condition that could widen what
+/// a phase touches would have to be gated; this one cannot, because it
+/// is derived from the step's own destination rather than authored.
 pub(crate) fn step(step: &lifecycle::Step) -> Result<Demand, ExecError> {
     let demand = match step {
         lifecycle::Step::Sh(_) => Demand {
             capability: Some("sh.exec"),
             ..Demand::default()
         },
-        lifecycle::Step::Transfer { src, dst } => {
+        lifecycle::Step::Transfer { src, dst, .. } => {
             let (local, remote) = transfer_targets("net_transfer", src, dst)?;
             Demand {
                 capability: Some("net.transfer"),
@@ -186,6 +193,7 @@ mod tests {
         let demand = step(&lifecycle::Step::Transfer {
             src: "https://huggingface.co/o/r/resolve/main/a.bin".into(),
             dst: "/workspace/a.bin".into(),
+            done: None,
         })
         .expect("resolves");
         assert_eq!(

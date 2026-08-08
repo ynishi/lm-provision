@@ -12,6 +12,13 @@
 //! This is now the sole execution path: the former mlua stack
 //! (`src/bridge/`, `src/sandbox/`, `src/vm/`, ...) has been removed and
 //! the profile frontend is JSON / canonical text only.
+//!
+//! [`assert`] carries the Assert model — what a step's completion
+//! condition is, what answers it can give, and how those compose —
+//! with [`observe`] supplying the observations it evaluates against.
+//! [`lifecycle`] is where the two meet the execution path: a step that
+//! carries a `done` has it evaluated before the effect runs, and a
+//! satisfied one is reported as skipped rather than re-run.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,12 +27,13 @@ use dsl_kit::NodeId;
 
 use crate::profile_ast::ProfileNode;
 
-pub(crate) mod assert;
+pub mod assert;
 pub mod audit;
 pub mod capgate;
 pub(crate) mod demand;
 pub mod effects;
 pub mod lifecycle;
+pub mod observe;
 pub mod payload;
 pub mod policy;
 pub mod registry;

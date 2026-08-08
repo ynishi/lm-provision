@@ -266,6 +266,13 @@ pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError>
 /// step kinds in [`super::lifecycle`]) hand their future to this
 /// function.
 ///
+/// **A caller with more than one thing to await hands over one future
+/// covering all of it**, rather than calling this once per await. The
+/// transfer step is the example: evaluating its completion condition
+/// and performing the transfer are both async, and both live inside the
+/// single future it passes here. Counting call sites is therefore a
+/// meaningful measure of how far the synchronous seam has spread.
+///
 /// Nothing on the `Call` route comes through here: a suspended effect is
 /// awaited by the host resolver ([`crate::apply`]) on the runtime that
 /// is already driving `drive_async`.

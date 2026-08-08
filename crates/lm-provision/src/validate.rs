@@ -85,18 +85,25 @@ const URI_ROUTE_SCHEMES: &[&str] = &["b2", "hf", "https"];
 /// `sync.push`).
 const POD_ID_PLACEHOLDER: &str = "{pod_id}";
 
-/// The one `models` element field pair check 6 reads: the destination
-/// file name is spelled `dst` or `name`, and an element carrying
-/// neither has nowhere to download to (02 §Catalog kinds `models`).
-/// The rest of the element shape belongs to the expansion site
-/// (`crate::exec::lifecycle`), which owns the full `ModelItemSpec`.
+/// The `models` element fields check 6 reads: the destination file
+/// name (spelled `dst` or `name` — an element carrying neither has
+/// nowhere to download to, 02 §Catalog kinds `models`) and the declared
+/// content digest. The rest of the element shape belongs to the
+/// expansion site (`crate::exec::lifecycle`), which owns the full
+/// `ModelItemSpec`.
 #[derive(serde::Deserialize)]
 struct ModelItemShape {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     dst: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
 }
+
+/// The length of a SHA-256 rendered as hex
+/// (`crate::digest::hex_sha256`).
+const SHA256_HEX_LEN: usize = 64;
 
 /// A validate-stage rejection (first violation only,
 /// 03-pipeline-stage-artifacts.md §validate). Each `Display` string
@@ -753,6 +760,15 @@ fn check_phase(
         // `models_json` that does not parse stays an apply-time op
         // failure — that shape is authored input, and the parse error
         // carries a better message from the expansion site.
+        //
+        // A declared `sha256` is checked for shape here for a reason
+        // specific to what it now does: it is the only part of a
+        // `models` element that becomes a *completion condition*
+        // (`crate::exec::assert::ModelFile`), and a digest that no
+        // content can ever have is a condition that can never be
+        // satisfied. Left unchecked it does not fail — it downloads the
+        // weight again on every apply, silently, which is the exact
+        // behaviour declaring a digest was meant to end.
         ProfileNode::Models { models_json, .. } => {
             let Ok(items) = serde_json::from_str::<Vec<ModelItemShape>>(models_json) else {
                 return Ok(());
@@ -763,6 +779,21 @@ fn check_phase(
                         "phases[{index}].models[{}]: one of dst / name is required",
                         i + 1
                     )));
+                }
+                if let Some(sha256) = &item.sha256 {
+                    // Case is not policed: the comparison lowercases
+                    // the declared digest, so an uppercase spelling is
+                    // a legible profile, not a broken one.
+                    if sha256.len() != SHA256_HEX_LEN
+                        || !sha256.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err(ValidateError::PhaseShape(format!(
+                            "phases[{index}].models[{}].sha256: expected {SHA256_HEX_LEN} hex \
+                             characters, got {:?}",
+                            i + 1,
+                            sha256
+                        )));
+                    }
                 }
             }
             Ok(())
@@ -1678,6 +1709,59 @@ mod tests {
 
     /// A `models_json` that does not parse stays an apply-time op
     /// failure — the expansion site owns that message.
+    /// A declared digest is now the file's completion condition, so a
+    /// malformed one is rejected before apply. Unchecked it would not
+    /// fail — it would re-download the weight on every apply, silently,
+    /// which is the behaviour declaring a digest is meant to end.
+    #[test]
+    fn a_malformed_models_digest_is_rejected() {
+        let good = "a".repeat(64);
+        for (label, spelling) in [
+            ("too short", "abc123".to_string()),
+            ("too long", "a".repeat(65)),
+            ("not hex", "g".repeat(64)),
+            ("prefixed", format!("sha256:{}", "a".repeat(57))),
+            ("empty", String::new()),
+        ] {
+            let g = ids();
+            let node = spec(
+                "demo",
+                vec![ProfileNode::Models {
+                    id: g.node(),
+                    models_json: format!(
+                        r#"[{{"src":"https://example.com/a.bin","name":"a.bin","sha256":"{spelling}"}}]"#
+                    ),
+                }],
+            );
+            let err = validate(&node).expect_err("a digest nothing can match is rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains("models[1].sha256"),
+                "{label}: the message must name the offending element: {message}",
+            );
+        }
+
+        // …and the well-formed spellings pass, upper case included:
+        // the comparison lowercases, so an uppercase digest is a
+        // legible profile rather than one that can never be satisfied.
+        for spelling in [good.clone(), good.to_uppercase()] {
+            let g = ids();
+            let node = spec(
+                "demo",
+                vec![ProfileNode::Models {
+                    id: g.node(),
+                    models_json: format!(
+                        r#"[{{"src":"https://example.com/a.bin","name":"a.bin","sha256":"{spelling}"}}]"#
+                    ),
+                }],
+            );
+            assert!(
+                validate(&node).is_ok(),
+                "a 64-char hex digest is well-formed however it is cased: {spelling}",
+            );
+        }
+    }
+
     #[test]
     fn an_unparsable_models_json_is_left_to_the_expansion_site() {
         let g = ids();

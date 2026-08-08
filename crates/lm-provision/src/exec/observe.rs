@@ -1,0 +1,218 @@
+//! [`LocalObserve`]: the Assert model's observations against the
+//! filesystem the provisioner itself runs on.
+//!
+//! The provisioner is a static binary that runs *on* the pod
+//! (08-push-driver-protocol.md), so "the host an Assert asks about" and
+//! "the filesystem this process sees" are the same thing, and these two
+//! observations are plain local reads.
+//!
+//! **That does not make the async evaluator pointless.** The design
+//! keeps observations on the far side of a driver precisely because a
+//! read can fail to return — a `stat()` on a hard-mounted NFS path
+//! enters D state, where not even SIGKILL helps and the only move left
+//! is for the caller to stop waiting and answer `CheckFailed(Timeout)`
+//! (design §3.2d). This implementation is the near case; the shape it
+//! implements is what lets a caller wrap it.
+//!
+//! ## What these two observations mean
+//!
+//! The model deliberately leaves the meaning to the observation
+//! ([`crate::exec::assert::Observe`]), so it is settled here:
+//!
+//! - **`file_exists`** follows symlinks and answers `true` for a
+//!   directory. It is `Path::try_exists`, which is the "is there
+//!   something at this path" question, not "is there a regular file".
+//!   The predicate's subject is a download destination, where a
+//!   directory in the way is a real state of the host and reporting it
+//!   as absent would be a lie.
+//! - **`file_digest`** reads the content as a byte stream. An absent
+//!   path answers [`DigestReading::Absent`]; a path that exists but is
+//!   not a readable byte stream (a directory, a permission failure) is
+//!   a [`CheckError`], not an absence — that distinction is the whole
+//!   reason the failure is an *answer* (design §4.1: folding the read
+//!   failure into "different" is what the driver's `ensure_binary` used
+//!   to do).
+
+use std::path::Path;
+
+use super::assert::{CheckError, CheckErrorCategory, DigestReading, Observe};
+
+/// Observes the filesystem this process is running on.
+///
+/// A unit struct: there is nothing to configure, and every call is a
+/// fresh read. It is a type rather than free functions because
+/// [`Observe`] is the seam a test replaces with a fixed-response host.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalObserve;
+
+impl Observe for LocalObserve {
+    async fn file_exists(&self, path: &Path) -> Result<bool, CheckError> {
+        // `try_exists` is the three-way answer: yes / no / the question
+        // could not be answered. `Path::exists` collapses the third
+        // into "no", which is the fold this model exists to undo.
+        path.try_exists().map_err(|err| unobservable(path, &err))
+    }
+
+    async fn file_digest(&self, path: &Path) -> Result<DigestReading, CheckError> {
+        match crate::digest::of_file(path) {
+            Ok(Some(hex)) => Ok(DigestReading::Present(hex)),
+            Ok(None) => Ok(DigestReading::Absent),
+            Err(err) => Err(unobservable(path, &err)),
+        }
+    }
+}
+
+/// Turn a failed read into the answer it is.
+///
+/// The detail is `<ErrorKind>: <path>` — both halves are functions of
+/// the observation alone, which [`CheckError`] requires: equality
+/// includes the detail, so a clock, an attempt counter or an OS error
+/// number that varies by platform would make "the same host state gives
+/// the same answer" untestable. `ErrorKind`'s `Debug` spelling
+/// (`PermissionDenied`) is the stable rendering; `io::Error`'s own
+/// `Display` embeds the raw errno.
+fn unobservable(path: &Path, err: &std::io::Error) -> CheckError {
+    CheckError::new(
+        CheckErrorCategory::Unobservable,
+        format!("{:?}: {}", err.kind(), path.display()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::assert::{eval, Assert, AssertOutcome};
+    use crate::exec::ExecMode;
+    use std::path::PathBuf;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-observe-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// The two predicates against a real file, both answers, plus the
+    /// mismatch — the whole point being that `Unsatisfied` for "wrong
+    /// content" and `Unsatisfied` for "nothing there" are reached
+    /// through different observations.
+    #[tokio::test]
+    async fn the_two_predicates_answer_from_the_real_filesystem() {
+        let dir = scratch_dir("real");
+        let present = dir.join("present.bin");
+        std::fs::write(&present, b"payload").expect("write payload");
+        let absent = dir.join("absent.bin");
+
+        let digest = crate::digest::hex_sha256(b"payload");
+
+        let cases: Vec<(&str, Assert, AssertOutcome)> = vec![
+            (
+                "existing file",
+                Assert::FileExists {
+                    path: present.clone(),
+                },
+                AssertOutcome::Satisfied,
+            ),
+            (
+                "absent file",
+                Assert::FileExists {
+                    path: absent.clone(),
+                },
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "matching digest",
+                Assert::FileDigest {
+                    path: present.clone(),
+                    expected_sha256: digest,
+                },
+                AssertOutcome::Satisfied,
+            ),
+            (
+                "differing digest",
+                Assert::FileDigest {
+                    path: present.clone(),
+                    expected_sha256: crate::digest::hex_sha256(b"something else"),
+                },
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "digest of an absent file",
+                Assert::FileDigest {
+                    path: absent,
+                    expected_sha256: crate::digest::hex_sha256(b"payload"),
+                },
+                AssertOutcome::Unsatisfied,
+            ),
+        ];
+
+        for (label, assert, want) in cases {
+            let node = eval(&assert, ExecMode::Real, &LocalObserve).await;
+            assert_eq!(node.outcome(), &want, "{label}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A path that exists but cannot be read as a byte stream answers
+    /// `CheckFailed`, not `Unsatisfied`: the caller does the work
+    /// either way, but the report has to be able to say which happened.
+    /// A directory is the portable way to produce that state.
+    #[tokio::test]
+    async fn an_unreadable_path_answers_check_failed_rather_than_unsatisfied() {
+        let dir = scratch_dir("unreadable");
+
+        let exists = eval(
+            &Assert::FileExists { path: dir.clone() },
+            ExecMode::Real,
+            &LocalObserve,
+        )
+        .await;
+        assert_eq!(
+            exists.outcome(),
+            &AssertOutcome::Satisfied,
+            "something is at that path, and existence says so",
+        );
+
+        let digest = eval(
+            &Assert::FileDigest {
+                path: dir.clone(),
+                expected_sha256: crate::digest::hex_sha256(b""),
+            },
+            ExecMode::Real,
+            &LocalObserve,
+        )
+        .await;
+        assert!(
+            matches!(digest.outcome(), AssertOutcome::CheckFailed(_)),
+            "an unreadable path is a failed observation, not a content mismatch: {:?}",
+            digest.outcome(),
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The detail is a function of the observation alone, so the same
+    /// host state answers identically twice — the property `CheckError`
+    /// being a value type exists to make testable.
+    #[tokio::test]
+    async fn the_same_host_state_gives_the_same_failure_detail() {
+        let dir = scratch_dir("stable-detail");
+        let assert = Assert::FileDigest {
+            path: dir.clone(),
+            expected_sha256: crate::digest::hex_sha256(b""),
+        };
+
+        let first = eval(&assert, ExecMode::Real, &LocalObserve).await;
+        let second = eval(&assert, ExecMode::Real, &LocalObserve).await;
+        assert_eq!(first.outcome(), second.outcome());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

@@ -53,13 +53,40 @@ service.ready         ServiceReady
 | `sync.pull` | `src` = `b2://<bucket>/<path>` \| `hf://<owner>/<repo>[@<rev>]/<path>` \| `https://...`; `dst` absolute path, no `..` (a **file** path, except on the hf-cli route — §Dispatch routing); `env` table\<string, string\|SecretRef\> optional; `revision` string optional (hf) | `net.transfer`, or `sh.exec` when routed to a CLI (§Dispatch routing) |
 | `sync.push` | `src` absolute path; `dst` = `b2://...` or `hf://<owner>/<repo>/<path>`; `{pod_id}` placeholder allowed in dst | none — marker only, not executed during apply |
 | `staging.push` | same shape as `sync.push` plus `env`, `revision`, `commit_message`, `include` list, `exclude` list, `content_type` | `net.transfer` or `sh.exec` (§Dispatch routing) |
-| `models` | `models` list of `{ src = "https://...", dst? \| name?, subdir? \| kind? (default "checkpoints"), sha256? }` → downloads to `/workspace/ComfyUI/models/<subdir>/<dst>`. At least one of `dst` / `name` is required and `dst` wins when both appear; `subdir` likewise wins over `kind`. Not scheme-routed: a credential-bearing `b2://` / `hf://` source belongs on `sync.pull` (§Dispatch routing) | `net.transfer` |
+| `models` | `models` list of `{ src = "https://...", dst? \| name?, subdir? \| kind? (default "checkpoints"), sha256? }` → downloads to `/workspace/ComfyUI/models/<subdir>/<dst>`. At least one of `dst` / `name` is required and `dst` wins when both appear; `subdir` likewise wins over `kind`. `sha256` is 64 hex characters (validate-stage reject otherwise) and drives the completion condition below. Not scheme-routed: a credential-bearing `b2://` / `hf://` source belongs on `sync.pull` (§Dispatch routing) | `net.transfer` |
 | `llm_models` | `models` list of `{ src = "hf://<owner>/<repo>[@<rev>]", dst_dir? (default "/tmp/"), revision? }` — repo snapshot download, always over the hf CLI (not scheme-routed) | `sh.exec` (hf CLI) |
 | `hooks.post_install` | `script` string — raw shell, inner escape (chapter 01) | `sh.exec` |
 | `comfyui.restart` | `port` number (default 8188); `extra_args` list\<string\> (shell-safe) | `sh.exec` |
 | `comfyui.health` | `port` number (default 8188); `timeout_sec?` number (default 180) — poll of `/object_info` | `net.http_get` |
 | `service.start` | `name` string (required, shell-safe, unique across the profile); `platform` = `{ kind string, model? (shell-safe), port?, dtype? (shell-safe), tensor_parallel_size?, extra_args? (shell-safe) }`. `kind` is a free string: `"vllm"`, `"ollama"`, `"llamacpp"` are the values this catalog gives an argv shape, any other value expands to a note step (§Spawn-and-poll invocations) | `sh.exec` |
 | `service.ready` | `name` string; `check` = `{ http = "<url>", timeout_sec? (default 300) }` | `net.http_get` |
+
+### Completion conditions (which kinds can be skipped)
+
+A kind may declare what "already done" looks like for the work it
+performs. Before running that work, apply evaluates the condition; if
+it already holds the work is **skipped** and the report says which
+parts of the condition were true. Whether a kind has one is a property
+of that kind, not a blanket contract over the catalog — the table below
+is the complete list.
+
+| kind | condition | evaluated in a dry run? |
+|---|---|---|
+| `models` | with `sha256`: the destination exists **and** its content has that digest. Without `sha256`: the destination exists | no — the answer is reported as undecided |
+
+Everything else in this catalog runs every time.
+
+Two properties this is meant to have, and one it is not:
+
+- **Only "already done" skips.** A condition that could not be
+  evaluated (an unreadable destination, a read that failed) does not
+  skip; the work runs. Skipping something that was not done costs a
+  broken pod, re-doing something that was costs bandwidth.
+- **A skip says what was true.** The report's `note` carries the
+  evaluated condition per sub-term, not a bare "skipped".
+- **It is not a guarantee that the work is unnecessary.** Existence
+  alone is a weak identity: a half-written file from an interrupted
+  download exists. Declaring `sha256` is what buys the strong one.
 
 ### Catalog kinds (direct operations)
 

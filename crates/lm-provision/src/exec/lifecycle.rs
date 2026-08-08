@@ -73,8 +73,10 @@ use tokio::time::sleep;
 
 use serde::Deserialize;
 
+use super::assert::{self, Done as _};
+use super::observe::LocalObserve;
 use super::scheme::{self, parse_hf_uri, split_b2_uri};
-use super::{effects, ExecError};
+use super::{effects, ExecError, ExecMode};
 use crate::profile_ast::ProfileNode;
 
 /// ComfyUI clone target (spec 02 §Built-in path constants).
@@ -146,6 +148,28 @@ pub enum Step {
         src: String,
         /// Destination local path or URL.
         dst: String,
+        /// What being finished looks like, when the phase knows.
+        ///
+        /// Evaluated before the transfer runs; a
+        /// [`AssertOutcome::Satisfied`](assert::AssertOutcome::Satisfied)
+        /// answer skips it (design §3.1: the same predicate, used to
+        /// skip rather than to fail). Every other answer — including
+        /// `NotChecked` and `CheckFailed` — transfers, which is the
+        /// safe direction.
+        ///
+        /// `None` is a step whose phase derives no entity: a
+        /// `sync.pull` / `staging.push` transfer names an arbitrary
+        /// source and destination and has no declared identity to
+        /// check, so it runs every time exactly as it did before.
+        //
+        // The model puts `done` on the *step* rather than on one step
+        // shape (design §3.2), which here would be a struct wrapping
+        // this enum. It sits on `Transfer` alone because `Transfer` is
+        // the only shape with an entity so far; when 段 2 gives `Sh`
+        // one (`Checkout`) and 段 3 gives `HttpPoll` one (`Service`),
+        // the field belongs on the wrapper instead, and moving it then
+        // is one refactor rather than three field additions.
+        done: Option<assert::Assert>,
     },
     /// Poll `url` via [`effects::http_get`] until a 2xx response or
     /// `timeout_sec` elapses.
@@ -397,6 +421,10 @@ fn expand_sync_pull(
         return Ok(vec![Step::Transfer {
             src: scheme::download_url("sync_pull", src, revision)?,
             dst: dst.to_string(),
+            // A `sync.pull` names an arbitrary source and destination
+            // and declares no digest, so there is no entity to ask and
+            // nothing to skip on.
+            done: None,
         }]);
     }
 
@@ -451,6 +479,7 @@ fn expand_sync_pull(
     Ok(vec![Step::Transfer {
         src: src.to_string(),
         dst: dst.to_string(),
+        done: None,
     }])
 }
 
@@ -499,6 +528,8 @@ fn expand_staging_push(
     Ok(vec![Step::Transfer {
         src: src.to_string(),
         dst: dst.to_string(),
+        // An upload's destination is remote; nothing here observes it.
+        done: None,
     }])
 }
 
@@ -517,6 +548,22 @@ struct ModelItemSpec {
     subdir: Option<String>,
     #[serde(default)]
     kind: Option<String>,
+    /// The declared content digest of the downloaded file, lowercase
+    /// hex (spec 02 `models[].sha256`).
+    ///
+    /// Read since this stage, and only here — the field was in the
+    /// payload spec from the start but was dropped on the way into
+    /// [`Step`], which is why a second apply re-downloaded every weight
+    /// (04-bridge.md §209 recorded it as deferred).
+    ///
+    /// **Decoding it does not move any profile's hash.** The AST
+    /// carries this payload as one opaque string
+    /// ([`ProfileNode::Models::models_json`]) and the canonical encoder
+    /// writes that string verbatim, so a declared `sha256` has been
+    /// inside the hash all along — dropped only here, at expansion.
+    /// What changes is what the provisioner does with it.
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 fn expand_models(json: &str) -> Result<Vec<Step>, ExecError> {
@@ -541,9 +588,16 @@ fn expand_models(json: &str) -> Result<Vec<Step>, ExecError> {
                 ),
             })?;
         let dst = format!("{MODELS_ROOT}/{subdir}/{filename}");
+        // The `done` is derived from the kind, not declared: a `models`
+        // element is a `ModelFile`, and what a finished one looks like
+        // is that entity's business (design §3.4). A profile cannot
+        // write its own condition yet — that form is settled once three
+        // entities exist, so it is not shaped by this one.
+        let done = assert::ModelFile::new(dst.clone(), model.sha256).done();
         steps.push(Step::Transfer {
             src: model.src,
             dst,
+            done: Some(done),
         });
     }
     Ok(steps)
@@ -849,6 +903,10 @@ fn missing_model_note(name: &str, platform_kind: &str) -> Step {
 /// or network. `env` is the phase's resolved env-injection map (empty
 /// for env-less ops); a [`Step::Sh`] renders its *key* names only —
 /// resolved values are never logged (spec 06 opacity).
+///
+/// A step carrying a `done` renders the condition, unevaluated, and
+/// says so — see [`skip_undecided_note`] for why a dry run does not
+/// answer it.
 pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
     match step {
         Step::Sh(argv) if env.is_empty() => format!("sh argv={argv:?}"),
@@ -856,7 +914,19 @@ pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
             "sh argv={argv:?} env_keys={:?}",
             env.keys().collect::<Vec<_>>()
         ),
-        Step::Transfer { src, dst } => format!("transfer src={src} dst={dst}"),
+        Step::Transfer {
+            src,
+            dst,
+            done: None,
+        } => format!("transfer src={src} dst={dst}"),
+        Step::Transfer {
+            src,
+            dst,
+            done: Some(done),
+        } => format!(
+            "transfer src={src} dst={dst} skip_if={} (undecided: not evaluated in a dry run)",
+            assert::describe(done)
+        ),
         Step::HttpPoll {
             url,
             timeout_sec,
@@ -906,6 +976,16 @@ pub struct StepResult {
     pub bytes: Option<u64>,
     /// Destination actually written (`transfer` steps).
     pub dst: Option<String>,
+    /// Why the step did what it did, when that is not obvious from the
+    /// other fields — currently, that it was skipped and which parts of
+    /// its `done` were true.
+    ///
+    /// Reaches the report as `StepReport::note`, which *is* serialized
+    /// into the step entry (unlike `reason`). Chef prints
+    /// `(skipped due to not_if)` and leaves the operator to go read the
+    /// cookbook; a skip that does not say what was true is the same
+    /// thing (design §3.8).
+    pub note: Option<String>,
 }
 
 impl StepResult {
@@ -988,17 +1068,12 @@ pub fn execute_step(
 ) -> Result<StepResult, StepFailure> {
     match step {
         Step::Sh(argv) => execute_sh(argv, op, env),
-        Step::Transfer { src, dst } => {
-            let outcome = effects::block_on_effect(op, effects::transfer(src, dst))?;
-            Ok(StepResult {
-                summary: format!(
-                    "transfer src={src} dst={} bytes={}",
-                    outcome.dst, outcome.bytes
-                ),
-                bytes: Some(outcome.bytes),
-                dst: Some(outcome.dst),
-                ..StepResult::default()
-            })
+        Step::Transfer { src, dst, done } => {
+            // One `block_on_effect` for the whole step, not one per
+            // await: the assert evaluation and the transfer share this
+            // seam, so wiring the skip in did not add a second place
+            // where the synchronous `Op::apply` boundary is crossed.
+            effects::block_on_effect(op, transfer_unless_done(src, dst, done.as_ref()))
         }
         Step::HttpPoll {
             url,
@@ -1016,6 +1091,94 @@ pub fn execute_step(
             ),
         ),
         Step::Note(message) => Ok(StepResult::summary_only(format!("note \"{message}\""))),
+    }
+}
+
+/// Evaluate the step's `done`, then transfer unless it already holds.
+///
+/// **Only [`AssertOutcome::Satisfied`](assert::AssertOutcome::Satisfied)
+/// skips.** `Unsatisfied` obviously transfers; so do `NotChecked` and
+/// `CheckFailed`, because neither is a statement that the file is
+/// already right. Transferring something that was already there costs
+/// bandwidth; skipping something that was not costs a broken pod.
+///
+/// **The condition's answers are reported either way**, skip or not.
+/// The fold gives `Unsatisfied` absolute priority, so a `CheckFailed`
+/// in the same conjunction disappears from the top answer — a
+/// permission failure on the digest read would otherwise be invisible,
+/// with the re-download as its only symptom. The note carries the whole
+/// evaluated tree, which is what the tree exists for (design §3.2b').
+async fn transfer_unless_done(
+    src: &str,
+    dst: &str,
+    done: Option<&assert::Assert>,
+) -> Result<StepResult, StepFailure> {
+    let evaluated = match done {
+        // `Real`, not the context's mode: this function is the real
+        // path by construction — a dry run renders through
+        // [`render_dry`] and never reaches an effect.
+        Some(done) => Some((
+            done,
+            assert::eval(done, ExecMode::Real, &LocalObserve).await,
+        )),
+        None => None,
+    };
+
+    if let Some((done, node)) = &evaluated {
+        if node.is_satisfied() {
+            let condition = assert::describe_execution(done, node);
+            return Ok(StepResult {
+                summary: format!("transfer src={src} dst={dst} skipped: {condition}"),
+                dst: Some(dst.to_string()),
+                note: Some(format!("skipped, already done: {condition}")),
+                ..StepResult::default()
+            });
+        }
+    }
+
+    let outcome = effects::transfer(src, dst).await?;
+    Ok(StepResult {
+        summary: format!(
+            "transfer src={src} dst={} bytes={}",
+            outcome.dst, outcome.bytes
+        ),
+        bytes: Some(outcome.bytes),
+        dst: Some(outcome.dst),
+        note: evaluated
+            .map(|(done, node)| format!("not done: {}", assert::describe_execution(done, &node))),
+        ..StepResult::default()
+    })
+}
+
+/// The report note for a step whose `done` a dry run did not answer.
+///
+/// **A dry run does not evaluate the condition at all here**, so this
+/// states the condition and that the skip is undecided rather than
+/// reporting an outcome.
+///
+/// The model would allow more: [`assert::Assert::FileExists`] is a
+/// cheap observation and answers under
+/// [`ExecMode::DryRun`](super::ExecMode::DryRun) — Ansible's `creates`
+/// guard is evaluated in check mode for the same reason (design §3.7).
+/// What stops it is the wiring, not the model: the evaluator is async,
+/// the registry's dry-run arm is reached through the synchronous
+/// `dsl_kit::Op::apply`, and crossing that boundary means a
+/// [`effects::block_on_effect`] call site. The real path already has
+/// one to share ([`transfer_unless_done`]); the dry-run path would need
+/// a new one, and spreading that seam is the thing the seam's own
+/// existence is meant to prevent.
+///
+/// The honest consequence, which the note states rather than hides: a
+/// dry run says what would decide the skip, not what it decided.
+pub fn skip_undecided_note(step: &Step) -> Option<String> {
+    match step {
+        Step::Transfer {
+            done: Some(done), ..
+        } => Some(format!(
+            "skip undecided: not evaluated in a dry run; would skip if {}",
+            assert::describe(done)
+        )),
+        _ => None,
     }
 }
 
@@ -1235,6 +1398,7 @@ async fn execute_http_poll_in(
 mod tests {
     use super::*;
     use dsl_kit::IdGen;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn node_id(ids: &IdGen) -> dsl_kit::NodeId {
         ids.node()
@@ -1426,6 +1590,9 @@ mod tests {
             vec![Step::Transfer {
                 src: "https://example.com/m.bin".to_string(),
                 dst: "/workspace/m.bin".to_string(),
+                // A `sync.pull` derives no entity, so it keeps running
+                // every time — the field is here, and `None`.
+                done: None,
             }]
         );
     }
@@ -1470,6 +1637,7 @@ mod tests {
             vec![Step::Transfer {
                 src: "https://huggingface.co/owner/repo/resolve/main/model.safetensors".to_string(),
                 dst: "/workspace/model.safetensors".to_string(),
+                done: None,
             }],
         );
     }
@@ -1491,6 +1659,7 @@ mod tests {
             vec![Step::Transfer {
                 src: "https://huggingface.co/owner/repo/resolve/v2/model.safetensors".to_string(),
                 dst: "/workspace/model.safetensors".to_string(),
+                done: None,
             }],
         );
     }
@@ -1677,6 +1846,9 @@ mod tests {
             vec![Step::Transfer {
                 src: "https://example.com/m.bin".to_string(),
                 dst: "/workspace/m.bin".to_string(),
+                // A `sync.pull` derives no entity, so it keeps running
+                // every time — the field is here, and `None`.
+                done: None,
             }]
         );
     }
@@ -1787,6 +1959,7 @@ mod tests {
             vec![Step::Transfer {
                 src: "/workspace/out.bin".to_string(),
                 dst: "https://example.com/out.bin".to_string(),
+                done: None,
             }],
         );
     }
@@ -1804,22 +1977,60 @@ mod tests {
             .to_string(),
         };
         let steps = expand(&payload).expect("models expands");
+        let existence = |path: &str| {
+            Some(assert::Assert::FileExists {
+                path: std::path::PathBuf::from(path),
+            })
+        };
         assert_eq!(
             steps,
             vec![
                 Step::Transfer {
                     src: "https://ex/a.bin".to_string(),
                     dst: "/workspace/ComfyUI/models/lora/a.bin".to_string(),
+                    // No declared digest, so the condition is existence
+                    // of the composed destination — the same path the
+                    // step downloads to, derived once.
+                    done: existence("/workspace/ComfyUI/models/lora/a.bin"),
                 },
                 Step::Transfer {
                     src: "https://ex/b.bin".to_string(),
                     dst: "/workspace/ComfyUI/models/vae/b.bin".to_string(),
+                    done: existence("/workspace/ComfyUI/models/vae/b.bin"),
                 },
                 Step::Transfer {
                     src: "https://ex/c.bin".to_string(),
                     dst: "/workspace/ComfyUI/models/checkpoints/c.bin".to_string(),
+                    done: existence("/workspace/ComfyUI/models/checkpoints/c.bin"),
                 },
             ]
+        );
+    }
+
+    /// A declared `sha256` reaches the step as the content half of its
+    /// condition — the field the payload spec has carried since the
+    /// start and the expansion used to drop, which is why a second
+    /// apply re-downloaded every weight.
+    #[test]
+    fn expand_models_carries_a_declared_digest_into_the_step_condition() {
+        let ids = IdGen::new();
+        let digest = crate::digest::hex_sha256(b"weights");
+        let payload = ProfileNode::Models {
+            id: node_id(&ids),
+            models_json: format!(
+                r#"[{{"src":"https://ex/a.bin","dst":"a.bin","subdir":"lora","sha256":"{digest}"}}]"#
+            ),
+        };
+
+        let steps = expand(&payload).expect("models expands");
+        let dst = "/workspace/ComfyUI/models/lora/a.bin";
+        assert_eq!(
+            steps,
+            vec![Step::Transfer {
+                src: "https://ex/a.bin".to_string(),
+                dst: dst.to_string(),
+                done: Some(assert::ModelFile::new(dst, Some(digest)).done()),
+            }],
         );
     }
 
@@ -2424,7 +2635,8 @@ mod tests {
         assert!(render_dry(
             &Step::Transfer {
                 src: "s".into(),
-                dst: "d".into()
+                dst: "d".into(),
+                done: None,
             },
             &no_env
         )
@@ -2989,5 +3201,210 @@ mod tests {
         .into();
         assert_eq!(*failure.observed, StepResult::default());
         assert_eq!(failure.observed.status, 0, "the registry substitutes -1");
+    }
+
+    // -------------------------------------------------------------
+    // A step's `done`: what gets skipped, and what does not.
+    //
+    // These drive `execute_step` rather than a whole profile, because
+    // a `models` phase composes its destination under the built-in
+    // `/workspace/ComfyUI/models` root, which a test cannot write to.
+    // The step is what the skip is decided on, so it is what is
+    // exercised; that the phase builds this step with this condition
+    // is `expand_models_carries_a_declared_digest_into_the_step_condition`.
+    // -------------------------------------------------------------
+
+    /// A local HTTP server that answers every request with `body`,
+    /// counting how many it served.
+    ///
+    /// The count is the point: "the second apply did not download it
+    /// again" is a statement about requests, and asserting it on the
+    /// destination's contents alone would pass for a re-download that
+    /// wrote the same bytes.
+    ///
+    /// The thread is deliberately not joined. A skip means the server
+    /// is never asked, so a `join` would wait on an `accept` that is
+    /// not coming — the test would hang exactly when it is supposed to
+    /// pass. It ends with the test binary.
+    fn serving_local_server(body: &'static [u8]) -> (String, std::sync::Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let served = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&served);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(header.as_bytes()).is_err() || stream.write_all(body).is_err() {
+                    break;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (format!("http://{addr}/payload.bin"), served)
+    }
+
+    fn transfer_step(src: &str, dst: &std::path::Path, sha256: Option<String>) -> Step {
+        Step::Transfer {
+            src: src.to_string(),
+            dst: dst.to_string_lossy().into_owned(),
+            done: Some(assert::ModelFile::new(dst, sha256).done()),
+        }
+    }
+
+    /// The UC this stage exists for: **a second apply does not download
+    /// the weight again.** The first call transfers, the second finds
+    /// the declared digest already satisfied and skips — and says which
+    /// parts of the condition were true when it did.
+    ///
+    /// Multi-threaded flavour because the step drives an async effect
+    /// through `block_on_effect`, which blocks its worker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_digest_skips_the_second_transfer() {
+        const BODY: &[u8] = b"model weights";
+        let dir = scratch_dir("skip-on-digest");
+        let dst = dir.join("weights.safetensors");
+        let (url, served) = serving_local_server(BODY);
+        let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
+        let env = BTreeMap::new();
+
+        let first = execute_step(&step, "models", &env).expect("the first apply downloads");
+        assert_eq!(first.bytes, Some(BODY.len() as u64));
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&dst).expect("destination written"), BODY);
+
+        let second = execute_step(&step, "models", &env).expect("the second apply skips");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the second apply must not ask the server again",
+        );
+        assert_eq!(second.bytes, None, "nothing was transferred");
+
+        // …and the skip says what was true, rather than Chef's bare
+        // `(skipped due to not_if)` (design §3.8).
+        let note = second.note.expect("a skipped step carries a note");
+        assert!(note.starts_with("skipped, already done: "), "{note}");
+        assert!(
+            note.contains(&format!("exists({})=satisfied", dst.display())),
+            "the existence conjunct's answer is in the note: {note}",
+        );
+        assert!(
+            note.contains("=satisfied]=satisfied"),
+            "so is the digest conjunct's, and the conjunction's: {note}",
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half: a destination whose content does not match the
+    /// declared digest is **not** skipped. Present-but-different is a
+    /// different thing, not the same thing (design §3.6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_digest_mismatch_transfers_again() {
+        const BODY: &[u8] = b"model weights";
+        let dir = scratch_dir("mismatch");
+        let dst = dir.join("weights.safetensors");
+        let (url, served) = serving_local_server(BODY);
+        let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
+        let env = BTreeMap::new();
+
+        execute_step(&step, "models", &env).expect("the first apply downloads");
+        fs::write(&dst, b"truncated or tampered").expect("overwrite the destination");
+
+        let second = execute_step(&step, "models", &env)
+            .expect("a mismatching destination must be downloaded again");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert_eq!(second.bytes, Some(BODY.len() as u64));
+        assert_eq!(fs::read(&dst).expect("destination rewritten"), BODY);
+
+        // The condition still reports, so a report reader can see *why*
+        // it ran: the file was there and the content was not.
+        let note = second.note.expect("an executed step reports its condition");
+        assert!(note.starts_with("not done: "), "{note}");
+        assert!(
+            note.contains("=satisfied") && note.contains("=unsatisfied"),
+            "existence held, content did not: {note}",
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no declared digest the condition is existence alone, so a
+    /// destination that is present — whatever it contains — is skipped.
+    ///
+    /// This is the honest consequence of a profile that names no
+    /// digest, not a defect: a half-written file from an interrupted
+    /// download exists too. Declaring `sha256` is what buys the
+    /// stronger identity.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_declared_digest_existence_alone_decides() {
+        const BODY: &[u8] = b"model weights";
+        let dir = scratch_dir("existence-only");
+        let dst = dir.join("weights.safetensors");
+        fs::write(&dst, b"something else entirely").expect("pre-existing destination");
+        let (url, served) = serving_local_server(BODY);
+        let step = transfer_step(&url, &dst, None);
+
+        let result = execute_step(&step, "models", &BTreeMap::new()).expect("the step decides");
+
+        assert_eq!(served.load(Ordering::SeqCst), 0, "nothing was downloaded");
+        let note = result.note.expect("a skipped step carries a note");
+        assert_eq!(
+            note,
+            format!("skipped, already done: exists({})=satisfied", dst.display()),
+            "one predicate, no conjunction around it",
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A dry run states the condition and that it did not answer it.
+    /// It must not claim the step would run, nor that it would be
+    /// skipped — the digest is not read, so neither is known.
+    #[test]
+    fn a_dry_run_states_the_condition_and_leaves_the_skip_undecided() {
+        let dst = std::path::Path::new("/workspace/ComfyUI/models/lora/a.bin");
+        let digest = crate::digest::hex_sha256(b"weights");
+        let step = transfer_step("https://ex/a.bin", dst, Some(digest.clone()));
+
+        let rendered = render_dry(&step, &BTreeMap::new());
+        assert_eq!(
+            rendered,
+            format!(
+                "transfer src=https://ex/a.bin dst={} \
+                 skip_if=all[exists({}), sha256({})={digest}] \
+                 (undecided: not evaluated in a dry run)",
+                dst.display(),
+                dst.display(),
+                dst.display(),
+            ),
+        );
+
+        let note = skip_undecided_note(&step).expect("a step with a condition notes it");
+        assert!(note.starts_with("skip undecided: "), "{note}");
+        assert!(
+            note.contains(&digest),
+            "the digest that would decide: {note}"
+        );
+
+        assert_eq!(
+            skip_undecided_note(&Step::Transfer {
+                src: "s".into(),
+                dst: "d".into(),
+                done: None,
+            }),
+            None,
+            "a step with no condition has nothing undecided to report",
+        );
+        assert_eq!(skip_undecided_note(&Step::Sh(vec!["ls".into()])), None);
     }
 }

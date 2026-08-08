@@ -135,6 +135,62 @@ async fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A dry-run `models` step reaches the report saying **what would
+/// decide whether it is skipped, and that nothing decided it**.
+///
+/// The two failure modes this pins down are the ones Chef's why-run
+/// mode is criticised for and the ones a skip that says nothing
+/// produces: claiming the step "would run" when the answer was never
+/// looked for, and claiming it was skipped without saying on what.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_models_step_reports_its_condition_as_undecided() {
+    let digest = "a".repeat(64);
+    let profile = json!({
+        "type": "Spec",
+        "name": "models-dry-run",
+        "capabilities": ["net.transfer"],
+        "paths": ["/workspace/ComfyUI/models"],
+        "http_allowlist": ["https://example.com/"],
+        "phases": [{
+            "type": "Models",
+            "models_json": format!(
+                r#"[{{"src":"https://example.com/a.bin","dst":"a.bin","subdir":"lora","sha256":"{digest}"}}]"#
+            ),
+        }]
+    });
+    let path = write_json_profile("models-dry-run", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, true)
+        .await
+        .expect("a dry run touches nothing and reports");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    let steps = report["steps"].as_array().expect("steps is an array");
+    assert_eq!(steps.len(), 1);
+    let step = &steps[0];
+    assert_eq!(step["op"], json!("net.transfer"));
+    assert_eq!(step["dry_run"], json!(true));
+    assert_eq!(
+        step["dst"],
+        json!("/workspace/ComfyUI/models/lora/a.bin"),
+        "the composed destination, which is also what the condition looks at",
+    );
+
+    let note = step["note"]
+        .as_str()
+        .expect("the condition reaches the report");
+    assert!(
+        note.starts_with("skip undecided: not evaluated in a dry run"),
+        "a dry run must not claim the step would run: {note}",
+    );
+    assert!(
+        note.contains("exists(/workspace/ComfyUI/models/lora/a.bin)") && note.contains(&digest),
+        "…and must say what would decide it: {note}",
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lifecycle_note_step_is_honest_never_dispatch_pending() {
     let profile = json!({

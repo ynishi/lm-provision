@@ -58,8 +58,8 @@
 //! Decode is out of scope: the current ledger persists JSON Lines and
 //! does not require canonical→AST reconstruction.
 
+use crate::exec::assert::Assert;
 use crate::profile_ast::ProfileNode;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Intermediate canonical value.
@@ -87,28 +87,85 @@ pub fn encode(node: &ProfileNode) -> String {
     out
 }
 
-/// SHA-256 of `bytes` rendered as hex.
+/// SHA-256 of the [`encode`] bytes, lowercase hex, no prefix (64 chars).
 ///
-/// Contract: **lowercase, zero-padded, exactly 64 chars, no prefix.**
-/// Every byte contributes two characters, so a digest byte below `0x10`
-/// keeps its leading zero.
-///
-/// This is the crate's single implementation of that rendering; callers
-/// that need a content digest go through here rather than writing
-/// another `{:02x}` loop.
-pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        // `format!("{byte:02x}")` guarantees two lowercase hex chars.
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    hex
+/// The rendering lives in [`crate::digest::hex_sha256`], which is also
+/// what the Assert model's content predicate and the driver's
+/// `ensure-binary` check use — one implementation of "content
+/// identity" for the whole workspace.
+pub fn hash(node: &ProfileNode) -> String {
+    crate::digest::hex_sha256(encode(node).as_bytes())
 }
 
-/// SHA-256 of the [`encode`] bytes, lowercase hex, no prefix (64 chars).
-pub fn hash(node: &ProfileNode) -> String {
-    hex_sha256(encode(node).as_bytes())
+/// Canonically encode an [`Assert`] to deterministic JSON bytes.
+///
+/// Same rules as [`encode`]: variant tag under `"type"`, object keys in
+/// lexicographic order (a `BTreeMap` by construction), array order
+/// preserved. A conjunction's children are **not** sorted — child order
+/// is the order the author wrote and the fold's tie-break rests on it
+/// (`exec::assert::fold_all`), so reordering would change which
+/// `CheckError` survives.
+///
+/// **This does not put anything into a profile's hash yet.** An Assert
+/// is not a `ProfileNode`, and at this stage every `done` is *derived*
+/// from the phase payload rather than authored — a derived value adds
+/// no information to the hash, and splicing one in would move the hash
+/// of every existing profile carrying that phase for no gain. What is
+/// fixed here is the encoding, so that when an authored `done` becomes
+/// a value node it hashes by an already-settled rule rather than one
+/// invented at that moment.
+pub fn encode_assert(assert: &Assert) -> String {
+    let mut out = String::new();
+    write_canon(&assert_to_canon(assert), &mut out);
+    out
+}
+
+/// `Assert` → [`CanonValue`], the counterpart of [`to_canon`].
+fn assert_to_canon(assert: &Assert) -> CanonValue {
+    match assert {
+        Assert::FileExists { path } => {
+            let mut fields = variant_object("FileExists");
+            fields.insert("path".into(), CanonValue::Str(path_string(path)));
+            CanonValue::Object(fields)
+        }
+        Assert::FileDigest {
+            path,
+            expected_sha256,
+        } => {
+            let mut fields = variant_object("FileDigest");
+            fields.insert(
+                "expected_sha256".into(),
+                CanonValue::Str(expected_sha256.clone()),
+            );
+            fields.insert("path".into(), CanonValue::Str(path_string(path)));
+            CanonValue::Object(fields)
+        }
+        Assert::All(children) => {
+            let mut fields = variant_object("All");
+            fields.insert(
+                "children".into(),
+                CanonValue::Array(children.iter().map(assert_to_canon).collect()),
+            );
+            CanonValue::Object(fields)
+        }
+    }
+}
+
+/// A path as canonical bytes.
+///
+/// [`Path::display`] is lossy for a non-UTF-8 path, which would make
+/// two different paths encode identically. Every path an Assert carries
+/// is built from a profile's UTF-8 payload, so the lossless conversion
+/// succeeds; the fallback exists so this is a total function and is
+/// marked in the bytes rather than silently producing a collision.
+fn path_string(path: &std::path::Path) -> String {
+    match path.to_str() {
+        Some(text) => text.to_string(),
+        // Not reachable from a profile (payload paths are UTF-8), and
+        // deliberately not a panic: canonical encoding is called from
+        // read-only stages.
+        None => format!("\u{fffd}non-utf8:{}", path.to_string_lossy()),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -576,7 +633,9 @@ fn write_string(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::assert::Done as _;
     use dsl_kit::{IdGen, NodeId};
+    use sha2::{Digest, Sha256};
 
     fn new_id(gen: &IdGen) -> NodeId {
         gen.node()
@@ -647,6 +706,213 @@ mod tests {
             phases: vec![],
         };
         assert_eq!(encode(&a), encode(&b));
+    }
+
+    // -----------------------------------------------------------------
+    // The `models` payload, before and after `sha256` was decoded
+    // -----------------------------------------------------------------
+
+    fn models_spec(gen: &IdGen, models_json: &str) -> ProfileNode {
+        ProfileNode::Spec {
+            id: new_id(gen),
+            name: "p".into(),
+            version: None,
+            description: None,
+            capabilities: vec![],
+            env: BTreeMap::new(),
+            env_secrets: vec![],
+            paths: vec![],
+            http_allowlist: vec![],
+            phases: vec![ProfileNode::Models {
+                id: new_id(gen),
+                models_json: models_json.into(),
+            }],
+        }
+    }
+
+    /// **A profile's hash does not move because `sha256` is now read.**
+    ///
+    /// The reason is structural rather than lucky: the AST carries a
+    /// `models` payload as one opaque string, and the encoder writes
+    /// that string through. A declared `sha256` was therefore already
+    /// inside the hash — dropped only at expansion — and an undeclared
+    /// one adds nothing to drop. The pin below is the literal byte
+    /// stream, so a later change that splices a *derived* value (the
+    /// step's `done`, say) into the phase's encoding fails here rather
+    /// than silently re-hashing every existing profile.
+    #[test]
+    fn a_models_phase_encodes_from_its_payload_string_alone() {
+        let gen = IdGen::new();
+        let models_json = r#"[{"src":"https://ex/a.bin","dst":"a.bin"}]"#;
+
+        let expected_bytes = concat!(
+            "{",
+            "\"capabilities\":[],",
+            "\"env_secrets\":[],",
+            "\"http_allowlist\":[],",
+            "\"name\":\"p\",",
+            "\"paths\":[],",
+            "\"phases\":[{",
+            "\"models_json\":",
+            "\"[{\\\"src\\\":\\\"https://ex/a.bin\\\",\\\"dst\\\":\\\"a.bin\\\"}]\",",
+            "\"type\":\"Models\"",
+            "}],",
+            "\"type\":\"Spec\"",
+            "}",
+        );
+        assert_eq!(encode(&models_spec(&gen, models_json)), expected_bytes);
+
+        // Independently computed, as `hash_regression_fixed_input` does
+        // — routing it through the helper would compare the code under
+        // test with itself.
+        let computed = {
+            let d = Sha256::digest(expected_bytes.as_bytes());
+            let mut s = String::with_capacity(64);
+            for b in d {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        };
+        assert_eq!(hash(&models_spec(&gen, models_json)), computed);
+    }
+
+    /// The other side of the same fact: a declared `sha256` has always
+    /// been in the hash, because it is part of the payload string. It
+    /// hashes differently from the same profile without it — which is
+    /// what it should do, and did before this stage as well.
+    #[test]
+    fn a_declared_digest_is_inside_the_payload_string_and_so_inside_the_hash() {
+        let gen = IdGen::new();
+        let without = models_spec(&gen, r#"[{"src":"https://ex/a.bin","dst":"a.bin"}]"#);
+        let with = models_spec(
+            &gen,
+            r#"[{"src":"https://ex/a.bin","dst":"a.bin","sha256":"ab"}]"#,
+        );
+        assert_ne!(hash(&without), hash(&with));
+        assert!(
+            encode(&with).contains("sha256"),
+            "the declared digest is in the canonical bytes: {}",
+            encode(&with),
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The Assert encoding
+    // -----------------------------------------------------------------
+
+    /// Read canonical Assert bytes back into an [`Assert`].
+    ///
+    /// Test-only on purpose. Nothing in production decodes yet — no
+    /// profile can author a `done` — so shipping a reader would be
+    /// shipping an unused one. It exists here because "deterministic"
+    /// is a weaker claim than "lossless": bytes that collapse two
+    /// different conditions would still be deterministic, and only a
+    /// round trip catches that.
+    fn decode_assert(encoded: &str) -> Assert {
+        fn from_value(value: &serde_json::Value) -> Assert {
+            let tag = value["type"].as_str().expect("every node carries a type");
+            let path = || {
+                std::path::PathBuf::from(value["path"].as_str().expect("a path-bearing predicate"))
+            };
+            match tag {
+                "FileExists" => Assert::FileExists { path: path() },
+                "FileDigest" => Assert::FileDigest {
+                    path: path(),
+                    expected_sha256: value["expected_sha256"]
+                        .as_str()
+                        .expect("a digest predicate carries its expectation")
+                        .to_string(),
+                },
+                "All" => {
+                    let children = value["children"]
+                        .as_array()
+                        .expect("a conjunction carries children");
+                    let (head, tail) = children.split_first().expect("children are non-empty");
+                    Assert::All(crate::exec::assert::NonEmpty::new(
+                        from_value(head),
+                        tail.iter().map(from_value).collect(),
+                    ))
+                }
+                other => panic!("unknown Assert tag {other}"),
+            }
+        }
+        from_value(&serde_json::from_str(encoded).expect("canonical bytes are JSON"))
+    }
+
+    /// Every shape the model can express today, including a nested
+    /// conjunction and two conditions that differ only in child order.
+    fn assert_samples() -> Vec<Assert> {
+        use crate::exec::assert::NonEmpty;
+        let exists = |path: &str| Assert::FileExists {
+            path: std::path::PathBuf::from(path),
+        };
+        let digest = |path: &str, hex: &str| Assert::FileDigest {
+            path: std::path::PathBuf::from(path),
+            expected_sha256: hex.to_string(),
+        };
+        vec![
+            exists("/a"),
+            exists("/b"),
+            digest("/a", "ab"),
+            digest("/a", "cd"),
+            digest("/b", "ab"),
+            Assert::All(NonEmpty::new(exists("/a"), vec![])),
+            Assert::All(NonEmpty::new(exists("/a"), vec![digest("/a", "ab")])),
+            // Same children, other order: the fold's tie-break depends
+            // on it, so the bytes must too.
+            Assert::All(NonEmpty::new(digest("/a", "ab"), vec![exists("/a")])),
+            Assert::All(NonEmpty::new(
+                Assert::All(NonEmpty::new(exists("/a"), vec![exists("/b")])),
+                vec![digest("/b", "ab")],
+            )),
+        ]
+    }
+
+    /// The same Assert encodes to the same bytes, and distinct Asserts
+    /// to distinct bytes.
+    #[test]
+    fn the_assert_encoding_is_deterministic_and_distinguishing() {
+        let samples = assert_samples();
+        for sample in &samples {
+            assert_eq!(
+                encode_assert(sample),
+                encode_assert(sample),
+                "the same Assert must encode identically: {sample:?}",
+            );
+        }
+        for (i, left) in samples.iter().enumerate() {
+            for right in samples.iter().skip(i + 1) {
+                assert_ne!(
+                    encode_assert(left),
+                    encode_assert(right),
+                    "different conditions must not share bytes: {left:?} / {right:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_assert_encoding_round_trips() {
+        for sample in assert_samples() {
+            assert_eq!(decode_assert(&encode_assert(&sample)), sample);
+        }
+    }
+
+    /// The literal bytes, so the shape is pinned rather than merely
+    /// self-consistent: variant tag under `"type"`, keys lexicographic,
+    /// children in author order.
+    #[test]
+    fn the_assert_encoding_has_the_same_shape_as_the_profile_encoding() {
+        let done = crate::exec::assert::ModelFile::new("/w/a.bin", Some("ab".into())).done();
+        assert_eq!(
+            encode_assert(&done),
+            concat!(
+                "{\"children\":[",
+                "{\"path\":\"/w/a.bin\",\"type\":\"FileExists\"},",
+                "{\"expected_sha256\":\"ab\",\"path\":\"/w/a.bin\",\"type\":\"FileDigest\"}",
+                "],\"type\":\"All\"}",
+            ),
+        );
     }
 
     #[test]
