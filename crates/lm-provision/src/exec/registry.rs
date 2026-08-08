@@ -1221,23 +1221,26 @@ impl ProfileCallAst {
 /// The `Call` a routable phase declares, or `None` for a node that stays
 /// on its op.
 ///
-/// **Only the label reaches the host.** dsl-kit-core 0.8.0 spawns a
-/// `Call` leaf with `serde_json::Value::Null` in place of the declared
-/// payload [`dsl-kit-core-0.8.0/src/engine.rs:1385-1387`], so a resolver
-/// cannot read the effect's inputs off the suspension. The payload is
-/// declared here anyway — it is what the node *means*, and it is what
-/// the resolver will read once the engine carries it — while
-/// [`resolve_call`] recovers the fields the way every other leaf payload
-/// in this crate is recovered, through [`super::payload`]'s
-/// `NodeId -> ProfileNode` map (see that module's doc: dsl-kit does not
-/// hand leaf payloads to [`Op::apply`] either).
+/// **The payload is what may be observed, not the channel the resolver
+/// reads.** Since dsl-kit-core 0.11.0 the engine carries it verbatim to
+/// the host, where it surfaces as `PendingProjection.payload` — visible
+/// to any MCP client watching the suspension. That is the reason a
+/// header value and a request body are deliberately **not** declared
+/// here: spec 09 §Audit log says header values are logged "never
+/// (headers may carry tokens); bodies never", and a channel an observer
+/// can read is a channel those values must not enter. The two HTTP calls
+/// declare header *names* and the body's *form*, matching the
+/// names-not-values rule the audit transcript follows; the values
+/// themselves resolve through the [`EnvPolicy`](super::policy::EnvPolicy)
+/// and reach the request and nothing else.
 ///
-/// A header value and a request body are deliberately **not** declared:
-/// they resolve through the
-/// [`EnvPolicy`](super::policy::EnvPolicy) and reach the request and
-/// nothing else, so the two HTTP calls declare header *names* and the
-/// body's *form* — the same names-not-values rule the audit transcript
-/// follows (spec 09 §Audit log).
+/// [`resolve_call`] therefore recovers every field from
+/// [`super::payload`]'s `NodeId -> ProfileNode` map rather than from the
+/// suspension — one path for the safe fields and the sensitive ones
+/// alike, which is also how every other leaf payload in this crate is
+/// recovered (see that module's doc: dsl-kit hands leaf payloads to
+/// neither [`Op::apply`] nor, for values that must stay unobserved, the
+/// resolver).
 fn call_kind(node: &ProfileNode) -> Option<NodeKind> {
     match node {
         ProfileNode::NetTransfer { src, dst, .. } => Some(NodeKind::Call {

@@ -154,26 +154,18 @@ impl DslHost for ProfileHost {
             .map(|(idx, name)| (idx as u64, name.clone()))
             .collect();
 
+        // `PendingProjection::of` rather than a hand-rolled match: the
+        // reason vocabulary and the payload pass-through then stay
+        // identical across every DSL
+        // (`dsl-kit-mcp-0.11.0/src/host.rs:132-137`). Building the
+        // struct by hand is what let this host answer `"unknown"` to a
+        // `SuspendReason::User { tag }` the upstream projection names,
+        // and what dropped the effect payload the engine now carries.
         let pending: Vec<PendingProjection> = self
             .engine
             .pending()
             .iter()
-            .map(|p| {
-                let (reason, label) = match &p.reason {
-                    dsl_kit::SuspendReason::Call { spec } => {
-                        ("call".to_string(), spec.label.clone())
-                    }
-                    dsl_kit::SuspendReason::Breakpoint => ("breakpoint".into(), String::new()),
-                    dsl_kit::SuspendReason::Cooperative => ("cooperative".into(), String::new()),
-                    _ => ("unknown".into(), String::new()),
-                };
-                PendingProjection {
-                    id: p.id.0,
-                    reason,
-                    label,
-                    at: pending_to_location(&p.at),
-                }
-            })
+            .map(PendingProjection::of)
             .collect();
 
         HostSnapshot {
