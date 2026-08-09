@@ -10,19 +10,20 @@
 //! "What does a finished `ModelFile` / `Service` / `Checkout` look like"
 //! is a separate design question, answered per entity. The model half
 //! of this module is the type, the value range, the composition, the
-//! evaluator and the three basic predicates; the entity half —
-//! [`Done`] and its implementors [`ModelFile`] and [`Checkout`] — sits
-//! at the bottom of the file and is what the lifecycle layer actually
-//! consumes.
+//! evaluator and the five basic predicates; the entity half —
+//! [`Done`] and its implementors [`ModelFile`], [`Checkout`] and
+//! [`Service`] — sits at the bottom of the file and is what the
+//! lifecycle layer actually consumes.
 //!
 //! ## Scope boundary
 //!
 //! The model was `pub(crate)` while nothing consumed it. It is public
 //! now because entities have been wired end to end: `models` derives a
-//! `done` from [`ModelFile`] and `comfyui.install` / `custom_nodes`
-//! from [`Checkout`], the lifecycle layer evaluates each before running
-//! the step it guards, and [`crate::canonical::encode_assert`] gives
-//! them deterministic bytes.
+//! `done` from [`ModelFile`], `comfyui.install` / `custom_nodes` from
+//! [`Checkout`], and `comfyui.restart` / `service.start` from
+//! [`Service`]; the lifecycle layer evaluates each before running the
+//! step it guards, and [`crate::canonical::encode_assert`] gives them
+//! deterministic bytes.
 //!
 //! **Nothing here is author-visible yet.** A profile cannot write a
 //! `done:` of its own — every `done` is derived from the phase kind —
@@ -350,6 +351,111 @@ pub enum Assert {
         git_ref: String,
     },
 
+    /// The process a launch recorded in `pid_file` is still running.
+    ///
+    /// This is where `Liveness` — the three-valued probe the readiness
+    /// poll has always used ([`crate::exec::lifecycle`]) — reaches the
+    /// model. The two are **not** the same question, and the difference
+    /// is where the three causes of `Liveness::Unknown` land:
+    ///
+    /// | the pid file… | `Liveness` | here |
+    /// |---|---|---|
+    /// | names a live process | `Alive` | `Satisfied` |
+    /// | names a process that is gone | `Dead(pid)` | `Unsatisfied` |
+    /// | **is not there** | `Unknown` | `Unsatisfied` |
+    /// | cannot be read, or holds no number | `Unknown` | `CheckFailed` |
+    ///
+    /// `Liveness` fuses the last two because its caller asks about a
+    /// *transition* — "did the launch I am waiting for die?" — where the
+    /// only thing that matters is that neither is a death, since a pid
+    /// file half-written by a launch a moment ago must not fail a poll
+    /// that would otherwise have succeeded.
+    ///
+    /// This predicate asks about a *state*: is a process running here
+    /// now. For that question the two causes come apart, and they come
+    /// apart the way the rest of this module already treats absence.
+    /// [`Assert::FileExists`] answers `Unsatisfied` for a path that is
+    /// not there and `CheckFailed` only when the question could not be
+    /// answered; [`Assert::FileDigest`] does the same through
+    /// [`DigestReading::Absent`]. **An absent pid file is a determinate
+    /// observation** — nothing has recorded a launch — and it is the
+    /// state of a fresh pod, so answering `CheckFailed` for it would
+    /// make `plan` say "undecided" for every service on exactly the run
+    /// where it has the most to say. A file that exists but yields no
+    /// pid is the other thing: the observation was attempted and did not
+    /// conclude.
+    ///
+    /// **Evaluated in both modes.** One small read plus one `stat`,
+    /// cheaper than [`Assert::GitTreeAt`] (which spawns a process) and
+    /// on the order of [`Assert::FileExists`]. It is a read with no
+    /// side effects at all, so the answer a dry run gives is the answer
+    /// a real run gives.
+    ///
+    /// **It does not carry which pid.** `Unsatisfied` has no payload in
+    /// this model, so "nothing was ever launched" and "the launch is
+    /// gone" arrive as the same answer. Splitting them would need a
+    /// fifth value or a payload on `Unsatisfied`, and the range is
+    /// fixed at four (design §3.2b) — so the distinction is left to
+    /// whoever reads the pid file, not to this answer.
+    ProcessAlive {
+        /// The pid file a launch wrote.
+        pid_file: PathBuf,
+    },
+
+    /// The process a launch recorded in `pid_file` was started with
+    /// exactly `argv`.
+    ///
+    /// **This is the conjunct that makes a service's identity its
+    /// arguments** (design §3.4). A running server answering on its port
+    /// is not evidence that *this profile's* server is running: the one
+    /// that is up may have been launched with other arguments, and
+    /// treating it as finished skips the restart and reports success for
+    /// a pod that never got what the profile declared. Comparing the
+    /// argv is what tells the two apart, and the pid file is what makes
+    /// it possible — the launch writes `$!`, and `nohup` execs the
+    /// command in that same process, so `/proc/<pid>/cmdline` is
+    /// verbatim the argv the launch was given.
+    ///
+    /// ## Exactly, not loosely
+    ///
+    /// The comparison is **full argv equality**, not the port alone and
+    /// not the binary plus the port. The two errors are not symmetric:
+    ///
+    /// - a false *negative* (a match this misses) restarts a server that
+    ///   was already the right one — the work the phase asks for anyway;
+    /// - a false *positive* (a mismatch this accepts) leaves the old
+    ///   server running and reports the new arguments as applied.
+    ///
+    /// Comparing only a port accepts every difference in `extra_args`,
+    /// which is precisely the set of arguments an author edits between
+    /// applies. So the loose end is the dangerous one, and this takes
+    /// the strict side: reordering `extra_args` reads as a mismatch and
+    /// costs one restart.
+    ///
+    /// **Two known false negatives**, both landing on the safe side —
+    /// the condition never holds, the launch runs on every apply, and
+    /// the symptom is a step visible in the report as never skipped
+    /// rather than a pod that is quietly wrong:
+    ///
+    /// - a process that **rewrites its own command line**
+    ///   (`setproctitle` and friends);
+    /// - a launch of a **script with a shebang**. The kernel execs the
+    ///   interpreter, so the command line is
+    ///   `<interpreter> <script> <args…>` rather than what was
+    ///   launched. Every launch this crate composes runs a real binary
+    ///   (`…/venv/bin/python`, `python -m …`, `ollama`,
+    ///   `llama-server`), so this does not arise today — it would arise
+    ///   the moment a launch is pointed at a wrapper script.
+    ///
+    /// **Evaluated in both modes**, for the same reason as
+    /// [`Assert::ProcessAlive`]: it is a read of one small file.
+    ProcessArgv {
+        /// The pid file a launch wrote.
+        pid_file: PathBuf,
+        /// The argv the process must have been started with.
+        argv: Vec<String>,
+    },
+
     /// Conjunction. Child order is the order the author wrote.
     All(NonEmpty<Assert>),
 }
@@ -543,6 +649,25 @@ pub enum DigestReading {
     Present(String),
 }
 
+/// What an observation of a launch's command line found.
+///
+/// The same shape as [`DigestReading`], and for the same reason: "there
+/// is nothing to compare against" is an observation, not a failure to
+/// observe, so it is an `Ok` variant rather than a [`CheckError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgvReading {
+    /// The pid file names no live process — it is not there at all, or
+    /// the process it names is gone — so there is no argv to read.
+    NoProcess,
+    /// The live process was started with this argv.
+    ///
+    /// Empty for a process that has one but exposes none (a zombie has
+    /// an entry and an empty command line), which compares unequal to
+    /// any declared launch and so answers `Unsatisfied` — a zombie is
+    /// not a running server.
+    Argv(Vec<String>),
+}
+
 /// The route a predicate takes to look at the host.
 ///
 /// Injected so a test can supply any answer, success or failure,
@@ -629,6 +754,33 @@ pub trait Observe {
         &self,
         argv: &[String],
     ) -> impl Future<Output = Result<i32, CheckError>> + Send;
+
+    /// Whether the process a launch recorded in `pid_file` is running.
+    ///
+    /// `Ok(false)` covers both "there is no pid file" and "the pid it
+    /// names is gone": neither is a failed observation, and the answer
+    /// they share is the one [`Assert::ProcessAlive`] needs. `Err` is
+    /// reserved for a pid file that exists and yields nothing — it could
+    /// not be read, or it does not hold a number.
+    fn process_alive(
+        &self,
+        pid_file: &Path,
+    ) -> impl Future<Output = Result<bool, CheckError>> + Send;
+
+    /// The command line of the process a launch recorded in `pid_file`.
+    ///
+    /// Splits on the same boundary as [`process_alive`](Self::process_alive):
+    /// an absent pid file and a pid that is gone are both
+    /// [`ArgvReading::NoProcess`], while a pid file that yields no pid —
+    /// or a command line that exists and cannot be read — is an `Err`.
+    ///
+    /// **It reports the argv; it does not judge it.** Whether the argv
+    /// found is the one that was asked for belongs to
+    /// [`Assert::ProcessArgv`], which is what carries the declaration.
+    fn process_argv(
+        &self,
+        pid_file: &Path,
+    ) -> impl Future<Output = Result<ArgvReading, CheckError>> + Send;
 }
 
 // ---------------------------------------------------------------------
@@ -752,6 +904,47 @@ pub async fn eval<O: Observe + Sync>(assert: &Assert, mode: ExecMode, obs: &O) -
             }
         }
 
+        Assert::ProcessAlive { pid_file } => {
+            // A pid file read plus a `stat`: cheaper than the command
+            // predicate above and about the cost of `FileExists`, so
+            // both modes evaluate it and `mode` does not appear.
+            let outcome = match obs.process_alive(pid_file).await {
+                Ok(true) => AssertOutcome::Satisfied,
+                // Both "no pid file" and "the pid is gone" — see the
+                // variant's doc for why the first of those is an answer
+                // rather than a failed observation.
+                Ok(false) => AssertOutcome::Unsatisfied,
+                Err(error) => AssertOutcome::CheckFailed(error),
+            };
+            AssertNode::Leaf {
+                id: AssertExecutionId::next(),
+                outcome,
+            }
+        }
+
+        Assert::ProcessArgv { pid_file, argv } => {
+            // Same cost and the same mode-independence.
+            let outcome = match obs.process_argv(pid_file).await {
+                Ok(ArgvReading::NoProcess) => AssertOutcome::Unsatisfied,
+                Ok(ArgvReading::Argv(found)) => {
+                    if &found == argv {
+                        AssertOutcome::Satisfied
+                    } else {
+                        // Including the empty argv of a zombie, and
+                        // including a server that is up with other
+                        // arguments — the dangerous case this predicate
+                        // exists for.
+                        AssertOutcome::Unsatisfied
+                    }
+                }
+                Err(error) => AssertOutcome::CheckFailed(error),
+            };
+            AssertNode::Leaf {
+                id: AssertExecutionId::next(),
+                outcome,
+            }
+        }
+
         Assert::All(children) => {
             // Head first, then the tail, so child order is the order
             // the author wrote (which is what the fold's tie-break
@@ -839,6 +1032,34 @@ pub fn describe_execution(assert: &Assert, node: &AssertNode) -> String {
 /// Render `assert`, annotating each subterm with the matching node's
 /// answer when one is supplied.
 ///
+/// ## Staying on one line
+///
+/// The previous stage left this open: a two-conjunct condition already
+/// rendered to about 150 characters, and the question was whether a
+/// wider one should break across lines or shorten its payloads.
+///
+/// **It stays on one line, and nothing is elided.** The reason is what
+/// this string is for. It reaches a step's trace summary and its report
+/// note, and the property that makes a plan readable is that each step
+/// is one line whose first clause (`would transfer` / `would skip` /
+/// `undecided …`) can be read straight down the left-hand edge. A
+/// condition that wrapped would put a step's answer on a line that no
+/// longer names the step.
+///
+/// The pressure turned out not to come from arity anyway. A service's
+/// condition has two conjuncts, like a checkout's, and is longer than
+/// either of the earlier ones because one leaf carries a whole command
+/// line — so what grows a rendering is the size of a leaf's payload,
+/// not the number of leaves. That also says where the lever is if this
+/// ever does have to shrink: shorten a payload's rendering, not the
+/// structure. Two payloads are already rendered as tersely as they can
+/// be read (a space-joined argv rather than a `Vec` debug; a digest as
+/// bare hex).
+///
+/// Eliding is rejected outright: the payload is exactly what an
+/// operator needs when a condition answers `Unsatisfied`, since "the
+/// running server has *these* arguments instead" is the news.
+///
 /// The two trees have the same shape by construction ([`eval`] builds
 /// the node from the expression), so the zip always lines up. A
 /// mismatch would mean the caller paired an expression with a foreign
@@ -857,6 +1078,19 @@ fn write_assert(assert: &Assert, node: Option<&AssertNode>, out: &mut String) {
         }
         Assert::GitTreeAt { dir, git_ref } => {
             out.push_str(&format!("git_tree({})={git_ref}", dir.display()));
+        }
+        Assert::ProcessAlive { pid_file } => {
+            out.push_str(&format!("proc_alive({})", pid_file.display()));
+        }
+        Assert::ProcessArgv { pid_file, argv } => {
+            // Space-joined rather than a `Vec` debug: this is a command
+            // line, and `[a b c]` is both shorter and the shape a reader
+            // recognises. See §Staying on one line below.
+            out.push_str(&format!(
+                "proc_argv({})=[{}]",
+                pid_file.display(),
+                argv.join(" ")
+            ));
         }
         Assert::All(children) => {
             let child_nodes = match node {
@@ -901,11 +1135,20 @@ fn write_assert(assert: &Assert, node: Option<&AssertNode>, out: &mut String) {
 /// second entity is what turned that into
 /// [`crate::exec::lifecycle::PlannedStep`].
 ///
-/// **`Service`** (段 4: pid alive ∧ cmdline matches ∧ 2xx, shared by
-/// `comfyui.restart` and `service.start`) is expected to fit too: the
-/// launch argv it compares against is constructor input like the two
-/// above, and the poll that waits for it is the step's execution
-/// strategy rather than part of the condition (design §3.2c).
+/// **The signature held for the third, and the third is the one that
+/// settles it.** [`Service`] fits `fn done(&self) -> Assert` unchanged,
+/// with the launch argv as constructor input exactly as `sha256` and
+/// the ref were — and it settles the signature because it is not the
+/// same *shape* as the first two. Both of those were
+/// `single | All[weak, strong]`, switched by an `Option` field the
+/// profile may leave out; a service has nothing optional, so its
+/// condition is always the conjunction. Three entities, two shapes, one
+/// signature, and nothing about the trait bent to admit any of them.
+///
+/// What did *not* survive is the arity design §3.4 predicted for it
+/// (pid ∧ cmdline ∧ 2xx): see [`Service::done`] for why the third
+/// conjunct is not here, and why leaving it out does not loosen what
+/// apply enforces.
 ///
 /// The signature is deliberately infallible (`-> Assert`, not
 /// `-> Result<Assert, _>`). A payload too underspecified to say what
@@ -1059,6 +1302,130 @@ impl Done for Checkout {
     }
 }
 
+/// One server a launch phase puts on the pod.
+///
+/// Shared by `comfyui.restart` and `service.start` — the recurrence
+/// design §3.4 gives as the reason for an entity to exist at all. Its
+/// identity is **the pid file the launch writes plus the argv it
+/// launches**: not the port, and not "something is answering on the
+/// port", because neither distinguishes this profile's server from
+/// somebody else's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Service {
+    pid_file: PathBuf,
+    argv: Vec<String>,
+}
+
+impl Service {
+    /// A server whose launch records its pid in `pid_file` and runs
+    /// `argv`.
+    ///
+    /// Both are what the launch step itself composed, so the condition
+    /// and the command can never disagree about what was asked for.
+    pub fn new(pid_file: impl Into<PathBuf>, argv: Vec<String>) -> Self {
+        Self {
+            pid_file: pid_file.into(),
+            argv,
+        }
+    }
+}
+
+impl Done for Service {
+    /// The recorded process is running, and it is running the declared
+    /// argv.
+    ///
+    /// **This is the condition whose false positives are expensive.** A
+    /// model file wrongly called finished costs a download; a checkout
+    /// wrongly called finished costs a clone. A *service* wrongly called
+    /// finished means the launch is skipped, the old server keeps the
+    /// port, and apply reports the declared arguments as applied when
+    /// nothing on the pod ever saw them. Every choice below takes the
+    /// side that errs towards launching.
+    ///
+    /// ## Why the argv conjunct is the whole point
+    ///
+    /// [`Assert::ProcessArgv`] is what makes the answer about *this*
+    /// profile's server. Skip it and the condition becomes "a server is
+    /// up", which is true of the server the operator is trying to
+    /// replace.
+    ///
+    /// ## Why there is no 2xx conjunct
+    ///
+    /// Design §3.4 wrote this entity's condition as pid ∧ cmdline ∧ 2xx.
+    /// The third conjunct is **not** here, and the reason is not that it
+    /// is awkward to build — it is that it protects nothing this pair
+    /// does not already protect, while costing decisions this pair gets
+    /// right:
+    ///
+    /// - **It does not catch the dangerous case.** An old server up with
+    ///   other arguments makes the argv conjunct `Unsatisfied`, fold row
+    ///   1 makes the condition `Unsatisfied`, and the launch runs. A 2xx
+    ///   conjunct adds nothing there — it would be `Satisfied`, since
+    ///   the old server answers.
+    /// - **What it uniquely adds is a wrong answer.** The one state it
+    ///   separates is "the recorded process is alive with exactly these
+    ///   arguments, but is not serving yet" — a server in its start-up,
+    ///   which on this codebase's own measurements spends about a minute
+    ///   importing before it binds
+    ///   ([`crate::exec::lifecycle`]'s poll deadlines). Calling that
+    ///   unfinished relaunches a server that was coming up fine, on a
+    ///   port it already holds, and the relaunch is the one that then
+    ///   fails.
+    /// - **Nothing is lost from what apply enforces.** The 2xx is not
+    ///   dropped; it stays exactly where it already lives, in the
+    ///   `comfyui.health` / `service.ready` phase that canonical
+    ///   ordering puts right after the launch — and *that* phase has no
+    ///   condition and cannot be skipped, so a pod whose server never
+    ///   answers still fails apply. Putting the same check in the guard
+    ///   would duplicate it two seconds earlier, in a position where its
+    ///   answer would skip work rather than fail it (design §3.2c: a
+    ///   poll is a step's execution strategy, not part of a predicate).
+    /// - **It is the only conjunct that is not a local read.** Both of
+    ///   these read one small file; an HTTP probe can hang, and a `plan`
+    ///   that stalls per service phase is a plan nobody runs.
+    ///
+    /// It would also have had to be *invented* for `service.start`,
+    /// whose payload carries no check URL — that lives on
+    /// `service.ready`, and §3.2e forbids deriving one step's condition
+    /// from its neighbour's. Guessing a health path would be the same
+    /// move `expand` refuses when it emits a `Note` instead of an
+    /// invented argv.
+    ///
+    /// ## Why both conjuncts, when one implies the other
+    ///
+    /// A matching argv can only be read from a live process, so
+    /// [`Assert::ProcessArgv`] alone would decide every case correctly —
+    /// including a fresh pod, where an absent pid file answers
+    /// `Unsatisfied` rather than leaving the answer open. So this is
+    /// **not** the [`Checkout`] situation, where the weak conjunct is
+    /// what keeps the answer decidable at all.
+    ///
+    /// The pair is here for the report. `Unsatisfied` carries no
+    /// payload, so a lone argv conjunct would give one undifferentiated
+    /// answer to two pieces of news an operator reads completely
+    /// differently: *nothing is running* and *the wrong thing is
+    /// running*. With both, the evaluated tree separates them —
+    /// `proc_alive=unsatisfied` against `proc_alive=satisfied,
+    /// proc_argv=unsatisfied` — which is the granularity this model
+    /// exists to keep (design §3.8, and the reason the evaluator returns
+    /// a tree at all in §3.2b'). A redundant conjunct that says nothing
+    /// would be noise; this one says which of the two happened.
+    ///
+    /// Liveness first, which is also the order the news reads in: is it
+    /// running, and is it the right one.
+    fn done(&self) -> Assert {
+        Assert::All(NonEmpty::new(
+            Assert::ProcessAlive {
+                pid_file: self.pid_file.clone(),
+            },
+            vec![Assert::ProcessArgv {
+                pid_file: self.pid_file.clone(),
+                argv: self.argv.clone(),
+            }],
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,12 +1456,32 @@ mod tests {
         Unrunnable,
     }
 
+    /// What a pid file and the process it names look like, from an
+    /// observation's point of view.
+    ///
+    /// The four cases are the four the real observations can reach —
+    /// see [`crate::exec::observe::PidFile`] for the reading they come
+    /// from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HostProcess {
+        /// No pid file: nothing has recorded a launch here.
+        NoLaunch,
+        /// The pid file names a process that is gone.
+        Gone,
+        /// The pid file names a live process, started with this argv.
+        Running(&'static [&'static str]),
+        /// There is a pid file, and it yields no pid — unreadable, or
+        /// not (yet) a number.
+        Unusable,
+    }
+
     /// Answers observations from a fixed table, so a whole evaluation is
     /// reproducible without touching the real filesystem — or spawning
     /// anything.
     struct FakeHost {
         files: BTreeMap<PathBuf, HostFile>,
         commands: BTreeMap<Vec<String>, HostCommand>,
+        processes: BTreeMap<PathBuf, HostProcess>,
     }
 
     impl FakeHost {
@@ -1105,6 +1492,7 @@ mod tests {
                     .map(|(path, state)| (PathBuf::from(path), *state))
                     .collect(),
                 commands: BTreeMap::new(),
+                processes: BTreeMap::new(),
             }
         }
 
@@ -1117,8 +1505,23 @@ mod tests {
             self
         }
 
+        /// Fix what a launch left at `pid_file`. A path this is not
+        /// called for is [`HostProcess::NoLaunch`], matching the
+        /// filesystem default of "absent".
+        fn launched(mut self, pid_file: &str, state: HostProcess) -> Self {
+            self.processes.insert(PathBuf::from(pid_file), state);
+            self
+        }
+
         fn at(&self, path: &Path) -> HostFile {
             self.files.get(path).copied().unwrap_or(HostFile::Absent)
+        }
+
+        fn launch_at(&self, pid_file: &Path) -> HostProcess {
+            self.processes
+                .get(pid_file)
+                .copied()
+                .unwrap_or(HostProcess::NoLaunch)
         }
     }
 
@@ -1135,6 +1538,13 @@ mod tests {
 
     fn unrunnable() -> CheckError {
         CheckError::new(CheckErrorCategory::Unobservable, UNRUNNABLE_DETAIL)
+    }
+
+    /// What a pid file that yields no pid answers with.
+    const UNUSABLE_PID_DETAIL: &str = "the pid file yielded no pid";
+
+    fn unusable_pid_file() -> CheckError {
+        CheckError::new(CheckErrorCategory::Unobservable, UNUSABLE_PID_DETAIL)
     }
 
     impl Observe for FakeHost {
@@ -1166,6 +1576,24 @@ mod tests {
             {
                 HostCommand::Exits(code) => Ok(code),
                 HostCommand::Unrunnable => Err(unrunnable()),
+            }
+        }
+
+        async fn process_alive(&self, pid_file: &Path) -> Result<bool, CheckError> {
+            match self.launch_at(pid_file) {
+                HostProcess::NoLaunch | HostProcess::Gone => Ok(false),
+                HostProcess::Running(_) => Ok(true),
+                HostProcess::Unusable => Err(unusable_pid_file()),
+            }
+        }
+
+        async fn process_argv(&self, pid_file: &Path) -> Result<ArgvReading, CheckError> {
+            match self.launch_at(pid_file) {
+                HostProcess::NoLaunch | HostProcess::Gone => Ok(ArgvReading::NoProcess),
+                HostProcess::Running(argv) => Ok(ArgvReading::Argv(
+                    argv.iter().map(|arg| (*arg).to_string()).collect(),
+                )),
+                HostProcess::Unusable => Err(unusable_pid_file()),
             }
         }
     }
@@ -1334,15 +1762,19 @@ mod tests {
     /// | file exists | absent / present (observable) / unobservable | `Real`, `DryRun` |
     /// | file digest | absent / present matching / present differing / unobservable | `Real`, `DryRun` |
     /// | git tree at | exit 0 / exit 1 / exit 128 / could not be started | `Real`, `DryRun` |
+    /// | process alive | no launch / gone / running / unusable pid file | `Real`, `DryRun` |
+    /// | process argv | no launch / gone / running matching / running differing / unusable pid file | `Real`, `DryRun` |
     ///
-    /// = 3×2 + 4×2 + 4×2 = **22 combinations**. It is not written as
-    /// "3 predicates × 4 observations × 2 modes": the existence
-    /// predicate has no matching/differing distinction, so that product
-    /// would double-count and the count would depend on how it was
-    /// written.
+    /// = 3×2 + 4×2 + 4×2 + 4×2 + 5×2 = **40 combinations**. It is not
+    /// written as "5 predicates × 5 observations × 2 modes": the
+    /// predicates do not share an observation set — existence has no
+    /// matching/differing distinction, and only the two process
+    /// predicates can see a launch that was never made — so that
+    /// product would double-count and the count would depend on how it
+    /// was written.
     ///
-    /// **The third row is what this stage adds, and it is why the
-    /// enumeration is the Done Criteria rather than a nicety.** The
+    /// **The third row was the previous stage's addition, and it is why
+    /// the enumeration is the Done Criteria rather than a nicety.** The
     /// command predicate answers *identically* in both modes — it does
     /// not merely avoid returning `Satisfied` in a dry run, it returns
     /// the same thing a real run would — so the contract holds by the
@@ -1350,6 +1782,15 @@ mod tests {
     /// documented exit shapes for `diff --quiet` (`0` no difference,
     /// `1` difference, other = git failed) plus the binary being
     /// missing, which is an answer rather than an error (design §3.2b).
+    ///
+    /// **The last two rows are this stage's**, and they hold by the same
+    /// strongest margin: both are local reads of one small file, so
+    /// neither has a reason to answer differently in a dry run. Their
+    /// observation sets carry the split that decides the whole
+    /// `Liveness` question — *no launch* and *gone* both answer
+    /// `Unsatisfied`, while an *unusable* pid file answers
+    /// `CheckFailed`. The first of those is what keeps a fresh pod
+    /// decidable.
     ///
     /// Composition is *not* covered here — the contract is a property of
     /// leaves, and a version of this that enumerated `All` up to depth 2
@@ -1367,6 +1808,17 @@ mod tests {
         let at_v1 = || Assert::GitTreeAt {
             dir: PathBuf::from("/repo"),
             git_ref: "v1".to_string(),
+        };
+        let launch = |state| FakeHost::new(&[]).launched("/tmp/svc.pid", state);
+        let alive = || Assert::ProcessAlive {
+            pid_file: PathBuf::from("/tmp/svc.pid"),
+        };
+        let declared_argv = || Assert::ProcessArgv {
+            pid_file: PathBuf::from("/tmp/svc.pid"),
+            argv: ["srv", "--port", "8188"]
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect(),
         };
 
         // (label, host, assert, expected DryRun answer, expected Real answer)
@@ -1452,6 +1904,72 @@ mod tests {
                 failed(UNRUNNABLE_DETAIL),
                 failed(UNRUNNABLE_DETAIL),
             ),
+            // process alive — 4 observations, answering the same in
+            // both modes.
+            (
+                "alive / no launch recorded",
+                launch(HostProcess::NoLaunch),
+                alive(),
+                AssertOutcome::Unsatisfied,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "alive / the recorded process is gone",
+                launch(HostProcess::Gone),
+                alive(),
+                AssertOutcome::Unsatisfied,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "alive / the recorded process is running",
+                launch(HostProcess::Running(&["srv", "--port", "8188"])),
+                alive(),
+                AssertOutcome::Satisfied,
+                AssertOutcome::Satisfied,
+            ),
+            (
+                "alive / the pid file yields no pid",
+                launch(HostProcess::Unusable),
+                alive(),
+                failed(UNUSABLE_PID_DETAIL),
+                failed(UNUSABLE_PID_DETAIL),
+            ),
+            // process argv — 5 observations, likewise mode-independent.
+            (
+                "argv / no launch recorded",
+                launch(HostProcess::NoLaunch),
+                declared_argv(),
+                AssertOutcome::Unsatisfied,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "argv / the recorded process is gone",
+                launch(HostProcess::Gone),
+                declared_argv(),
+                AssertOutcome::Unsatisfied,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "argv / running with the declared argv",
+                launch(HostProcess::Running(&["srv", "--port", "8188"])),
+                declared_argv(),
+                AssertOutcome::Satisfied,
+                AssertOutcome::Satisfied,
+            ),
+            (
+                "argv / running with other arguments",
+                launch(HostProcess::Running(&["srv", "--port", "8188", "--listen"])),
+                declared_argv(),
+                AssertOutcome::Unsatisfied,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "argv / the pid file yields no pid",
+                launch(HostProcess::Unusable),
+                declared_argv(),
+                failed(UNUSABLE_PID_DETAIL),
+                failed(UNUSABLE_PID_DETAIL),
+            ),
         ];
 
         for (label, host, assert, want_dry, want_real) in cases {
@@ -1477,11 +1995,20 @@ mod tests {
     /// `All(Not, _)` are not expressible as expressions, and trying to
     /// build them would contradict the expression type.
     ///
-    /// The starting set is the `(DryRun, Real)` pairs the two leaves can
+    /// The starting set is the `(DryRun, Real)` pairs the leaves can
     /// actually produce, read off the enumeration above. The first level
     /// closes them under `not` and under `All` of one, two and three
     /// children; the second level closes that result under `not` and
     /// under `All` of one and two children.
+    ///
+    /// **The three later predicates add no pairs**, and that is a fact
+    /// about them rather than an omission here: each answers identically
+    /// in both modes, so every pair they can produce is a diagonal one
+    /// (`(Satisfied, Satisfied)`, `(Unsatisfied, Unsatisfied)`,
+    /// `(CheckFailed, CheckFailed)`) and all three are already in the
+    /// set below, contributed by the existence predicate. Only a
+    /// predicate that declines to evaluate in a dry run — so far, the
+    /// digest — widens this.
     #[test]
     fn the_one_sided_contract_survives_fold_and_not_to_depth_two() {
         /// A leaf's or a composition's `(DryRun, Real)` answers.
@@ -1881,6 +2408,294 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // The third entity: Service
+    // -----------------------------------------------------------------
+
+    const COMFYUI_PID: &str = "/tmp/comfyui.pid";
+
+    /// The argv `comfyui.restart` composes for a bare `port: 8188`.
+    fn comfyui_argv(extra: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            "/workspace/ComfyUI/venv/bin/python".to_string(),
+            "/workspace/ComfyUI/main.py".to_string(),
+            "--port".to_string(),
+            "8188".to_string(),
+        ];
+        argv.extend(extra.iter().map(|arg| (*arg).to_string()));
+        argv
+    }
+
+    fn comfyui_service() -> Assert {
+        Service::new(COMFYUI_PID, comfyui_argv(&[])).done()
+    }
+
+    /// A service's condition is **always** the conjunction — there is no
+    /// single-predicate shape, because nothing about a launch is
+    /// optional.
+    ///
+    /// That is what makes this entity the one that settles the trait:
+    /// the first two were `single | All[weak, strong]` switched by an
+    /// `Option` the profile may omit, and this one is neither of those
+    /// shapes while needing no change to `fn done(&self) -> Assert`.
+    #[test]
+    fn a_service_always_conjoins_liveness_and_the_declared_argv() {
+        assert_eq!(
+            comfyui_service(),
+            Assert::All(NonEmpty::new(
+                Assert::ProcessAlive {
+                    pid_file: PathBuf::from(COMFYUI_PID),
+                },
+                vec![Assert::ProcessArgv {
+                    pid_file: PathBuf::from(COMFYUI_PID),
+                    argv: comfyui_argv(&[]),
+                }],
+            )),
+            "liveness first, then identity — the order the news reads in",
+        );
+    }
+
+    /// **The stage's UC**: the server that is up was launched with
+    /// exactly these arguments, so the launch is finished and a second
+    /// apply skips it.
+    ///
+    /// Both modes: neither predicate declines to evaluate, so a plan
+    /// says "would skip" as confidently as an apply skips.
+    #[tokio::test]
+    async fn a_server_up_with_the_declared_arguments_is_finished() {
+        let host = FakeHost::new(&[]).launched(
+            COMFYUI_PID,
+            HostProcess::Running(&[
+                "/workspace/ComfyUI/venv/bin/python",
+                "/workspace/ComfyUI/main.py",
+                "--port",
+                "8188",
+            ]),
+        );
+        for mode in [ExecMode::DryRun, ExecMode::Real] {
+            assert_eq!(
+                eval(&comfyui_service(), mode, &host).await.outcome(),
+                &AssertOutcome::Satisfied,
+                "{mode:?}: this exact server is already the one running",
+            );
+        }
+    }
+
+    /// **The dangerous case, and the one this entity exists for.** A
+    /// server is up, its pid file is current, and it answers on the
+    /// port — but it was launched with other arguments. Calling that
+    /// finished would skip the restart and report the declared
+    /// arguments as applied to a pod that never saw them.
+    ///
+    /// Every way a launch can differ is swept, because the loose
+    /// comparisons this rejects each fail on a different one: matching
+    /// the port alone would accept rows 1, 2 and 4; matching the binary
+    /// and the port would accept the same three.
+    #[tokio::test]
+    async fn a_server_up_with_other_arguments_is_not_finished() {
+        // (label, what is actually running)
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                "an extra flag the profile no longer declares",
+                &[
+                    "/workspace/ComfyUI/venv/bin/python",
+                    "/workspace/ComfyUI/main.py",
+                    "--port",
+                    "8188",
+                    "--listen",
+                ],
+            ),
+            (
+                "a flag the profile declares and the server lacks",
+                &[
+                    "/workspace/ComfyUI/venv/bin/python",
+                    "/workspace/ComfyUI/main.py",
+                    "--port",
+                ],
+            ),
+            (
+                "another port",
+                &[
+                    "/workspace/ComfyUI/venv/bin/python",
+                    "/workspace/ComfyUI/main.py",
+                    "--port",
+                    "8189",
+                ],
+            ),
+            (
+                "another interpreter",
+                &[
+                    "/usr/bin/python3",
+                    "/workspace/ComfyUI/main.py",
+                    "--port",
+                    "8188",
+                ],
+            ),
+            // A zombie: an entry under the procfs root, and no command
+            // line at all.
+            ("a process with no command line", &[]),
+        ];
+
+        for (label, running) in cases {
+            let host = FakeHost::new(&[]).launched(COMFYUI_PID, HostProcess::Running(running));
+            for mode in [ExecMode::DryRun, ExecMode::Real] {
+                let node = eval(&comfyui_service(), mode, &host).await;
+                assert_eq!(
+                    node.outcome(),
+                    &AssertOutcome::Unsatisfied,
+                    "{mode:?}: {label} must not read as finished",
+                );
+                assert_eq!(
+                    shape(&node),
+                    Shape::All(
+                        AssertOutcome::Unsatisfied,
+                        vec![
+                            Shape::Leaf(AssertOutcome::Satisfied),
+                            Shape::Leaf(AssertOutcome::Unsatisfied),
+                        ],
+                    ),
+                    "{mode:?}: {label} reads as 'running, but not this one'",
+                );
+            }
+        }
+    }
+
+    /// A profile whose `extra_args` changed must not be told its launch
+    /// is finished — the same statement as above, made against the
+    /// declaration rather than against the host, because
+    /// `extra_args` is the field an author actually edits between
+    /// applies.
+    #[tokio::test]
+    async fn changing_extra_args_stops_the_condition_from_holding() {
+        let running: &[&str] = &[
+            "/workspace/ComfyUI/venv/bin/python",
+            "/workspace/ComfyUI/main.py",
+            "--port",
+            "8188",
+            "--listen",
+        ];
+        let host = FakeHost::new(&[]).launched(COMFYUI_PID, HostProcess::Running(running));
+
+        let before = Service::new(COMFYUI_PID, comfyui_argv(&["--listen"])).done();
+        assert_eq!(
+            eval(&before, ExecMode::Real, &host).await.outcome(),
+            &AssertOutcome::Satisfied,
+            "the profile that launched this server still matches it",
+        );
+
+        for edit in [
+            vec!["--listen", "--highvram"],
+            vec!["--highvram", "--listen"],
+            vec![],
+        ] {
+            let after = Service::new(COMFYUI_PID, comfyui_argv(&edit)).done();
+            assert_eq!(
+                eval(&after, ExecMode::Real, &host).await.outcome(),
+                &AssertOutcome::Unsatisfied,
+                "editing extra_args to {edit:?} must reopen the launch",
+            );
+        }
+    }
+
+    /// **A pid file that is not backed by a running process never
+    /// reads as finished** — in all three of the states `Liveness`
+    /// fused into `Unknown`, plus the death it did not.
+    ///
+    /// This is where the carried question lands: which of the model's
+    /// four answers each of those states gets. Two are absences and
+    /// answer `Unsatisfied`; one is a failed observation and answers
+    /// `CheckFailed`. What matters for safety is the column they share
+    /// — none of them is `Satisfied`, so none of them skips a launch.
+    /// What matters for the plan is that the two absences are *decided*:
+    /// a fresh pod, which is the commonest state a plan is run against,
+    /// says "would run" rather than "undecided".
+    #[tokio::test]
+    async fn a_pid_file_without_a_live_process_never_reads_as_finished() {
+        // (label, host state, the answer the whole condition gives)
+        let cases = [
+            (
+                "no pid file at all — a fresh pod",
+                HostProcess::NoLaunch,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "a stale pid file left by an earlier apply",
+                HostProcess::Gone,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "a pid file that cannot be read, or holds no number yet",
+                HostProcess::Unusable,
+                failed(UNUSABLE_PID_DETAIL),
+            ),
+        ];
+
+        for (label, state, want) in cases {
+            let host = FakeHost::new(&[]).launched(COMFYUI_PID, state);
+            for mode in [ExecMode::DryRun, ExecMode::Real] {
+                let node = eval(&comfyui_service(), mode, &host).await;
+                assert_eq!(node.outcome(), &want, "{mode:?}: {label}");
+                assert!(
+                    !node.is_satisfied(),
+                    "{mode:?}: {label} must never skip a launch",
+                );
+            }
+        }
+    }
+
+    /// The two conjuncts are not redundant *in the report*, which is the
+    /// only reason both are there.
+    ///
+    /// A matching argv can only be read off a live process, so the argv
+    /// conjunct alone would decide every case correctly. But
+    /// `Unsatisfied` carries no payload, so it would give one answer to
+    /// two pieces of news. With both, the evaluated tree tells them
+    /// apart — and this pins that it does.
+    #[tokio::test]
+    async fn the_tree_says_which_of_the_two_failures_happened() {
+        let nothing_running = FakeHost::new(&[]).launched(COMFYUI_PID, HostProcess::Gone);
+        let wrong_one_running = FakeHost::new(&[]).launched(
+            COMFYUI_PID,
+            HostProcess::Running(&["/usr/bin/python3", "/workspace/ComfyUI/main.py"]),
+        );
+
+        let down = eval(&comfyui_service(), ExecMode::Real, &nothing_running).await;
+        let wrong = eval(&comfyui_service(), ExecMode::Real, &wrong_one_running).await;
+
+        assert_eq!(
+            down.outcome(),
+            wrong.outcome(),
+            "the projection is the same"
+        );
+        assert_ne!(
+            shape(&down),
+            shape(&wrong),
+            "…and the tree is not: that difference is the whole reason for two conjuncts",
+        );
+        assert_eq!(
+            shape(&down),
+            Shape::All(
+                AssertOutcome::Unsatisfied,
+                vec![
+                    Shape::Leaf(AssertOutcome::Unsatisfied),
+                    Shape::Leaf(AssertOutcome::Unsatisfied),
+                ],
+            ),
+            "nothing is running",
+        );
+        assert_eq!(
+            shape(&wrong),
+            Shape::All(
+                AssertOutcome::Unsatisfied,
+                vec![
+                    Shape::Leaf(AssertOutcome::Satisfied),
+                    Shape::Leaf(AssertOutcome::Unsatisfied),
+                ],
+            ),
+            "something is running, and it is not this",
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------
 
@@ -1910,6 +2725,43 @@ mod tests {
                  {UNOBSERVABLE_DETAIL})]=unsatisfied"
             ),
             "the check failure the top answer drops is still printed",
+        );
+    }
+
+    /// The widest condition the model can currently build, rendered
+    /// with every answer attached — **on one line, with nothing
+    /// elided**.
+    ///
+    /// This pins the decision [`write_assert`] argues for. The length is
+    /// asserted as a bound rather than left implicit, because the
+    /// property being kept is that a step stays one readable line: if a
+    /// later payload pushes past this, the lever is that payload's
+    /// rendering, and this test is what will say so.
+    #[tokio::test]
+    async fn a_services_condition_renders_on_one_line() {
+        let done = Service::new(COMFYUI_PID, comfyui_argv(&["--listen", "--highvram"])).done();
+        assert_eq!(
+            describe(&done),
+            "all[proc_alive(/tmp/comfyui.pid), \
+             proc_argv(/tmp/comfyui.pid)=[/workspace/ComfyUI/venv/bin/python \
+             /workspace/ComfyUI/main.py --port 8188 --listen --highvram]]",
+        );
+
+        let host = FakeHost::new(&[]).launched(COMFYUI_PID, HostProcess::Gone);
+        let node = eval(&done, ExecMode::Real, &host).await;
+        let rendered = describe_execution(&done, &node);
+        assert!(
+            !rendered.contains('\n'),
+            "a condition must not wrap: a step's answer has to stay on the step's line",
+        );
+        assert!(
+            rendered.len() < 256,
+            "the annotated rendering is {} chars: {rendered}",
+            rendered.len(),
+        );
+        assert!(
+            rendered.contains("--highvram"),
+            "the declared argv is not elided — it is the news when the answer is unsatisfied",
         );
     }
 

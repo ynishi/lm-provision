@@ -74,7 +74,7 @@ use tokio::time::sleep;
 use serde::Deserialize;
 
 use super::assert::{self, Done as _};
-use super::observe::LocalObserve;
+use super::observe::{self, LocalObserve, PidFile, PROC_ROOT};
 use super::scheme::{self, parse_hf_uri, split_b2_uri};
 use super::{effects, ExecError, ExecMode};
 use crate::profile_ast::ProfileNode;
@@ -125,10 +125,6 @@ const COMFYUI_HEALTH_TIMEOUT_SEC: u64 = 180;
 const SERVICE_READY_TIMEOUT_SEC: u64 = 300;
 /// Poll interval between GETs while waiting for a 2xx.
 const HTTP_POLL_INTERVAL_SEC: u64 = 2;
-/// Linux procfs root. A running process has a `/proc/<pid>` directory,
-/// which is how a poll step decides whether the launch it is waiting
-/// for is still alive (§Died-during-wait detection).
-const PROC_ROOT: &str = "/proc";
 /// Lines of the launch log a died-during-wait / died-immediately
 /// failure carries, matching the predecessor's `tail -100`.
 const DIED_LOG_TAIL_LINES: usize = 100;
@@ -811,6 +807,48 @@ fn expand_llm_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
 // watching. The pid file is read only inside the readiness window, so
 // a crash after the poll succeeded is still undetected (spec 02
 // §Spawn-and-poll invocations).
+//
+// ## Re-launching an already-running server
+//
+// What a second launch does on a pod where the first is still up was
+// recorded as unverified (design §4.4). It is measured now, against a
+// real `sh`, by `a_second_launch_overwrites_the_pid_file_whether_or_not_it_survives`:
+//
+// - **the pid file is overwritten every time**, including when the
+//   launch then fails. `echo $pid > pidfile` is unconditional and comes
+//   *before* the settle check, so after a failed second launch the
+//   well-known path names a corpse while the first server is still
+//   serving;
+// - **whether the step fails is decided entirely by the second
+//   process's first second.** The shape has no opinion about ports: a
+//   replacement that exits inside the settle window fails the step, and
+//   one that lives past it is reported as a successful launch even if
+//   it is doomed;
+// - a server that binds late is in the second class. ComfyUI spends
+//   about a minute in prestartup before it listens (see
+//   `COMFYUI_HEALTH_TIMEOUT_SEC`), so a port collision surfaces long
+//   after the settle check has passed — the launch step reports success
+//   and the failure lands on the poll;
+// - and there the *first* server answers the poll's GET, because the
+//   poll asks a URL and never asks who is answering. So without a
+//   condition a re-apply reported success while spawning a second
+//   process that died a minute later, leaving a stale pid file behind.
+//
+// That is the case `Service` removes: with the condition, a re-apply
+// against the same arguments skips the launch outright, and the pid
+// file keeps naming the server that is actually running.
+//
+// ## Why the poll phases keep no condition
+//
+// `comfyui.health` / `service.ready` are the post-conditions of the two
+// launches (design §4.1), and they stay phases rather than being
+// desugared into `Service`'s `done`. A poll is a time-axis operator,
+// not a predicate (§3.2c) — but the decisive part is the direction it
+// points. A phase's `done` *skips* work when it holds; these phases
+// have to *fail* when they do not hold. Fold those together and a
+// server that never answers stops failing apply and starts being
+// "undecided, would poll". Their 2xx is the enforcement, and it is why
+// `Service` does not need one of its own.
 // ---------------------------------------------------------------------
 
 /// `service.start` / `service.ready` launch log for a service `name`
@@ -874,6 +912,17 @@ fn sh_c(command: String) -> Step {
     Step::Sh(vec!["sh".to_string(), "-c".to_string(), command])
 }
 
+/// `comfyui.restart` — background the server, and skip doing so when
+/// this exact server is already the one that is up.
+///
+/// **The condition here is the one that had to be read most carefully**
+/// (§Re-launching an already-running server). A satisfied
+/// [`assert::Service`] means "the recorded process is alive and was
+/// started with exactly these arguments", which is the only state in
+/// which not restarting is right. Anything weaker — a port answering,
+/// a pid file existing — is also true of the server the operator is
+/// replacing, and would skip the launch while reporting the new
+/// arguments as applied.
 fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<PlannedStep> {
     let mut argv = vec![
         COMFYUI_VENV_PY.to_string(),
@@ -882,27 +931,31 @@ fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<PlannedStep> 
         port.to_string(),
     ];
     argv.extend(extra_args.iter().cloned());
+    // The condition compares against the argv this launch composes, so
+    // the two cannot drift apart: `extra_args` reaches both.
+    let done = assert::Service::new(COMFYUI_PID_PATH, argv.clone()).done();
     // `cd` first: ComfyUI resolves `models/` / `custom_nodes/` relative
     // to its working directory. The launch is braced so `&` backgrounds
     // only the `nohup` — `cd … && nohup … &` would background the whole
     // list and leave `$!` naming the subshell, not the server. A failing
     // `cd` short-circuits the group and fails the step.
     //
-    // No `done` yet: what a running service looks like is `Service`
-    // (段 4), and a restart is the step whose condition has to be read
-    // most carefully — a satisfied one means "the server is already up
-    // with these arguments", which is precisely when a restart should
-    // be skipped and precisely what an unconditional restart gets
-    // wrong.
-    vec![PlannedStep::always(sh_c(format!(
-        "cd {COMFYUI_INSTALL_DIR} && {}",
-        grouped(spawn_detached_command(
-            &argv,
-            COMFYUI_LOG_PATH,
-            COMFYUI_PID_PATH,
-            "comfyui"
-        ))
-    )))]
+    // The `cd` is deliberately *not* part of the identity: `nohup` execs
+    // the command, so what a running server's command line shows is the
+    // argv above, and a condition that included the working directory
+    // would be comparing against something no process reports.
+    vec![PlannedStep::done_when(
+        sh_c(format!(
+            "cd {COMFYUI_INSTALL_DIR} && {}",
+            grouped(spawn_detached_command(
+                &argv,
+                COMFYUI_LOG_PATH,
+                COMFYUI_PID_PATH,
+                "comfyui"
+            ))
+        )),
+        done,
+    )]
 }
 
 /// Per-platform launch invocation. An unrecognised platform expands to
@@ -987,15 +1040,30 @@ fn expand_service_start(
             )))]
         }
     };
-    // No `done` — same as `comfyui.restart`; `Service` is 段 4.
-    vec![PlannedStep::always(sh_c(spawn_detached_command(
-        &argv,
-        &log_path,
-        &pid_path,
-        &format!("service {name}"),
-    )))]
+    // The same entity as `comfyui.restart`, against this service's own
+    // pid file — which is what makes `Service` worth being an entity
+    // (design §3.4: the payoff is a conjunction that recurs across
+    // kinds).
+    let done = assert::Service::new(pid_path.clone(), argv.clone()).done();
+    vec![PlannedStep::done_when(
+        sh_c(spawn_detached_command(
+            &argv,
+            &log_path,
+            &pid_path,
+            &format!("service {name}"),
+        )),
+        done,
+    )]
 }
 
+/// A `service.start` whose payload does not say what to launch.
+///
+/// **No condition**, and that is not an omission: nothing is launched,
+/// so there is no argv for a service's identity to be, and a `Note`
+/// runs no effect for a condition to skip. This is the shape the `Done`
+/// trait's infallibility rests on — a payload too under-specified to
+/// say what finished means gets no entity constructed for it, and the
+/// absence sits at the construction site where it can be seen.
 fn missing_model_note(name: &str, platform_kind: &str) -> PlannedStep {
     PlannedStep::always(Step::Note(format!(
         "service_start name={name} platform_kind={platform_kind}: no launch \
@@ -1467,17 +1535,34 @@ enum Liveness {
 /// `proc_root` is a parameter so the decision can be tested without a
 /// procfs — on a host without `/proc` every pid would otherwise read as
 /// dead.
+///
+/// **This survives the Assert model absorbing liveness, and it is not a
+/// second implementation of the same judgement.** The read itself —
+/// what a pid file says, and whether that pid has an entry — moved to
+/// [`super::observe`], and both this and
+/// [`assert::Assert::ProcessAlive`] project from it. What differs is
+/// the projection, because the two callers ask different questions:
+///
+/// - this one asks about a **transition**, "did the launch I am waiting
+///   for die", and needs three answers plus the pid — `Dead(pid)` is
+///   fatal only once the poll has seen that same pid alive, and the
+///   failure message names it;
+/// - the predicate asks about a **state**, "is a server running here",
+///   and answers on the model's four values, where `Unsatisfied`
+///   carries no pid and fuses "gone" with "never launched".
+///
+/// Neither projection can be built from the other: the poll cannot use
+/// `Unsatisfied` because it must not treat an absent pid file as a
+/// death, and the predicate cannot use `Unknown` because a fresh pod
+/// would then answer "undecided" instead of "not running". One read,
+/// two folds.
 fn probe_liveness(pid_file: &str, proc_root: &Path) -> Liveness {
-    let Ok(text) = fs::read_to_string(pid_file) else {
-        return Liveness::Unknown;
-    };
-    let Ok(pid) = text.trim().parse::<u32>() else {
-        return Liveness::Unknown;
-    };
-    if proc_root.join(pid.to_string()).exists() {
-        Liveness::Alive
-    } else {
-        Liveness::Dead(pid)
+    match observe::read_pid_file(Path::new(pid_file)) {
+        // An absent file and an unusable one are alike *here*: neither
+        // is a death, which is all the arming rule needs of them.
+        PidFile::Absent | PidFile::Unusable(_) => Liveness::Unknown,
+        PidFile::Pid(pid) if observe::process_exists(pid, proc_root) => Liveness::Alive,
+        PidFile::Pid(pid) => Liveness::Dead(pid),
     }
 }
 
@@ -1977,7 +2062,11 @@ mod tests {
                     port: 8188,
                     extra_args: Vec::new(),
                 },
-                vec![None],
+                vec![Some(
+                    "all[proc_alive(/tmp/comfyui.pid), \
+                     proc_argv(/tmp/comfyui.pid)=[/workspace/ComfyUI/venv/bin/python \
+                     /workspace/ComfyUI/main.py --port 8188]]",
+                )],
             ),
             (
                 ProfileNode::ComfyUiHealth {
@@ -1998,9 +2087,16 @@ mod tests {
                     tensor_parallel_size: None,
                     extra_args: Vec::new(),
                 },
-                vec![None],
+                vec![Some(
+                    "all[proc_alive(/tmp/llm.pid), proc_argv(/tmp/llm.pid)=[ollama serve]]",
+                )],
             ),
             (
+                // The poll phases keep **no** condition, deliberately:
+                // their 2xx is what apply enforces, and a condition
+                // would turn it into something that skips instead of
+                // something that fails (§Why the poll phases keep no
+                // condition).
                 ProfileNode::ServiceReady {
                     id: node_id(&ids),
                     name: "llm".into(),
@@ -2657,6 +2753,159 @@ mod tests {
         );
     }
 
+    /// **The UC of this stage**: a launch is guarded by the service it
+    /// launches, so a second apply against the same profile does not
+    /// spawn a doomed replacement (the behaviour
+    /// `a_second_launch_overwrites_the_pid_file_whether_or_not_it_survives`
+    /// measures).
+    ///
+    /// The condition is compared as a value rather than by substring:
+    /// it is what decides whether a running server is replaced, and its
+    /// shape — the pid file the launch writes, then the argv the launch
+    /// runs — is the part that has to be trustworthy.
+    #[test]
+    fn expand_comfyui_restart_guards_its_launch_with_the_service_condition() {
+        let ids = IdGen::new();
+        let steps = expand(&ProfileNode::ComfyUiRestart {
+            id: node_id(&ids),
+            port: 8188,
+            extra_args: vec!["--listen".to_string()],
+        })
+        .expect("comfyui_restart expands");
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].done,
+            Some(
+                assert::Service::new(
+                    "/tmp/comfyui.pid",
+                    vec![
+                        "/workspace/ComfyUI/venv/bin/python".to_string(),
+                        "/workspace/ComfyUI/main.py".to_string(),
+                        "--port".to_string(),
+                        "8188".to_string(),
+                        "--listen".to_string(),
+                    ],
+                )
+                .done()
+            ),
+            "the condition compares against the very argv this launch runs",
+        );
+    }
+
+    /// The same entity for the other launch kind — which is the whole
+    /// reason `Service` is an entity rather than an expression written
+    /// twice (design §3.4).
+    #[test]
+    fn expand_service_start_guards_its_launch_with_the_service_condition() {
+        let ids = IdGen::new();
+        let steps = expand(&ProfileNode::ServiceStart {
+            id: node_id(&ids),
+            name: "llm".to_string(),
+            platform_kind: "vllm".to_string(),
+            model: Some("Qwen/Qwen3-8B".to_string()),
+            port: Some(9000),
+            dtype: None,
+            tensor_parallel_size: None,
+            extra_args: Vec::new(),
+        })
+        .expect("service_start expands");
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].done,
+            Some(
+                assert::Service::new(
+                    "/tmp/llm.pid",
+                    vec![
+                        "python".to_string(),
+                        "-m".to_string(),
+                        "vllm.entrypoints.openai.api_server".to_string(),
+                        "--model".to_string(),
+                        "Qwen/Qwen3-8B".to_string(),
+                        "--port".to_string(),
+                        "9000".to_string(),
+                    ],
+                )
+                .done()
+            ),
+            "the service's own pid file, and the argv its platform composed",
+        );
+    }
+
+    /// A launch that was never composed gets **no** condition: there is
+    /// no argv for an identity to be, and a `Note` runs no effect for a
+    /// condition to skip.
+    ///
+    /// This is the shape `Done`'s infallible signature rests on — an
+    /// under-specified payload builds no entity, and the absence sits
+    /// where it can be seen rather than inside a method that would have
+    /// to invent an error.
+    #[test]
+    fn a_service_start_that_launches_nothing_declares_no_condition() {
+        let ids = IdGen::new();
+        for (platform_kind, model) in [
+            // Requires a model and has none.
+            ("vllm", None),
+            ("llamacpp", None),
+            // Not a platform this crate knows how to launch.
+            ("tgi", Some("Qwen/Qwen3-8B".to_string())),
+        ] {
+            let steps = expand(&ProfileNode::ServiceStart {
+                id: node_id(&ids),
+                name: "llm".to_string(),
+                platform_kind: platform_kind.to_string(),
+                model,
+                port: None,
+                dtype: None,
+                tensor_parallel_size: None,
+                extra_args: Vec::new(),
+            })
+            .expect("service_start expands");
+
+            assert_eq!(steps.len(), 1);
+            assert!(
+                matches!(steps[0].step, Step::Note(_)),
+                "{platform_kind}: nothing is launched",
+            );
+            assert_eq!(
+                steps[0].done, None,
+                "{platform_kind}: nothing launched means no service to be finished",
+            );
+        }
+    }
+
+    /// A dry run answers a launch's condition rather than describing
+    /// it, and says the two things apart — the property that made the
+    /// earlier entities worth wiring, now holding for the third.
+    ///
+    /// On a machine with no procfs (and on a fresh pod) both hosts read
+    /// the same way, so what is pinned here is the shape of the
+    /// sentence and that the answer is *decided*: a plan that could not
+    /// tell whether a server needs launching is a plan with nothing to
+    /// say about the phase most worth reading.
+    #[tokio::test]
+    async fn a_dry_run_decides_whether_a_launch_would_run() {
+        let ids = IdGen::new();
+        let steps = expand(&ProfileNode::ComfyUiRestart {
+            id: node_id(&ids),
+            port: 8188,
+            extra_args: Vec::new(),
+        })
+        .expect("comfyui_restart expands");
+
+        let dry = dry_run_step(&steps[0], &BTreeMap::new()).await;
+        let note = dry.note.expect("a conditioned step reports its answer");
+        assert!(
+            note.starts_with("would run, not done: "),
+            "an unlaunched server is decided, not undecided: {note}",
+        );
+        assert!(
+            note.contains("proc_alive(/tmp/comfyui.pid)=unsatisfied"),
+            "the tree says which half failed: {note}",
+        );
+    }
+
     /// The redirect keeps `Command::output()` from blocking on pipes the
     /// backgrounded server would otherwise hold open for its lifetime.
     #[test]
@@ -3246,6 +3495,236 @@ mod tests {
 
             fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// Write an executable stub that lives for `seconds` and then exits
+    /// with `code`, standing in for a server with a chosen lifetime.
+    #[cfg(unix)]
+    fn write_lifetime_stub(dir: &std::path::Path, name: &str, seconds: &str, code: u8) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("{name}.sh"));
+        fs::write(&path, format!("#!/bin/sh\nsleep {seconds}\nexit {code}\n"))
+            .expect("write lifetime stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Whether a pid is still running, asked of the real OS.
+    #[cfg(unix)]
+    fn still_running(pid: &str) -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid} 2>/dev/null"))
+            .status()
+            .expect("run kill -0")
+            .success()
+    }
+
+    /// **The measurement design §4.4 recorded as unverified**: what a
+    /// second launch does on a pod where the first one is still
+    /// running. Run against a real `sh`, because the answer is a
+    /// property of the composed text rather than of anything readable
+    /// off a type.
+    ///
+    /// Two facts come out, and they are what
+    /// [`assert::Service`] was wired in to act on.
+    ///
+    /// **The pid file is overwritten every time.** `echo $pid > pidfile`
+    /// is unconditional and runs *before* the settle check, so the
+    /// well-known path stops naming the server that is actually serving
+    /// the moment a second launch starts — including when that second
+    /// launch then fails, which leaves the path naming a corpse while
+    /// the first server is still up.
+    ///
+    /// **Whether the step fails is decided by the replacement's first
+    /// second, and by nothing else.** The shape has no opinion about
+    /// ports: a replacement that exits inside the settle window fails
+    /// the step, and one that outlives it is reported as a successful
+    /// launch even when it is already doomed. A server that binds late
+    /// is in the second class — ComfyUI spends about a minute in
+    /// prestartup before it listens ([`COMFYUI_HEALTH_TIMEOUT_SEC`]) —
+    /// so a port collision is invisible here and surfaces on the poll,
+    /// where the *first* server is what answers the GET.
+    ///
+    /// Both launch kinds are covered by covering
+    /// [`spawn_detached_command`]: `comfyui.restart` and
+    /// `service.start` compose their launch from this one function and
+    /// differ only in the paths they pass and the `cd` the first one
+    /// prefixes (`a_backgrounded_launch_always_redirects_its_output_to_a_file`).
+    #[cfg(unix)]
+    #[test]
+    fn a_second_launch_overwrites_the_pid_file_whether_or_not_it_survives() {
+        let dir = scratch_dir("relaunch");
+        let log = dir.join("svc.log").to_string_lossy().into_owned();
+        let pid_file = dir.join("svc.pid");
+
+        let launch = |stub: &str| {
+            let command = spawn_detached_command(
+                std::slice::from_ref(&stub.to_string()),
+                &log,
+                &pid_file.to_string_lossy(),
+                "svc",
+            );
+            let outcome = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+                .expect("run the launch command");
+            let recorded = fs::read_to_string(&pid_file).expect("a launch wrote a pid file");
+            (outcome.status.success(), recorded.trim().to_string())
+        };
+
+        // The server that is already up, and stays up throughout.
+        let first_stub = write_lifetime_stub(&dir, "first", "30", 0);
+        let (ok, first_pid) = launch(&first_stub);
+        assert!(ok, "the first launch succeeds");
+        assert!(still_running(&first_pid), "the first server is up");
+
+        // (label, replacement lifetime, does the launch step succeed)
+        let cases = [
+            ("outlives the settle check", "30", 0u8, true),
+            ("dies inside the settle check", "0", 1, false),
+            ("dies just after the settle check", "2", 1, true),
+        ];
+
+        let mut previous = first_pid.clone();
+        for (index, (label, seconds, code, want_ok)) in cases.into_iter().enumerate() {
+            // The stub's file name carries no spaces: the launch text
+            // interpolates argv unquoted, which is the production
+            // shape and not something to work around here.
+            let stub = write_lifetime_stub(&dir, &format!("replacement-{index}"), seconds, code);
+            let (ok, recorded) = launch(&stub);
+
+            assert_eq!(
+                ok, want_ok,
+                "{label}: the step's verdict is decided by the first second alone",
+            );
+            assert_ne!(
+                recorded, previous,
+                "{label}: the pid file is overwritten before the settle check, always",
+            );
+            assert!(
+                still_running(&first_pid),
+                "{label}: nothing in a launch stops the server that is already up",
+            );
+            previous = recorded;
+        }
+
+        // The last replacement was reported as a successful launch and
+        // then died — so a step that said "ok" left the well-known pid
+        // file naming a process that is gone, while the first server is
+        // still the one serving.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !still_running(&previous),
+            "the late-dying replacement is gone, and the launch step never noticed",
+        );
+        assert!(
+            still_running(&first_pid),
+            "the server that is actually serving is the one from the first launch",
+        );
+
+        // Leave nothing running behind.
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill {first_pid} 2>/dev/null"))
+            .status();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The assumption the whole `Service` condition rests on**: the
+    /// pid the launch records names a process whose command line *is*
+    /// the argv the launch was given.
+    ///
+    /// It is an assumption about `nohup`, which POSIX requires to
+    /// `exec` its operand rather than fork it — so `$!` names the
+    /// server itself and its command line is the server's, with no
+    /// `nohup` prefix and no shell in between. If that were wrong,
+    /// [`assert::Assert::ProcessArgv`] would never match anything, every
+    /// launch would run on every apply (the safe direction), and the
+    /// stage would be useless rather than dangerous. It is worth a test
+    /// either way.
+    ///
+    /// **This can only be checked where there is a procfs**, which is
+    /// the pod's platform and not necessarily a developer machine. The
+    /// branch is chosen by looking for the procfs rather than by a
+    /// `cfg`, so the test compiles everywhere and says which half it
+    /// ran — and the half that cannot look still asserts the thing that
+    /// is true there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_launchs_recorded_pid_reports_the_argv_the_launch_was_given() {
+        let dir = scratch_dir("launch-argv");
+        let log = dir.join("stub.log");
+        let pid_file = dir.join("stub.pid");
+
+        // `sleep` rather than a shell stub, and deliberately: a script
+        // with a shebang is exec'd through its interpreter, so its
+        // command line is the *interpreter's* and would not match what
+        // was launched (see [`assert::Assert::ProcessArgv`]). Every
+        // launch this crate composes runs a real binary, so a real
+        // binary is what this measures.
+        let argv = vec!["sleep".to_string(), "3".to_string()];
+        let command = spawn_detached_command(
+            &argv,
+            &log.to_string_lossy(),
+            &pid_file.to_string_lossy(),
+            "svc",
+        );
+        let outcome = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("run the launch command");
+        assert!(
+            outcome.status.success(),
+            "the launch succeeds: {}",
+            String::from_utf8_lossy(&outcome.stderr),
+        );
+
+        let recorded: u32 = fs::read_to_string(&pid_file)
+            .expect("the launch wrote a pid file")
+            .trim()
+            .parse()
+            .expect("the pid file holds a pid");
+
+        let proc_root = Path::new(PROC_ROOT);
+        match observe::process_argv(recorded, proc_root).expect("the process is observable") {
+            Some(found) => {
+                assert_eq!(
+                    found, argv,
+                    "the recorded pid's command line is the launched argv — \
+                     nohup exec'd, and nothing wrapped it",
+                );
+                // And therefore the condition the launch phase derives
+                // holds against the process the launch produced.
+                let done = assert::Service::new(&pid_file, argv).done();
+                let node = assert::eval(&done, ExecMode::Real, &LocalObserve).await;
+                assert!(
+                    node.is_satisfied(),
+                    "a server this launch just started is finished: {}",
+                    assert::describe_execution(&done, &node),
+                );
+            }
+            None => {
+                // No procfs on this host, so the launched process
+                // cannot be found by pid at all. The one thing that is
+                // true here is that no condition naming it can hold —
+                // i.e. every launch runs, which is the safe direction.
+                assert!(
+                    !proc_root.join(recorded.to_string()).exists(),
+                    "a pid with no command line must also have no entry",
+                );
+                let done = assert::Service::new(&pid_file, argv).done();
+                let node = assert::eval(&done, ExecMode::Real, &LocalObserve).await;
+                assert!(
+                    !node.is_satisfied(),
+                    "without a procfs a launch is never reported as finished",
+                );
+            }
+        }
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// The settle check is what turns "the spawn was accepted" into

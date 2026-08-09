@@ -153,6 +153,27 @@ fn assert_to_canon(assert: &Assert) -> CanonValue {
             fields.insert("git_ref".into(), CanonValue::Str(git_ref.clone()));
             CanonValue::Object(fields)
         }
+        Assert::ProcessAlive { pid_file } => {
+            let mut fields = variant_object("ProcessAlive");
+            fields.insert("pid_file".into(), CanonValue::Str(path_string(pid_file)));
+            CanonValue::Object(fields)
+        }
+        Assert::ProcessArgv { pid_file, argv } => {
+            let mut fields = variant_object("ProcessArgv");
+            // The argv **is** encoded, unlike `GitTreeAt`'s — and the
+            // difference is which side it belongs to. There the command
+            // is the host's, derived from the two fields by a fixed
+            // template; here it is the condition itself, the declaration
+            // that a launch must match. Two services differing only in
+            // an `extra_args` position are different conditions, so they
+            // have to be different bytes.
+            fields.insert(
+                "argv".into(),
+                CanonValue::Array(argv.iter().cloned().map(CanonValue::Str).collect()),
+            );
+            fields.insert("pid_file".into(), CanonValue::Str(path_string(pid_file)));
+            CanonValue::Object(fields)
+        }
         Assert::All(children) => {
             let mut fields = variant_object("All");
             fields.insert(
@@ -847,6 +868,30 @@ mod tests {
                         .expect("a git predicate carries its ref")
                         .to_string(),
                 },
+                "ProcessAlive" => Assert::ProcessAlive {
+                    pid_file: std::path::PathBuf::from(
+                        value["pid_file"]
+                            .as_str()
+                            .expect("a process predicate carries its pid file"),
+                    ),
+                },
+                "ProcessArgv" => Assert::ProcessArgv {
+                    pid_file: std::path::PathBuf::from(
+                        value["pid_file"]
+                            .as_str()
+                            .expect("a process predicate carries its pid file"),
+                    ),
+                    argv: value["argv"]
+                        .as_array()
+                        .expect("an argv predicate carries its argv")
+                        .iter()
+                        .map(|arg| {
+                            arg.as_str()
+                                .expect("every argv position is a string")
+                                .to_string()
+                        })
+                        .collect(),
+                },
                 "All" => {
                     let children = value["children"]
                         .as_array()
@@ -878,6 +923,13 @@ mod tests {
             dir: std::path::PathBuf::from(dir),
             git_ref: git_ref.to_string(),
         };
+        let alive = |pid_file: &str| Assert::ProcessAlive {
+            pid_file: std::path::PathBuf::from(pid_file),
+        };
+        let argv = |pid_file: &str, argv: &[&str]| Assert::ProcessArgv {
+            pid_file: std::path::PathBuf::from(pid_file),
+            argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
+        };
         vec![
             exists("/a"),
             exists("/b"),
@@ -889,12 +941,30 @@ mod tests {
             git("/a", "v1"),
             git("/a", "v2"),
             git("/b", "v1"),
+            alive("/tmp/a.pid"),
+            alive("/tmp/b.pid"),
+            argv("/tmp/a.pid", &["srv"]),
+            argv("/tmp/b.pid", &["srv"]),
+            // Argv identity has to survive every way two launches can
+            // differ: an added argument, a changed value, and — the one
+            // a joined-string encoding would lose — the same arguments
+            // in another order.
+            argv("/tmp/a.pid", &["srv", "--listen"]),
+            argv("/tmp/a.pid", &["srv", "--port", "8188"]),
+            argv("/tmp/a.pid", &["srv", "--port", "8189"]),
+            argv("/tmp/a.pid", &["srv", "--listen", "--highvram"]),
+            argv("/tmp/a.pid", &["srv", "--highvram", "--listen"]),
+            argv("/tmp/a.pid", &[]),
             Assert::All(NonEmpty::new(exists("/a"), vec![])),
             Assert::All(NonEmpty::new(exists("/a"), vec![digest("/a", "ab")])),
             // Same children, other order: the fold's tie-break depends
             // on it, so the bytes must too.
             Assert::All(NonEmpty::new(digest("/a", "ab"), vec![exists("/a")])),
             Assert::All(NonEmpty::new(exists("/a/.git"), vec![git("/a", "v1")])),
+            Assert::All(NonEmpty::new(
+                alive("/tmp/a.pid"),
+                vec![argv("/tmp/a.pid", &["srv", "--port", "8188"])],
+            )),
             Assert::All(NonEmpty::new(
                 Assert::All(NonEmpty::new(exists("/a"), vec![exists("/b")])),
                 vec![digest("/b", "ab")],
@@ -973,6 +1043,34 @@ mod tests {
         assert!(
             !encoded.contains("--no-optional-locks") && !encoded.contains("diff"),
             "the command is not part of the condition's bytes: {encoded}",
+        );
+    }
+
+    /// The third entity's bytes.
+    ///
+    /// **Here the argv *is* in them**, which is the opposite of the
+    /// git predicate above and for a reason worth pinning: git's
+    /// command is the host's, derived from the condition, while a
+    /// service's argv is the condition — the declaration a running
+    /// process has to match. It is encoded as an array, so two launches
+    /// differing only in the order of their arguments are different
+    /// bytes, exactly as they are different conditions.
+    #[test]
+    fn the_service_predicate_encodes_the_declared_argv_as_an_array() {
+        let done = crate::exec::assert::Service::new(
+            "/tmp/comfyui.pid",
+            vec!["python".into(), "--port".into(), "8188".into()],
+        )
+        .done();
+        assert_eq!(
+            encode_assert(&done),
+            concat!(
+                "{\"children\":[",
+                "{\"pid_file\":\"/tmp/comfyui.pid\",\"type\":\"ProcessAlive\"},",
+                "{\"argv\":[\"python\",\"--port\",\"8188\"],",
+                "\"pid_file\":\"/tmp/comfyui.pid\",\"type\":\"ProcessArgv\"}",
+                "],\"type\":\"All\"}",
+            ),
         );
     }
 
