@@ -1423,9 +1423,10 @@ pub enum StepRun {
 ///
 /// There are two drivers, and they reach an effect differently:
 ///
-/// - [`crate::apply`] drives the engine with `drive_async`, and a
-///   lifecycle step is a `Call` node ([`super::steps`]), so its resolver
-///   `await`s this directly;
+/// - [`crate::apply`] drives the engine with its own async loop, and a
+///   lifecycle step is a `Call` node ([`super::steps`]), so the driver
+///   `await`s this directly — and, for a phase whose steps are
+///   independent, awaits several of them at the same time;
 /// - [`crate::profile_ast::create_profile_engine`] drives the engine
 ///   with a synchronous `Stepper` (the MCP debugger host and the exec
 ///   integration tests), where a lifecycle phase is still an `Apply` and

@@ -284,8 +284,8 @@ pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError>
 /// meaningful measure of how far the synchronous seam has spread.
 ///
 /// Nothing on the `Call` route comes through here: a suspended effect is
-/// awaited by the host resolver ([`crate::apply`]) on the runtime that
-/// is already driving `drive_async`.
+/// awaited by the host driver ([`crate::apply`]) on the runtime that is
+/// already turning it.
 ///
 /// **A multi-threaded tokio runtime must be current.** Production gets
 /// one from the CLI entry point ([`crate::cli`] builds it and

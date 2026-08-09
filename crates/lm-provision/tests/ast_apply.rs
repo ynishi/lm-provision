@@ -16,6 +16,7 @@
 //! (`assert_cmd`) exercise that wiring itself and stay synchronous.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use serde_json::{json, Value};
@@ -182,8 +183,11 @@ async fn a_dry_run_models_step_reports_the_conditions_answer() {
         .expect("a dry run touches nothing and reports");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
-    // One report entry per composed step — the phase is a `Seq` over two
-    // `Call` nodes now, and each suspended on its own.
+    // One report entry per composed step — the phase is a `Par` over two
+    // `Call` nodes now, and each suspended on its own. The condition is
+    // answered per step under the fan-out exactly as it was under the
+    // sequence: `done` lives in `lifecycle::run_step`, which the join
+    // policy does not touch.
     assert_eq!(
         step_ids(&report),
         vec!["1_models_1", "1_models_2"],
@@ -536,6 +540,214 @@ async fn python_version_check_fails_the_run_on_a_mismatch() {
             .contains("python version mismatch"),
         "the assert message names the mismatch: {step}"
     );
+
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------
+// A phase whose steps are independent runs them at the same time.
+//
+// The claim is about wall-clock, so one of these measures it. The others
+// are about what the parallelism must *not* cost: the report still reads
+// in the order the profile was written, every entry is still there, and a
+// denial that every step discovers is still stated once.
+//
+// Every entry below transfers to the built-in `/workspace/ComfyUI/models`
+// root, which the tests cannot create, so each transfer reaches the
+// server, waits for it, and then fails on the destination — the delay
+// under test is the server's, and it is spent before the failure.
+// ---------------------------------------------------------------------
+
+/// A local server that handles every connection **at the same time**,
+/// holding each for however long `delay` says the requested entry takes.
+///
+/// One thread per connection is what makes the measurement mean
+/// something: a client that opens the connections one after another pays
+/// the sum of the delays, and a client that opens them together pays the
+/// longest.
+fn concurrent_server(
+    serves: usize,
+    delay: fn(usize) -> Duration,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        let mut open = Vec::with_capacity(serves);
+        for _ in 0..serves {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            open.push(std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let entry = entry_number(&String::from_utf8_lossy(&buf[..read]));
+                std::thread::sleep(delay(entry));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }));
+        }
+        for worker in open {
+            let _ = worker.join();
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// The `<n>` of the `/<n>.bin` a request line asked for, so a server can
+/// answer a named entry rather than "whichever arrived first".
+fn entry_number(request: &str) -> usize {
+    request
+        .split('/')
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A profile whose single `models` phase declares `entries` weights,
+/// numbered `1.bin` … `<entries>.bin` in declaration order.
+fn models_profile(name: &str, base_url: &str, entries: usize) -> Value {
+    let models: Vec<Value> = (1..=entries)
+        .map(|n| {
+            json!({
+                "src": format!("{base_url}/{n}.bin"),
+                "dst": format!("{n}.bin"),
+                "subdir": "lora",
+            })
+        })
+        .collect();
+    json!({
+        "type": "Spec",
+        "name": name,
+        "capabilities": ["net.transfer"],
+        "paths": ["/workspace/ComfyUI/models"],
+        "http_allowlist": [base_url],
+        "phases": [{
+            "type": "Models",
+            "models_json": serde_json::to_string(&models).expect("models encode"),
+        }]
+    })
+}
+
+fn declared_ids(entries: usize) -> Vec<String> {
+    (1..=entries).map(|n| format!("1_models_{n}")).collect()
+}
+
+/// **The measurement.** Four entries against a server that holds every
+/// request for the same time: run one after another that is four delays,
+/// run together it is one.
+///
+/// The bounds are deliberately far from each other. The lower one is what
+/// makes the upper one mean anything — it proves the run really waited on
+/// the server rather than failing before it reached one — and the upper
+/// one sits at three delays, half way between the one a parallel run
+/// spends and the four a sequential run would, so neither a slow machine
+/// nor a fast one moves the verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_models_phase_transfers_its_entries_at_the_same_time() {
+    const ENTRIES: usize = 4;
+    const DELAY: Duration = Duration::from_millis(400);
+
+    let (base_url, server) = concurrent_server(ENTRIES, |_| DELAY);
+    let profile = models_profile("models-parallel", &base_url, ENTRIES);
+    let path = write_json_profile("models-parallel", &profile);
+
+    let started = Instant::now();
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
+        .expect("a run that reaches its steps produces a report");
+    let elapsed = started.elapsed();
+    server.join().expect("the server thread finishes");
+
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+    assert_eq!(step_ids(&report), declared_ids(ENTRIES), "{report}");
+
+    assert!(
+        elapsed >= DELAY,
+        "the run did not wait on the server at all ({elapsed:?}); the measurement below \
+         would prove nothing"
+    );
+    assert!(
+        elapsed < DELAY * 3,
+        "{ENTRIES} entries took {elapsed:?}; one after another they would take \
+         {:?}, together about {DELAY:?}",
+        DELAY * ENTRIES as u32
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// The report reads in the order the profile was written even though the
+/// entries answered in the reverse of it: entry 1 is held longest, so it
+/// finishes last, and it is still the first row.
+///
+/// The same run pins the join policy: nothing is cancelled when a sibling
+/// fails, so all four entries answered and all four are in the report,
+/// each with its own reason — and the envelope's one `error` line names
+/// the first of them in declaration order rather than the first to fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parallel_phase_reports_every_entry_once_in_declaration_order() {
+    const ENTRIES: usize = 4;
+
+    let (base_url, server) = concurrent_server(ENTRIES, |n| {
+        Duration::from_millis(80 * (ENTRIES.saturating_sub(n) + 1) as u64)
+    });
+    let profile = models_profile("models-order", &base_url, ENTRIES);
+    let path = write_json_profile("models-order", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
+        .expect("a run that reaches its steps produces a report");
+    server.join().expect("the server thread finishes");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    assert_eq!(step_ids(&report), declared_ids(ENTRIES), "{report}");
+
+    let steps = report["steps"].as_array().expect("steps is an array");
+    assert_eq!(steps.len(), ENTRIES, "{report}");
+    for step in steps {
+        assert_eq!(step["op"], json!("net.transfer"), "{step}");
+        assert_eq!(
+            step["ok"],
+            json!(false),
+            "the built-in models root is not there, so every entry fails on it: {step}"
+        );
+    }
+    assert_eq!(report["ok"], json!(false), "{report}");
+    assert!(
+        report["error"]
+            .as_str()
+            .expect("a failing run carries an error line")
+            .starts_with("step 1_models_1 (models) failed:"),
+        "{report}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A denial every step of a parallel phase discovers is reported **once**.
+///
+/// The preflight is a pure function of the phase, so under a `Seq` only
+/// the first step ever reaches it (the engine stops) while under a `Par`
+/// every sibling reaches the same verdict. Four copies of one sentence,
+/// all carrying the phase's single id, would be a report contradicting
+/// its own rule that ids are unique within it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denial_every_parallel_step_hits_is_reported_once() {
+    let mut profile = models_profile("models-denied", "http://127.0.0.1:9/", 4);
+    // Nothing declared, so every step's source is refused before any of
+    // them reaches the network.
+    profile["http_allowlist"] = json!([]);
+    let path = write_json_profile("models-denied", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
+        .expect("a denied run still produces a report");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    assert_eq!(step_ids(&report), vec!["1_models"], "{report}");
+    assert_eq!(report["ok"], json!(false), "{report}");
 
     std::fs::remove_file(&path).ok();
 }

@@ -36,8 +36,8 @@
 //!   the async effect from the synchronous seam
 //!   ([`effects::block_on_effect`]).
 //! - [`EffectRoute::Call`] — [`ProfileCallAst`] reclassifies the node as
-//!   a dsl-kit `Call`, so the engine suspends on it and the host's
-//!   `AsyncEffectResolver` ([`crate::apply`]) awaits the effect
+//!   a dsl-kit `Call`, so the engine suspends on it and the host's async
+//!   driver ([`crate::apply`]) awaits the effect
 //!   ([`effects::transfer`] / [`effects::http_get`] /
 //!   [`effects::http_post`]) directly. No `block_on` is involved.
 //!
@@ -59,12 +59,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dsl_kit::{
-    Ast, EngineError, LoopDecision, NodeContext, NodeId, NodeKind, Op, OpRegistry, OwnedDerivedAst,
-    Path, SuspendReason,
+    Ast, ChildIndex, EngineError, FailPolicy, JoinPolicy, JoinShape, LoopDecision, NodeContext,
+    NodeId, NodeKind, Op, OpRegistry, OwnedDerivedAst, Path, ReducerCollectAll, ReducerId,
+    ReducerRegistry, SuspendReason,
 };
 
 use super::{
-    audit, demand, effects, lifecycle, report::StepReport, ExecContext, ExecError, ExecMode,
+    audit, demand, effects, lifecycle,
+    report::{DeclaredAt, StepReport},
+    ExecContext, ExecError, ExecMode,
 };
 use crate::profile_ast::{ProfileAst, ProfileNode, ProfileSemantics, ProfileValue};
 
@@ -310,6 +313,7 @@ impl ProfileOp {
         node: NodeId,
         payload: &ProfileNode,
     ) -> Result<ProfileValue, ExecError> {
+        let (phase_index, _) = self.ctx.phase_meta_of(node);
         let (base_id, kind) = self.base(node);
         let env = match resolve_phase_env(&self.ctx, payload) {
             Ok(env) => env,
@@ -341,6 +345,7 @@ impl ProfileOp {
             renders.push(record_lifecycle_step(
                 &self.ctx,
                 sub_id,
+                (phase_index, index + 1),
                 kind.clone(),
                 &planned.step,
                 run,
@@ -925,6 +930,33 @@ fn push_report(ctx: &ExecContext, entry: StepReport) {
     ctx.reports.lock().unwrap().push(entry);
 }
 
+/// Append a **phase-level** failure entry unless the identical one is
+/// already there.
+///
+/// A phase-level failure is about the phase — a denied capability, an
+/// `env` that will not resolve, a step destination no declared path
+/// covers — so however many of the phase's steps discover it, the report
+/// states it once. Under a sequential phase only the first step ever gets
+/// that far, because the engine stops on it. Under a parallel one every
+/// sibling runs the same preflight over the same phase and reaches the
+/// same verdict, and N copies of one sentence — all carrying the phase's
+/// single report id — would be a report contradicting its own rule that
+/// ids are unique within it.
+///
+/// Identity is `(id, reason)`: two phases never share an id, and one
+/// phase's preflight is a pure function of the phase, so a repeat is
+/// always the same denial seen again.
+fn push_phase_failure_report(ctx: &ExecContext, entry: StepReport) {
+    let mut reports = ctx.reports.lock().unwrap();
+    if reports
+        .iter()
+        .any(|seen| seen.id == entry.id && seen.reason == entry.reason)
+    {
+        return;
+    }
+    reports.push(entry);
+}
+
 /// The `(<phase_index>_<kind>, kind)` base for `node`'s report entry.
 /// Falls back to a `n<node-id>` id for a node the phase map does not
 /// know (never expected for a registered op or a routed phase).
@@ -991,11 +1023,14 @@ fn push_http_failure_report(
 /// effect ran — a payload lookup miss or a capability denial. The report
 /// entry carries the phase kind as its `op` (no effect was reached to
 /// name a more specific one).
+///
+/// Written through [`push_phase_failure_report`], so a phase whose steps
+/// all discover the same denial still states it once.
 fn record_phase_failure_report(ctx: &ExecContext, node: NodeId, err: &ExecError) {
     let (id, kind) = report_base(ctx, node);
     let mut entry = StepReport::new(id, kind.clone(), kind);
     mark_report_failed(ctx, &mut entry, err);
-    push_report(ctx, entry);
+    push_phase_failure_report(ctx, entry);
 }
 
 /// Push the failing [`StepReport`] for a direct phase denied by policy,
@@ -1154,11 +1189,17 @@ fn lifecycle_preflight(
 fn record_lifecycle_step(
     ctx: &ExecContext,
     sub_id: String,
+    declared_at: DeclaredAt,
     kind: String,
     step: &lifecycle::Step,
     run: Result<lifecycle::StepRun, lifecycle::StepFailure>,
 ) -> Result<String, ExecError> {
     let mut entry = StepReport::new(sub_id, kind, step_effect_op(step));
+    // The one writer of sub-step entries, and therefore the one place
+    // that has to say where an entry belongs: this is the only push a
+    // parallel phase makes, so it is the only push whose arrival order
+    // can differ from the profile's (see `report::in_declaration_order`).
+    entry.declared_at = Some(declared_at);
     apply_step_input_fields(&mut entry, step);
     match run {
         Ok(lifecycle::StepRun::Dry(decided)) => {
@@ -1302,11 +1343,12 @@ impl From<&ExecError> for CallError {
 ///
 /// - a **routable network phase**, when `route` is
 ///   [`EffectRoute::Call`] — an `Apply` becomes a `Call` ([`call_kind`]);
-/// - a **lifecycle phase**, always — an `Apply` becomes a `Seq` over one
-///   synthetic `Call` node per composed step ([`super::steps`]). The
-///   step nodes exist only here and in the [`StepPlan`](super::steps::StepPlan)
-///   both sides read, so they carry no payload of their own; the
-///   resolver reaches everything through the phase they name.
+/// - a **lifecycle phase**, always — an `Apply` becomes a `Seq` (or a
+///   `Par`, when [`steps_are_independent`]) over one synthetic `Call`
+///   node per composed step ([`super::steps`]). The step nodes exist only
+///   here and in the [`StepPlan`](super::steps::StepPlan) both sides
+///   read, so they carry no payload of their own; the resolver reaches
+///   everything through the phase they name.
 pub struct ProfileCallAst {
     /// The unmodified derived projection.
     inner: ProfileAst,
@@ -1327,12 +1369,21 @@ impl ProfileCallAst {
     /// construction, but nothing would keep it doing so — one plan, two
     /// readers.
     ///
-    /// **The children are a `Seq`, not a `Par`.** A phase's steps are
-    /// still run in written order, which is the whole basis on which a
-    /// partial apply is readable (design §2). What changed is that the
-    /// order is now the *engine's*, over independent child nodes, rather
-    /// than a loop inside one op — so a later stage swaps this one
-    /// constructor call for a `Par` and changes nothing else.
+    /// **The children are a `Par` when the phase's steps are independent
+    /// of one another, and a `Seq` otherwise** ([`steps_are_independent`]).
+    /// A `Seq` phase is still run in written order, which is the basis on
+    /// which a partial apply is readable (design §2); a `Par` phase gives
+    /// that up at the *engine* level and gets it back at the *report*
+    /// level ([`super::report::in_declaration_order`]), which is where a
+    /// reader actually needs it.
+    ///
+    /// A `Par` phase names a reducer, and the one it names is its own
+    /// ([`par_reducer_id`]) so the fold can report which phase failed.
+    /// The registry those ids resolve against is built from the same
+    /// `plan` by [`lifecycle_reducer_registry`] — one plan, two readers,
+    /// again — and a disagreement between the two is loud rather than
+    /// silent: the engine refuses the `Par` with `UnknownReducer` on
+    /// entry.
     pub fn new(root: &ProfileNode, route: EffectRoute, plan: &super::steps::StepPlan) -> Self {
         let inner = OwnedDerivedAst::new(root, ProfileSemantics);
         let mut overrides = HashMap::new();
@@ -1357,15 +1408,203 @@ impl ProfileCallAst {
                     },
                 );
             }
+            let children = phase.nodes.clone();
             overrides.insert(
                 phase_id,
-                NodeKind::Seq {
-                    children: phase.nodes.clone(),
+                if steps_are_independent(&phase.steps) {
+                    NodeKind::Par {
+                        children,
+                        policy: LIFECYCLE_JOIN_POLICY,
+                        reducer_id: par_reducer_id(phase_id),
+                    }
+                } else {
+                    NodeKind::Seq { children }
                 },
             );
         }
         Self { inner, overrides }
     }
+}
+
+/// How a parallel lifecycle phase joins.
+///
+/// **`shape: All`** — every step of a phase is work the profile asked
+/// for; there is no reading of `models` under which four of five weights
+/// is the answer.
+///
+/// **`fail: CollectAll`** — see [`LifecycleJoin`] for why this and not
+/// `FailFast`.
+const LIFECYCLE_JOIN_POLICY: JoinPolicy = JoinPolicy {
+    shape: JoinShape::All,
+    fail: FailPolicy::CollectAll,
+};
+
+/// The [`ReducerId`] the parallel phase at `phase` names.
+///
+/// One id per phase rather than one for all of them, so the reducer
+/// registered under it knows which phase it is folding and the failure it
+/// raises can say so.
+fn par_reducer_id(phase: NodeId) -> ReducerId {
+    ReducerId(format!("lifecycle.join.n{}", phase.0))
+}
+
+/// Whether a phase's composed steps may run **at the same time**.
+///
+/// The question is not which kind the phase is — a kind name is a label
+/// on the answer, not the answer — so it is asked of the steps:
+///
+/// - **every step is a [`lifecycle::Step::Transfer`].** A transfer's
+///   entire effect is the bytes it puts at its own destination, and its
+///   condition reads that same destination and nothing else, so what one
+///   transfer does is invisible to another. A `Step::Sh`'s effect is
+///   whatever the command does, which nothing here can bound; two of them
+///   are independent only on the author's word, and the author has no way
+///   to give it yet. (It is also what keeps the concurrency real rather
+///   than nominal: `Sh` runs a child process synchronously, so N of them
+///   handed to one runtime thread would run one after another while the
+///   AST claimed they ran together.)
+/// - **their destinations are pairwise distinct.** Two steps writing one
+///   path are the one shape in which transfers are *not* independent, and
+///   overlapping them turns "the later one wins" into "whichever finishes
+///   last wins".
+/// - **there are at least two of them.** A single-step phase has nothing
+///   to overlap, and wrapping it would change the engine's shape for
+///   every single-transfer phase (`sync.pull`, `sync.push`,
+///   `staging.push`) in order to say what the `Seq` already says.
+///
+/// Today exactly one kind passes: `models`, whose destination is composed
+/// per entry from that entry's own `subdir` / `dst`.
+///
+/// `custom_nodes` fails the first clause and would fail it even if the
+/// steps were transfers: clone → checkout → pip is an order, not a list.
+/// `llm_models` fails it too, and the second clause is the more
+/// interesting reason — its steps are `hf download --local-dir <dir>` and
+/// `dir` falls back to a single shared constant
+/// (`DEFAULT_LLM_MODELS_DST_DIR`), so two entries that look separate are
+/// writing into one directory. Node-level parallelism for `custom_nodes`
+/// is a separate change: the expansion is a flat `Vec<PlannedStep>` with
+/// no node boundary in it, so there is nothing here to group by.
+pub(crate) fn steps_are_independent(steps: &[lifecycle::PlannedStep]) -> bool {
+    if steps.len() < 2 {
+        return false;
+    }
+    let mut destinations = std::collections::HashSet::with_capacity(steps.len());
+    steps.iter().all(|planned| match &planned.step {
+        lifecycle::Step::Transfer { dst, .. } => destinations.insert(dst.as_str()),
+        _ => false,
+    })
+}
+
+/// The fold at the end of a parallel lifecycle phase.
+///
+/// ## Why `CollectAll` and not `FailFast`
+///
+/// `FailFast` would cancel the phase's other transfers the moment one
+/// failed, and the argument for it is that a pod is billed by the second,
+/// so a doomed phase should stop spending. Three things say otherwise
+/// here, and the first is decisive:
+///
+/// 1. **A cancelled transfer leaves its partial file behind.**
+///    [`super::effects`]'s streaming download removes the destination on
+///    the *error* path; there is no drop guard, and cancelling an
+///    in-flight transfer means dropping its future, which runs no error
+///    path at all. Stage 1 derived a `models` entry's completion from
+///    `FileExists { dst }` alone when no `sha256` is declared — so the
+///    truncated file left behind would be read as **done** on the next
+///    apply, and the profile would be satisfied by a broken weight. That
+///    is a worse outcome than any amount of transfer that FailFast saves.
+/// 2. **Most of what FailFast "saves" has to be paid again.** It discards
+///    siblings that were nine tenths finished, and nothing carries that
+///    nine tenths forward; the next apply starts them from zero. What
+///    `CollectAll` spends on a doomed phase, it converts into files that
+///    the next apply skips.
+/// 3. **It costs the operator applies.** A profile with three bad URLs out
+///    of twenty needs three apply cycles under FailFast to learn all three
+///    names, one under `CollectAll`.
+///
+/// What `CollectAll` costs is that a phase runs to its slowest member
+/// before reporting. That wait is bounded rather than open: a supplier
+/// that stops sending trips the transfer's per-read deadline
+/// (`TRANSFER_READ_TIMEOUT_SEC`), so "waits for the timeout" is a minute,
+/// not forever.
+///
+/// A consequence worth naming: nothing in this host ever cancels a
+/// suspension, so `AsyncEffectResolver::cancelled` is never called on the
+/// `Call` route. That is not an omission — it is the same decision seen
+/// from the driver's side.
+///
+/// ## What it produces
+///
+/// Nothing consumes a phase's value, but the fold still has to choose
+/// one, and it chooses **the last step's in declaration order** — what
+/// the `Seq` this replaces propagated. The `winners` the engine hands in
+/// are in *completion* order, which is exactly the order this stage set
+/// out to stop reporting.
+struct LifecycleJoin {
+    /// The phase being folded, so a failure names it.
+    phase: NodeId,
+}
+
+impl ReducerCollectAll<ProfileValue, (), CallError> for LifecycleJoin {
+    fn reduce(
+        &self,
+        slots: &[Option<Result<ProfileValue, CallError>>],
+        _deltas: &[Option<()>],
+        _winners: &[ChildIndex],
+    ) -> Result<(ProfileValue, ()), EngineError> {
+        let failed: Vec<usize> = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| matches!(slot, Some(Err(_))))
+            .map(|(index, _)| index)
+            .collect();
+        if let Some(&first) = failed.first() {
+            // Every failing step already wrote its own report entry with
+            // its own reason; this sentence exists to stop the run and to
+            // say how many there were, and the envelope's `error` line is
+            // built from the entries rather than from here.
+            let reason = match (failed.len(), slots.len()) {
+                (1, total) => format!("step {} of {total} failed", first + 1),
+                (count, total) => format!(
+                    "{count} of {total} steps failed (the first was step {})",
+                    first + 1
+                ),
+            };
+            return Err(EngineError::Aborted {
+                at: NodeContext::at(self.phase, Path::root().push(self.phase)),
+                reason,
+            });
+        }
+        let value = slots
+            .iter()
+            .rev()
+            .find_map(|slot| match slot {
+                Some(Ok(value)) => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| ProfileValue::Success("ok".to_string()));
+        Ok((value, ()))
+    }
+}
+
+/// The reducers every parallel phase in `plan` will look for.
+///
+/// Built from the same [`super::steps::StepPlan`] the AST projection
+/// reads, and by the same [`steps_are_independent`] rule, so the two
+/// agree by construction rather than by convention.
+pub fn lifecycle_reducer_registry(
+    plan: &super::steps::StepPlan,
+) -> ReducerRegistry<ProfileValue, (), CallError> {
+    let mut registry = ReducerRegistry::new();
+    for (phase_id, phase) in plan.projected_phases() {
+        if steps_are_independent(&phase.steps) {
+            registry.register_collect_all(
+                par_reducer_id(phase_id),
+                Arc::new(LifecycleJoin { phase: phase_id }),
+            );
+        }
+    }
+    registry
 }
 
 /// The declared phase node `phase_id` names, looked up under `root`.
@@ -1685,6 +1924,7 @@ async fn resolve_lifecycle_step(
     let env = lifecycle_preflight(ctx, phase, payload, &phase_steps.steps)
         .map_err(|err| CallError::from(&err))?;
 
+    let (phase_index, _) = ctx.phase_meta_of(phase);
     let (base_id, kind) = report_base(ctx, phase);
     let sub_id = format!("{base_id}_{}", step_ref.index);
     let op = phase_steps.op;
@@ -1696,8 +1936,15 @@ async fn resolve_lifecycle_step(
     // take their mutexes for the duration of one push, after the step
     // has finished.
     let run = lifecycle::run_step(planned, op, &env, ctx.mode).await;
-    let summary = record_lifecycle_step(ctx, sub_id, kind, &planned.step, run)
-        .map_err(|err| CallError::from(&err))?;
+    let summary = record_lifecycle_step(
+        ctx,
+        sub_id,
+        (phase_index, step_ref.index),
+        kind,
+        &planned.step,
+        run,
+    )
+    .map_err(|err| CallError::from(&err))?;
     Ok(record_line(ctx, format!("{op} {summary}")))
 }
 
@@ -2001,7 +2248,7 @@ fn check_routed_demand(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsl_kit::IdGen;
+    use dsl_kit::{DslNode as _, IdGen};
 
     /// Which phases the host can route, pinned directly.
     ///
@@ -2130,5 +2377,199 @@ mod tests {
                 other => panic!("n{}: expected a Call, got {other:?}", id.0),
             }
         }
+    }
+
+    fn spec(phases: Vec<ProfileNode>, ids: &IdGen) -> ProfileNode {
+        ProfileNode::Spec {
+            id: ids.node(),
+            name: "parallel".into(),
+            version: None,
+            description: None,
+            capabilities: vec!["net.transfer".into(), "sh.exec".into()],
+            env: Default::default(),
+            env_secrets: Vec::new(),
+            paths: Vec::new(),
+            http_allowlist: Vec::new(),
+            phases,
+        }
+    }
+
+    /// The rule, stated over the steps rather than over the kind:
+    /// transfers to separate destinations may overlap, and nothing else
+    /// may.
+    #[test]
+    fn independence_is_decided_by_the_steps_not_by_the_phase_kind() {
+        let transfer = |dst: &str| {
+            lifecycle::PlannedStep::always(lifecycle::Step::Transfer {
+                src: "https://example.com/a.bin".into(),
+                dst: dst.into(),
+            })
+        };
+        let command = || lifecycle::PlannedStep::always(lifecycle::Step::Sh(vec!["git".into()]));
+
+        assert!(steps_are_independent(&[transfer("/a"), transfer("/b")]));
+        assert!(steps_are_independent(&[
+            transfer("/a"),
+            transfer("/b"),
+            transfer("/c")
+        ]));
+
+        // One destination written twice: overlapping them would turn "the
+        // later one wins" into "whichever finishes last wins".
+        assert!(!steps_are_independent(&[transfer("/a"), transfer("/a")]));
+        // A command's effect is unbounded from here.
+        assert!(!steps_are_independent(&[command(), command()]));
+        assert!(!steps_are_independent(&[transfer("/a"), command()]));
+        // Nothing to overlap.
+        assert!(!steps_are_independent(&[transfer("/a")]));
+        assert!(!steps_are_independent(&[]));
+    }
+
+    /// The decision reaches the AST the engine reads: a `models` phase is
+    /// a `Par` over its entries, a `custom_nodes` phase is a `Seq` over
+    /// clone → checkout → pip **in that order**, and the reducer the
+    /// `Par` names is registered.
+    #[test]
+    fn models_fans_out_and_custom_nodes_stays_in_order() {
+        let ids = IdGen::new();
+        let models = ProfileNode::Models {
+            id: ids.node(),
+            models_json: r#"[{"src":"https://e/a.bin","dst":"a.bin","subdir":"lora"},
+                             {"src":"https://e/b.bin","dst":"b.bin","subdir":"lora"}]"#
+                .into(),
+        };
+        let nodes = ProfileNode::CustomNodes {
+            id: ids.node(),
+            nodes_json: r#"[{"name":"n","repo":"o/n","ref":"v1","pip":true}]"#.into(),
+        };
+        let models_id = models.node_id();
+        let nodes_id = nodes.node_id();
+        let root = spec(vec![models, nodes], &ids);
+
+        let plan = crate::exec::steps::StepPlan::build(&root);
+        let ast = ProfileCallAst::new(&root, EffectRoute::Call, &plan);
+
+        let models_children = plan.phase(models_id).expect("projected").nodes.clone();
+        match ast.node_kind(models_id) {
+            NodeKind::Par {
+                children,
+                policy,
+                reducer_id,
+            } => {
+                assert_eq!(children, models_children);
+                assert!(matches!(policy.shape, JoinShape::All));
+                assert!(matches!(policy.fail, FailPolicy::CollectAll));
+                assert_eq!(reducer_id, par_reducer_id(models_id));
+                // The two readers of the same rule agree: the id the AST
+                // names resolves in the registry the run is built with.
+                assert!(lifecycle_reducer_registry(&plan)
+                    .resolve(&reducer_id, FailPolicy::CollectAll)
+                    .is_ok());
+            }
+            other => panic!("a models phase fans out, got {other:?}"),
+        }
+
+        let nodes_children = plan.phase(nodes_id).expect("projected").nodes.clone();
+        match ast.node_kind(nodes_id) {
+            // clone → checkout → pip is an order, not a list, and the
+            // engine is what enforces it.
+            NodeKind::Seq { children } => assert_eq!(children, nodes_children),
+            other => panic!("a custom_nodes phase stays sequential, got {other:?}"),
+        }
+        // …and the sequence it keeps is the composed one.
+        let steps = &plan.phase(nodes_id).expect("projected").steps;
+        let argv = |index: usize| match &steps[index].step {
+            lifecycle::Step::Sh(argv) => argv.clone(),
+            other => panic!("step {index} is {other:?}"),
+        };
+        assert_eq!(argv(0)[1], "clone");
+        assert_eq!(argv(1)[3], "checkout");
+        assert_eq!(argv(2)[1], "install");
+        // Nothing but the fanned-out phase names a reducer.
+        assert!(lifecycle_reducer_registry(&plan)
+            .resolve(&par_reducer_id(nodes_id), FailPolicy::CollectAll)
+            .is_err());
+    }
+
+    /// A single-entry `models` phase is left alone: a one-child `Par`
+    /// would say what the `Seq` already says, and would change the engine
+    /// shape of every single-transfer phase with it.
+    #[test]
+    fn a_single_entry_phase_is_not_worth_fanning_out() {
+        let ids = IdGen::new();
+        let models = ProfileNode::Models {
+            id: ids.node(),
+            models_json: r#"[{"src":"https://e/a.bin","dst":"a.bin"}]"#.into(),
+        };
+        let models_id = models.node_id();
+        let root = spec(vec![models], &ids);
+        let plan = crate::exec::steps::StepPlan::build(&root);
+        let ast = ProfileCallAst::new(&root, EffectRoute::Call, &plan);
+        assert!(matches!(ast.node_kind(models_id), NodeKind::Seq { .. }));
+    }
+
+    /// `llm_models` looks like a list of independent downloads and is
+    /// not one: `--local-dir` falls back to a single shared constant, so
+    /// two entries write into one directory.
+    #[test]
+    fn llm_models_entries_share_a_destination_directory_and_stay_sequential() {
+        let ids = IdGen::new();
+        let models = ProfileNode::LlmModels {
+            id: ids.node(),
+            models_json: r#"[{"src":"hf://o/a"},{"src":"hf://o/b"}]"#.into(),
+        };
+        let models_id = models.node_id();
+        let root = spec(vec![models], &ids);
+        let plan = crate::exec::steps::StepPlan::build(&root);
+        let steps = &plan.phase(models_id).expect("projected").steps;
+        let local_dir = |index: usize| match &steps[index].step {
+            lifecycle::Step::Sh(argv) => {
+                let at = argv
+                    .iter()
+                    .position(|arg| arg == "--local-dir")
+                    .expect("the download names a local dir");
+                argv[at + 1].clone()
+            }
+            other => panic!("step {index} is {other:?}"),
+        };
+        assert_eq!(
+            local_dir(0),
+            local_dir(1),
+            "two entries that declare no dst_dir land in one directory"
+        );
+        assert!(!steps_are_independent(steps));
+        let ast = ProfileCallAst::new(&root, EffectRoute::Call, &plan);
+        assert!(matches!(ast.node_kind(models_id), NodeKind::Seq { .. }));
+    }
+
+    /// The fold: every step answered means the phase's value is the last
+    /// one's (declaration order, not completion order); any failure ends
+    /// the run and the sentence counts them.
+    #[test]
+    fn the_join_propagates_the_last_value_and_stops_on_any_failure() {
+        let join = LifecycleJoin { phase: NodeId(7) };
+        let ok = |s: &str| Some(Ok(ProfileValue::Success(s.to_string())));
+        let err = || Some(Err(CallError("boom".to_string())));
+
+        // `winners` arrives in completion order — the fold must not use
+        // it to pick the value.
+        let (value, ()) = join
+            .reduce(&[ok("first"), ok("second")], &[None, None], &[1, 0])
+            .expect("every step answered");
+        assert_eq!(value, ProfileValue::Success("second".to_string()));
+
+        let one = join
+            .reduce(&[ok("first"), err()], &[None, None], &[0])
+            .expect_err("a failure ends the run");
+        assert!(one.to_string().contains("step 2 of 2 failed"), "{one}");
+
+        let two = join
+            .reduce(&[err(), ok("second"), err()], &[None; 3], &[1])
+            .expect_err("a failure ends the run");
+        assert!(
+            two.to_string().contains("2 of 3 steps failed")
+                && two.to_string().contains("the first was step 1"),
+            "{two}"
+        );
     }
 }

@@ -254,15 +254,17 @@ fn run_plan(profile: &Path) -> ExitCode {
 /// surface).
 fn run_apply(profile: &Path, dry_run: bool) -> ExitCode {
     // This `block_on` is the only one in the process: the engine is
-    // driven by `dsl_kit::drive_async` from here down, and a phase on
-    // the `Call` route is awaited rather than blocked on.
+    // driven by `apply::drive` from here down, and a phase on the `Call`
+    // route is awaited rather than blocked on.
     //
-    // Multi-threaded on purpose all the same: the ops that have not
-    // moved onto the `Call` route yet drive their async effect from the
-    // synchronous `Op::apply` seam (`exec::effects::block_on_effect`),
-    // which blocks its own worker and needs a sibling to keep the
-    // reactor turning. `Runtime::new` is the multi-threaded builder with
-    // every driver enabled.
+    // Multi-threaded on purpose all the same, for two reasons now. The
+    // ops that have not moved onto the `Call` route yet drive their async
+    // effect from the synchronous `Op::apply` seam
+    // (`exec::effects::block_on_effect`), which blocks its own worker and
+    // needs a sibling to keep the reactor turning; and a phase whose
+    // steps are independent hands several transfers to the runtime at
+    // once. `Runtime::new` is the multi-threaded builder with every
+    // driver enabled.
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => return print_failure("apply", err),
