@@ -328,21 +328,21 @@ impl ProfileOp {
         check_lifecycle_steps(&self.ctx, node, &steps)?;
 
         let mut renders = Vec::with_capacity(steps.len());
-        for (index, step) in steps.iter().enumerate() {
+        for (index, planned) in steps.iter().enumerate() {
             let sub_id = format!("{base_id}_{}", index + 1);
             // Audit before the sub-step runs. Env keys go through the
             // redaction helper (spec 09 §Audit log); the resolved values
             // from the phase's `env` map never reach the event.
-            audit_lifecycle_step(self.ctx.mode, &kind, step, &env);
+            audit_lifecycle_step(self.ctx.mode, &kind, &planned.step, &env);
             let run = effects::block_on_effect(
                 self.name,
-                lifecycle::run_step(step, self.name, &env, self.ctx.mode),
+                lifecycle::run_step(planned, self.name, &env, self.ctx.mode),
             );
             renders.push(record_lifecycle_step(
                 &self.ctx,
                 sub_id,
                 kind.clone(),
-                step,
+                &planned.step,
                 run,
             )?);
         }
@@ -1088,9 +1088,10 @@ fn check_step_policy(ctx: &ExecContext, step: &lifecycle::Step) -> Result<(), Ex
 fn check_lifecycle_steps(
     ctx: &ExecContext,
     phase: NodeId,
-    steps: &[lifecycle::Step],
+    steps: &[lifecycle::PlannedStep],
 ) -> Result<(), ExecError> {
-    for step in steps {
+    for planned in steps {
+        let step = &planned.step;
         let capability = match demand::step(step) {
             Ok(demanded) => demanded.capability,
             Err(err) => {
@@ -1124,7 +1125,7 @@ fn lifecycle_preflight(
     ctx: &ExecContext,
     phase: NodeId,
     payload: &ProfileNode,
-    steps: &[lifecycle::Step],
+    steps: &[lifecycle::PlannedStep],
 ) -> Result<std::collections::BTreeMap<String, String>, ExecError> {
     if let Some(capability) = demand::env_ref(payload) {
         if let Err(err) = ctx.gate.require(capability) {
@@ -1347,12 +1348,12 @@ impl ProfileCallAst {
             let Some(payload) = plan_phase_payload(root, phase_id) else {
                 continue;
             };
-            for (offset, step) in phase.steps.iter().enumerate() {
+            for (offset, planned) in phase.steps.iter().enumerate() {
                 overrides.insert(
                     phase.nodes[offset],
                     NodeKind::Call {
                         label: LIFECYCLE_STEP_CALL_LABEL.to_string(),
-                        payload: lifecycle_step_payload(payload, step, offset + 1, total),
+                        payload: lifecycle_step_payload(payload, &planned.step, offset + 1, total),
                     },
                 );
             }
@@ -1403,9 +1404,12 @@ fn plan_phase_payload(root: &ProfileNode, phase_id: NodeId) -> Option<&ProfileNo
 /// - a [`lifecycle::Step::Note`] declares its message, which is
 ///   host-composed text about what was *not* run.
 ///
-/// The step's `done` is deliberately absent: it is derived from the
-/// destination, which is already here, and printing the condition twice
-/// would only widen the surface.
+/// The step's condition is deliberately absent — this takes a
+/// [`lifecycle::Step`], not the [`lifecycle::PlannedStep`] beside it.
+/// Every condition is derived from payload fields the step's own
+/// declaration already carries (a transfer's destination, a clone's
+/// directory and ref), so publishing it would repeat what is here
+/// while widening the surface a watching client reads.
 fn lifecycle_step_payload(
     phase: &ProfileNode,
     step: &lifecycle::Step,
@@ -1660,7 +1664,7 @@ async fn resolve_lifecycle_step(
     ctx: &ExecContext,
     node: NodeId,
 ) -> Result<ProfileValue, CallError> {
-    let Some((phase_steps, step_ref, step)) = ctx.step_plan.locate(node) else {
+    let Some((phase_steps, step_ref, planned)) = ctx.step_plan.locate(node) else {
         return Err(CallError(format!(
             "n{} is labelled '{LIFECYCLE_STEP_CALL_LABEL}' but the step plan does not \
              project it; the AST and the plan disagree",
@@ -1687,13 +1691,13 @@ async fn resolve_lifecycle_step(
     // Audit before the step runs (spec 09 §Audit log). Env keys go
     // through the redaction helper; the resolved values never reach the
     // event.
-    audit_lifecycle_step(ctx.mode, &kind, step, &env);
+    audit_lifecycle_step(ctx.mode, &kind, &planned.step, &env);
     // No lock is held across this await: `record_line` / `push_report`
     // take their mutexes for the duration of one push, after the step
     // has finished.
-    let run = lifecycle::run_step(step, op, &env, ctx.mode).await;
-    let summary =
-        record_lifecycle_step(ctx, sub_id, kind, step, run).map_err(|err| CallError::from(&err))?;
+    let run = lifecycle::run_step(planned, op, &env, ctx.mode).await;
+    let summary = record_lifecycle_step(ctx, sub_id, kind, &planned.step, run)
+        .map_err(|err| CallError::from(&err))?;
     Ok(record_line(ctx, format!("{op} {summary}")))
 }
 

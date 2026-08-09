@@ -10,17 +10,19 @@
 //! "What does a finished `ModelFile` / `Service` / `Checkout` look like"
 //! is a separate design question, answered per entity. The model half
 //! of this module is the type, the value range, the composition, the
-//! evaluator and the two basic predicates; the entity half — currently
-//! [`Done`] and its one implementor [`ModelFile`] — sits at the bottom
-//! of the file and is what the lifecycle layer actually consumes.
+//! evaluator and the three basic predicates; the entity half —
+//! [`Done`] and its implementors [`ModelFile`] and [`Checkout`] — sits
+//! at the bottom of the file and is what the lifecycle layer actually
+//! consumes.
 //!
 //! ## Scope boundary
 //!
 //! The model was `pub(crate)` while nothing consumed it. It is public
-//! now because one entity has been wired end to end: `models` derives a
-//! `done` from [`ModelFile`], the lifecycle layer evaluates it before
-//! transferring, and [`crate::canonical::encode_assert`] gives it
-//! deterministic bytes.
+//! now because entities have been wired end to end: `models` derives a
+//! `done` from [`ModelFile`] and `comfyui.install` / `custom_nodes`
+//! from [`Checkout`], the lifecycle layer evaluates each before running
+//! the step it guards, and [`crate::canonical::encode_assert`] gives
+//! them deterministic bytes.
 //!
 //! **Nothing here is author-visible yet.** A profile cannot write a
 //! `done:` of its own — every `done` is derived from the phase kind —
@@ -127,10 +129,17 @@ impl CheckError {
 /// alike and the report prints the detail. A second category earns its
 /// place when a caller would branch on it.
 //
-// 段 B/C で決める: command exit codes, mount state and HTTP status are
-// observed on the far side of a transport, where "the observation did
-// not come back" is plausibly a different answer from "the observed
-// side said no". That is the shape that would split this enum.
+// The note this replaces expected command exit codes to be what split
+// the enum, on the grounds that a command observed across a transport
+// could fail to come back at all — a different answer from "the
+// observed side said no". [`Assert::GitTreeAt`] added command exit
+// codes and did not split it, for two reasons. The observation is local
+// (the provisioner runs on the pod it asks about), so "did not come
+// back" is not a case that arises here; and, more to the point, the
+// rule above still holds — the skip decision treats "git is not
+// installed" and "git exited 128" exactly alike, and the report prints
+// the detail either way. There is still no caller that would branch.
+// Mount state and HTTP status remain open on the same test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckErrorCategory {
     /// The observation could not be carried out at all (the observed
@@ -268,8 +277,113 @@ pub enum Assert {
         expected_sha256: String,
     },
 
+    /// The git repository at `dir` holds `git_ref`'s content.
+    ///
+    /// Observed by running [`git_tree_at_argv`] and reading its exit
+    /// status: `0` is `Satisfied`, `1` is `Unsatisfied`, anything else
+    /// is a [`CheckError`] (git's own convention — `--quiet` implies
+    /// `--exit-code`, and a broken repository or an unknown ref exits
+    /// `128`).
+    ///
+    /// ## Why this runs in a dry run too
+    ///
+    /// The two file predicates split on cost: existence is cheap and is
+    /// evaluated in both modes, a digest reads the whole file and is
+    /// not. A command predicate raises a second question, because the
+    /// precedents §3.7 cites both answer it the other way — Chef's
+    /// why-run suppresses shell-command guards, and Ansible's `command`
+    /// module evaluates `creates` / `removes` in check mode but does not
+    /// run the command. Neither is being cautious about *cost*; they are
+    /// being cautious about **side effects**, which a command generally
+    /// has and a read never does.
+    ///
+    /// This predicate is evaluated in both modes anyway, and the reason
+    /// is that it is not a general command:
+    ///
+    /// - **The command is fixed by the predicate.** A profile cannot
+    ///   write an `Assert` at all yet — every `done` is derived from a
+    ///   phase kind — and even when it can, this variant carries a
+    ///   repository and a ref, not an argv. The only command it can ever
+    ///   fire is [`git_tree_at_argv`]'s, which is a `git diff` under
+    ///   `--no-optional-locks`: a read, and a read that is denied even
+    ///   the index-refresh lock git would otherwise be free to take.
+    /// - **It is cheap** — the axis §3.7 does use. Resolving two refs
+    ///   and comparing two trees is a small local read, on the same
+    ///   order as the `stat` behind [`Assert::FileExists`].
+    ///
+    /// So the answer a dry run gives is the answer a real run gives, and
+    /// `plan` can say "this will clone" instead of "undecided". Had this
+    /// returned [`AssertOutcome::NotChecked`] instead, a `Checkout`
+    /// would have been *less* answerable in a dry run than a
+    /// [`ModelFile`] — which can at least decide an absent destination —
+    /// and the plan output would have gone backwards as entities were
+    /// added.
+    ///
+    /// **The obligation this creates** lands on the stage that lets an
+    /// author write a `done` of their own: an authored condition that
+    /// could name an arbitrary command would break the first bullet, and
+    /// that stage has to decide the question again rather than inherit
+    /// this answer.
+    ///
+    /// ## What "holds `git_ref`" means
+    ///
+    /// The comparison is `<git_ref>` against `HEAD`, both as commits, so
+    /// what is compared is **the content two commits name**, not the
+    /// commit identity and not the working tree:
+    ///
+    /// - a **dirty** work tree is still finished. It has to be: `git
+    ///   clone` / `git checkout` will not clean local modifications, so a
+    ///   condition that counted them would name something the step
+    ///   cannot achieve, and the step would run — and fail — on every
+    ///   apply. A completion condition an action cannot reach is not a
+    ///   completion condition.
+    /// - a **branch**, a **tag** and a **sha** are judged alike, because
+    ///   the ref is resolved in the same local repository the step
+    ///   produced. Neither the step nor this predicate fetches, so a
+    ///   branch that has moved upstream is not a difference either of
+    ///   them can see, and reporting one would be an answer about a
+    ///   remote that nothing in this phase consults.
+    GitTreeAt {
+        /// The work tree observed.
+        dir: PathBuf,
+        /// The ref — branch, tag or commit — its content must match.
+        git_ref: String,
+    },
+
     /// Conjunction. Child order is the order the author wrote.
     All(NonEmpty<Assert>),
+}
+
+/// The command [`Assert::GitTreeAt`] fires.
+///
+/// **A template, not an argument.** Everything variable in it is a
+/// repository path and a ref; the verb, the flags and their order are
+/// fixed here, which is what makes "this predicate has no side effects"
+/// a property of the code rather than a promise about the caller.
+///
+/// - `--no-optional-locks` is git's own answer to "a tool is inspecting
+///   this repository and must not write to it": it suppresses the
+///   optional index refresh, which is the one write a plain `git diff`
+///   might otherwise perform.
+/// - `--quiet` implies `--exit-code`, so the answer arrives as the exit
+///   status and no output has to be parsed.
+/// - Two revisions are compared, rather than one revision against the
+///   work tree, so local modifications do not enter the answer (see
+///   [`Assert::GitTreeAt`]).
+/// - The trailing `--` keeps a ref that looks like a path from being
+///   read as a pathspec.
+fn git_tree_at_argv(dir: &Path, git_ref: &str) -> Vec<String> {
+    vec![
+        "git".to_string(),
+        "--no-optional-locks".to_string(),
+        "-C".to_string(),
+        dir.to_string_lossy().into_owned(),
+        "diff".to_string(),
+        "--quiet".to_string(),
+        git_ref.to_string(),
+        "HEAD".to_string(),
+        "--".to_string(),
+    ]
 }
 
 // ---------------------------------------------------------------------
@@ -495,6 +609,26 @@ pub trait Observe {
         &self,
         path: &Path,
     ) -> impl Future<Output = Result<DigestReading, CheckError>> + Send;
+
+    /// Run `argv` and report the status it exited with.
+    ///
+    /// `Ok(code)` means the command ran to completion; the code is the
+    /// process's, and what it *means* belongs to the predicate that
+    /// composed the argv (git's `1` is not curl's). `Err` is reserved
+    /// for "it could not be run at all" — a missing binary is detected,
+    /// so it is an answer, not a host-process error.
+    ///
+    /// **The channel is general; the expressions on it are not.** This
+    /// method takes any argv because an observation channel that took a
+    /// closed set of commands would have to be widened for every
+    /// predicate. What may reach it is decided one level up, by
+    /// [`Assert`] having no variant that carries an author's argv — see
+    /// [`Assert::GitTreeAt`] for why that distinction is what lets a
+    /// command be observed during a dry run.
+    fn command_status(
+        &self,
+        argv: &[String],
+    ) -> impl Future<Output = Result<i32, CheckError>> + Send;
 }
 
 // ---------------------------------------------------------------------
@@ -520,10 +654,21 @@ pub trait Observe {
 /// **Nothing short-circuits: every child is evaluated.** Stopping at
 /// fold row 1 would leave unevaluated branches needing a value, and
 /// `NotChecked` would then mean both "policy said no" and "the answer
-/// was already settled". This stage's two predicates are side-effect
-/// free reads, so full evaluation and short-circuiting are
-/// indistinguishable apart from cost; that gets revisited when a
-/// predicate with side effects (running a command) arrives.
+/// was already settled".
+///
+/// **That was left to be reconsidered once a predicate ran a command,
+/// and it has been.** [`Assert::GitTreeAt`] does spawn a process, so
+/// full evaluation is no longer free — a conjunction whose first child
+/// already answered `Unsatisfied` still pays for a `git` invocation. It
+/// stays anyway, for two reasons. The command is a read (the variant's
+/// doc argues that at length), so short-circuiting would still be
+/// *observationally* indistinguishable and the difference remains cost
+/// alone. And the cost is one local process per leaf, against a step
+/// that clones a repository — while what short-circuiting would buy is
+/// paid for in the report, where the skipped branch is exactly the one
+/// an operator needs to see. A predicate that changed the host would
+/// reopen this properly; a predicate that merely takes longer to read
+/// does not.
 ///
 /// `mode` is [`crate::exec::ExecMode`], the same type the rest of the
 /// execution layer branches on — a second mode type would split one
@@ -573,6 +718,33 @@ pub async fn eval<O: Observe + Sync>(assert: &Assert, mode: ExecMode, obs: &O) -
                     }
                     Err(error) => AssertOutcome::CheckFailed(error),
                 },
+            };
+            AssertNode::Leaf {
+                id: AssertExecutionId::next(),
+                outcome,
+            }
+        }
+
+        Assert::GitTreeAt { dir, git_ref } => {
+            // Evaluated in both modes: the command is the predicate's
+            // own, is read-only by construction, and costs about what a
+            // `stat` does (see the variant's doc for the whole
+            // argument). `mode` therefore does not appear here.
+            let argv = git_tree_at_argv(dir, git_ref);
+            let outcome = match obs.command_status(&argv).await {
+                Ok(0) => AssertOutcome::Satisfied,
+                Ok(1) => AssertOutcome::Unsatisfied,
+                // Anything else is git failing to answer rather than
+                // answering "no": no repository there, an unknown ref, a
+                // signal (which `sh_exec` reports as `-1`). The skip
+                // decision treats it like `Unsatisfied` — the work runs
+                // — but the report has to be able to tell them apart,
+                // which is the whole reason this variant exists.
+                Ok(code) => AssertOutcome::CheckFailed(CheckError::new(
+                    CheckErrorCategory::Unobservable,
+                    format!("git exited {code}"),
+                )),
+                Err(error) => AssertOutcome::CheckFailed(error),
             };
             AssertNode::Leaf {
                 id: AssertExecutionId::next(),
@@ -683,6 +855,9 @@ fn write_assert(assert: &Assert, node: Option<&AssertNode>, out: &mut String) {
         } => {
             out.push_str(&format!("sha256({})={expected_sha256}", path.display()));
         }
+        Assert::GitTreeAt { dir, git_ref } => {
+            out.push_str(&format!("git_tree({})={git_ref}", dir.display()));
+        }
         Assert::All(children) => {
             let child_nodes = match node {
                 Some(AssertNode::All { children, .. }) => Some(children),
@@ -717,17 +892,20 @@ fn write_assert(assert: &Assert, node: Option<&AssertNode>, out: &mut String) {
 /// kind of thing, not once per kind of phase (design §3.4: the payoff
 /// is the conjunctions that recur across kinds).
 ///
-/// Whether the next two entities fit this shape, one line each:
+/// **The signature held for the second entity.** [`Checkout`] was
+/// predicted to fit — needing a new [`Assert`] variant, not a new
+/// signature — and it does: `fn done(&self) -> Assert`, infallible,
+/// with the repository and the ref as constructor input exactly as
+/// `sha256` is for [`ModelFile`]. What did *not* hold was where the
+/// condition was kept: it used to sit on one `Step` variant, and a
+/// second entity is what turned that into
+/// [`crate::exec::lifecycle::PlannedStep`].
 ///
-/// - **`Checkout`** (段 2: dir exists ∧ ref matches, shared by
-///   `comfyui.install` and `custom_nodes`) — fits: it needs a command
-///   exit-code predicate that does not exist yet, but that is a new
-///   [`Assert`] variant, not a change to this signature.
-/// - **`Service`** (段 3: pid alive ∧ cmdline matches ∧ 2xx, shared by
-///   `comfyui.restart` and `service.start`) — fits: the launch argv it
-///   compares against is constructor input, exactly as `sha256` is
-///   here, and the poll that waits for it is the step's execution
-///   strategy rather than part of the condition (design §3.2c).
+/// **`Service`** (段 4: pid alive ∧ cmdline matches ∧ 2xx, shared by
+/// `comfyui.restart` and `service.start`) is expected to fit too: the
+/// launch argv it compares against is constructor input like the two
+/// above, and the poll that waits for it is the step's execution
+/// strategy rather than part of the condition (design §3.2c).
 ///
 /// The signature is deliberately infallible (`-> Assert`, not
 /// `-> Result<Assert, _>`). A payload too underspecified to say what
@@ -806,6 +984,81 @@ impl Done for ModelFile {
     }
 }
 
+/// One git working copy a phase puts on the pod.
+///
+/// Shared by `comfyui.install` (which clones and checks out in a single
+/// composed step) and `custom_nodes` (which clones and, when the entry
+/// names a `ref`, checks out in a second one) — the recurrence design
+/// §3.4 gives as the reason for an entity to exist at all.
+///
+/// Its identity is the destination directory plus, when the profile
+/// names one, the ref its content must match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkout {
+    dir: PathBuf,
+    git_ref: Option<String>,
+}
+
+impl Checkout {
+    /// A working copy at `dir`, optionally pinned to `git_ref`.
+    ///
+    /// `None` is a profile that named no ref — a `custom_nodes` entry
+    /// that only clones — not a ref that is unknown yet.
+    pub fn new(dir: impl Into<PathBuf>, git_ref: Option<String>) -> Self {
+        Self {
+            dir: dir.into(),
+            git_ref,
+        }
+    }
+}
+
+impl Done for Checkout {
+    /// A repository is there and — when the profile named a ref — holds
+    /// that ref's content.
+    ///
+    /// **The weak half is `<dir>/.git`, not `<dir>`.** Design §3.3 says
+    /// existence alone does not finish a checkout, and this is where
+    /// that is paid: a directory can exist without being a clone (the
+    /// operator made it, an earlier tool wrote into it), and answering
+    /// "finished" for one would skip the clone and leave every step
+    /// after it working against an empty tree. Asking for the
+    /// repository's own directory is the same cost and a true statement.
+    /// It is still the weaker half, and honestly so: an interrupted
+    /// clone can leave a `.git` behind, and a profile that named no ref
+    /// has asked for "there is a clone here" and gets exactly that.
+    ///
+    /// **With a ref, the conjunction is load-bearing** — for a different
+    /// reason than [`ModelFile`]'s. There the second conjunct goes
+    /// `NotChecked` in a dry run, so the first is what keeps the answer
+    /// decidable. Here [`Assert::GitTreeAt`] answers in both modes, but
+    /// on a pod where nothing has been cloned yet it answers
+    /// `CheckFailed` — git cannot find a repository to compare in. On
+    /// its own that is "undecided"; conjoined with the existence of
+    /// `.git`, fold row 1 makes the answer `Unsatisfied`, which is the
+    /// difference between a plan that says "this will clone" and a plan
+    /// that says it could not tell. The tree keeps git's failure
+    /// underneath either way (design §3.2b'), so nothing is hidden by
+    /// deciding.
+    ///
+    /// The order is existence first, which is also the order a reader
+    /// wants: is there a clone, and is it the right one.
+    fn done(&self) -> Assert {
+        let cloned = Assert::FileExists {
+            path: self.dir.join(".git"),
+        };
+        match &self.git_ref {
+            None => cloned,
+            Some(git_ref) => Assert::All(NonEmpty::new(
+                cloned,
+                vec![Assert::GitTreeAt {
+                    dir: self.dir.clone(),
+                    git_ref: git_ref.clone(),
+                }],
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,10 +1080,21 @@ mod tests {
         Unobservable,
     }
 
+    /// How a command ends, from an observation's point of view.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HostCommand {
+        /// It ran and exited with this status.
+        Exits(i32),
+        /// It could not be started at all (the binary is not there).
+        Unrunnable,
+    }
+
     /// Answers observations from a fixed table, so a whole evaluation is
-    /// reproducible without touching the real filesystem.
+    /// reproducible without touching the real filesystem — or spawning
+    /// anything.
     struct FakeHost {
         files: BTreeMap<PathBuf, HostFile>,
+        commands: BTreeMap<Vec<String>, HostCommand>,
     }
 
     impl FakeHost {
@@ -840,7 +1104,17 @@ mod tests {
                     .iter()
                     .map(|(path, state)| (PathBuf::from(path), *state))
                     .collect(),
+                commands: BTreeMap::new(),
             }
+        }
+
+        /// Fix what `argv` does. A command this is not called for is
+        /// [`HostCommand::Unrunnable`] — a test that did not say what a
+        /// command does gets the answer that says so, rather than a
+        /// silent success.
+        fn running(mut self, argv: Vec<String>, reply: HostCommand) -> Self {
+            self.commands.insert(argv, reply);
+            self
         }
 
         fn at(&self, path: &Path) -> HostFile {
@@ -854,6 +1128,13 @@ mod tests {
 
     fn unobservable() -> CheckError {
         CheckError::new(CheckErrorCategory::Unobservable, UNOBSERVABLE_DETAIL)
+    }
+
+    /// What a command that could not be started answers with.
+    const UNRUNNABLE_DETAIL: &str = "the command could not be started";
+
+    fn unrunnable() -> CheckError {
+        CheckError::new(CheckErrorCategory::Unobservable, UNRUNNABLE_DETAIL)
     }
 
     impl Observe for FakeHost {
@@ -873,6 +1154,18 @@ mod tests {
                     crate::digest::hex_sha256(content.as_bytes()),
                 )),
                 HostFile::Unobservable => Err(unobservable()),
+            }
+        }
+
+        async fn command_status(&self, argv: &[String]) -> Result<i32, CheckError> {
+            match self
+                .commands
+                .get(argv)
+                .copied()
+                .unwrap_or(HostCommand::Unrunnable)
+            {
+                HostCommand::Exits(code) => Ok(code),
+                HostCommand::Unrunnable => Err(unrunnable()),
             }
         }
     }
@@ -1036,15 +1329,27 @@ mod tests {
     ///
     /// The enumeration is over **leaves only**, literally:
     ///
-    /// | predicate | host states | modes |
+    /// | predicate | observations | modes |
     /// |---|---|---|
     /// | file exists | absent / present (observable) / unobservable | `Real`, `DryRun` |
     /// | file digest | absent / present matching / present differing / unobservable | `Real`, `DryRun` |
+    /// | git tree at | exit 0 / exit 1 / exit 128 / could not be started | `Real`, `DryRun` |
     ///
-    /// = 3×2 + 4×2 = **14 combinations**. It is not written as
-    /// "2 predicates × 4 host states × 2 modes": the existence predicate
-    /// has no matching/differing distinction, so that product would
-    /// double-count and the count would depend on how it was written.
+    /// = 3×2 + 4×2 + 4×2 = **22 combinations**. It is not written as
+    /// "3 predicates × 4 observations × 2 modes": the existence
+    /// predicate has no matching/differing distinction, so that product
+    /// would double-count and the count would depend on how it was
+    /// written.
+    ///
+    /// **The third row is what this stage adds, and it is why the
+    /// enumeration is the Done Criteria rather than a nicety.** The
+    /// command predicate answers *identically* in both modes — it does
+    /// not merely avoid returning `Satisfied` in a dry run, it returns
+    /// the same thing a real run would — so the contract holds by the
+    /// strongest available margin. The four observations are git's own
+    /// documented exit shapes for `diff --quiet` (`0` no difference,
+    /// `1` difference, other = git failed) plus the binary being
+    /// missing, which is an answer rather than an error (design §3.2b).
     ///
     /// Composition is *not* covered here — the contract is a property of
     /// leaves, and a version of this that enumerated `All` up to depth 2
@@ -1056,66 +1361,100 @@ mod tests {
     async fn every_leaf_satisfies_the_dry_run_contract() {
         let matching = "content that matches";
         let expected = digest_of(matching);
+        let file = |state| FakeHost::new(&[("/target", state)]);
+        let repo =
+            |reply| FakeHost::new(&[]).running(git_tree_at_argv(Path::new("/repo"), "v1"), reply);
+        let at_v1 = || Assert::GitTreeAt {
+            dir: PathBuf::from("/repo"),
+            git_ref: "v1".to_string(),
+        };
 
-        // (host state, assert, expected DryRun answer, expected Real answer)
-        let cases: Vec<(&str, Assert, AssertOutcome, AssertOutcome)> = vec![
-            // file exists — 3 host states.
+        // (label, host, assert, expected DryRun answer, expected Real answer)
+        let cases: Vec<(&str, FakeHost, Assert, AssertOutcome, AssertOutcome)> = vec![
+            // file exists — 3 observations.
             (
                 "exists / absent",
+                file(HostFile::Absent),
                 exists("/target"),
                 AssertOutcome::Unsatisfied,
                 AssertOutcome::Unsatisfied,
             ),
             (
                 "exists / present",
+                file(HostFile::Readable(matching)),
                 exists("/target"),
                 AssertOutcome::Satisfied,
                 AssertOutcome::Satisfied,
             ),
             (
                 "exists / unobservable",
+                file(HostFile::Unobservable),
                 exists("/target"),
                 failed(UNOBSERVABLE_DETAIL),
                 failed(UNOBSERVABLE_DETAIL),
             ),
-            // file digest — 4 host states.
+            // file digest — 4 observations.
             (
                 "digest / absent",
+                file(HostFile::Absent),
                 digest("/target", &expected),
                 AssertOutcome::NotChecked,
                 AssertOutcome::Unsatisfied,
             ),
             (
                 "digest / present matching",
+                file(HostFile::Readable(matching)),
                 digest("/target", &expected),
                 AssertOutcome::NotChecked,
                 AssertOutcome::Satisfied,
             ),
             (
                 "digest / present differing",
+                file(HostFile::Readable("content that does not match")),
                 digest("/target", &expected),
                 AssertOutcome::NotChecked,
                 AssertOutcome::Unsatisfied,
             ),
             (
                 "digest / unobservable",
+                file(HostFile::Unobservable),
                 digest("/target", &expected),
                 AssertOutcome::NotChecked,
                 failed(UNOBSERVABLE_DETAIL),
             ),
-        ];
-        let hosts = [
-            HostFile::Absent,
-            HostFile::Readable(matching),
-            HostFile::Unobservable,
-            HostFile::Absent,
-            HostFile::Readable(matching),
-            HostFile::Readable("content that does not match"),
-            HostFile::Unobservable,
+            // git tree at — 4 observations, answering the same in both
+            // modes.
+            (
+                "git tree / exit 0 (no difference)",
+                repo(HostCommand::Exits(0)),
+                at_v1(),
+                AssertOutcome::Satisfied,
+                AssertOutcome::Satisfied,
+            ),
+            (
+                "git tree / exit 1 (difference)",
+                repo(HostCommand::Exits(1)),
+                at_v1(),
+                AssertOutcome::Unsatisfied,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "git tree / exit 128 (no repository, or unknown ref)",
+                repo(HostCommand::Exits(128)),
+                at_v1(),
+                failed("git exited 128"),
+                failed("git exited 128"),
+            ),
+            (
+                "git tree / git could not be started",
+                repo(HostCommand::Unrunnable),
+                at_v1(),
+                failed(UNRUNNABLE_DETAIL),
+                failed(UNRUNNABLE_DETAIL),
+            ),
         ];
 
-        for ((label, assert, want_dry, want_real), state) in cases.into_iter().zip(hosts) {
-            let host = FakeHost::new(&[("/target", state)]);
+        for (label, host, assert, want_dry, want_real) in cases {
             let dry = eval(&assert, ExecMode::DryRun, &host).await;
             let real = eval(&assert, ExecMode::Real, &host).await;
             assert_eq!(dry.outcome(), &want_dry, "{label} under DryRun");
@@ -1385,6 +1724,160 @@ mod tests {
             &AssertOutcome::NotChecked,
             "a present file is undecided in a dry run: the digest was not read",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The second entity: Checkout
+    // -----------------------------------------------------------------
+
+    fn checkout_host(dir: &str, git_ref: &str, state: HostFile, reply: HostCommand) -> FakeHost {
+        FakeHost::new(&[(&format!("{dir}/.git"), state)])
+            .running(git_tree_at_argv(Path::new(dir), git_ref), reply)
+    }
+
+    /// A profile that named no ref asks for a repository and gets one —
+    /// a bare predicate, no conjunction around it.
+    ///
+    /// **The subject is `<dir>/.git`, not `<dir>`.** A directory that
+    /// exists without being a clone is a real state of a pod, and
+    /// answering "finished" for it would skip the clone and leave every
+    /// later step working against an empty tree (design §3.3:
+    /// "`Checkout` は存在だけでは足りない").
+    #[test]
+    fn a_checkout_without_a_ref_asks_for_the_repository_alone() {
+        let done = Checkout::new("/workspace/ComfyUI", None).done();
+        assert_eq!(
+            done,
+            Assert::FileExists {
+                path: PathBuf::from("/workspace/ComfyUI/.git"),
+            },
+        );
+        assert!(
+            !matches!(done, Assert::All(_)),
+            "a lone predicate must not be wrapped in a conjunction",
+        );
+    }
+
+    /// With a ref the condition is repository ∧ ref, in that order.
+    #[test]
+    fn a_checkout_with_a_ref_conjoins_the_repository_and_the_ref() {
+        let done = Checkout::new("/nodes/impact", Some("v2".to_string())).done();
+        assert_eq!(
+            done,
+            Assert::All(NonEmpty::new(
+                Assert::FileExists {
+                    path: PathBuf::from("/nodes/impact/.git"),
+                },
+                vec![Assert::GitTreeAt {
+                    dir: PathBuf::from("/nodes/impact"),
+                    git_ref: "v2".to_string(),
+                }],
+            )),
+        );
+    }
+
+    /// **Why the conjunction is load-bearing**, and it is not the same
+    /// reason as [`ModelFile`]'s.
+    ///
+    /// On a pod where nothing has been cloned, `git` has no repository
+    /// to compare in and exits 128 — `CheckFailed`, i.e. "undecided" on
+    /// its own. The existence conjunct answers `Unsatisfied`, and fold
+    /// row 1 makes the whole condition `Unsatisfied`: **this will
+    /// clone**, which is what a plan has to be able to say. The tree
+    /// still carries git's failure underneath, so deciding hides
+    /// nothing (design §3.2b').
+    ///
+    /// Both modes, because the command predicate does not change its
+    /// answer between them — the dry run is as decided as the real run.
+    #[tokio::test]
+    async fn a_checkout_on_a_pod_with_no_clone_is_decided_rather_than_undecided() {
+        let done = Checkout::new("/workspace/ComfyUI", Some("v0.1.0".to_string())).done();
+        let host = checkout_host(
+            "/workspace/ComfyUI",
+            "v0.1.0",
+            HostFile::Absent,
+            HostCommand::Exits(128),
+        );
+
+        for mode in [ExecMode::DryRun, ExecMode::Real] {
+            let node = eval(&done, mode, &host).await;
+            assert_eq!(
+                node.outcome(),
+                &AssertOutcome::Unsatisfied,
+                "{mode:?}: an absent repository is decided, not undecided",
+            );
+            assert_eq!(
+                shape(&node),
+                Shape::All(
+                    AssertOutcome::Unsatisfied,
+                    vec![
+                        Shape::Leaf(AssertOutcome::Unsatisfied),
+                        Shape::Leaf(failed("git exited 128")),
+                    ],
+                ),
+                "{mode:?}: git's failure survives in the tree",
+            );
+        }
+    }
+
+    /// The three answers a cloned repository can give, in both modes:
+    /// at the ref, at a different one, and unreadable.
+    #[tokio::test]
+    async fn a_cloned_repository_answers_on_the_ref() {
+        let done = Checkout::new("/repo", Some("v1".to_string())).done();
+        let cases = [
+            (HostCommand::Exits(0), AssertOutcome::Satisfied),
+            (HostCommand::Exits(1), AssertOutcome::Unsatisfied),
+            (HostCommand::Exits(128), failed("git exited 128")),
+            (HostCommand::Unrunnable, failed(UNRUNNABLE_DETAIL)),
+        ];
+        for (reply, want) in cases {
+            let host = checkout_host("/repo", "v1", HostFile::Readable("gitdir"), reply);
+            for mode in [ExecMode::DryRun, ExecMode::Real] {
+                assert_eq!(
+                    eval(&done, mode, &host).await.outcome(),
+                    &want,
+                    "{reply:?} under {mode:?}",
+                );
+            }
+        }
+    }
+
+    /// The command is a template of the two fields, and read-only by
+    /// construction: nothing an entity supplies can change the verb or
+    /// the flags. That is the property the dry-run decision rests on
+    /// ([`Assert::GitTreeAt`]), so it is pinned rather than left to be
+    /// read off the source.
+    #[test]
+    fn the_command_the_predicate_fires_is_a_read_only_template() {
+        assert_eq!(
+            git_tree_at_argv(Path::new("/workspace/ComfyUI"), "v0.1.0"),
+            vec![
+                "git".to_string(),
+                "--no-optional-locks".to_string(),
+                "-C".to_string(),
+                "/workspace/ComfyUI".to_string(),
+                "diff".to_string(),
+                "--quiet".to_string(),
+                "v0.1.0".to_string(),
+                "HEAD".to_string(),
+                "--".to_string(),
+            ],
+        );
+    }
+
+    /// A branch, a tag and a commit compose the same command, so they
+    /// are judged the same way: the ref is resolved in the local
+    /// repository the step produced, and neither the step nor this
+    /// predicate fetches.
+    #[test]
+    fn a_branch_a_tag_and_a_sha_are_all_just_the_ref() {
+        let dir = Path::new("/repo");
+        for git_ref in ["main", "v1.2.3", "9660479"] {
+            let argv = git_tree_at_argv(dir, git_ref);
+            assert_eq!(argv[6], git_ref, "the ref reaches the command verbatim");
+            assert_eq!(argv[7], "HEAD");
+        }
     }
 
     // -----------------------------------------------------------------

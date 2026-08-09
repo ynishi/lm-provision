@@ -140,6 +140,19 @@ fn assert_to_canon(assert: &Assert) -> CanonValue {
             fields.insert("path".into(), CanonValue::Str(path_string(path)));
             CanonValue::Object(fields)
         }
+        Assert::GitTreeAt { dir, git_ref } => {
+            let mut fields = variant_object("GitTreeAt");
+            // The argv the predicate fires is *not* encoded: it is a
+            // fixed template of these two fields
+            // (`exec::assert::git_tree_at_argv`), so writing it would
+            // put a host implementation detail into bytes that are
+            // supposed to describe the condition — and a change to the
+            // template's flags would then move a profile's hash without
+            // the profile having changed.
+            fields.insert("dir".into(), CanonValue::Str(path_string(dir)));
+            fields.insert("git_ref".into(), CanonValue::Str(git_ref.clone()));
+            CanonValue::Object(fields)
+        }
         Assert::All(children) => {
             let mut fields = variant_object("All");
             fields.insert(
@@ -823,6 +836,17 @@ mod tests {
                         .expect("a digest predicate carries its expectation")
                         .to_string(),
                 },
+                "GitTreeAt" => Assert::GitTreeAt {
+                    dir: std::path::PathBuf::from(
+                        value["dir"]
+                            .as_str()
+                            .expect("a git predicate carries its work tree"),
+                    ),
+                    git_ref: value["git_ref"]
+                        .as_str()
+                        .expect("a git predicate carries its ref")
+                        .to_string(),
+                },
                 "All" => {
                     let children = value["children"]
                         .as_array()
@@ -850,17 +874,27 @@ mod tests {
             path: std::path::PathBuf::from(path),
             expected_sha256: hex.to_string(),
         };
+        let git = |dir: &str, git_ref: &str| Assert::GitTreeAt {
+            dir: std::path::PathBuf::from(dir),
+            git_ref: git_ref.to_string(),
+        };
         vec![
             exists("/a"),
             exists("/b"),
             digest("/a", "ab"),
             digest("/a", "cd"),
             digest("/b", "ab"),
+            // The two fields of the git predicate vary independently,
+            // so both have to reach the bytes.
+            git("/a", "v1"),
+            git("/a", "v2"),
+            git("/b", "v1"),
             Assert::All(NonEmpty::new(exists("/a"), vec![])),
             Assert::All(NonEmpty::new(exists("/a"), vec![digest("/a", "ab")])),
             // Same children, other order: the fold's tie-break depends
             // on it, so the bytes must too.
             Assert::All(NonEmpty::new(digest("/a", "ab"), vec![exists("/a")])),
+            Assert::All(NonEmpty::new(exists("/a/.git"), vec![git("/a", "v1")])),
             Assert::All(NonEmpty::new(
                 Assert::All(NonEmpty::new(exists("/a"), vec![exists("/b")])),
                 vec![digest("/b", "ab")],
@@ -912,6 +946,33 @@ mod tests {
                 "{\"expected_sha256\":\"ab\",\"path\":\"/w/a.bin\",\"type\":\"FileDigest\"}",
                 "],\"type\":\"All\"}",
             ),
+        );
+    }
+
+    /// The second entity's bytes, likewise pinned.
+    ///
+    /// **The argv the predicate fires is not in them.** It is a fixed
+    /// template of `dir` and `git_ref`, so encoding it would put a host
+    /// implementation detail into a description of the condition — and
+    /// a change to git's flags would then move a profile's hash without
+    /// the profile changing.
+    #[test]
+    fn the_git_predicate_encodes_its_two_fields_and_not_its_command() {
+        let done =
+            crate::exec::assert::Checkout::new("/workspace/ComfyUI", Some("v0.1.0".into())).done();
+        let encoded = encode_assert(&done);
+        assert_eq!(
+            encoded,
+            concat!(
+                "{\"children\":[",
+                "{\"path\":\"/workspace/ComfyUI/.git\",\"type\":\"FileExists\"},",
+                "{\"dir\":\"/workspace/ComfyUI\",\"git_ref\":\"v0.1.0\",\"type\":\"GitTreeAt\"}",
+                "],\"type\":\"All\"}",
+            ),
+        );
+        assert!(
+            !encoded.contains("--no-optional-locks") && !encoded.contains("diff"),
+            "the command is not part of the condition's bytes: {encoded}",
         );
     }
 

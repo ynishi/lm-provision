@@ -148,28 +148,6 @@ pub enum Step {
         src: String,
         /// Destination local path or URL.
         dst: String,
-        /// What being finished looks like, when the phase knows.
-        ///
-        /// Evaluated before the transfer runs; a
-        /// [`AssertOutcome::Satisfied`](assert::AssertOutcome::Satisfied)
-        /// answer skips it (design §3.1: the same predicate, used to
-        /// skip rather than to fail). Every other answer — including
-        /// `NotChecked` and `CheckFailed` — transfers, which is the
-        /// safe direction.
-        ///
-        /// `None` is a step whose phase derives no entity: a
-        /// `sync.pull` / `staging.push` transfer names an arbitrary
-        /// source and destination and has no declared identity to
-        /// check, so it runs every time exactly as it did before.
-        //
-        // The model puts `done` on the *step* rather than on one step
-        // shape (design §3.2), which here would be a struct wrapping
-        // this enum. It sits on `Transfer` alone because `Transfer` is
-        // the only shape with an entity so far; when 段 2 gives `Sh`
-        // one (`Checkout`) and 段 3 gives `HttpPoll` one (`Service`),
-        // the field belongs on the wrapper instead, and moving it then
-        // is one refactor rather than three field additions.
-        done: Option<assert::Assert>,
     },
     /// Poll `url` via [`effects::http_get`] until a 2xx response or
     /// `timeout_sec` elapses.
@@ -192,6 +170,61 @@ pub enum Step {
     Note(String),
 }
 
+/// One step, plus what its being finished looks like.
+///
+/// **The condition sits beside the step rather than inside it**, which
+/// is where the second entity put it. While `models` was the only phase
+/// deriving one, `done` was a field on [`Step::Transfer`]; `Checkout`
+/// gives `comfyui.install` and `custom_nodes` a condition on a
+/// [`Step::Sh`], and adding a second field would have meant a third
+/// when `Service` reaches [`Step::HttpPoll`] — with the skip written
+/// out once per shape each time. Here it is written once, for every
+/// shape, in [`execute_step`] and [`dry_run_step`].
+///
+/// The split is not only convenience. What a step *is* — the capability
+/// it demands ([`super::demand::step`]), the audit event it emits, the
+/// report fields it declares — is a property of the effect, and every
+/// one of those readers still takes a [`Step`]. What being finished
+/// looks like is a property of the entity the phase derived, and
+/// nothing about it is per-effect: the answer is folded the same way and
+/// only `Satisfied` skips, whether the step clones a repository or
+/// downloads a weight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedStep {
+    /// The effect to run.
+    pub step: Step,
+    /// What has to hold for the step to be finished.
+    ///
+    /// Evaluated before the step runs; an
+    /// [`AssertOutcome::Satisfied`](assert::AssertOutcome::Satisfied)
+    /// answer skips it (design §3.1: the same predicate, used to skip
+    /// rather than to fail). Every other answer — including
+    /// `NotChecked` and `CheckFailed` — runs the step, which is the
+    /// safe direction.
+    ///
+    /// `None` is a step whose phase derives no entity: a `sync.pull`
+    /// transfer names an arbitrary source and destination, a
+    /// `hooks.post_install` runs a script only its author can judge, a
+    /// `custom_nodes` pip install puts requirements in a venv — none of
+    /// them has a declared identity to check, so they run every time.
+    pub done: Option<assert::Assert>,
+}
+
+impl PlannedStep {
+    /// A step that runs on every apply.
+    pub fn always(step: Step) -> Self {
+        Self { step, done: None }
+    }
+
+    /// A step that is skipped once `done` holds.
+    pub fn done_when(step: Step, done: assert::Assert) -> Self {
+        Self {
+            step,
+            done: Some(done),
+        }
+    }
+}
+
 /// Expand a lifecycle payload node into its list of executable steps.
 ///
 /// Pure (no I/O) — the registry decides what to do with the steps based
@@ -202,7 +235,7 @@ pub enum Step {
 /// [`ExecError::EffectFailed`] on a malformed payload JSON string
 /// (that shape is authored input, so a parse error is an op failure,
 /// not an internal programmer error).
-pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
+pub fn expand(payload: &ProfileNode) -> Result<Vec<PlannedStep>, ExecError> {
     match payload {
         ProfileNode::SystemApt { packages, .. } => Ok(expand_system_apt(packages)),
         ProfileNode::ComfyUiInstall { ref_name, repo, .. } => {
@@ -222,25 +255,29 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             revision,
             ..
         } => expand_sync_pull(src, dst, env, revision.as_deref()),
-        ProfileNode::SyncPush { src, dst, .. } => Ok(vec![Step::Note(format!(
-            "sync_push src={src} dst={dst}: marker only; not executed during apply"
+        ProfileNode::SyncPush { src, dst, .. } => Ok(vec![PlannedStep::always(Step::Note(
+            format!("sync_push src={src} dst={dst}: marker only; not executed during apply"),
         ))]),
         ProfileNode::StagingPush {
             src, dst, revision, ..
         } => expand_staging_push(src, dst, revision.as_deref()),
         ProfileNode::Models { models_json, .. } => expand_models(models_json),
         ProfileNode::LlmModels { models_json, .. } => expand_llm_models(models_json),
-        ProfileNode::PostInstall { script, .. } => Ok(vec![Step::Sh(vec![
+        // No `done`: `hooks.post_install` is the spec's sanctioned
+        // escape hatch for raw shell, so only its author knows what
+        // finishing it looks like — and an author cannot write a
+        // condition yet (design §3.4).
+        ProfileNode::PostInstall { script, .. } => Ok(vec![PlannedStep::always(Step::Sh(vec![
             "sh".to_string(),
             "-c".to_string(),
             script.clone(),
-        ])]),
+        ]))]),
         ProfileNode::ComfyUiRestart {
             port, extra_args, ..
         } => Ok(expand_comfyui_restart(*port, extra_args)),
         ProfileNode::ComfyUiHealth {
             port, timeout_sec, ..
-        } => Ok(vec![Step::HttpPoll {
+        } => Ok(vec![PlannedStep::always(Step::HttpPoll {
             // `/object_info` is the API readiness endpoint. `/` serves
             // the UI's HTML and answers 200 before the backend can take
             // an API call, so polling it reports ready too early.
@@ -250,7 +287,7 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             // ordering places directly before this poll.
             pid_file: Some(COMFYUI_PID_PATH.to_string()),
             log_path: Some(COMFYUI_LOG_PATH.to_string()),
-        }]),
+        })]),
         ProfileNode::ServiceStart {
             name,
             platform_kind,
@@ -274,14 +311,14 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<Step>, ExecError> {
             check_url,
             timeout_sec,
             ..
-        } => Ok(vec![Step::HttpPoll {
+        } => Ok(vec![PlannedStep::always(Step::HttpPoll {
             url: check_url.clone(),
             timeout_sec: poll_timeout(*timeout_sec, SERVICE_READY_TIMEOUT_SEC),
             // Paired with the `service.start` of the same `name`, whose
             // launch wrote these two paths.
             pid_file: Some(service_pid_path(name)),
             log_path: Some(service_log_path(name)),
-        }]),
+        })]),
         other => {
             use dsl_kit::DslNode as _;
             Err(ExecError::PayloadVariant {
@@ -302,24 +339,47 @@ fn poll_timeout(declared: Option<u16>, default_sec: u64) -> u64 {
     declared.map_or(default_sec, u64::from)
 }
 
-fn expand_system_apt(packages: &[String]) -> Vec<Step> {
+fn expand_system_apt(packages: &[String]) -> Vec<PlannedStep> {
     let mut argv = vec![
         "apt-get".to_string(),
         "install".to_string(),
         "-y".to_string(),
     ];
     argv.extend(packages.iter().cloned());
-    vec![Step::Sh(argv)]
+    // No `done`: what "these packages are installed" looks like is a
+    // per-package query (`dpkg -s`) over a list, which needs `ForEach`
+    // and a predicate neither of which exists. `apt-get install -y` is
+    // idempotent on its own, so nothing is broken by re-running it —
+    // unlike the clone below.
+    vec![PlannedStep::always(Step::Sh(argv))]
 }
 
-fn expand_comfyui_install(ref_name: &str, repo: Option<&str>) -> Vec<Step> {
+/// `comfyui.install` — clone and check out, in **one** composed step.
+///
+/// The step's condition is therefore the whole [`Checkout`], not half
+/// of it: the two commands are joined by `&&` inside a single `sh -c`,
+/// so there is no position between them for a second condition to
+/// describe. That the conjunction falls out of the step's own shape,
+/// rather than being imposed, is the point of deriving it from an
+/// entity.
+///
+/// This is the phase the stage exists for: without a condition, the
+/// `git clone` fails on the second apply because its destination is
+/// already there (design §4.4). The predecessor implementation guards
+/// the same clone with `test -d {name} ||`; the condition here asks the
+/// stronger question — is there a *repository*, and is it at the ref
+/// the profile named.
+fn expand_comfyui_install(ref_name: &str, repo: Option<&str>) -> Vec<PlannedStep> {
     let repo = repo.unwrap_or(DEFAULT_COMFYUI_REPO);
     let url = format!("https://github.com/{repo}.git");
     let script = format!(
         "git clone {url} {dir} && git -C {dir} checkout {ref_name}",
         dir = COMFYUI_INSTALL_DIR
     );
-    vec![Step::Sh(vec!["sh".to_string(), "-c".to_string(), script])]
+    vec![PlannedStep::done_when(
+        Step::Sh(vec!["sh".to_string(), "-c".to_string(), script]),
+        assert::Checkout::new(COMFYUI_INSTALL_DIR, Some(ref_name.to_string())).done(),
+    )]
 }
 
 /// `python3 -c '<assert>'` — exits non-zero when the running
@@ -330,19 +390,22 @@ fn expand_comfyui_install(ref_name: &str, repo: Option<&str>) -> Vec<Step> {
 /// Emitting `python3 --version` and letting the operator compare was
 /// the earlier shape; it called itself advisory while checking nothing,
 /// so a version mismatch passed silently.
-fn expand_python_version_check(want: &str) -> Vec<Step> {
+fn expand_python_version_check(want: &str) -> Vec<PlannedStep> {
     let script = format!(
         "import sys; assert sys.version.startswith(\"{want}\"), \
          \"python version mismatch: want {want}, got \" + sys.version"
     );
-    vec![Step::Sh(vec![
+    // No `done`, and deliberately: this step *is* an assertion. Skipping
+    // it when it already held would mean not checking, which is the one
+    // thing it exists to do.
+    vec![PlannedStep::always(Step::Sh(vec![
         "python3".to_string(),
         "-c".to_string(),
         script,
-    ])]
+    ]))]
 }
 
-fn expand_python_deps(deps: &[String], in_comfy_venv: bool) -> Vec<Step> {
+fn expand_python_deps(deps: &[String], in_comfy_venv: bool) -> Vec<PlannedStep> {
     let pip = if in_comfy_venv {
         COMFYUI_VENV_PIP
     } else {
@@ -350,7 +413,9 @@ fn expand_python_deps(deps: &[String], in_comfy_venv: bool) -> Vec<Step> {
     };
     let mut argv = vec![pip.to_string(), "install".to_string()];
     argv.extend(deps.iter().cloned());
-    vec![Step::Sh(argv)]
+    // No `done`: same shape as `system.apt` — a per-requirement query
+    // over a list, and `pip install` is already idempotent.
+    vec![PlannedStep::always(Step::Sh(argv))]
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,7 +428,31 @@ struct CustomNodeSpec {
     pip: bool,
 }
 
-fn expand_custom_nodes(json: &str) -> Result<Vec<Step>, ExecError> {
+/// `custom_nodes` — clone, optionally check out, optionally pip, per
+/// entry.
+///
+/// Unlike `comfyui.install` the clone and the checkout are **separate**
+/// steps, so each carries its own condition and the two are different
+/// (design §3.2e: a step's completion is not derived from its
+/// neighbours'):
+///
+/// - the clone is finished once there is a repository at the node's
+///   directory — [`assert::Checkout`] with no ref, because at this
+///   position the profile's `ref` has not been applied yet and asking
+///   for it would make the clone's condition describe the checkout's
+///   work;
+/// - the checkout is finished once that repository holds the declared
+///   ref — the full two-conjunct condition.
+///
+/// **The pip step gets none**, and that absence is the honest answer
+/// rather than an omission. "The requirements are installed" is a
+/// statement about a venv's contents, not about a checkout; deriving it
+/// from [`assert::Checkout`] would say the pip step is finished the
+/// moment the repository exists, which would skip the install on the
+/// very first apply. The entity that could answer it does not exist
+/// yet, so the step runs every time — `pip install -r` being idempotent
+/// is what makes that acceptable, exactly as it is for `python.deps`.
+fn expand_custom_nodes(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
     let nodes: Vec<CustomNodeSpec> =
         serde_json::from_str(json).map_err(|err| ExecError::EffectFailed {
             op: "custom_nodes".to_string(),
@@ -372,28 +461,34 @@ fn expand_custom_nodes(json: &str) -> Result<Vec<Step>, ExecError> {
     let mut steps = Vec::with_capacity(nodes.len() * 2);
     for node in nodes {
         let node_dir = format!("{CUSTOM_NODES_ROOT}/{}", node.name);
-        steps.push(Step::Sh(vec![
-            "git".to_string(),
-            "clone".to_string(),
-            format!("https://github.com/{}.git", node.repo),
-            node_dir.clone(),
-        ]));
-        if let Some(git_ref) = node.git_ref {
-            steps.push(Step::Sh(vec![
+        steps.push(PlannedStep::done_when(
+            Step::Sh(vec![
                 "git".to_string(),
-                "-C".to_string(),
+                "clone".to_string(),
+                format!("https://github.com/{}.git", node.repo),
                 node_dir.clone(),
-                "checkout".to_string(),
-                git_ref,
-            ]));
+            ]),
+            assert::Checkout::new(node_dir.clone(), None).done(),
+        ));
+        if let Some(git_ref) = node.git_ref {
+            steps.push(PlannedStep::done_when(
+                Step::Sh(vec![
+                    "git".to_string(),
+                    "-C".to_string(),
+                    node_dir.clone(),
+                    "checkout".to_string(),
+                    git_ref.clone(),
+                ]),
+                assert::Checkout::new(node_dir.clone(), Some(git_ref)).done(),
+            ));
         }
         if node.pip {
-            steps.push(Step::Sh(vec![
+            steps.push(PlannedStep::always(Step::Sh(vec![
                 COMFYUI_VENV_PIP.to_string(),
                 "install".to_string(),
                 "-r".to_string(),
                 format!("{node_dir}/requirements.txt"),
-            ]));
+            ])));
         }
     }
     Ok(steps)
@@ -410,7 +505,7 @@ fn expand_sync_pull(
     dst: &str,
     env: &BTreeMap<String, ProfileNode>,
     revision: Option<&str>,
-) -> Result<Vec<Step>, ExecError> {
+) -> Result<Vec<PlannedStep>, ExecError> {
     if env.is_empty() {
         // Public download: the bridge's scheme resolution turns the
         // source into the URL it will actually GET (chapter 04
@@ -418,27 +513,26 @@ fn expand_sync_pull(
         // destination file exactly as an `https://` one does. The step
         // carries the resolved URL, which is what the dry-run trace and
         // the report then show.
-        return Ok(vec![Step::Transfer {
+        // A `sync.pull` names an arbitrary source and destination and
+        // declares no digest, so there is no entity to ask and nothing
+        // to skip on.
+        return Ok(vec![PlannedStep::always(Step::Transfer {
             src: scheme::download_url("sync_pull", src, revision)?,
             dst: dst.to_string(),
-            // A `sync.pull` names an arbitrary source and destination
-            // and declares no digest, so there is no entity to ask and
-            // nothing to skip on.
-            done: None,
-        }]);
+        })]);
     }
 
     // Non-empty env → credential-carrying download routed to the native
     // CLI over sh.exec (spec 02 §Dispatch routing).
     if let Some(rest) = src.strip_prefix("b2://") {
         let (bucket, path) = split_b2_uri(rest, "sync_pull", src)?;
-        return Ok(vec![Step::Sh(vec![
+        return Ok(vec![PlannedStep::always(Step::Sh(vec![
             "b2".to_string(),
             "download-file-by-name".to_string(),
             bucket.to_string(),
             path.to_string(),
             dst.to_string(),
-        ])]);
+        ]))]);
     }
     if let Some(rest) = src.strip_prefix("hf://") {
         let (owner, repo, url_rev, path_in_repo) = parse_hf_uri(rest, "sync_pull", src)?;
@@ -471,16 +565,15 @@ fn expand_sync_pull(
             argv.push("--revision".to_string());
             argv.push(rev);
         }
-        return Ok(vec![Step::Sh(argv)]);
+        return Ok(vec![PlannedStep::always(Step::Sh(argv))]);
     }
     // Any other scheme (e.g. https://) with a non-empty env stays on the
     // plain download path — env is inert for a bridge download (spec 02
     // §Dispatch routing: only b2/hf route to a CLI).
-    Ok(vec![Step::Transfer {
+    Ok(vec![PlannedStep::always(Step::Transfer {
         src: src.to_string(),
         dst: dst.to_string(),
-        done: None,
-    }])
+    })])
 }
 
 /// Route a `staging.push` upload (spec 02 §Dispatch routing).
@@ -493,16 +586,16 @@ fn expand_staging_push(
     src: &str,
     dst: &str,
     revision: Option<&str>,
-) -> Result<Vec<Step>, ExecError> {
+) -> Result<Vec<PlannedStep>, ExecError> {
     if let Some(rest) = dst.strip_prefix("b2://") {
         let (bucket, path) = split_b2_uri(rest, "staging_push", dst)?;
-        return Ok(vec![Step::Sh(vec![
+        return Ok(vec![PlannedStep::always(Step::Sh(vec![
             "b2".to_string(),
             "upload-file".to_string(),
             bucket.to_string(),
             src.to_string(),
             path.to_string(),
-        ])]);
+        ]))]);
     }
     if let Some(rest) = dst.strip_prefix("hf://") {
         let (owner, repo, url_rev, path_in_repo) = parse_hf_uri(rest, "staging_push", dst)?;
@@ -520,17 +613,16 @@ fn expand_staging_push(
             argv.push("--revision".to_string());
             argv.push(rev);
         }
-        return Ok(vec![Step::Sh(argv)]);
+        return Ok(vec![PlannedStep::always(Step::Sh(argv))]);
     }
     // An `https://` dst is an HTTP PUT over the net.transfer bridge; the
     // step carries the pair unresolved and the bridge reads the
-    // direction off the schemes (chapter 04 §net.transfer).
-    Ok(vec![Step::Transfer {
+    // direction off the schemes (chapter 04 §net.transfer). No `done`:
+    // an upload's destination is remote, and nothing here observes it.
+    Ok(vec![PlannedStep::always(Step::Transfer {
         src: src.to_string(),
         dst: dst.to_string(),
-        // An upload's destination is remote; nothing here observes it.
-        done: None,
-    }])
+    })])
 }
 
 // The `b2://` / `hf://` URI parsers and the public-download URL
@@ -566,7 +658,7 @@ struct ModelItemSpec {
     sha256: Option<String>,
 }
 
-fn expand_models(json: &str) -> Result<Vec<Step>, ExecError> {
+fn expand_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
     let models: Vec<ModelItemSpec> =
         serde_json::from_str(json).map_err(|err| ExecError::EffectFailed {
             op: "models".to_string(),
@@ -594,11 +686,13 @@ fn expand_models(json: &str) -> Result<Vec<Step>, ExecError> {
         // write its own condition yet — that form is settled once three
         // entities exist, so it is not shaped by this one.
         let done = assert::ModelFile::new(dst.clone(), model.sha256).done();
-        steps.push(Step::Transfer {
-            src: model.src,
-            dst,
-            done: Some(done),
-        });
+        steps.push(PlannedStep::done_when(
+            Step::Transfer {
+                src: model.src,
+                dst,
+            },
+            done,
+        ));
     }
     Ok(steps)
 }
@@ -612,7 +706,7 @@ struct LlmModelSpec {
     revision: Option<String>,
 }
 
-fn expand_llm_models(json: &str) -> Result<Vec<Step>, ExecError> {
+fn expand_llm_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
     let models: Vec<LlmModelSpec> =
         serde_json::from_str(json).map_err(|err| ExecError::EffectFailed {
             op: "llm_models".to_string(),
@@ -665,7 +759,12 @@ fn expand_llm_models(json: &str) -> Result<Vec<Step>, ExecError> {
             argv.push("--revision".to_string());
             argv.push(rev);
         }
-        steps.push(Step::Sh(argv));
+        // No `done`: `hf download` lands a whole repository snapshot in
+        // `--local-dir`, and what "that snapshot is here" looks like is
+        // a different entity from `ModelFile`'s single file. hf-cli's
+        // own cache makes a repeat cheap, which is why this is a
+        // deferral rather than a defect.
+        steps.push(PlannedStep::always(Step::Sh(argv)));
     }
     Ok(steps)
 }
@@ -775,7 +874,7 @@ fn sh_c(command: String) -> Step {
     Step::Sh(vec!["sh".to_string(), "-c".to_string(), command])
 }
 
-fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<Step> {
+fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<PlannedStep> {
     let mut argv = vec![
         COMFYUI_VENV_PY.to_string(),
         COMFYUI_MAIN_PY.to_string(),
@@ -788,7 +887,14 @@ fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<Step> {
     // only the `nohup` — `cd … && nohup … &` would background the whole
     // list and leave `$!` naming the subshell, not the server. A failing
     // `cd` short-circuits the group and fails the step.
-    vec![sh_c(format!(
+    //
+    // No `done` yet: what a running service looks like is `Service`
+    // (段 4), and a restart is the step whose condition has to be read
+    // most carefully — a satisfied one means "the server is already up
+    // with these arguments", which is precisely when a restart should
+    // be skipped and precisely what an unconditional restart gets
+    // wrong.
+    vec![PlannedStep::always(sh_c(format!(
         "cd {COMFYUI_INSTALL_DIR} && {}",
         grouped(spawn_detached_command(
             &argv,
@@ -796,7 +902,7 @@ fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<Step> {
             COMFYUI_PID_PATH,
             "comfyui"
         ))
-    ))]
+    )))]
 }
 
 /// Per-platform launch invocation. An unrecognised platform expands to
@@ -825,7 +931,7 @@ fn expand_service_start(
     dtype: Option<&str>,
     tensor_parallel_size: Option<u16>,
     extra_args: &[String],
-) -> Vec<Step> {
+) -> Vec<PlannedStep> {
     let log_path = service_log_path(name);
     let pid_path = service_pid_path(name);
     let argv = match platform_kind {
@@ -875,25 +981,26 @@ fn expand_service_start(
             argv
         }
         other => {
-            return vec![Step::Note(format!(
+            return vec![PlannedStep::always(Step::Note(format!(
                 "service_start name={name} platform_kind={other}: no launch \
                  invocation — spec 02 specifies vllm / ollama / llamacpp"
-            ))]
+            )))]
         }
     };
-    vec![sh_c(spawn_detached_command(
+    // No `done` — same as `comfyui.restart`; `Service` is 段 4.
+    vec![PlannedStep::always(sh_c(spawn_detached_command(
         &argv,
         &log_path,
         &pid_path,
         &format!("service {name}"),
-    ))]
+    )))]
 }
 
-fn missing_model_note(name: &str, platform_kind: &str) -> Step {
-    Step::Note(format!(
+fn missing_model_note(name: &str, platform_kind: &str) -> PlannedStep {
+    PlannedStep::always(Step::Note(format!(
         "service_start name={name} platform_kind={platform_kind}: no launch \
          invocation — the platform requires `model` and the profile declares none"
-    ))
+    )))
 }
 
 /// Render one step for the dry-run trace log, **without** answering its
@@ -903,10 +1010,12 @@ fn missing_model_note(name: &str, platform_kind: &str) -> Step {
 /// ops); a [`Step::Sh`] renders its *key* names only — resolved values
 /// are never logged (spec 06 opacity).
 ///
-/// A step's `done` is deliberately absent from this rendering: a dry run
-/// now *evaluates* it, and what it answered belongs with the answer.
-/// [`dry_run_step`] is the whole dry-run rendering; this is the half of
-/// it that describes the step itself.
+/// This takes a [`Step`] rather than a [`PlannedStep`], so a condition
+/// cannot reach it: a dry run *evaluates* the condition, and what it
+/// answered belongs with the answer. [`dry_run_step`] is the whole
+/// dry-run rendering, and it uses this for the half that describes the
+/// step itself — as does the skip line in [`execute_step`], so the two
+/// spell a step identically.
 pub fn render_dry(step: &Step, env: &BTreeMap<String, String>) -> String {
     match step {
         Step::Sh(argv) if env.is_empty() => format!("sh argv={argv:?}"),
@@ -1051,14 +1160,86 @@ impl From<ExecError> for StepFailure {
 /// lifecycle step is its own `Call` node ([`super::steps`]), so the host
 /// resolver awaits this directly and the two seams that used to sit here
 /// are gone.
+/// **Only [`AssertOutcome::Satisfied`](assert::AssertOutcome::Satisfied)
+/// skips.** `Unsatisfied` obviously runs; so do `NotChecked` and
+/// `CheckFailed`, because neither is a statement that the work is
+/// already done. Re-running something that was already finished costs
+/// bandwidth, or a failed `git clone`; skipping something that was not
+/// costs a broken pod.
+///
+/// **The condition's answers are reported either way**, skip or not.
+/// The fold gives `Unsatisfied` absolute priority, so a `CheckFailed`
+/// in the same conjunction disappears from the top answer — a
+/// permission failure on the digest read, or a `git` that could not be
+/// started, would otherwise be invisible with the repeated work as its
+/// only symptom. The note carries the whole evaluated tree, which is
+/// what the tree exists for (design §3.2b').
 pub async fn execute_step(
+    planned: &PlannedStep,
+    op: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<StepResult, StepFailure> {
+    let evaluated = match &planned.done {
+        // `Real`, not the context's mode: this function is the real
+        // path by construction — a dry run goes through
+        // [`dry_run_step`] and never reaches an effect.
+        Some(done) => Some((
+            done,
+            assert::eval(done, ExecMode::Real, &LocalObserve).await,
+        )),
+        None => None,
+    };
+
+    if let Some((done, node)) = &evaluated {
+        if node.is_satisfied() {
+            let condition = assert::describe_execution(done, node);
+            return Ok(StepResult {
+                // The step renders exactly as a dry run renders it, so
+                // a skip line reads as "here is the step, and here is
+                // why it did not run".
+                summary: format!("{} skipped: {condition}", render_dry(&planned.step, env)),
+                note: Some(format!("skipped, already done: {condition}")),
+                ..StepResult::default()
+            });
+        }
+    }
+
+    let mut result = run_effect(&planned.step, op, env).await?;
+    if let Some((done, node)) = &evaluated {
+        result.note = Some(format!(
+            "not done: {}",
+            assert::describe_execution(done, node)
+        ));
+    }
+    Ok(result)
+}
+
+/// Run one step's effect, with no reference to any condition.
+///
+/// Split from [`execute_step`] so the skip is decided in exactly one
+/// place for every step shape. Before a second entity existed the two
+/// were entangled — the transfer arm evaluated its own condition — and
+/// giving `Sh` a condition under that shape would have meant writing
+/// the same decision a second time.
+async fn run_effect(
     step: &Step,
     op: &str,
     env: &BTreeMap<String, String>,
 ) -> Result<StepResult, StepFailure> {
     match step {
         Step::Sh(argv) => execute_sh(argv, op, env),
-        Step::Transfer { src, dst, done } => transfer_unless_done(src, dst, done.as_ref()).await,
+        Step::Transfer { src, dst } => {
+            let outcome = effects::transfer(src, dst).await?;
+            Ok(StepResult {
+                summary: format!(
+                    "transfer src={src} dst={} bytes={}",
+                    outcome.dst, outcome.bytes
+                ),
+                bytes: Some(outcome.bytes),
+                dst: Some(outcome.dst),
+                ..StepResult::default()
+            })
+        }
         Step::HttpPoll {
             url,
             timeout_sec,
@@ -1076,62 +1257,6 @@ pub async fn execute_step(
         }
         Step::Note(message) => Ok(StepResult::summary_only(format!("note \"{message}\""))),
     }
-}
-
-/// Evaluate the step's `done`, then transfer unless it already holds.
-///
-/// **Only [`AssertOutcome::Satisfied`](assert::AssertOutcome::Satisfied)
-/// skips.** `Unsatisfied` obviously transfers; so do `NotChecked` and
-/// `CheckFailed`, because neither is a statement that the file is
-/// already right. Transferring something that was already there costs
-/// bandwidth; skipping something that was not costs a broken pod.
-///
-/// **The condition's answers are reported either way**, skip or not.
-/// The fold gives `Unsatisfied` absolute priority, so a `CheckFailed`
-/// in the same conjunction disappears from the top answer — a
-/// permission failure on the digest read would otherwise be invisible,
-/// with the re-download as its only symptom. The note carries the whole
-/// evaluated tree, which is what the tree exists for (design §3.2b').
-async fn transfer_unless_done(
-    src: &str,
-    dst: &str,
-    done: Option<&assert::Assert>,
-) -> Result<StepResult, StepFailure> {
-    let evaluated = match done {
-        // `Real`, not the context's mode: this function is the real
-        // path by construction — a dry run renders through
-        // [`render_dry`] and never reaches an effect.
-        Some(done) => Some((
-            done,
-            assert::eval(done, ExecMode::Real, &LocalObserve).await,
-        )),
-        None => None,
-    };
-
-    if let Some((done, node)) = &evaluated {
-        if node.is_satisfied() {
-            let condition = assert::describe_execution(done, node);
-            return Ok(StepResult {
-                summary: format!("transfer src={src} dst={dst} skipped: {condition}"),
-                dst: Some(dst.to_string()),
-                note: Some(format!("skipped, already done: {condition}")),
-                ..StepResult::default()
-            });
-        }
-    }
-
-    let outcome = effects::transfer(src, dst).await?;
-    Ok(StepResult {
-        summary: format!(
-            "transfer src={src} dst={} bytes={}",
-            outcome.dst, outcome.bytes
-        ),
-        bytes: Some(outcome.bytes),
-        dst: Some(outcome.dst),
-        note: evaluated
-            .map(|(done, node)| format!("not done: {}", assert::describe_execution(done, &node))),
-        ..StepResult::default()
-    })
 }
 
 /// What a dry run has to say about one step.
@@ -1175,24 +1300,44 @@ pub struct DryStep {
 /// The whole evaluated tree reaches the note, not just the top answer:
 /// the fold hides a `CheckFailed` under an `Unsatisfied` sibling, and
 /// the tree is what exists to undo that (design §3.2b').
-pub async fn dry_run_step(step: &Step, env: &BTreeMap<String, String>) -> DryStep {
-    let Step::Transfer {
-        src,
-        dst,
-        done: Some(done),
-    } = step
-    else {
+///
+/// **The table above was written for a transfer and now holds for a
+/// clone as well.** A `Checkout`'s condition answers in a dry run in
+/// both halves — [`assert::Assert::GitTreeAt`] runs its `git` in either
+/// mode — so the `NotChecked` row is one a `comfyui.install` never
+/// reaches: a dry run says either "would skip" or "would run", and
+/// only a `git` that could not answer at all lands in the last row.
+pub async fn dry_run_step(planned: &PlannedStep, env: &BTreeMap<String, String>) -> DryStep {
+    let rendered = render_dry(&planned.step, env);
+    let Some(done) = &planned.done else {
         return DryStep {
-            summary: render_dry(step, env),
+            summary: rendered,
             note: None,
         };
     };
     let node = assert::eval(done, ExecMode::DryRun, &LocalObserve).await;
-    let verdict = dry_run_verdict(node.outcome());
+    let verdict = dry_run_verdict(node.outcome(), would_verb(&planned.step));
     let condition = assert::describe_execution(done, &node);
     DryStep {
-        summary: format!("transfer src={src} dst={dst} {verdict}: {condition}"),
+        summary: format!("{rendered} {verdict}: {condition}"),
         note: Some(format!("{verdict}: {condition}")),
+    }
+}
+
+/// What a dry run says the step *would* do, in the step's own words.
+///
+/// A transfer "would transfer" and a command "would run": the phrasing
+/// is per shape rather than a single neutral verb, because the first
+/// clause of the note is what an operator reads down the left-hand edge
+/// of a plan, and "would run" for a 4 GiB download would be a worse
+/// sentence than either.
+fn would_verb(step: &Step) -> &'static str {
+    match step {
+        Step::Transfer { .. } => "transfer",
+        Step::HttpPoll { .. } => "poll",
+        // A `Note` runs no effect and never carries a condition, so it
+        // reaches this only if one is ever given to it.
+        Step::Sh(_) | Step::Note(_) => "run",
     }
 }
 
@@ -1224,34 +1369,35 @@ pub enum StepRun {
 /// real run that skips on it must not depend on which driver is turning
 /// the engine.
 pub async fn run_step(
-    step: &Step,
+    planned: &PlannedStep,
     op: &str,
     env: &BTreeMap<String, String>,
     mode: ExecMode,
 ) -> Result<StepRun, StepFailure> {
     match mode {
-        ExecMode::DryRun => Ok(StepRun::Dry(dry_run_step(step, env).await)),
-        ExecMode::Real => execute_step(step, op, env).await.map(StepRun::Real),
+        ExecMode::DryRun => Ok(StepRun::Dry(dry_run_step(planned, env).await)),
+        ExecMode::Real => execute_step(planned, op, env).await.map(StepRun::Real),
     }
 }
 
-/// How a dry run words each of the four answers.
+/// How a dry run words each of the four answers, for a step that would
+/// `verb` ([`would_verb`]).
 ///
-/// Only `Satisfied` skips, so the other three all say "would transfer" —
-/// the same safe direction [`transfer_unless_done`] takes. They are
-/// still worded apart: "the destination is not there" and "the condition
-/// could not be read" are different pieces of news for whoever reads the
-/// plan, and collapsing them is the granularity this model exists to get
-/// away from.
-fn dry_run_verdict(outcome: &assert::AssertOutcome) -> &'static str {
+/// Only `Satisfied` skips, so the other three all say the step would run
+/// — the same safe direction [`execute_step`] takes. They are still
+/// worded apart: "the destination is not there" and "the condition could
+/// not be read" are different pieces of news for whoever reads the plan,
+/// and collapsing them is the granularity this model exists to get away
+/// from.
+fn dry_run_verdict(outcome: &assert::AssertOutcome, verb: &str) -> String {
     match outcome {
-        assert::AssertOutcome::Satisfied => "would skip, already done",
-        assert::AssertOutcome::Unsatisfied => "would transfer, not done",
+        assert::AssertOutcome::Satisfied => "would skip, already done".to_string(),
+        assert::AssertOutcome::Unsatisfied => format!("would {verb}, not done"),
         assert::AssertOutcome::NotChecked => {
-            "undecided (not evaluated in a dry run), would transfer"
+            format!("undecided (not evaluated in a dry run), would {verb}")
         }
         assert::AssertOutcome::CheckFailed(_) => {
-            "undecided (the condition could not be read), would transfer"
+            format!("undecided (the condition could not be read), would {verb}")
         }
     }
 }
@@ -1478,6 +1624,24 @@ mod tests {
         ids.node()
     }
 
+    /// The effects a phase composed, with the conditions beside them
+    /// dropped.
+    ///
+    /// For the tests whose subject is *which command a payload builds*.
+    /// Where the condition is the subject — `comfyui.install`,
+    /// `custom_nodes`, `models` — the whole [`PlannedStep`] is compared
+    /// instead, and `every_composed_step_declares_its_condition`
+    /// pins which phases have one at all, so nothing hides in the gap
+    /// this helper opens.
+    fn effects(steps: &[PlannedStep]) -> Vec<Step> {
+        steps.iter().map(|planned| planned.step.clone()).collect()
+    }
+
+    /// The condition of a phase's `index`-th step, as rendered.
+    fn condition(steps: &[PlannedStep], index: usize) -> Option<String> {
+        steps[index].done.as_ref().map(assert::describe)
+    }
+
     // -------------------------------------------------------------
     // expand: one variant per lifecycle op (15 total).
     // -------------------------------------------------------------
@@ -1491,7 +1655,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("system_apt expands");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "apt-get".to_string(),
                 "install".to_string(),
@@ -1512,7 +1676,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("comfyui_install expands");
         assert_eq!(steps.len(), 1);
-        match &steps[0] {
+        match &steps[0].step {
             Step::Sh(argv) => {
                 assert_eq!(argv[0], "sh");
                 assert_eq!(argv[1], "-c");
@@ -1524,6 +1688,36 @@ mod tests {
         }
     }
 
+    /// **The UC of this stage**: the one step `comfyui.install` composes
+    /// carries the whole `Checkout` condition, so a second apply does
+    /// not re-run a `git clone` whose destination is already there.
+    ///
+    /// The condition is compared as a value, not by substring: it is
+    /// what decides whether the clone runs, and the shape of it — the
+    /// repository directory, then the ref — is the part a reader has to
+    /// be able to trust.
+    #[test]
+    fn expand_comfyui_install_guards_its_clone_with_the_checkout_condition() {
+        let ids = IdGen::new();
+        let steps = expand(&ProfileNode::ComfyUiInstall {
+            id: node_id(&ids),
+            ref_name: "v0.1.0".to_string(),
+            repo: None,
+        })
+        .expect("comfyui_install expands");
+
+        assert_eq!(steps.len(), 1, "clone and checkout are one composed step");
+        assert_eq!(
+            steps[0].done,
+            Some(assert::Checkout::new("/workspace/ComfyUI", Some("v0.1.0".to_string())).done()),
+        );
+        assert_eq!(
+            condition(&steps, 0).as_deref(),
+            Some("all[exists(/workspace/ComfyUI/.git), git_tree(/workspace/ComfyUI)=v0.1.0]"),
+            "the repository first, then the ref it must hold",
+        );
+    }
+
     #[test]
     fn expand_comfyui_install_honours_a_declared_repo() {
         let ids = IdGen::new();
@@ -1533,7 +1727,7 @@ mod tests {
             repo: Some("fork/ComfyUI".to_string()),
         };
         let steps = expand(&payload).expect("comfyui_install expands");
-        match &steps[0] {
+        match &steps[0].step {
             Step::Sh(argv) => {
                 assert!(argv[2].contains("https://github.com/fork/ComfyUI.git"));
             }
@@ -1552,7 +1746,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("python_version_check expands");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -1573,7 +1767,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("python_deps expands");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "/workspace/ComfyUI/venv/bin/pip".to_string(),
                 "install".to_string(),
@@ -1592,7 +1786,7 @@ mod tests {
             in_comfy_venv: false,
         };
         let steps = expand(&payload).expect("python_deps expands");
-        match &steps[0] {
+        match &steps[0].step {
             Step::Sh(argv) => assert_eq!(argv[0], "pip"),
             other => panic!("expected Sh, got {other:?}"),
         }
@@ -1614,21 +1808,219 @@ mod tests {
         let steps = expand(&payload).expect("custom_nodes expands");
         // only-clone: 1, with-ref: 2, with-pip: 2, full: 3 → 8 steps.
         assert_eq!(steps.len(), 8);
-        assert!(matches!(&steps[0], Step::Sh(a) if a[2] == "https://github.com/a/b.git"));
-        assert!(matches!(&steps[1], Step::Sh(a) if a[2] == "https://github.com/c/d.git"));
+        assert!(matches!(&steps[0].step, Step::Sh(a) if a[2] == "https://github.com/a/b.git"));
+        assert!(matches!(&steps[1].step, Step::Sh(a) if a[2] == "https://github.com/c/d.git"));
         assert!(matches!(
-            &steps[2],
+            &steps[2].step,
             Step::Sh(a) if a[0] == "git" && a[3] == "checkout" && a[4] == "v2"
         ));
         assert!(matches!(
-            &steps[4],
+            &steps[4].step,
             Step::Sh(a) if a[0] == "/workspace/ComfyUI/venv/bin/pip"
         ));
         assert!(matches!(
-            &steps[7],
+            &steps[7].step,
             Step::Sh(a) if a[0] == "/workspace/ComfyUI/venv/bin/pip"
                 && a[3] == "/workspace/ComfyUI/custom_nodes/full/requirements.txt"
         ));
+    }
+
+    /// Each of a `custom_nodes` entry's steps answers for **itself**:
+    /// the clone for the repository being there, the checkout for the
+    /// ref being out — and the pip install for nothing at all.
+    ///
+    /// The last one is the load-bearing absence. Deriving a condition
+    /// for it from the same `Checkout` would make it satisfied the
+    /// moment the clone succeeded, so the requirements would never be
+    /// installed; "the requirements are in the venv" is a different
+    /// entity, and it does not exist yet.
+    #[test]
+    fn expand_custom_nodes_conditions_the_clone_and_the_checkout_but_not_the_pip() {
+        let ids = IdGen::new();
+        let steps = expand(&ProfileNode::CustomNodes {
+            id: node_id(&ids),
+            nodes_json: r#"[{"name":"full","repo":"g/h","ref":"main","pip":true}]"#.to_string(),
+        })
+        .expect("custom_nodes expands");
+        assert_eq!(steps.len(), 3);
+
+        let node_dir = "/workspace/ComfyUI/custom_nodes/full";
+        assert_eq!(
+            steps[0].done,
+            Some(assert::Checkout::new(node_dir, None).done()),
+            "the clone is finished once the repository is there — the ref is the next step's work",
+        );
+        assert_eq!(
+            condition(&steps, 0).as_deref(),
+            Some("exists(/workspace/ComfyUI/custom_nodes/full/.git)"),
+            "one predicate, no conjunction around it",
+        );
+        assert_eq!(
+            steps[1].done,
+            Some(assert::Checkout::new(node_dir, Some("main".to_string())).done()),
+        );
+        assert_eq!(
+            steps[2].done, None,
+            "the pip install has no condition: 'the requirements are installed' is not a Checkout",
+        );
+    }
+
+    /// Which composed steps carry a condition at all, in one place.
+    ///
+    /// Most of the tests above compare argv through `effects`, which
+    /// drops the conditions; this is what keeps that from hiding a
+    /// condition that was added — or lost — by accident. A phase that
+    /// gains an entity is expected to change this test.
+    #[test]
+    fn every_composed_step_declares_its_condition() {
+        let ids = IdGen::new();
+        // (payload, one `Some(rendered)` / `None` per composed step)
+        let cases: Vec<(ProfileNode, Vec<Option<&str>>)> = vec![
+            (
+                ProfileNode::SystemApt {
+                    id: node_id(&ids),
+                    packages: vec!["git".into()],
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::ComfyUiInstall {
+                    id: node_id(&ids),
+                    ref_name: "v1".into(),
+                    repo: None,
+                },
+                vec![Some(
+                    "all[exists(/workspace/ComfyUI/.git), git_tree(/workspace/ComfyUI)=v1]",
+                )],
+            ),
+            (
+                ProfileNode::PythonVersionCheck {
+                    id: node_id(&ids),
+                    want: "3.12".into(),
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::PythonDeps {
+                    id: node_id(&ids),
+                    deps: vec!["torch".into()],
+                    in_comfy_venv: true,
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::CustomNodes {
+                    id: node_id(&ids),
+                    nodes_json: r#"[{"name":"n","repo":"a/b","ref":"v2","pip":true}]"#.into(),
+                },
+                vec![
+                    Some("exists(/workspace/ComfyUI/custom_nodes/n/.git)"),
+                    Some(
+                        "all[exists(/workspace/ComfyUI/custom_nodes/n/.git), \
+                         git_tree(/workspace/ComfyUI/custom_nodes/n)=v2]",
+                    ),
+                    None,
+                ],
+            ),
+            (
+                ProfileNode::SyncPull {
+                    id: node_id(&ids),
+                    src: "https://ex/m.bin".into(),
+                    dst: "/workspace/m.bin".into(),
+                    env: Default::default(),
+                    revision: None,
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::SyncPush {
+                    id: node_id(&ids),
+                    src: "/workspace/out.bin".into(),
+                    dst: "https://ex/out.bin".into(),
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::StagingPush {
+                    id: node_id(&ids),
+                    src: "/workspace/out.bin".into(),
+                    dst: "b2://bucket/out.bin".into(),
+                    env: Default::default(),
+                    revision: None,
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::Models {
+                    id: node_id(&ids),
+                    models_json: r#"[{"src":"https://ex/a.bin","dst":"a.bin"}]"#.into(),
+                },
+                vec![Some("exists(/workspace/ComfyUI/models/checkpoints/a.bin)")],
+            ),
+            (
+                ProfileNode::LlmModels {
+                    id: node_id(&ids),
+                    models_json: r#"[{"src":"hf://owner/repo"}]"#.into(),
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::PostInstall {
+                    id: node_id(&ids),
+                    script: "true".into(),
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::ComfyUiRestart {
+                    id: node_id(&ids),
+                    port: 8188,
+                    extra_args: Vec::new(),
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::ComfyUiHealth {
+                    id: node_id(&ids),
+                    port: 8188,
+                    timeout_sec: None,
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::ServiceStart {
+                    id: node_id(&ids),
+                    name: "llm".into(),
+                    platform_kind: "ollama".into(),
+                    model: None,
+                    port: None,
+                    dtype: None,
+                    tensor_parallel_size: None,
+                    extra_args: Vec::new(),
+                },
+                vec![None],
+            ),
+            (
+                ProfileNode::ServiceReady {
+                    id: node_id(&ids),
+                    name: "llm".into(),
+                    check_url: "http://127.0.0.1:9000/health".into(),
+                    timeout_sec: None,
+                },
+                vec![None],
+            ),
+        ];
+        assert_eq!(cases.len(), 15, "one case per lifecycle kind");
+
+        for (payload, want) in cases {
+            let kind = crate::plan::kind_of(&payload);
+            let steps = expand(&payload).unwrap_or_else(|err| panic!("{kind} expands: {err}"));
+            let got: Vec<Option<String>> = (0..steps.len())
+                .map(|index| condition(&steps, index))
+                .collect();
+            let got: Vec<Option<&str>> = got.iter().map(Option::as_deref).collect();
+            assert_eq!(got, want, "{kind}");
+        }
     }
 
     #[test]
@@ -1661,13 +2053,12 @@ mod tests {
         let steps = expand(&payload).expect("sync_pull expands");
         assert_eq!(
             steps,
-            vec![Step::Transfer {
+            // A `sync.pull` derives no entity, so it keeps running
+            // every time.
+            vec![PlannedStep::always(Step::Transfer {
                 src: "https://example.com/m.bin".to_string(),
                 dst: "/workspace/m.bin".to_string(),
-                // A `sync.pull` derives no entity, so it keeps running
-                // every time — the field is here, and `None`.
-                done: None,
-            }]
+            })]
         );
     }
 
@@ -1708,11 +2099,10 @@ mod tests {
         };
         assert_eq!(
             expand(&payload).expect("public hf:// resolves"),
-            vec![Step::Transfer {
+            vec![PlannedStep::always(Step::Transfer {
                 src: "https://huggingface.co/owner/repo/resolve/main/model.safetensors".to_string(),
                 dst: "/workspace/model.safetensors".to_string(),
-                done: None,
-            }],
+            })],
         );
     }
 
@@ -1730,11 +2120,10 @@ mod tests {
         };
         assert_eq!(
             expand(&payload).expect("public hf:// resolves"),
-            vec![Step::Transfer {
+            vec![PlannedStep::always(Step::Transfer {
                 src: "https://huggingface.co/owner/repo/resolve/v2/model.safetensors".to_string(),
                 dst: "/workspace/model.safetensors".to_string(),
-                done: None,
-            }],
+            })],
         );
     }
 
@@ -1758,7 +2147,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("b2 + env expands to a CLI step");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "b2".to_string(),
                 "download-file-by-name".to_string(),
@@ -1792,7 +2181,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("hf + env expands to a CLI step");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "hf".to_string(),
                 "download".to_string(),
@@ -1827,7 +2216,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("hf + env + @rev expands");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "hf".to_string(),
                 "download".to_string(),
@@ -1861,7 +2250,7 @@ mod tests {
             revision: Some("abc123".to_string()),
         };
         let steps = expand(&payload).expect("hf + env + payload revision expands");
-        match &steps[0] {
+        match &steps[0].step {
             Step::Sh(argv) => {
                 assert_eq!(argv[argv.len() - 2..], ["--revision", "abc123"]);
             }
@@ -1917,13 +2306,10 @@ mod tests {
         let steps = expand(&payload).expect("https + env stays on the plain download path");
         assert_eq!(
             steps,
-            vec![Step::Transfer {
+            vec![PlannedStep::always(Step::Transfer {
                 src: "https://example.com/m.bin".to_string(),
                 dst: "/workspace/m.bin".to_string(),
-                // A `sync.pull` derives no entity, so it keeps running
-                // every time — the field is here, and `None`.
-                done: None,
-            }]
+            })]
         );
     }
 
@@ -1937,7 +2323,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("sync_push expands");
         assert_eq!(steps.len(), 1);
-        match &steps[0] {
+        match &steps[0].step {
             Step::Note(msg) => {
                 assert!(msg.contains("marker only"));
                 assert!(msg.contains("not executed during apply"));
@@ -1958,7 +2344,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("b2 staging upload expands to a CLI step");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "b2".to_string(),
                 "upload-file".to_string(),
@@ -1981,7 +2367,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("hf staging upload expands to a CLI step");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "hf".to_string(),
                 "upload".to_string(),
@@ -2005,7 +2391,7 @@ mod tests {
             revision: Some("optsrev".to_string()),
         };
         let steps = expand(&payload).expect("hf staging upload expands");
-        match &steps[0] {
+        match &steps[0].step {
             Step::Sh(argv) => {
                 assert_eq!(argv[2], "owner/repo");
                 // The URL-carried @urlrev wins over the opts revision.
@@ -2030,11 +2416,10 @@ mod tests {
         };
         assert_eq!(
             expand(&payload).expect("https upload composes a transfer step"),
-            vec![Step::Transfer {
+            vec![PlannedStep::always(Step::Transfer {
                 src: "/workspace/out.bin".to_string(),
                 dst: "https://example.com/out.bin".to_string(),
-                done: None,
-            }],
+            })],
         );
     }
 
@@ -2059,22 +2444,28 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                Step::Transfer {
-                    src: "https://ex/a.bin".to_string(),
-                    dst: "/workspace/ComfyUI/models/lora/a.bin".to_string(),
-                    // No declared digest, so the condition is existence
-                    // of the composed destination — the same path the
-                    // step downloads to, derived once.
+                // No declared digest, so the condition is existence of
+                // the composed destination — the same path the step
+                // downloads to, derived once.
+                PlannedStep {
+                    step: Step::Transfer {
+                        src: "https://ex/a.bin".to_string(),
+                        dst: "/workspace/ComfyUI/models/lora/a.bin".to_string(),
+                    },
                     done: existence("/workspace/ComfyUI/models/lora/a.bin"),
                 },
-                Step::Transfer {
-                    src: "https://ex/b.bin".to_string(),
-                    dst: "/workspace/ComfyUI/models/vae/b.bin".to_string(),
+                PlannedStep {
+                    step: Step::Transfer {
+                        src: "https://ex/b.bin".to_string(),
+                        dst: "/workspace/ComfyUI/models/vae/b.bin".to_string(),
+                    },
                     done: existence("/workspace/ComfyUI/models/vae/b.bin"),
                 },
-                Step::Transfer {
-                    src: "https://ex/c.bin".to_string(),
-                    dst: "/workspace/ComfyUI/models/checkpoints/c.bin".to_string(),
+                PlannedStep {
+                    step: Step::Transfer {
+                        src: "https://ex/c.bin".to_string(),
+                        dst: "/workspace/ComfyUI/models/checkpoints/c.bin".to_string(),
+                    },
                     done: existence("/workspace/ComfyUI/models/checkpoints/c.bin"),
                 },
             ]
@@ -2100,11 +2491,13 @@ mod tests {
         let dst = "/workspace/ComfyUI/models/lora/a.bin";
         assert_eq!(
             steps,
-            vec![Step::Transfer {
-                src: "https://ex/a.bin".to_string(),
-                dst: dst.to_string(),
-                done: Some(assert::ModelFile::new(dst, Some(digest)).done()),
-            }],
+            vec![PlannedStep::done_when(
+                Step::Transfer {
+                    src: "https://ex/a.bin".to_string(),
+                    dst: dst.to_string(),
+                },
+                assert::ModelFile::new(dst, Some(digest)).done(),
+            )],
         );
     }
 
@@ -2135,7 +2528,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("llm_models expands");
         assert_eq!(
-            steps[0],
+            steps[0].step,
             Step::Sh(vec![
                 "hf".to_string(),
                 "download".to_string(),
@@ -2145,7 +2538,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            steps[1],
+            steps[1].step,
             Step::Sh(vec![
                 "hf".to_string(),
                 "download".to_string(),
@@ -2198,7 +2591,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("post_install expands");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::Sh(vec![
                 "sh".to_string(),
                 "-c".to_string(),
@@ -2214,8 +2607,8 @@ mod tests {
     // them exactly rather than asserting on fragments.
     // -------------------------------------------------------------
 
-    fn sh_command(step: &Step) -> &str {
-        match step {
+    fn sh_command(planned: &PlannedStep) -> &str {
+        match &planned.step {
             Step::Sh(argv) => {
                 assert_eq!(argv[..2], ["sh".to_string(), "-c".to_string()]);
                 &argv[2]
@@ -2392,7 +2785,7 @@ mod tests {
 
         for (launch, poll) in pairs {
             let command = sh_command(&launch[0]);
-            match &poll[0] {
+            match &poll[0].step {
                 Step::HttpPoll {
                     pid_file: Some(pid_file),
                     log_path: Some(log_path),
@@ -2422,7 +2815,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("comfyui_health expands");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::HttpPoll {
                 // `/` answers 200 from the UI before the API is usable.
                 url: "http://127.0.0.1:8188/object_info".to_string(),
@@ -2452,7 +2845,7 @@ mod tests {
             };
             let steps = expand(&payload).expect("comfyui_health expands");
             assert_eq!(
-                steps,
+                effects(&steps),
                 vec![Step::HttpPoll {
                     url: "http://127.0.0.1:8188/object_info".to_string(),
                     timeout_sec: u64::from(declared),
@@ -2471,7 +2864,7 @@ mod tests {
         dtype: Option<&str>,
         tensor_parallel_size: Option<u16>,
         extra_args: &[&str],
-    ) -> Vec<Step> {
+    ) -> Vec<PlannedStep> {
         let payload = ProfileNode::ServiceStart {
             id: node_id(ids),
             name: "llm".to_string(),
@@ -2580,7 +2973,7 @@ mod tests {
         let ids = IdGen::new();
         for platform in ["vllm", "llamacpp"] {
             let steps = service_start(&ids, platform, None, None, None, None, &[]);
-            match &steps[0] {
+            match &steps[0].step {
                 Step::Note(msg) => {
                     assert!(msg.contains("name=llm"), "{msg}");
                     assert!(msg.contains("requires `model`"), "{msg}");
@@ -2594,7 +2987,7 @@ mod tests {
     fn expand_service_start_notes_out_an_unspecified_platform() {
         let ids = IdGen::new();
         let steps = service_start(&ids, "tgi", Some("m"), None, None, None, &[]);
-        match &steps[0] {
+        match &steps[0].step {
             Step::Note(msg) => {
                 assert!(msg.contains("platform_kind=tgi"), "{msg}");
                 assert!(msg.contains("vllm / ollama / llamacpp"), "{msg}");
@@ -2614,7 +3007,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("service_ready expands");
         assert_eq!(
-            steps,
+            effects(&steps),
             vec![Step::HttpPoll {
                 url: "http://127.0.0.1:9000/health".to_string(),
                 // Engine start-up, not an HTTP round trip, sets this
@@ -2643,7 +3036,7 @@ mod tests {
             };
             let steps = expand(&payload).expect("service_ready expands");
             assert_eq!(
-                steps,
+                effects(&steps),
                 vec![Step::HttpPoll {
                     url: "http://127.0.0.1:9000/health".to_string(),
                     timeout_sec: u64::from(declared),
@@ -2673,7 +3066,7 @@ mod tests {
             timeout_sec: None,
         })
         .expect("service_ready expands");
-        let deadline = |steps: &[Step]| match &steps[0] {
+        let deadline = |steps: &[PlannedStep]| match &steps[0].step {
             Step::HttpPoll { timeout_sec, .. } => *timeout_sec,
             other => panic!("expected HttpPoll, got {other:?}"),
         };
@@ -2710,7 +3103,6 @@ mod tests {
             &Step::Transfer {
                 src: "s".into(),
                 dst: "d".into(),
-                done: None,
             },
             &no_env
         )
@@ -3230,11 +3622,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_zero_sh_exit_carries_its_exit_code_and_captured_output() {
-        let step = Step::Sh(vec![
+        let step = PlannedStep::always(Step::Sh(vec![
             "sh".into(),
             "-c".into(),
             "echo out-before-failing; echo err-before-failing 1>&2; exit 7".into(),
-        ]);
+        ]));
         let failure = execute_step(&step, "post_install", &BTreeMap::new())
             .await
             .expect_err("a non-zero exit is a step failure");
@@ -3327,12 +3719,14 @@ mod tests {
         (format!("http://{addr}/payload.bin"), served)
     }
 
-    fn transfer_step(src: &str, dst: &std::path::Path, sha256: Option<String>) -> Step {
-        Step::Transfer {
-            src: src.to_string(),
-            dst: dst.to_string_lossy().into_owned(),
-            done: Some(assert::ModelFile::new(dst, sha256).done()),
-        }
+    fn transfer_step(src: &str, dst: &std::path::Path, sha256: Option<String>) -> PlannedStep {
+        PlannedStep::done_when(
+            Step::Transfer {
+                src: src.to_string(),
+                dst: dst.to_string_lossy().into_owned(),
+            },
+            assert::ModelFile::new(dst, sha256).done(),
+        )
     }
 
     /// The UC this stage exists for: **a second apply does not download
@@ -3451,6 +3845,241 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // -------------------------------------------------------------
+    // `Checkout`: the second apply, against a real repository.
+    //
+    // These run `git` rather than a fixed-response observer. The
+    // predicate's whole content is what git's exit status means, so a
+    // test that supplied that status itself would be checking the
+    // mapping and nothing else — and the failure this stage exists to
+    // remove (a `git clone` onto an existing directory) is git's
+    // behaviour, not this crate's.
+    //
+    // Nothing here reaches the network: the clone source is a local
+    // repository the test builds. `git` not being installed fails these
+    // loudly rather than skipping them — a skip would report green for
+    // an unverified feature.
+    // -------------------------------------------------------------
+
+    /// Run `argv` and require it to succeed.
+    fn git_ok(argv: &[&str]) {
+        let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
+        let outcome = effects::sh_exec(&argv, &effects::ShOpts::default())
+            .unwrap_or_else(|err| panic!("these tests require git on PATH: {err}"));
+        assert_eq!(
+            outcome.exit_code, 0,
+            "{argv:?} failed: {}",
+            outcome.stderr_tail
+        );
+    }
+
+    /// A local source repository with two commits whose **contents
+    /// differ**, tagged `v1` and `v2`.
+    ///
+    /// The contents have to differ: the condition compares what two
+    /// refs name, so two commits with identical trees would answer
+    /// "finished" for either tag and the ref half of the test would
+    /// prove nothing.
+    ///
+    /// Returns `(scratch dir, source repo, clone destination)`; the
+    /// destination does not exist yet.
+    fn source_repo(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = scratch_dir(tag);
+        let src = dir.join("source");
+        let src_text = src.to_string_lossy().into_owned();
+        fs::create_dir_all(&src).expect("create the source repo dir");
+        git_ok(&["git", "init", "-q", "-b", "main", &src_text]);
+        for (content, tag) in [("one", "v1"), ("two", "v2")] {
+            fs::write(src.join("file.txt"), content).expect("write the tracked file");
+            git_ok(&["git", "-C", &src_text, "add", "file.txt"]);
+            git_ok(&[
+                "git",
+                "-C",
+                &src_text,
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-q",
+                "-m",
+                content,
+            ]);
+            git_ok(&["git", "-C", &src_text, "tag", tag]);
+        }
+        (dir.clone(), src, dir.join("clone"))
+    }
+
+    /// The step `comfyui.install` composes, with the destination and
+    /// source substituted — one `sh -c` that clones and checks out,
+    /// guarded by the whole `Checkout`.
+    fn clone_step(src: &std::path::Path, dst: &std::path::Path, git_ref: &str) -> PlannedStep {
+        let script = format!(
+            "git clone -q {src} {dst} && git -C {dst} checkout -q {git_ref}",
+            src = src.display(),
+            dst = dst.display(),
+        );
+        PlannedStep::done_when(
+            Step::Sh(vec!["sh".to_string(), "-c".to_string(), script]),
+            assert::Checkout::new(dst, Some(git_ref.to_string())).done(),
+        )
+    }
+
+    /// **The UC of this stage: a second apply does not fail on the
+    /// clone.**
+    ///
+    /// The same test also shows what it is protecting against — the
+    /// identical command without the condition fails the second time,
+    /// which is the `git clone` refusing a destination that already
+    /// exists (design §4.4).
+    #[tokio::test]
+    async fn a_second_apply_skips_the_clone_instead_of_failing_on_it() {
+        let (dir, src, dst) = source_repo("checkout-second-apply");
+        let step = clone_step(&src, &dst, "v1");
+        let env = BTreeMap::new();
+
+        let first = execute_step(&step, "comfyui_install", &env)
+            .await
+            .expect("the first apply clones");
+        assert!(dst.join(".git").is_dir(), "the repository was cloned");
+        assert_eq!(fs::read_to_string(dst.join("file.txt")).unwrap(), "one");
+        let note = first.note.expect("an executed step reports its condition");
+        assert!(note.starts_with("not done: "), "{note}");
+
+        let second = execute_step(&step, "comfyui_install", &env)
+            .await
+            .expect("the second apply skips rather than failing");
+        let note = second.note.expect("a skipped step carries a note");
+        assert!(note.starts_with("skipped, already done: "), "{note}");
+        assert!(
+            note.contains(&format!("exists({}/.git)=satisfied", dst.display()))
+                && note.contains(&format!("git_tree({})=v1=satisfied", dst.display())),
+            "the skip says which halves were true: {note}",
+        );
+
+        // And the same command *without* the condition is exactly the
+        // failure this stage removes.
+        let unguarded = PlannedStep::always(step.step.clone());
+        let failure = execute_step(&unguarded, "comfyui_install", &env)
+            .await
+            .expect_err("an unguarded second clone fails");
+        assert_eq!(failure.observed.status, 128, "git refused the destination");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The completion is not "the directory is there".** With the
+    /// clone already at `v1`, a step that asks for `v2` is not
+    /// satisfied — same directory, different answer — and running it
+    /// makes it satisfied.
+    ///
+    /// The `v1` condition is checked alongside on the same host, so the
+    /// two answers differ by the ref alone.
+    #[tokio::test]
+    async fn a_different_ref_is_not_finished_even_though_the_directory_is_there() {
+        let (dir, src, dst) = source_repo("checkout-other-ref");
+        let env = BTreeMap::new();
+        execute_step(&clone_step(&src, &dst, "v1"), "comfyui_install", &env)
+            .await
+            .expect("the first apply clones at v1");
+
+        let at_v1 = assert::Checkout::new(&dst, Some("v1".to_string())).done();
+        let at_v2 = assert::Checkout::new(&dst, Some("v2".to_string())).done();
+        assert!(
+            assert::eval(&at_v1, ExecMode::Real, &LocalObserve)
+                .await
+                .is_satisfied(),
+            "the clone is at v1",
+        );
+        assert!(
+            !assert::eval(&at_v2, ExecMode::Real, &LocalObserve)
+                .await
+                .is_satisfied(),
+            "…and therefore not at v2, though the directory exists either way",
+        );
+
+        // The checkout step `custom_nodes` composes, guarded the same
+        // way: it runs, because the ref is not out yet.
+        let checkout = PlannedStep::done_when(
+            Step::Sh(vec![
+                "git".to_string(),
+                "-C".to_string(),
+                dst.to_string_lossy().into_owned(),
+                "checkout".to_string(),
+                "-q".to_string(),
+                "v2".to_string(),
+            ]),
+            at_v2.clone(),
+        );
+        let ran = execute_step(&checkout, "custom_nodes", &env)
+            .await
+            .expect("the checkout runs");
+        assert!(ran
+            .note
+            .expect("a condition is reported")
+            .starts_with("not done: "));
+        assert_eq!(fs::read_to_string(dst.join("file.txt")).unwrap(), "two");
+        assert!(
+            assert::eval(&at_v2, ExecMode::Real, &LocalObserve)
+                .await
+                .is_satisfied(),
+            "running the step is what makes its condition true",
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A dry run answers the clone**, in the words §(2) settled on:
+    /// `Unsatisfied` / `Satisfied`, never `NotChecked`.
+    ///
+    /// This is the whole payoff of evaluating the command predicate in
+    /// both modes. A `plan` run against a fresh pod says "would run" for
+    /// the install and, run again after the apply, says "would skip" —
+    /// neither of which a `NotChecked` could have said.
+    ///
+    /// The dry run must also **not clone anything**, which is checked
+    /// on the destination before the real apply happens.
+    #[tokio::test]
+    async fn a_dry_run_decides_the_clone_in_both_directions() {
+        let (dir, src, dst) = source_repo("checkout-dry-run");
+        let step = clone_step(&src, &dst, "v1");
+        let no_env = BTreeMap::new();
+
+        let before = dry_run_step(&step, &no_env).await;
+        let note = before.note.expect("a step with a condition answers");
+        assert!(
+            note.starts_with("would run, not done: "),
+            "an absent repository is decided, not undecided: {note}",
+        );
+        assert!(
+            !note.contains("not-checked"),
+            "nothing in a Checkout goes unread in a dry run: {note}",
+        );
+        assert!(
+            !dst.exists(),
+            "answering the condition must not clone anything",
+        );
+
+        execute_step(&step, "comfyui_install", &no_env)
+            .await
+            .expect("the apply clones");
+
+        let after = dry_run_step(&step, &no_env).await;
+        assert_eq!(
+            after.note.as_deref(),
+            Some(
+                format!(
+                    "would skip, already done: all[exists({dst}/.git)=satisfied, \
+                     git_tree({dst})=v1=satisfied]=satisfied",
+                    dst = dst.display(),
+                )
+                .as_str()
+            ),
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// **A dry run now answers the condition**, and the two answers it
     /// can give about a `sha256`-carrying entry are different sentences
     /// about the host — which is the whole point of evaluating it.
@@ -3522,11 +4151,10 @@ mod tests {
         // A step with no condition has no answer to report.
         assert_eq!(
             dry_run_step(
-                &Step::Transfer {
+                &PlannedStep::always(Step::Transfer {
                     src: "s".into(),
                     dst: "d".into(),
-                    done: None,
-                },
+                }),
                 &no_env,
             )
             .await,
@@ -3536,7 +4164,7 @@ mod tests {
             },
         );
         assert_eq!(
-            dry_run_step(&Step::Sh(vec!["ls".into()]), &no_env)
+            dry_run_step(&PlannedStep::always(Step::Sh(vec!["ls".into()])), &no_env)
                 .await
                 .note,
             None

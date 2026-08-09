@@ -91,19 +91,31 @@ pub(crate) fn direct(payload: &ProfileNode) -> Result<Demand, ExecError> {
 /// poll re-reads is likewise absent — a provisioner-internal read, not a
 /// bridge op (spec 02 §Poll deadlines).
 ///
-/// A step's `done` adds no demand either, for the same reason as the
-/// pid file: evaluating it reads the provisioner's own filesystem
-/// rather than calling a bridge op, and it reads only the destination
-/// the transfer is already gated on. A condition that could widen what
-/// a phase touches would have to be gated; this one cannot, because it
-/// is derived from the step's own destination rather than authored.
+/// **This answers for the effect, not for the condition beside it**
+/// ([`lifecycle::PlannedStep`]), and that is the whole of the argument
+/// that a condition needs no gate of its own:
+///
+/// - a condition is *derived*, never authored, so what it observes is
+///   fixed by the same payload fields the step's own targets come from
+///   — it cannot name a path or a URL the step does not already reach;
+/// - the two observations that read the filesystem read the step's own
+///   destination, which the path policy has already passed;
+/// - the one that runs a command runs it only where the step itself is
+///   a `Sh`, so `sh.exec` — the capability the condition's `git` would
+///   need — is demanded by the step regardless, and a profile that has
+///   not declared it is refused before either runs.
+///
+/// The last bullet is a fact about today's two entities rather than a
+/// property of the model. A condition on a step whose effect demanded
+/// *less* than the condition does would break it, and the stage that
+/// writes one has to gate it instead of inheriting this reasoning.
 pub(crate) fn step(step: &lifecycle::Step) -> Result<Demand, ExecError> {
     let demand = match step {
         lifecycle::Step::Sh(_) => Demand {
             capability: Some("sh.exec"),
             ..Demand::default()
         },
-        lifecycle::Step::Transfer { src, dst, .. } => {
+        lifecycle::Step::Transfer { src, dst } => {
             let (local, remote) = transfer_targets("net_transfer", src, dst)?;
             Demand {
                 capability: Some("net.transfer"),
@@ -193,7 +205,6 @@ mod tests {
         let demand = step(&lifecycle::Step::Transfer {
             src: "https://huggingface.co/o/r/resolve/main/a.bin".into(),
             dst: "/workspace/a.bin".into(),
-            done: None,
         })
         .expect("resolves");
         assert_eq!(

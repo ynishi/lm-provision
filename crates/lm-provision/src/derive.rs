@@ -68,8 +68,10 @@ pub fn derive(root: &ProfileNode) -> Derived {
             // expanded steps' (the routes are decided by the payload,
             // so they are known statically).
             Ok(steps) => {
-                for step in &steps {
-                    if let Ok(demanded) = demand::step(step) {
+                for planned in &steps {
+                    // The demand is the *effect's*; a step's condition
+                    // adds none (see `demand::step`).
+                    if let Ok(demanded) = demand::step(&planned.step) {
                         derived.absorb(demanded);
                     }
                 }

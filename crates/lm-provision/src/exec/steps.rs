@@ -51,7 +51,7 @@ use std::collections::HashMap;
 
 use dsl_kit::{DslNode, NodeId, Walk};
 
-use super::lifecycle::{self, Step};
+use super::lifecycle::{self, PlannedStep};
 use crate::profile_ast::ProfileNode;
 
 /// The registry op name a lifecycle phase dispatches to, or `None` for
@@ -96,7 +96,7 @@ pub struct PhaseSteps {
     /// The expanded steps, in the order [`lifecycle::expand`] composed
     /// them. **Never reordered**: the report id of a step is its
     /// position here, and the phase is still executed in sequence.
-    pub steps: Vec<Step>,
+    pub steps: Vec<PlannedStep>,
     /// The synthetic node ids, one per entry of [`steps`](Self::steps)
     /// and in the same order.
     pub nodes: Vec<NodeId>,
@@ -199,7 +199,7 @@ impl StepPlan {
     /// [`build`](Self::build) handed out — which is what lets a resolver
     /// fail loudly on a suspension it was not meant to answer rather
     /// than guessing at a step.
-    pub fn locate(&self, node: NodeId) -> Option<(&PhaseSteps, StepRef, &Step)> {
+    pub fn locate(&self, node: NodeId) -> Option<(&PhaseSteps, StepRef, &PlannedStep)> {
         let step_ref = *self.steps.get(&node)?;
         let phase = self.phases.get(&step_ref.phase)?;
         let step = phase.steps.get(step_ref.index - 1)?;

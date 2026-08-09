@@ -32,10 +32,24 @@
 //!   reason the failure is an *answer* (design §4.1: folding the read
 //!   failure into "different" is what the driver's `ensure_binary` used
 //!   to do).
+//! - **`command_status`** spawns `argv` and waits for it, reporting the
+//!   status it exited with. It does not judge that status: `0` is not
+//!   "true" here, it is just what the process returned, and the
+//!   predicate that composed the argv is what knows whether that means
+//!   the condition holds. A binary that cannot be started is a
+//!   [`CheckError`] — detected, therefore an answer — and a signal
+//!   arrives as the `-1` the effect layer reports for one.
+//!
+//! `command_status` blocks the thread it is polled on, exactly as the
+//! two file reads do: the effect layer's `sh_exec` is synchronous, and
+//! this implementation is the near case (§Why the async evaluator is
+//! not pointless, above). A `command_status` reaching a remote pod is
+//! the one that would need the wrapper the async shape exists for.
 
 use std::path::Path;
 
 use super::assert::{CheckError, CheckErrorCategory, DigestReading, Observe};
+use super::effects;
 
 /// Observes the filesystem this process is running on.
 ///
@@ -58,6 +72,30 @@ impl Observe for LocalObserve {
             Ok(Some(hex)) => Ok(DigestReading::Present(hex)),
             Ok(None) => Ok(DigestReading::Absent),
             Err(err) => Err(unobservable(path, &err)),
+        }
+    }
+
+    async fn command_status(&self, argv: &[String]) -> Result<i32, CheckError> {
+        // The same spawn the effect layer uses, so a predicate and a
+        // step see one implementation of "run this argv" — and one
+        // answer to what an exit code, a signal or a missing binary
+        // looks like. No env is injected: a predicate's command is
+        // composed by the crate and carries no secrets, and handing it
+        // the phase's resolved map would put them in reach of something
+        // that only ever needs to read.
+        match effects::sh_exec(argv, &effects::ShOpts::default()) {
+            // `exit_code` is `-1` for a signal or an unknown status,
+            // which is a code no predicate treats as an answer — it
+            // falls into whatever "anything else" bucket the predicate
+            // has, i.e. a failed observation.
+            Ok(outcome) => Ok(outcome.exit_code),
+            // Reached only when the process could not be started at all
+            // (a missing binary). That is detected, so it is an answer
+            // rather than an error (design §3.2b).
+            Err(err) => Err(CheckError::new(
+                CheckErrorCategory::Unobservable,
+                err.to_string(),
+            )),
         }
     }
 }
@@ -84,6 +122,11 @@ mod tests {
     use crate::exec::assert::{eval, Assert, AssertOutcome};
     use crate::exec::ExecMode;
     use std::path::PathBuf;
+
+    // The command channel meeting a real repository is
+    // `lifecycle`'s `a_second_apply_skips_the_clone_instead_of_failing_on_it`,
+    // which drives the whole step. Here it is exercised on its own, with
+    // commands that need nothing installed.
 
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -196,6 +239,40 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The command channel returns the status a process exited with,
+    /// **without judging it**: `1` is not an error here, it is what the
+    /// process said, and the predicate that composed the argv is what
+    /// knows whether that means the condition holds.
+    #[tokio::test]
+    async fn a_command_that_runs_reports_the_status_it_exited_with() {
+        for want in [0, 1, 7] {
+            let argv = vec!["sh".to_string(), "-c".to_string(), format!("exit {want}")];
+            assert_eq!(
+                LocalObserve.command_status(&argv).await,
+                Ok(want),
+                "exit {want} is reported as-is",
+            );
+        }
+    }
+
+    /// A binary that is not there is **detected**, so it is an answer
+    /// (`CheckFailed`) rather than a host-process error — the same
+    /// boundary the two file reads sit on (design §3.2b).
+    #[tokio::test]
+    async fn a_command_that_cannot_be_started_answers_check_failed() {
+        let argv = vec!["lm-provision-no-such-binary-8f3a".to_string()];
+        let err = LocalObserve
+            .command_status(&argv)
+            .await
+            .expect_err("a missing binary cannot be run");
+        assert_eq!(err.category(), CheckErrorCategory::Unobservable);
+        assert!(
+            err.detail().contains("lm-provision-no-such-binary-8f3a"),
+            "the detail names what could not be started: {}",
+            err.detail(),
+        );
     }
 
     /// The detail is a function of the observation alone, so the same
