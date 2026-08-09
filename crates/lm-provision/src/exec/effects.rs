@@ -639,8 +639,65 @@ async fn read_capped(mut response: reqwest::Response, max_bytes: u64) -> Result<
     Ok(buf)
 }
 
+/// Removes a half-written destination unless the transfer that owns it
+/// finished.
+///
+/// A guard rather than a line on the error path, because **the failure
+/// that matters never reaches an error path**: cancelling an in-flight
+/// transfer is dropping its future, and a dropped future runs no more of
+/// its own code — only the `Drop` impls of what it was holding. Without
+/// one, the bytes written so far stay at the destination, and a `models`
+/// entry that declares no `sha256` has `FileExists { dst }` for its whole
+/// completion condition — so the next apply reads that truncated file as
+/// a finished weight.
+///
+/// It is armed *after* the file is created, so a failure to create one
+/// cannot delete a file this transfer never opened, and the removal is
+/// [`std::fs::remove_file`] rather than tokio's: `Drop` is synchronous
+/// and cannot await. It is one `unlink`.
+struct PartialFile<'a> {
+    /// The destination to remove while the transfer is unfinished.
+    path: &'a str,
+    /// Whether dropping this guard removes [`Self::path`]. False until
+    /// the file exists, and false again once the transfer has completed.
+    armed: bool,
+}
+
+impl<'a> PartialFile<'a> {
+    /// A disarmed guard for `path`; [`Self::arm`] once the file exists.
+    fn new(path: &'a str) -> Self {
+        Self { path, armed: false }
+    }
+
+    /// From here on, dropping this guard removes the destination.
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// The transfer completed: the destination stays.
+    ///
+    /// Takes `self` so that the guard is spent, not merely quieted — a
+    /// second completion cannot exist to be reasoned about.
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartialFile<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
 /// Stream `response`'s body to `dst_path`, removing the partial file on
-/// any failure. Errors are returned as a message string.
+/// any failure **and on cancellation**. Errors are returned as a message
+/// string.
+///
+/// Both removals are the one [`PartialFile`] guard: an error returns
+/// through it and a cancellation drops through it, so neither leaves a
+/// truncated destination and neither can remove it twice.
 ///
 /// **No cap.** This is the path a model weight travels; the size that
 /// would have to be refused is the size that is normal here. What
@@ -648,9 +705,13 @@ async fn read_capped(mut response: reqwest::Response, max_bytes: u64) -> Result<
 /// that stops sending fails, a supplier that keeps sending is allowed to
 /// finish.
 async fn stream_to_file(mut response: reqwest::Response, dst_path: &str) -> Result<u64, String> {
+    // Declared before the file so that it is dropped *after* it: the
+    // handle is closed before the destination is unlinked.
+    let mut guard = PartialFile::new(dst_path);
     let mut file = tokio::fs::File::create(dst_path)
         .await
         .map_err(|err| format!("failed creating '{dst_path}': {err}"))?;
+    guard.arm();
 
     let mut total: u64 = 0;
     let result: Result<u64, String> = loop {
@@ -674,11 +735,13 @@ async fn stream_to_file(mut response: reqwest::Response, dst_path: &str) -> Resu
     };
 
     match result {
-        Ok(total) => Ok(total),
-        Err(err) => {
-            let _ = tokio::fs::remove_file(dst_path).await;
-            Err(err)
+        Ok(total) => {
+            guard.keep();
+            Ok(total)
         }
+        // The guard is still armed, so returning through here removes the
+        // destination — the same line the cancellation path takes.
+        Err(err) => Err(err),
     }
 }
 
@@ -1287,6 +1350,124 @@ mod tests {
         );
 
         stop.store(true, Ordering::Relaxed);
+        handle.join().expect("server thread joins");
+    }
+
+    // -----------------------------------------------------------------
+    // Cancellation
+    // -----------------------------------------------------------------
+
+    /// A transfer that is **cancelled** must leave no destination behind.
+    ///
+    /// Cancelling a future is dropping it, so the error path that removes
+    /// a partial file never runs — only a `Drop` impl does. What makes
+    /// the leftover worse than wasted bytes is how it reads: a `models`
+    /// entry declaring no `sha256` is complete when its destination
+    /// exists, so a truncated file left here is a finished weight to the
+    /// next apply.
+    ///
+    /// The drop is taken **explicitly** rather than by letting a timeout
+    /// swallow the future, so that what the assertion pins is the drop
+    /// itself: the file is observed present while the transfer is in
+    /// flight, then absent on the line after `drop`.
+    #[tokio::test]
+    async fn a_cancelled_transfer_removes_its_partial_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Promise far more than is sent: the first chunk arrives (so
+            // the destination is created and written) and the transfer
+            // then stays in flight, waiting for a body that never ends.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+            let _ = stream.write_all(&[b'w'; 4096]);
+            let _ = stream.flush();
+            while !server_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-cancelled-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        // A read deadline long enough that nothing but the drop can end
+        // this transfer.
+        let url = format!("http://{addr}/");
+        let mut transfer = Box::pin(transfer_in(&url, &dst_str, Duration::from_secs(30)));
+
+        // Drive it until the destination exists — that is the state a
+        // cancellation has to clean up.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !dst.exists() {
+            if let Ok(outcome) =
+                tokio::time::timeout(Duration::from_millis(25), &mut transfer).await
+            {
+                panic!("the transfer must still be in flight, got: {outcome:?}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the destination was never created, so nothing was cancelled"
+            );
+        }
+
+        drop(transfer);
+
+        assert!(
+            !dst.exists(),
+            "cancelling a transfer must not leave a partial file that the next \
+             apply would read as a finished download"
+        );
+
+        std::fs::remove_file(&dst).ok();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("server thread joins");
+    }
+
+    /// The guard must not double up with the error path: a transfer that
+    /// *fails* still removes its destination exactly once, and reports
+    /// the failure rather than whatever a second removal would have said.
+    #[tokio::test]
+    async fn a_failed_transfer_still_removes_its_partial_file_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Promise 1 MiB, send 4 KiB, hang up: the body ends early, so
+            // the read fails rather than timing out.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+            let _ = stream.write_all(&[b'w'; 4096]);
+            let _ = stream.flush();
+        });
+
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-truncated-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let err = transfer(&format!("http://{addr}/"), &dst_str)
+            .await
+            .expect_err("a body that ends early is a failed download");
+        assert!(
+            err.to_string().contains("response body"),
+            "the failure names the read, not a cleanup: {err}"
+        );
+        assert!(
+            !dst.exists(),
+            "a failed transfer leaves no partial file behind"
+        );
+
         handle.join().expect("server thread joins");
     }
 

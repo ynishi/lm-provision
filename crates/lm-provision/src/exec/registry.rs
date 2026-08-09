@@ -1501,24 +1501,23 @@ pub(crate) fn steps_are_independent(steps: &[lifecycle::PlannedStep]) -> bool {
 ///
 /// `FailFast` would cancel the phase's other transfers the moment one
 /// failed, and the argument for it is that a pod is billed by the second,
-/// so a doomed phase should stop spending. Three things say otherwise
-/// here, and the first is decisive:
+/// so a doomed phase should stop spending. Two things say otherwise here.
 ///
-/// 1. **A cancelled transfer leaves its partial file behind.**
-///    [`super::effects`]'s streaming download removes the destination on
-///    the *error* path; there is no drop guard, and cancelling an
-///    in-flight transfer means dropping its future, which runs no error
-///    path at all. Stage 1 derived a `models` entry's completion from
-///    `FileExists { dst }` alone when no `sha256` is declared — so the
-///    truncated file left behind would be read as **done** on the next
-///    apply, and the profile would be satisfied by a broken weight. That
-///    is a worse outcome than any amount of transfer that FailFast saves.
-/// 2. **Most of what FailFast "saves" has to be paid again.** It discards
+/// A third reason used to stand first and no longer holds: a cancelled
+/// transfer left its partial file behind, which a `models` entry with no
+/// declared `sha256` would read as **done** on the next apply. That was
+/// true when this policy was chosen; [`super::effects`]'s download now
+/// carries a drop guard, so a dropped transfer unlinks its destination on
+/// the way out. The hazard is gone, and with it the reason that made this
+/// choice forced rather than weighed. The two below are why it still
+/// stands:
+///
+/// 1. **Most of what FailFast "saves" has to be paid again.** It discards
 ///    siblings that were nine tenths finished, and nothing carries that
 ///    nine tenths forward; the next apply starts them from zero. What
 ///    `CollectAll` spends on a doomed phase, it converts into files that
 ///    the next apply skips.
-/// 3. **It costs the operator applies.** A profile with three bad URLs out
+/// 2. **It costs the operator applies.** A profile with three bad URLs out
 ///    of twenty needs three apply cycles under FailFast to learn all three
 ///    names, one under `CollectAll`.
 ///
