@@ -340,7 +340,16 @@ impl ProfileOp {
             audit_lifecycle_step(self.ctx.mode, &kind, &planned.step, &env);
             let run = effects::block_on_effect(
                 self.name,
-                lifecycle::run_step(planned, self.name, &env, self.ctx.mode),
+                lifecycle::run_step(
+                    planned,
+                    lifecycle::StepLabel {
+                        op: self.name,
+                        kind: &kind,
+                        step: &sub_id,
+                    },
+                    &env,
+                    self.ctx.mode,
+                ),
             );
             renders.push(record_lifecycle_step(
                 &self.ctx,
@@ -669,14 +678,21 @@ impl ProfileOp {
                 Ok(value)
             }
             ExecMode::Real => {
-                let outcome =
-                    match effects::block_on_effect("net_transfer", effects::transfer(src, dst)) {
-                        Ok(outcome) => outcome,
-                        Err(err) => {
-                            self.push_transfer_failure(&id, &kind, src, dst, &err);
-                            return Err(err);
-                        }
-                    };
+                // A direct `net.transfer` phase is one transfer, so its
+                // transcript's step id is the phase's own report id
+                // (no `_<n>`); the events still separate it from
+                // whatever else the run is doing.
+                let transcript = audit::TransferTranscript::new(&kind, &id, dst);
+                let outcome = match effects::block_on_effect(
+                    "net_transfer",
+                    effects::transfer(src, dst, &transcript.sink()),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        self.push_transfer_failure(&id, &kind, src, dst, &err);
+                        return Err(err);
+                    }
+                };
                 let value = self.record(format!(
                     "net_transfer src={src} dst={} bytes={}",
                     outcome.dst, outcome.bytes
@@ -1934,7 +1950,17 @@ async fn resolve_lifecycle_step(
     // No lock is held across this await: `record_line` / `push_report`
     // take their mutexes for the duration of one push, after the step
     // has finished.
-    let run = lifecycle::run_step(planned, op, &env, ctx.mode).await;
+    let run = lifecycle::run_step(
+        planned,
+        lifecycle::StepLabel {
+            op,
+            kind: &kind,
+            step: &sub_id,
+        },
+        &env,
+        ctx.mode,
+    )
+    .await;
     let summary = record_lifecycle_step(
         ctx,
         sub_id,
@@ -2005,7 +2031,8 @@ async fn resolve_transfer(
             // No lock is held across this await: `record_line` /
             // `push_report` take the report and log mutexes for the
             // duration of one push, after the transfer has finished.
-            let outcome = match effects::transfer(src, dst).await {
+            let transcript = audit::TransferTranscript::new(&kind, &id, dst);
+            let outcome = match effects::transfer(src, dst, &transcript.sink()).await {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     push_transfer_failure_report(ctx, &id, &kind, src, dst, &err);

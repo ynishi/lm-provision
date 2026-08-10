@@ -76,7 +76,7 @@ use serde::Deserialize;
 use super::assert::{self, Done as _};
 use super::observe::{self, LocalObserve, PidFile, PROC_ROOT};
 use super::scheme::{self, parse_hf_uri, split_b2_uri};
-use super::{effects, ExecError, ExecMode};
+use super::{audit, effects, ExecError, ExecMode};
 use crate::profile_ast::ProfileNode;
 
 /// ComfyUI clone target (spec 02 §Built-in path constants).
@@ -1209,12 +1209,51 @@ impl From<ExecError> for StepFailure {
     }
 }
 
+/// The three names one step answers to.
+///
+/// They were one `op: &str` parameter until a transfer had to identify
+/// *itself* in the audit transcript rather than identify its phase: a
+/// `models` phase runs its entries at the same time
+/// ([`crate::apply`]), so "a transfer under `models` is at 29%" names
+/// four different transfers and settles nothing. [`Self::step`] is what
+/// separates them.
+///
+/// All three are read-only labels — nothing here changes what a step
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepLabel<'a> {
+    /// The registry op name. Labels the [`ExecError::EffectFailed`]
+    /// surface, so the engine's node-located error carries the op that
+    /// ran.
+    pub op: &'a str,
+    /// The phase kind — the `kind` field on every audit event
+    /// (spec 09 §Audit log).
+    pub kind: &'a str,
+    /// The step's report id (`<phase_index>_<kind>_<n>`), the same
+    /// string the apply report's entry carries. What tells concurrent
+    /// steps apart in the transcript.
+    pub step: &'a str,
+}
+
+impl<'a> StepLabel<'a> {
+    /// A label whose three names are all `op` — for a caller that has no
+    /// phase index to build a report id from (the lifecycle unit tests,
+    /// which drive a step directly rather than through the engine).
+    #[cfg(test)]
+    fn flat(op: &'a str) -> Self {
+        Self {
+            op,
+            kind: op,
+            step: op,
+        }
+    }
+}
+
 /// Execute one step for real, returning what it observed.
 ///
-/// `op` is the registry op name — used only to label the
-/// [`ExecError::EffectFailed`] surface, so the engine's node-located
-/// error carries the op that ran. `env` is the phase's resolved
-/// env-injection map, injected into a [`Step::Sh`] child process.
+/// `label` carries the names the step reports under ([`StepLabel`]).
+/// `env` is the phase's resolved env-injection map, injected into a
+/// [`Step::Sh`] child process.
 ///
 /// On failure the error travels with whatever the step observed first
 /// ([`StepFailure`]); callers that only need the error take
@@ -1244,7 +1283,7 @@ impl From<ExecError> for StepFailure {
 /// what the tree exists for (design §3.2b').
 pub async fn execute_step(
     planned: &PlannedStep,
-    op: &str,
+    label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
 ) -> Result<StepResult, StepFailure> {
     let evaluated = match &planned.done {
@@ -1272,7 +1311,7 @@ pub async fn execute_step(
         }
     }
 
-    let mut result = run_effect(&planned.step, op, env).await?;
+    let mut result = run_effect(&planned.step, label, env).await?;
     if let Some((done, node)) = &evaluated {
         result.note = Some(format!(
             "not done: {}",
@@ -1291,13 +1330,17 @@ pub async fn execute_step(
 /// the same decision a second time.
 async fn run_effect(
     step: &Step,
-    op: &str,
+    label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
 ) -> Result<StepResult, StepFailure> {
     match step {
-        Step::Sh(argv) => execute_sh(argv, op, env),
+        Step::Sh(argv) => execute_sh(argv, label.op, env),
         Step::Transfer { src, dst } => {
-            let outcome = effects::transfer(src, dst).await?;
+            // The transcript is this transfer's own: it carries the step
+            // id, which is what separates it from the siblings a
+            // parallel phase is running beside it (spec 09 §Audit log).
+            let transcript = audit::TransferTranscript::new(label.kind, label.step, dst);
+            let outcome = effects::transfer(src, dst, &transcript.sink()).await?;
             Ok(StepResult {
                 summary: format!(
                     "transfer src={src} dst={} bytes={}",
@@ -1319,7 +1362,7 @@ async fn run_effect(
                 *timeout_sec,
                 pid_file.as_deref(),
                 log_path.as_deref(),
-                op,
+                label.op,
             )
             .await
         }
@@ -1437,15 +1480,20 @@ pub enum StepRun {
 /// point of it existing: a dry run that answers a step's `done` and a
 /// real run that skips on it must not depend on which driver is turning
 /// the engine.
+/// **A dry run emits no progress**, because there is no transfer to have
+/// any: [`dry_run_step`] answers the step's condition and stops, so
+/// nothing reaches a byte loop. That is the whole of the rule — no mode
+/// check guards the transcript, the transfer that would write it does
+/// not happen.
 pub async fn run_step(
     planned: &PlannedStep,
-    op: &str,
+    label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
     mode: ExecMode,
 ) -> Result<StepRun, StepFailure> {
     match mode {
         ExecMode::DryRun => Ok(StepRun::Dry(dry_run_step(planned, env).await)),
-        ExecMode::Real => execute_step(planned, op, env).await.map(StepRun::Real),
+        ExecMode::Real => execute_step(planned, label, env).await.map(StepRun::Real),
     }
 }
 
@@ -4107,7 +4155,7 @@ mod tests {
             "-c".into(),
             "echo out-before-failing; echo err-before-failing 1>&2; exit 7".into(),
         ]));
-        let failure = execute_step(&step, "post_install", &BTreeMap::new())
+        let failure = execute_step(&step, StepLabel::flat("post_install"), &BTreeMap::new())
             .await
             .expect_err("a non-zero exit is a step failure");
 
@@ -4225,14 +4273,14 @@ mod tests {
         let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
         let env = BTreeMap::new();
 
-        let first = execute_step(&step, "models", &env)
+        let first = execute_step(&step, StepLabel::flat("models"), &env)
             .await
             .expect("the first apply downloads");
         assert_eq!(first.bytes, Some(BODY.len() as u64));
         assert_eq!(served.load(Ordering::SeqCst), 1);
         assert_eq!(fs::read(&dst).expect("destination written"), BODY);
 
-        let second = execute_step(&step, "models", &env)
+        let second = execute_step(&step, StepLabel::flat("models"), &env)
             .await
             .expect("the second apply skips");
         assert_eq!(
@@ -4270,12 +4318,12 @@ mod tests {
         let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
         let env = BTreeMap::new();
 
-        execute_step(&step, "models", &env)
+        execute_step(&step, StepLabel::flat("models"), &env)
             .await
             .expect("the first apply downloads");
         fs::write(&dst, b"truncated or tampered").expect("overwrite the destination");
 
-        let second = execute_step(&step, "models", &env)
+        let second = execute_step(&step, StepLabel::flat("models"), &env)
             .await
             .expect("a mismatching destination must be downloaded again");
         assert_eq!(served.load(Ordering::SeqCst), 2);
@@ -4310,7 +4358,7 @@ mod tests {
         let (url, served) = serving_local_server(BODY);
         let step = transfer_step(&url, &dst, None);
 
-        let result = execute_step(&step, "models", &BTreeMap::new())
+        let result = execute_step(&step, StepLabel::flat("models"), &BTreeMap::new())
             .await
             .expect("the step decides");
 
@@ -4418,7 +4466,7 @@ mod tests {
         let step = clone_step(&src, &dst, "v1");
         let env = BTreeMap::new();
 
-        let first = execute_step(&step, "comfyui_install", &env)
+        let first = execute_step(&step, StepLabel::flat("comfyui_install"), &env)
             .await
             .expect("the first apply clones");
         assert!(dst.join(".git").is_dir(), "the repository was cloned");
@@ -4426,7 +4474,7 @@ mod tests {
         let note = first.note.expect("an executed step reports its condition");
         assert!(note.starts_with("not done: "), "{note}");
 
-        let second = execute_step(&step, "comfyui_install", &env)
+        let second = execute_step(&step, StepLabel::flat("comfyui_install"), &env)
             .await
             .expect("the second apply skips rather than failing");
         let note = second.note.expect("a skipped step carries a note");
@@ -4440,7 +4488,7 @@ mod tests {
         // And the same command *without* the condition is exactly the
         // failure this stage removes.
         let unguarded = PlannedStep::always(step.step.clone());
-        let failure = execute_step(&unguarded, "comfyui_install", &env)
+        let failure = execute_step(&unguarded, StepLabel::flat("comfyui_install"), &env)
             .await
             .expect_err("an unguarded second clone fails");
         assert_eq!(failure.observed.status, 128, "git refused the destination");
@@ -4459,9 +4507,13 @@ mod tests {
     async fn a_different_ref_is_not_finished_even_though_the_directory_is_there() {
         let (dir, src, dst) = source_repo("checkout-other-ref");
         let env = BTreeMap::new();
-        execute_step(&clone_step(&src, &dst, "v1"), "comfyui_install", &env)
-            .await
-            .expect("the first apply clones at v1");
+        execute_step(
+            &clone_step(&src, &dst, "v1"),
+            StepLabel::flat("comfyui_install"),
+            &env,
+        )
+        .await
+        .expect("the first apply clones at v1");
 
         let at_v1 = assert::Checkout::new(&dst, Some("v1".to_string())).done();
         let at_v2 = assert::Checkout::new(&dst, Some("v2".to_string())).done();
@@ -4491,7 +4543,7 @@ mod tests {
             ]),
             at_v2.clone(),
         );
-        let ran = execute_step(&checkout, "custom_nodes", &env)
+        let ran = execute_step(&checkout, StepLabel::flat("custom_nodes"), &env)
             .await
             .expect("the checkout runs");
         assert!(ran
@@ -4540,7 +4592,7 @@ mod tests {
             "answering the condition must not clone anything",
         );
 
-        execute_step(&step, "comfyui_install", &no_env)
+        execute_step(&step, StepLabel::flat("comfyui_install"), &no_env)
             .await
             .expect("the apply clones");
 

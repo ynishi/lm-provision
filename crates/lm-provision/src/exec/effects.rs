@@ -50,6 +50,18 @@
 //! is a value between "detects a stalled supplier" and "does not kill a
 //! slow CDN". It is a host-side constant, not a profile field.
 //!
+//! ## Progress
+//!
+//! The same two facts — no cap, a per-read deadline — mean a download
+//! that takes twenty minutes is the normal case. [`download`] therefore
+//! reports what it has written to a [`ProgressSink`] as it goes; what
+//! that becomes is the caller's business (the transcript's
+//! `net.transfer.progress` events, via
+//! [`super::audit::TransferTranscript`]). This module logs nothing
+//! itself — the audit lines were stripped out of these functions on the
+//! way over from the Lua bridges and are not coming back in through the
+//! byte loop.
+//!
 //! ## The synchronous seam
 //!
 //! `dsl_kit::Op::apply` is a synchronous trait method, so an op cannot
@@ -228,6 +240,52 @@ pub struct TransferOutcome {
     pub bytes: u64,
     /// Destination path written to.
     pub dst: String,
+}
+
+/// What a streaming download has moved, reported while it runs.
+///
+/// A 4 GiB weight is minutes of silence otherwise (see the module doc's
+/// §Progress), so [`download`] hands this out as the bytes land. It says
+/// only what was measured — no rate, no estimate; the caller decides what
+/// to make of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferProgress {
+    /// Bytes written to the destination so far.
+    pub written: u64,
+    /// The supplier's declared total, **absent when it declared none**.
+    /// `Content-Length` is optional, and a chunked or content-encoded
+    /// response has none to give, so a consumer must have an answer for
+    /// "how far along" that does not need this.
+    pub total: Option<u64>,
+    /// Whether this is the report of a finished transfer. It arrives
+    /// once, after the last byte is flushed — so a transfer that failed
+    /// or was cancelled never sends one, and the last thing heard from
+    /// it is a `false`.
+    pub finished: bool,
+}
+
+/// Where a streaming download reports its [`TransferProgress`].
+///
+/// The effect layer keeps no audit concern (see the module doc: the
+/// audit lines were stripped out of these functions on the way over from
+/// the Lua bridges), so the byte counter is handed out rather than
+/// logged here — [`super::audit::TransferTranscript`] is what turns it
+/// into the stderr transcript's events, and a test can pass a counter
+/// instead.
+///
+/// **Called once per received chunk**, which for a multi-gigabyte weight
+/// is six figures of calls: a sink does a clock read and a comparison,
+/// not I/O of its own.
+pub type ProgressSink<'a> = &'a (dyn Fn(TransferProgress) + Send + Sync);
+
+/// The function [`ignore_progress`] hands out, as a `static` so the
+/// reference to it is `'static` without a promotion rule doing the work.
+static IGNORE_PROGRESS: fn(TransferProgress) = |_| {};
+
+/// A sink that drops every report — for a caller that wants no
+/// transcript (a test, or a route that reports elsewhere).
+pub fn ignore_progress() -> ProgressSink<'static> {
+    &IGNORE_PROGRESS
 }
 
 /// Last `TAIL_LIMIT` bytes of `bytes`, lossily decoded to UTF-8.
@@ -443,8 +501,24 @@ async fn http_outcome(response: reqwest::Response) -> Result<HttpOutcome, ExecEr
 /// [`super::lifecycle`], spec 02 §Dispatch routing) — and a `b2://`
 /// source fails with an error naming the endpoint no profile field
 /// declares, rather than a guessed host.
-pub async fn transfer(src: &str, dst: &str) -> Result<TransferOutcome, ExecError> {
-    transfer_in(src, dst, Duration::from_secs(TRANSFER_READ_TIMEOUT_SEC)).await
+/// `progress` receives a [`TransferProgress`] as the bytes land — see
+/// [`ProgressSink`]. **A download reports; an upload does not**: the
+/// request body of an upload is handed whole to `reqwest`
+/// ([`upload`]), so there is no loop here to count it, and inventing a
+/// counter for a route no profile reaches yet would be a shape without a
+/// caller.
+pub async fn transfer(
+    src: &str,
+    dst: &str,
+    progress: ProgressSink<'_>,
+) -> Result<TransferOutcome, ExecError> {
+    transfer_in(
+        src,
+        dst,
+        Duration::from_secs(TRANSFER_READ_TIMEOUT_SEC),
+        progress,
+    )
+    .await
 }
 
 /// [`transfer`] with the per-read deadline injected, so a test can prove
@@ -454,9 +528,12 @@ async fn transfer_in(
     src: &str,
     dst: &str,
     read_timeout: Duration,
+    progress: ProgressSink<'_>,
 ) -> Result<TransferOutcome, ExecError> {
     match super::scheme::resolve("net_transfer", src, dst)? {
-        super::scheme::Transfer::Download { url } => download(&url, dst, read_timeout).await,
+        super::scheme::Transfer::Download { url } => {
+            download(&url, dst, read_timeout, progress).await
+        }
         super::scheme::Transfer::Upload { url } => upload(src, &url, read_timeout).await,
     }
 }
@@ -474,6 +551,7 @@ async fn download(
     url: &str,
     dst: &str,
     read_timeout: Duration,
+    progress: ProgressSink<'_>,
 ) -> Result<TransferOutcome, ExecError> {
     let client = client("net_transfer", |builder| builder.read_timeout(read_timeout))?;
     let response = client
@@ -493,7 +571,7 @@ async fn download(
         });
     }
 
-    let bytes = stream_to_file(response, dst)
+    let bytes = stream_to_file(response, dst, progress)
         .await
         .map_err(|message| ExecError::EffectFailed {
             op: "net_transfer".to_string(),
@@ -704,7 +782,25 @@ impl Drop for PartialFile<'_> {
 /// bounds the stream instead is the client's `read_timeout` — a supplier
 /// that stops sending fails, a supplier that keeps sending is allowed to
 /// finish.
-async fn stream_to_file(mut response: reqwest::Response, dst_path: &str) -> Result<u64, String> {
+///
+/// **`progress` is told after every write, and once more when the last
+/// byte is flushed.** Reporting *after* the write is what makes the
+/// number honest: it is bytes that reached the destination, not bytes
+/// that arrived off the socket. The declared total is read off the
+/// response before the first chunk and repeated on every report, so a
+/// consumer never has to have kept the first one.
+///
+/// **A failed or cancelled transfer sends no finished report.** An error
+/// returns before it and a cancellation drops the future mid-`await`,
+/// which runs no more of this function — the same reason [`PartialFile`]
+/// is a guard. So "the last thing this stream said was not finished" is
+/// the truth about a stream that did not finish, and a reader does not
+/// need a separate failure event to know it.
+async fn stream_to_file(
+    mut response: reqwest::Response,
+    dst_path: &str,
+    progress: ProgressSink<'_>,
+) -> Result<u64, String> {
     // Declared before the file so that it is dropped *after* it: the
     // handle is closed before the destination is unlinked.
     let mut guard = PartialFile::new(dst_path);
@@ -713,6 +809,11 @@ async fn stream_to_file(mut response: reqwest::Response, dst_path: &str) -> Resu
         .map_err(|err| format!("failed creating '{dst_path}': {err}"))?;
     guard.arm();
 
+    // Read before the body is touched: `content_length` answers from the
+    // response's own `Content-Length`, and a supplier that declared none
+    // (chunked, or content-encoded) gives `None` here rather than a
+    // guess.
+    let declared = response.content_length();
     let mut total: u64 = 0;
     let result: Result<u64, String> = loop {
         match response.chunk().await {
@@ -721,6 +822,11 @@ async fn stream_to_file(mut response: reqwest::Response, dst_path: &str) -> Resu
                     break Err(format!("failed writing '{dst_path}': {err}"));
                 }
                 total += chunk.len() as u64;
+                progress(TransferProgress {
+                    written: total,
+                    total: declared,
+                    finished: false,
+                });
             }
             // The body ended. `tokio::fs::File` buffers, so the last
             // write is only on disk once it is flushed — a destination
@@ -737,6 +843,12 @@ async fn stream_to_file(mut response: reqwest::Response, dst_path: &str) -> Resu
     match result {
         Ok(total) => {
             guard.keep();
+            // After the flush, so the report and the destination agree.
+            progress(TransferProgress {
+                written: total,
+                total: declared,
+                finished: true,
+            });
             Ok(total)
         }
         // The guard is still armed, so returning through here removes the
@@ -751,7 +863,7 @@ mod tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn unique_suffix() -> u128 {
         std::time::SystemTime::now()
@@ -1094,7 +1206,7 @@ mod tests {
         ));
         let dst_str = dst.to_string_lossy().into_owned();
 
-        let outcome = transfer(&url, &dst_str)
+        let outcome = transfer(&url, &dst_str, ignore_progress())
             .await
             .expect("a 302 supplier must still deliver");
 
@@ -1115,9 +1227,13 @@ mod tests {
     /// "not implemented" (chapter 04 §net.transfer).
     #[tokio::test]
     async fn transfer_names_what_a_public_b2_source_is_missing() {
-        let err = transfer("b2://bucket/model.safetensors", "/tmp/model.safetensors")
-            .await
-            .expect_err("b2:// source must be unsupported");
+        let err = transfer(
+            "b2://bucket/model.safetensors",
+            "/tmp/model.safetensors",
+            ignore_progress(),
+        )
+        .await
+        .expect_err("b2:// source must be unsupported");
         let message = err.to_string();
         assert!(
             message.contains("download endpoint") && message.contains("b2 CLI route"),
@@ -1130,9 +1246,13 @@ mod tests {
     /// so rather than attempting a PUT.
     #[tokio::test]
     async fn transfer_rejects_a_cli_routed_upload_destination() {
-        let err = transfer("/workspace/out.bin", "hf://owner/repo/out.bin")
-            .await
-            .expect_err("hf:// destination must not reach the bridge");
+        let err = transfer(
+            "/workspace/out.bin",
+            "hf://owner/repo/out.bin",
+            ignore_progress(),
+        )
+        .await
+        .expect_err("hf:// destination must not reach the bridge");
         assert!(err.to_string().contains("CLI-routed"), "{err}");
     }
 
@@ -1185,7 +1305,7 @@ mod tests {
         ));
         let dst_str = dst.to_string_lossy().into_owned();
 
-        let outcome = transfer(&url, &dst_str)
+        let outcome = transfer(&url, &dst_str, ignore_progress())
             .await
             .expect("a 20 MiB download must succeed");
 
@@ -1243,7 +1363,7 @@ mod tests {
             assert_eq!(received, expected, "the whole file must reach the wire");
         });
 
-        let outcome = transfer(&src_str, &format!("http://{addr}/put"))
+        let outcome = transfer(&src_str, &format!("http://{addr}/put"), ignore_progress())
             .await
             .expect("a 20 MiB upload must succeed");
         assert_eq!(outcome.bytes, body.len() as u64);
@@ -1331,9 +1451,14 @@ mod tests {
 
         let read_timeout = Duration::from_secs(1);
         let started = std::time::Instant::now();
-        let err = transfer_in(&format!("http://{addr}/"), &dst_str, read_timeout)
-            .await
-            .expect_err("a supplier that stops sending must fail");
+        let err = transfer_in(
+            &format!("http://{addr}/"),
+            &dst_str,
+            read_timeout,
+            ignore_progress(),
+        )
+        .await
+        .expect_err("a supplier that stops sending must fail");
         let elapsed = started.elapsed();
 
         assert!(
@@ -1401,7 +1526,12 @@ mod tests {
         // A read deadline long enough that nothing but the drop can end
         // this transfer.
         let url = format!("http://{addr}/");
-        let mut transfer = Box::pin(transfer_in(&url, &dst_str, Duration::from_secs(30)));
+        let mut transfer = Box::pin(transfer_in(
+            &url,
+            &dst_str,
+            Duration::from_secs(30),
+            ignore_progress(),
+        ));
 
         // Drive it until the destination exists — that is the state a
         // cancellation has to clean up.
@@ -1456,7 +1586,7 @@ mod tests {
         ));
         let dst_str = dst.to_string_lossy().into_owned();
 
-        let err = transfer(&format!("http://{addr}/"), &dst_str)
+        let err = transfer(&format!("http://{addr}/"), &dst_str, ignore_progress())
             .await
             .expect_err("a body that ends early is a failed download");
         assert!(
@@ -1466,6 +1596,206 @@ mod tests {
         assert!(
             !dst.exists(),
             "a failed transfer leaves no partial file behind"
+        );
+
+        handle.join().expect("server thread joins");
+    }
+
+    // -----------------------------------------------------------------
+    // Progress: what the byte loop hands out while it runs.
+    //
+    // These pin the *reports*, not the transcript — the cadence and the
+    // rendering are `super::audit`'s, and are tested there. What is
+    // proved here is that a download in flight says something at all,
+    // says it more than once, says it without a `Content-Length`, and
+    // does not claim to have finished when it did not.
+    // -----------------------------------------------------------------
+
+    /// A server that dribbles `chunks` pieces of `piece` bytes with
+    /// `gap` between them, so a download lasts long enough to be
+    /// reported on more than once.
+    ///
+    /// `declare_length` picks the two supplier shapes that matter:
+    /// with a `Content-Length` the total is known from the first byte,
+    /// and without one the body simply ends at the close — which is what
+    /// a chunked or content-encoded supplier looks like, and the case a
+    /// progress consumer must survive.
+    fn trickle_server(
+        chunks: usize,
+        piece: usize,
+        gap: Duration,
+        declare_length: bool,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let head = if declare_length {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    chunks * piece
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
+            };
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            for _ in 0..chunks {
+                std::thread::sleep(gap);
+                let _ = stream.write_all(&vec![b'x'; piece]);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// A sink that keeps every report, so a test can look at the whole
+    /// sequence rather than the last one.
+    fn recording_sink() -> (Arc<Mutex<Vec<TransferProgress>>>, impl Fn(TransferProgress)) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        (seen, move |progress| {
+            sink.lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(progress)
+        })
+    }
+
+    /// A transfer of any real size is minutes long, so the loop has to
+    /// report **during** it. The fixture makes "during" observable: the
+    /// body arrives in five pieces, and a download that only spoke at
+    /// the end would leave one report here instead of several.
+    #[tokio::test]
+    async fn a_download_reports_what_it_has_written_while_it_runs() {
+        const CHUNKS: usize = 5;
+        const PIECE: usize = 4096;
+        let (url, handle) = trickle_server(CHUNKS, PIECE, Duration::from_millis(60), true);
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-progress-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let (seen, sink) = recording_sink();
+        let outcome = transfer(&url, &dst_str, &sink)
+            .await
+            .expect("the trickled body must arrive");
+
+        let reports = seen.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        let running: Vec<_> = reports.iter().filter(|r| !r.finished).collect();
+        let finished: Vec<_> = reports.iter().filter(|r| r.finished).collect();
+
+        assert!(
+            running.len() >= 2,
+            "a download that reports only once has told the operator nothing about \
+             progress: {reports:?}"
+        );
+        assert_eq!(
+            finished.len(),
+            1,
+            "exactly one finished report closes a transfer: {reports:?}"
+        );
+        assert_eq!(finished[0].written, outcome.bytes);
+        assert_eq!(outcome.bytes, (CHUNKS * PIECE) as u64);
+
+        // Bytes only ever go up, and the declared total rides on every
+        // report so a consumer never has to have kept the first one.
+        let mut previous = 0;
+        for report in &reports {
+            assert!(report.written >= previous, "{reports:?}");
+            previous = report.written;
+            assert_eq!(report.total, Some((CHUNKS * PIECE) as u64), "{report:?}");
+        }
+
+        std::fs::remove_file(&dst).ok();
+        handle.join().expect("server thread joins");
+    }
+
+    /// `Content-Length` is optional, and HuggingFace's CDN is not the
+    /// only supplier that omits it. A download that reported nothing
+    /// without one would go silent exactly where the operator has least
+    /// other information.
+    #[tokio::test]
+    async fn a_supplier_that_declares_no_total_still_reports_its_bytes() {
+        const CHUNKS: usize = 4;
+        const PIECE: usize = 4096;
+        let (url, handle) = trickle_server(CHUNKS, PIECE, Duration::from_millis(60), false);
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-progress-untotalled-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let (seen, sink) = recording_sink();
+        let outcome = transfer(&url, &dst_str, &sink)
+            .await
+            .expect("a body that ends at the close is a complete body");
+
+        let reports = seen.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        assert!(!reports.is_empty(), "an untotalled download still reports");
+        for report in &reports {
+            assert_eq!(
+                report.total, None,
+                "no total was declared, so none is invented: {report:?}"
+            );
+        }
+        let finished = reports
+            .iter()
+            .find(|r| r.finished)
+            .expect("the transfer finished, so it said so");
+        assert_eq!(
+            finished.written,
+            (CHUNKS * PIECE) as u64,
+            "the finished report is where the real size finally appears"
+        );
+        assert_eq!(outcome.bytes, finished.written);
+
+        std::fs::remove_file(&dst).ok();
+        handle.join().expect("server thread joins");
+    }
+
+    /// A transfer that fails never reports finished — which is what
+    /// makes "the last thing this stream said was `running`" mean
+    /// something to a reader watching several at once.
+    #[tokio::test]
+    async fn a_failed_download_never_reports_that_it_finished() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Promise 1 MiB, send 4 KiB, hang up: enough to be reported
+            // on, not enough to finish.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+            let _ = stream.write_all(&[b'w'; 4096]);
+            let _ = stream.flush();
+        });
+
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-progress-failed-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let (seen, sink) = recording_sink();
+        transfer(&format!("http://{addr}/"), &dst_str, &sink)
+            .await
+            .expect_err("a body that ends early is a failed download");
+
+        let reports = seen.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        assert!(
+            !reports.is_empty(),
+            "the bytes that did arrive were reported: {reports:?}"
+        );
+        assert!(
+            reports.iter().all(|r| !r.finished),
+            "a failed transfer must not claim to have finished: {reports:?}"
         );
 
         handle.join().expect("server thread joins");
