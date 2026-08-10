@@ -53,6 +53,7 @@ use dsl_kit::{DslNode, NodeId, Walk};
 
 use super::lifecycle::{self, PlannedStep};
 use crate::profile_ast::ProfileNode;
+use crate::resource::ResourceEnv;
 
 /// The registry op name a lifecycle phase dispatches to, or `None` for
 /// any other node.
@@ -126,6 +127,14 @@ pub struct StepRef {
 pub struct StepPlan {
     phases: HashMap<NodeId, PhaseSteps>,
     steps: HashMap<NodeId, StepRef>,
+    /// The resources in scope at each phase, recorded by the same walk
+    /// that expanded it.
+    ///
+    /// Kept so that the op handler can re-expand a phase against the
+    /// environment it was *composed* against. Re-deriving it there would
+    /// mean a second fold over the phase list, and two folds are two
+    /// chances to disagree about what "earlier" means.
+    envs: HashMap<NodeId, ResourceEnv>,
 }
 
 impl StepPlan {
@@ -147,15 +156,28 @@ impl StepPlan {
     /// given profile always projects onto the same ids.
     pub fn build(root: &ProfileNode) -> Self {
         let mut plan = StepPlan::default();
-        let ProfileNode::Spec { phases, .. } = root else {
+        let ProfileNode::Spec {
+            phases, assumes, ..
+        } = root
+        else {
             return plan;
         };
         let mut next = max_node_id(root) + 1;
+        // The scope fold (design §3.6). This walk *is* the scope check's
+        // walk: phases in canonical order, each composing against what
+        // earlier phases produced, then folding in its own `produces`.
+        // A phase whose `requires` nothing bound fails to expand and so
+        // stays on its own op, where the error is reported — the same
+        // route an unparseable payload takes.
+        let mut env = ResourceEnv::from_assumes(assumes);
         for phase in phases {
+            let expanded = lifecycle::expand(phase, &env);
+            plan.envs.insert(phase.node_id(), env.clone());
+            env.bind(phase);
             let Some(op) = lifecycle_op_name(phase) else {
                 continue;
             };
-            let Ok(steps) = lifecycle::expand(phase) else {
+            let Ok(steps) = expanded else {
                 continue;
             };
             if steps.is_empty() {
@@ -185,6 +207,15 @@ impl StepPlan {
     /// stayed on its op.
     pub fn phase(&self, phase: NodeId) -> Option<&PhaseSteps> {
         self.phases.get(&phase)
+    }
+
+    /// The resources in scope at `phase`, as the build walk saw them.
+    ///
+    /// An empty environment for a phase the walk never reached, which is
+    /// the honest answer: nothing was bound, so a phase requiring
+    /// anything fails to expand and says which resource was missing.
+    pub fn env_at(&self, phase: NodeId) -> ResourceEnv {
+        self.envs.get(&phase).cloned().unwrap_or_default()
     }
 
     /// Every projected phase, for the AST projection to declare.
@@ -221,8 +252,16 @@ mod tests {
     use super::*;
     use dsl_kit::IdGen;
 
+    /// Every fixture here declares the ComfyUI root as already present.
+    /// These tests are about projection — how many nodes a phase becomes
+    /// and where their ids start — so a `models` phase has to be able to
+    /// compose steps at all, and an install phase would add its own.
     fn spec(phases: Vec<ProfileNode>, ids: &IdGen) -> ProfileNode {
         ProfileNode::Spec {
+            assumes: std::collections::BTreeMap::from([(
+                crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
+                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
+            )]),
             id: ids.node(),
             name: "step-plan".to_string(),
             version: None,

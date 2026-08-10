@@ -322,7 +322,11 @@ impl ProfileOp {
                 return Err(err);
             }
         };
-        let steps = match lifecycle::expand(payload) {
+        // Re-expanded against the environment the build walk recorded
+        // for this phase, not a freshly folded one: the phase must
+        // compose the same steps here that `StepPlan` projected.
+        let resources = self.ctx.step_plan.env_at(node);
+        let steps = match lifecycle::expand(payload, &resources) {
             Ok(steps) => steps,
             Err(err) => {
                 self.record_phase_failure(node, &err);
@@ -2346,6 +2350,7 @@ mod tests {
         let ids = IdGen::new();
         let phase_ids = [ids.node(), ids.node(), ids.node()];
         let root = ProfileNode::Spec {
+            assumes: Default::default(),
             id: ids.node(),
             name: "routing".into(),
             version: None,
@@ -2405,8 +2410,16 @@ mod tests {
         }
     }
 
+    /// Declares the ComfyUI root as already present: these fixtures are
+    /// about fan-out shape, so their `models` / `custom_nodes` phases
+    /// need a bound root to compose steps at all, and adding an install
+    /// phase would put a third phase into assertions about two.
     fn spec(phases: Vec<ProfileNode>, ids: &IdGen) -> ProfileNode {
         ProfileNode::Spec {
+            assumes: std::collections::BTreeMap::from([(
+                crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
+                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
+            )]),
             id: ids.node(),
             name: "parallel".into(),
             version: None,

@@ -96,6 +96,25 @@ pub enum ExecError {
         url: String,
     },
 
+    /// A phase needs a resource that no earlier phase produces and that
+    /// `profile.assumes` does not declare (design §3.6). A precondition
+    /// class error: the phase cannot compose a step at all, because it
+    /// has nowhere to put one.
+    ///
+    /// Validate reports the same condition over the whole phase list
+    /// ahead of time; this is the apply-side enforcement, since apply
+    /// does not run validate first (see [`crate::apply`]).
+    #[error(
+        "{kind} requires resource '{resource}', which no earlier phase produces \
+         and profile.assumes does not declare"
+    )]
+    ResourceUnbound {
+        /// The consuming phase's catalog kind.
+        kind: &'static str,
+        /// The resource nothing bound.
+        resource: &'static str,
+    },
+
     /// No payload node was recorded for the op's `NodeId` (an AST/host
     /// wiring bug, not a profile-author error).
     #[error("no payload recorded for node n{0}")]

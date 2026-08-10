@@ -67,6 +67,7 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         env_secrets,
         paths,
         http_allowlist,
+        assumes,
         phases,
     } = root
     else {
@@ -83,6 +84,7 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         env_secrets: env_secrets.clone(),
         paths: paths.clone(),
         http_allowlist: http_allowlist.clone(),
+        assumes: assumes.clone(),
         phases: normalize_phases(phases, IdMinter::above(root)),
     }
 }
@@ -293,6 +295,7 @@ mod tests {
     fn spec(phases: Vec<ProfileNode>) -> ProfileNode {
         let g = IdGen::new();
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: g.node(),
             name: "demo".into(),
             version: None,
@@ -362,6 +365,7 @@ mod tests {
     fn an_install_alone_gains_both_lifecycle_phases_at_the_default_port() {
         let g = ids();
         let root = spec(vec![ProfileNode::ComfyUiInstall {
+            install_dir: None,
             id: g.node(),
             ref_name: "master".into(),
             repo: None,
@@ -385,6 +389,7 @@ mod tests {
         let g = ids();
         let root = spec(vec![
             ProfileNode::ComfyUiInstall {
+                install_dir: None,
                 id: g.node(),
                 ref_name: "master".into(),
                 repo: None,
@@ -428,6 +433,7 @@ mod tests {
     fn inserted_phases_get_ids_above_every_id_in_the_tree() {
         let g = ids();
         let install = ProfileNode::ComfyUiInstall {
+            install_dir: None,
             id: g.node(),
             ref_name: "master".into(),
             repo: None,
@@ -444,6 +450,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: Vec::new(),
             http_allowlist: Vec::new(),
+            assumes: Default::default(),
             phases: vec![install],
         };
         let root_id = root.node_id();

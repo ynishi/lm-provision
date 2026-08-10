@@ -78,25 +78,13 @@ use super::observe::{self, LocalObserve, PidFile, PROC_ROOT};
 use super::scheme::{self, parse_hf_uri, split_b2_uri};
 use super::{audit, effects, ExecError, ExecMode};
 use crate::profile_ast::ProfileNode;
+use crate::resource::{ComfyUiPaths, Resource, ResourceEnv};
 
-/// ComfyUI clone target (spec 02 §Built-in path constants).
-const COMFYUI_INSTALL_DIR: &str = "/workspace/ComfyUI";
-/// Venv-relative pip binary (spec 02 §Built-in path constants).
-const COMFYUI_VENV_PIP: &str = "/workspace/ComfyUI/venv/bin/pip";
-/// Root of the ComfyUI model store (spec 02 §Built-in path constants).
-const MODELS_ROOT: &str = "/workspace/ComfyUI/models";
-/// Root of the ComfyUI custom-nodes store (spec 02 §Built-in path constants).
-const CUSTOM_NODES_ROOT: &str = "/workspace/ComfyUI/custom_nodes";
 /// `models` entry default subdir when neither `subdir` nor `kind` is set.
 const DEFAULT_MODEL_SUBDIR: &str = "checkpoints";
 /// `llm_models` entry default destination directory
 /// (`hf download --local-dir` target).
 const DEFAULT_LLM_MODELS_DST_DIR: &str = "/tmp/";
-/// Venv-relative python binary, the ComfyUI launch interpreter
-/// (spec 02 §Built-in path constants).
-const COMFYUI_VENV_PY: &str = "/workspace/ComfyUI/venv/bin/python";
-/// ComfyUI entry point (spec 02 §Built-in path constants).
-const COMFYUI_MAIN_PY: &str = "/workspace/ComfyUI/main.py";
 /// ComfyUI launch log (spec 02 §Built-in path constants).
 const COMFYUI_LOG_PATH: &str = "/tmp/comfyui.log";
 /// ComfyUI launch pid file, written by `comfyui.restart` and read by
@@ -231,19 +219,33 @@ impl PlannedStep {
 /// [`ExecError::EffectFailed`] on a malformed payload JSON string
 /// (that shape is authored input, so a parse error is an op failure,
 /// not an internal programmer error).
-pub fn expand(payload: &ProfileNode) -> Result<Vec<PlannedStep>, ExecError> {
+pub fn expand(payload: &ProfileNode, env: &ResourceEnv) -> Result<Vec<PlannedStep>, ExecError> {
     match payload {
         ProfileNode::SystemApt { packages, .. } => Ok(expand_system_apt(packages)),
-        ProfileNode::ComfyUiInstall { ref_name, repo, .. } => {
-            Ok(expand_comfyui_install(ref_name, repo.as_deref()))
-        }
+        // The one phase that reads its root off its own payload rather
+        // than off `env`: it is the producer, so nothing has bound it
+        // yet (`crate::resource`).
+        ProfileNode::ComfyUiInstall { ref_name, repo, .. } => Ok(expand_comfyui_install(
+            ref_name,
+            repo.as_deref(),
+            &produced_root(payload),
+        )),
         ProfileNode::PythonVersionCheck { want, .. } => Ok(expand_python_version_check(want)),
         ProfileNode::PythonDeps {
             deps,
             in_comfy_venv,
             ..
-        } => Ok(expand_python_deps(deps, *in_comfy_venv)),
-        ProfileNode::CustomNodes { nodes_json, .. } => expand_custom_nodes(nodes_json),
+        } => {
+            let venv_pip = if *in_comfy_venv {
+                Some(comfyui_paths(payload, env)?.venv_pip())
+            } else {
+                None
+            };
+            Ok(expand_python_deps(deps, venv_pip.as_deref()))
+        }
+        ProfileNode::CustomNodes { nodes_json, .. } => {
+            expand_custom_nodes(nodes_json, &comfyui_paths(payload, env)?)
+        }
         ProfileNode::SyncPull {
             src,
             dst,
@@ -257,7 +259,9 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<PlannedStep>, ExecError> {
         ProfileNode::StagingPush {
             src, dst, revision, ..
         } => expand_staging_push(src, dst, revision.as_deref()),
-        ProfileNode::Models { models_json, .. } => expand_models(models_json),
+        ProfileNode::Models { models_json, .. } => {
+            expand_models(models_json, &comfyui_paths(payload, env)?)
+        }
         ProfileNode::LlmModels { models_json, .. } => expand_llm_models(models_json),
         // No `done`: `hooks.post_install` is the spec's sanctioned
         // escape hatch for raw shell, so only its author knows what
@@ -270,7 +274,11 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<PlannedStep>, ExecError> {
         ]))]),
         ProfileNode::ComfyUiRestart {
             port, extra_args, ..
-        } => Ok(expand_comfyui_restart(*port, extra_args)),
+        } => Ok(expand_comfyui_restart(
+            *port,
+            extra_args,
+            &comfyui_paths(payload, env)?,
+        )),
         ProfileNode::ComfyUiHealth {
             port, timeout_sec, ..
         } => Ok(vec![PlannedStep::always(Step::HttpPoll {
@@ -325,6 +333,38 @@ pub fn expand(payload: &ProfileNode) -> Result<Vec<PlannedStep>, ExecError> {
     }
 }
 
+/// The ComfyUI paths `payload` composes against, or the error naming
+/// what nothing bound.
+///
+/// This is the enforcement point for `requires` on the exec side.
+/// Validate runs the same rule over the whole phase list ahead of time,
+/// but apply does not run validate (`crate::apply`), so a profile that
+/// consumes ComfyUI without installing or assuming it has to fail here
+/// too — **naming the resource**, rather than silently composing against
+/// `/workspace/ComfyUI` and failing later with `no such file`, which is
+/// the shape design §4.2 calls "failing without being named".
+///
+/// Which kinds reach this function must agree with
+/// [`crate::resource::requires`]; nothing but a test would stop the two
+/// drifting, so `expand_without_a_bound_root_fails_exactly_the_requiring_kinds`
+/// pins them together.
+fn comfyui_paths(payload: &ProfileNode, env: &ResourceEnv) -> Result<ComfyUiPaths, ExecError> {
+    env.comfyui().ok_or(ExecError::ResourceUnbound {
+        kind: crate::plan::kind_of(payload),
+        resource: Resource::ComfyUiRoot.as_str(),
+    })
+}
+
+/// The root `comfyui.install` itself creates, read off its own payload.
+fn produced_root(payload: &ProfileNode) -> ComfyUiPaths {
+    let root = crate::resource::produces(payload)
+        .map(|(_, path)| path)
+        // Unreachable: the only caller matched `ComfyUiInstall`, which
+        // `produces` always answers for. Kept total.
+        .unwrap_or_else(|| crate::resource::COMFYUI_ROOT_DEFAULT.to_string());
+    ComfyUiPaths::new(root)
+}
+
 /// The deadline a poll step runs with: the payload's `timeout_sec`
 /// when the profile declares one, otherwise the kind's default
 /// ([`COMFYUI_HEALTH_TIMEOUT_SEC`] / [`SERVICE_READY_TIMEOUT_SEC`]).
@@ -365,16 +405,18 @@ fn expand_system_apt(packages: &[String]) -> Vec<PlannedStep> {
 /// the same clone with `test -d {name} ||`; the condition here asks the
 /// stronger question — is there a *repository*, and is it at the ref
 /// the profile named.
-fn expand_comfyui_install(ref_name: &str, repo: Option<&str>) -> Vec<PlannedStep> {
+fn expand_comfyui_install(
+    ref_name: &str,
+    repo: Option<&str>,
+    paths: &ComfyUiPaths,
+) -> Vec<PlannedStep> {
     let repo = repo.unwrap_or(DEFAULT_COMFYUI_REPO);
     let url = format!("https://github.com/{repo}.git");
-    let script = format!(
-        "git clone {url} {dir} && git -C {dir} checkout {ref_name}",
-        dir = COMFYUI_INSTALL_DIR
-    );
+    let dir = paths.root();
+    let script = format!("git clone {url} {dir} && git -C {dir} checkout {ref_name}");
     vec![PlannedStep::done_when(
         Step::Sh(vec!["sh".to_string(), "-c".to_string(), script]),
-        assert::Checkout::new(COMFYUI_INSTALL_DIR, Some(ref_name.to_string())).done(),
+        assert::Checkout::new(dir, Some(ref_name.to_string())).done(),
     )]
 }
 
@@ -401,12 +443,10 @@ fn expand_python_version_check(want: &str) -> Vec<PlannedStep> {
     ]))]
 }
 
-fn expand_python_deps(deps: &[String], in_comfy_venv: bool) -> Vec<PlannedStep> {
-    let pip = if in_comfy_venv {
-        COMFYUI_VENV_PIP
-    } else {
-        "pip"
-    };
+/// `venv_pip` is `Some` exactly when the phase declared `in_comfy_venv`,
+/// in which case the caller has already resolved the bound root.
+fn expand_python_deps(deps: &[String], venv_pip: Option<&str>) -> Vec<PlannedStep> {
+    let pip = venv_pip.unwrap_or("pip");
     let mut argv = vec![pip.to_string(), "install".to_string()];
     argv.extend(deps.iter().cloned());
     // No `done`: same shape as `system.apt` — a per-requirement query
@@ -448,15 +488,17 @@ struct CustomNodeSpec {
 /// very first apply. The entity that could answer it does not exist
 /// yet, so the step runs every time — `pip install -r` being idempotent
 /// is what makes that acceptable, exactly as it is for `python.deps`.
-fn expand_custom_nodes(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
+fn expand_custom_nodes(json: &str, paths: &ComfyUiPaths) -> Result<Vec<PlannedStep>, ExecError> {
     let nodes: Vec<CustomNodeSpec> =
         serde_json::from_str(json).map_err(|err| ExecError::EffectFailed {
             op: "custom_nodes".to_string(),
             message: format!("nodes_json parse: {err}"),
         })?;
+    let custom_nodes_root = paths.custom_nodes_root();
+    let venv_pip = paths.venv_pip();
     let mut steps = Vec::with_capacity(nodes.len() * 2);
     for node in nodes {
-        let node_dir = format!("{CUSTOM_NODES_ROOT}/{}", node.name);
+        let node_dir = format!("{custom_nodes_root}/{}", node.name);
         steps.push(PlannedStep::done_when(
             Step::Sh(vec![
                 "git".to_string(),
@@ -480,7 +522,7 @@ fn expand_custom_nodes(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
         }
         if node.pip {
             steps.push(PlannedStep::always(Step::Sh(vec![
-                COMFYUI_VENV_PIP.to_string(),
+                venv_pip.clone(),
                 "install".to_string(),
                 "-r".to_string(),
                 format!("{node_dir}/requirements.txt"),
@@ -654,12 +696,13 @@ struct ModelItemSpec {
     sha256: Option<String>,
 }
 
-fn expand_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
+fn expand_models(json: &str, paths: &ComfyUiPaths) -> Result<Vec<PlannedStep>, ExecError> {
     let models: Vec<ModelItemSpec> =
         serde_json::from_str(json).map_err(|err| ExecError::EffectFailed {
             op: "models".to_string(),
             message: format!("models_json parse: {err}"),
         })?;
+    let models_root = paths.models_root();
     let mut steps = Vec::with_capacity(models.len());
     for (i, model) in models.into_iter().enumerate() {
         let subdir = model
@@ -675,7 +718,7 @@ fn expand_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
                     "models[{i}]: entry must declare either 'dst' or 'name' for the target file"
                 ),
             })?;
-        let dst = format!("{MODELS_ROOT}/{subdir}/{filename}");
+        let dst = format!("{models_root}/{subdir}/{filename}");
         // The `done` is derived from the kind, not declared: a `models`
         // element is a `ModelFile`, and what a finished one looks like
         // is that entity's business (design §3.4). A profile cannot
@@ -923,10 +966,14 @@ fn sh_c(command: String) -> Step {
 /// a pid file existing — is also true of the server the operator is
 /// replacing, and would skip the launch while reporting the new
 /// arguments as applied.
-fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<PlannedStep> {
+fn expand_comfyui_restart(
+    port: u16,
+    extra_args: &[String],
+    paths: &ComfyUiPaths,
+) -> Vec<PlannedStep> {
     let mut argv = vec![
-        COMFYUI_VENV_PY.to_string(),
-        COMFYUI_MAIN_PY.to_string(),
+        paths.venv_python(),
+        paths.main_py(),
         "--port".to_string(),
         port.to_string(),
     ];
@@ -946,7 +993,8 @@ fn expand_comfyui_restart(port: u16, extra_args: &[String]) -> Vec<PlannedStep> 
     // would be comparing against something no process reports.
     vec![PlannedStep::done_when(
         sh_c(format!(
-            "cd {COMFYUI_INSTALL_DIR} && {}",
+            "cd {} && {}",
+            paths.root(),
             grouped(spawn_detached_command(
                 &argv,
                 COMFYUI_LOG_PATH,
@@ -1754,6 +1802,26 @@ mod tests {
     use dsl_kit::IdGen;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// The scope every phase below composes against: the built-in
+    /// ComfyUI root bound, as a preceding `comfyui.install` binds it.
+    ///
+    /// These tests are about what each kind composes, not about whether
+    /// the root is in scope — that is
+    /// [`expand_without_a_bound_root_fails_exactly_the_requiring_kinds`],
+    /// which uses an empty environment on purpose.
+    fn bound_env() -> ResourceEnv {
+        ResourceEnv::from_assumes(&BTreeMap::from([(
+            Resource::ComfyUiRoot.as_str().to_string(),
+            crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
+        )]))
+    }
+
+    /// Shadows [`super::expand`] so the per-kind tests read as they did
+    /// before the environment parameter existed.
+    fn expand(payload: &ProfileNode) -> Result<Vec<PlannedStep>, ExecError> {
+        super::expand(payload, &bound_env())
+    }
+
     fn node_id(ids: &IdGen) -> dsl_kit::NodeId {
         ids.node()
     }
@@ -1804,6 +1872,7 @@ mod tests {
     fn expand_comfyui_install_uses_the_default_repo_when_none_is_given() {
         let ids = IdGen::new();
         let payload = ProfileNode::ComfyUiInstall {
+            install_dir: None,
             id: node_id(&ids),
             ref_name: "v0.1.0".to_string(),
             repo: None,
@@ -1834,6 +1903,7 @@ mod tests {
     fn expand_comfyui_install_guards_its_clone_with_the_checkout_condition() {
         let ids = IdGen::new();
         let steps = expand(&ProfileNode::ComfyUiInstall {
+            install_dir: None,
             id: node_id(&ids),
             ref_name: "v0.1.0".to_string(),
             repo: None,
@@ -1856,6 +1926,7 @@ mod tests {
     fn expand_comfyui_install_honours_a_declared_repo() {
         let ids = IdGen::new();
         let payload = ProfileNode::ComfyUiInstall {
+            install_dir: None,
             id: node_id(&ids),
             ref_name: "main".to_string(),
             repo: Some("fork/ComfyUI".to_string()),
@@ -2019,6 +2090,7 @@ mod tests {
             ),
             (
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: node_id(&ids),
                     ref_name: "v1".into(),
                     repo: None,
@@ -4703,5 +4775,172 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // Resource scope: which kinds need a bound root.
+    // -----------------------------------------------------------------
+
+    /// The two statements of "this kind needs the ComfyUI root" —
+    /// [`crate::resource::requires`], which validate reads, and the
+    /// [`comfyui_paths`] calls inside [`expand`], which apply reaches —
+    /// are written out separately. Nothing but this stops them drifting,
+    /// and drifting either way is silent: a kind that expands against
+    /// the root but is missing from `requires` would pass validate and
+    /// fail on the pod, and one listed in `requires` that never reaches
+    /// the root would reject profiles for a resource it does not use.
+    ///
+    /// So: over every kind, expanding with **nothing bound** must fail
+    /// exactly when `requires` names the root.
+    #[test]
+    fn expand_without_a_bound_root_fails_exactly_the_requiring_kinds() {
+        let ids = IdGen::new();
+        let empty = ResourceEnv::default();
+        let kinds = vec![
+            ProfileNode::SystemApt {
+                id: node_id(&ids),
+                packages: vec!["git".into()],
+            },
+            ProfileNode::ComfyUiInstall {
+                id: node_id(&ids),
+                ref_name: "master".into(),
+                repo: None,
+                install_dir: None,
+            },
+            ProfileNode::PythonVersionCheck {
+                id: node_id(&ids),
+                want: "3.12".into(),
+            },
+            ProfileNode::PythonDeps {
+                id: node_id(&ids),
+                deps: vec!["numpy".into()],
+                in_comfy_venv: false,
+            },
+            ProfileNode::PythonDeps {
+                id: node_id(&ids),
+                deps: vec!["numpy".into()],
+                in_comfy_venv: true,
+            },
+            ProfileNode::CustomNodes {
+                id: node_id(&ids),
+                nodes_json: r#"[{"name":"n","repo":"o/r"}]"#.into(),
+            },
+            ProfileNode::Models {
+                id: node_id(&ids),
+                models_json: r#"[{"src":"https://e.example/a.bin","dst":"a.bin"}]"#.into(),
+            },
+            ProfileNode::LlmModels {
+                id: node_id(&ids),
+                models_json: r#"[{"repo":"o/r"}]"#.into(),
+            },
+            ProfileNode::PostInstall {
+                id: node_id(&ids),
+                script: "echo hi".into(),
+            },
+            ProfileNode::ComfyUiRestart {
+                id: node_id(&ids),
+                port: 8188,
+                extra_args: Vec::new(),
+            },
+            ProfileNode::ComfyUiHealth {
+                id: node_id(&ids),
+                port: 8188,
+                timeout_sec: None,
+            },
+        ];
+
+        for phase in &kinds {
+            let kind = crate::plan::kind_of(phase);
+            let needs_root = crate::resource::requires(phase).contains(&Resource::ComfyUiRoot);
+            let unbound = matches!(
+                super::expand(phase, &empty),
+                Err(ExecError::ResourceUnbound { .. })
+            );
+            assert_eq!(
+                needs_root,
+                unbound,
+                "{kind}: `requires` says it needs the root = {needs_root}, \
+                 but expanding with nothing bound {}",
+                if unbound { "failed" } else { "succeeded" }
+            );
+        }
+
+        // And the whole point of the error: it names the resource.
+        let err = super::expand(&kinds[6], &empty).expect_err("models needs the root");
+        assert_eq!(
+            err.to_string(),
+            "models requires resource 'comfyui_root', which no earlier phase produces \
+             and profile.assumes does not declare"
+        );
+    }
+
+    /// A declared install dir moves every derived path with it — the
+    /// five constants this replaced could not disagree, because there is
+    /// one input.
+    #[test]
+    fn a_declared_install_dir_moves_every_comfyui_path() {
+        let ids = IdGen::new();
+        let install = ProfileNode::ComfyUiInstall {
+            id: node_id(&ids),
+            ref_name: "master".into(),
+            repo: None,
+            install_dir: Some("/opt/comfy".into()),
+        };
+        let mut env = ResourceEnv::default();
+        env.bind(&install);
+
+        // The producer clones into its own declared dir.
+        let steps = super::expand(&install, &ResourceEnv::default()).expect("install expands");
+        assert!(
+            format!("{:?}", steps[0].step).contains("/opt/comfy"),
+            "{:?}",
+            steps[0].step
+        );
+
+        // Consumers compose against the bound root.
+        let models = ProfileNode::Models {
+            id: node_id(&ids),
+            models_json: r#"[{"src":"https://e.example/a.bin","dst":"a.bin"}]"#.into(),
+        };
+        let steps = super::expand(&models, &env).expect("models expands");
+        assert_eq!(
+            steps[0].step,
+            Step::Transfer {
+                src: "https://e.example/a.bin".into(),
+                dst: "/opt/comfy/models/checkpoints/a.bin".into(),
+            }
+        );
+
+        let restart = ProfileNode::ComfyUiRestart {
+            id: node_id(&ids),
+            port: 8188,
+            extra_args: Vec::new(),
+        };
+        let rendered = format!(
+            "{:?}",
+            super::expand(&restart, &env).expect("restart expands")
+        );
+        assert!(
+            rendered.contains("/opt/comfy/venv/bin/python"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/opt/comfy/main.py"), "{rendered}");
+        assert!(rendered.contains("cd /opt/comfy &&"), "{rendered}");
+
+        let deps = ProfileNode::PythonDeps {
+            id: node_id(&ids),
+            deps: vec!["numpy".into()],
+            in_comfy_venv: true,
+        };
+        let rendered = format!("{:?}", super::expand(&deps, &env).expect("deps expands"));
+        assert!(rendered.contains("/opt/comfy/venv/bin/pip"), "{rendered}");
+
+        let nodes = ProfileNode::CustomNodes {
+            id: node_id(&ids),
+            nodes_json: r#"[{"name":"n","repo":"o/r","pip":true}]"#.into(),
+        };
+        let rendered = format!("{:?}", super::expand(&nodes, &env).expect("nodes expands"));
+        assert!(rendered.contains("/opt/comfy/custom_nodes/n"), "{rendered}");
+        assert!(rendered.contains("/opt/comfy/venv/bin/pip"), "{rendered}");
     }
 }

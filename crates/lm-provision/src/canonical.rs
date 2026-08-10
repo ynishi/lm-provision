@@ -218,6 +218,7 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             env_secrets,
             paths,
             http_allowlist,
+            assumes,
             phases,
         } => {
             let mut fields = variant_object("Spec");
@@ -237,6 +238,13 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             fields.insert("env_secrets".into(), sorted_string_array(env_secrets));
             fields.insert("http_allowlist".into(), sorted_string_array(http_allowlist));
             fields.insert("paths".into(), sorted_string_array(paths));
+            // Spec.assumes: `resource name → path`. Omitted when empty
+            // under the same rule as `env` above, so every profile
+            // written before resources existed keeps its hash — which is
+            // what makes this slot addable at all (the alternative,
+            // emitting `"assumes":{}`, would re-hash every profile in
+            // every ledger).
+            insert_str_map(&mut fields, "assumes", assumes);
             fields.insert(
                 "phases".into(),
                 CanonValue::Array(phases.iter().map(to_canon).collect()),
@@ -254,10 +262,15 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             id: _,
             ref_name,
             repo,
+            install_dir,
         } => {
             let mut fields = variant_object("ComfyUiInstall");
             fields.insert("ref_name".into(), CanonValue::Str(ref_name.clone()));
             insert_optional_str(&mut fields, "repo", repo);
+            // Omitted when undeclared, like `repo` beside it: a profile
+            // that never mentioned an install dir hashes as it did
+            // before the slot existed.
+            insert_optional_str(&mut fields, "install_dir", install_dir);
             CanonValue::Object(fields)
         }
 
@@ -520,6 +533,27 @@ fn insert_env(fields: &mut BTreeMap<String, CanonValue>, env: &BTreeMap<String, 
     insert_value_map(fields, "env", env);
 }
 
+/// The scalar-valued counterpart of [`insert_value_map`]: insert `key`
+/// as an object of plain strings, or omit it entirely when `map` is
+/// empty. Same omit-when-empty rule, same reason — a keyed slot added
+/// after profiles were already being hashed must not move an
+/// undeclaring profile's bytes. `BTreeMap` iteration is already
+/// lexicographic by key.
+fn insert_str_map(
+    fields: &mut BTreeMap<String, CanonValue>,
+    key: &str,
+    map: &BTreeMap<String, String>,
+) {
+    if map.is_empty() {
+        return;
+    }
+    let mut obj = BTreeMap::new();
+    for (entry_key, value) in map {
+        obj.insert(entry_key.clone(), CanonValue::Str(value.clone()));
+    }
+    fields.insert(key.into(), CanonValue::Object(obj));
+}
+
 /// The keyed-slot counterpart of [`insert_when_non_empty`]: insert
 /// `key` as an object mapping each entry to its value node's canonical
 /// form, or omit it entirely when `map` is empty. [`insert_env`] is the
@@ -677,6 +711,7 @@ mod tests {
 
     fn empty_spec(gen: &IdGen, name: &str) -> ProfileNode {
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(gen),
             name: name.into(),
             version: None,
@@ -716,6 +751,7 @@ mod tests {
         // are still Vec<String> and the encoder sorts them before
         // emission, so the parity check runs over those.
         let a = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -728,6 +764,7 @@ mod tests {
             phases: vec![],
         };
         let b = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -748,6 +785,7 @@ mod tests {
 
     fn models_spec(gen: &IdGen, models_json: &str) -> ProfileNode {
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(gen),
             name: "p".into(),
             version: None,
@@ -1088,6 +1126,7 @@ mod tests {
         };
 
         let a = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1100,6 +1139,7 @@ mod tests {
             phases: vec![apt(), sh()],
         };
         let b = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1126,6 +1166,7 @@ mod tests {
 
         // Some -> keys present with value
         let some = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: Some("1.0.0".into()),
@@ -1183,6 +1224,7 @@ mod tests {
             },
         );
         let node = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1236,6 +1278,7 @@ mod tests {
     fn nested_spec_full_literal_encoding() {
         let gen = IdGen::new();
         let node = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "demo".into(),
             version: None,
@@ -1332,6 +1375,7 @@ mod tests {
     fn paths_and_http_allowlist_are_sorted_lexicographically() {
         let gen = IdGen::new();
         let node = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1787,5 +1831,76 @@ mod tests {
             name: "B2_KEY".into(),
         };
         assert_eq!(encode(&node), "{\"__secret\":\"B2_KEY\"}");
+    }
+
+    // -----------------------------------------------------------------
+    // Resource slots: addable only because they are omitted when empty.
+    // -----------------------------------------------------------------
+
+    /// **The condition that let `assumes` and `install_dir` exist at
+    /// all.** Every profile written before resources did carries neither,
+    /// and every one of those hashes is already in a ledger. If an empty
+    /// `assumes` emitted `"assumes":{}`, or an undeclared `install_dir`
+    /// emitted `null`, all of them would move at once.
+    #[test]
+    fn the_resource_slots_are_invisible_to_a_profile_that_declares_neither() {
+        let gen = IdGen::new();
+        let install = |dir: Option<&str>| ProfileNode::ComfyUiInstall {
+            id: new_id(&gen),
+            ref_name: "master".into(),
+            repo: None,
+            install_dir: dir.map(str::to_string),
+        };
+
+        let bytes = encode(&install(None));
+        assert!(
+            !bytes.contains("install_dir"),
+            "an undeclared install dir carries no bytes: {bytes}"
+        );
+        assert_eq!(
+            bytes, r#"{"ref_name":"master","type":"ComfyUiInstall"}"#,
+            "the encoding is exactly what it was before the slot existed"
+        );
+
+        let mut spec = empty_spec(&gen, "demo");
+        let without = encode(&spec);
+        assert!(
+            !without.contains("assumes"),
+            "an empty assumes carries no bytes: {without}"
+        );
+
+        // And declaring either one *does* move the hash — the slot is
+        // omitted because it is empty, not because it is ignored.
+        assert_ne!(encode(&install(Some("/opt/comfy"))), bytes);
+        if let ProfileNode::Spec { assumes, .. } = &mut spec {
+            assumes.insert("comfyui_root".into(), "/opt/comfy".into());
+        }
+        let with = encode(&spec);
+        assert_ne!(with, without);
+        assert!(
+            with.contains(r#""assumes":{"comfyui_root":"/opt/comfy"}"#),
+            "{with}"
+        );
+    }
+
+    /// `assumes` keys are already lexicographic in a `BTreeMap`, so two
+    /// profiles that declare the same bindings in different source order
+    /// hash the same — the property every keyed slot here carries.
+    #[test]
+    fn assumes_is_order_independent() {
+        let gen = IdGen::new();
+        let with = |pairs: &[(&str, &str)]| {
+            let mut spec = empty_spec(&gen, "demo");
+            if let ProfileNode::Spec { assumes, .. } = &mut spec {
+                for (k, v) in pairs {
+                    assumes.insert((*k).into(), (*v).into());
+                }
+            }
+            encode(&spec)
+        };
+        assert_eq!(
+            with(&[("comfyui_root", "/a"), ("other", "/b")]),
+            with(&[("other", "/b"), ("comfyui_root", "/a")])
+        );
     }
 }

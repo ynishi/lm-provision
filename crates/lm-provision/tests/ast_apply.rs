@@ -155,10 +155,11 @@ async fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
 /// The *other* answer a present destination gets (`NotChecked` —
 /// undecided, because deciding it would mean reading the whole file) is
 /// pinned in `exec::lifecycle`'s
-/// `a_dry_run_answers_the_condition_and_tells_the_two_apart`, for the
-/// same reason the skip tests live there: a `models` phase composes its
-/// destination under the built-in `/workspace/ComfyUI/models` root,
-/// which a test cannot create.
+/// `a_dry_run_answers_the_condition_and_tells_the_two_apart`, where the
+/// condition is exercised directly. What a real apply does with that
+/// answer — transfer the first time, skip the second — is
+/// `comfyui_root::a_second_apply_does_not_fetch_an_entry_that_is_already_there`,
+/// which a declared root made writable.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dry_run_models_step_reports_the_conditions_answer() {
     let digest = "a".repeat(64);
@@ -168,6 +169,10 @@ async fn a_dry_run_models_step_reports_the_conditions_answer() {
         "capabilities": ["net.transfer"],
         "paths": ["/workspace/ComfyUI/models"],
         "http_allowlist": ["https://example.com/"],
+        // The root has to be in scope for the phase to compose a
+        // destination; declaring it present keeps this about what the
+        // condition answers.
+        "assumes": { "comfyui_root": "/workspace/ComfyUI" },
         "phases": [{
             "type": "Models",
             "models_json": format!(
@@ -552,10 +557,13 @@ async fn python_version_check_fails_the_run_on_a_mismatch() {
 // in the order the profile was written, every entry is still there, and a
 // denial that every step discovers is still stated once.
 //
-// Every entry below transfers to the built-in `/workspace/ComfyUI/models`
-// root, which the tests cannot create, so each transfer reaches the
-// server, waits for it, and then fails on the destination — the delay
-// under test is the server's, and it is spent before the failure.
+// Every entry below assumes the built-in `/workspace/ComfyUI` root and
+// transfers under it, a directory these tests do not create — so each
+// transfer reaches the server, waits for it, and then fails on the
+// destination. That is deliberate: the delay under test is the server's,
+// and it is spent before the failure, so the measurement does not depend
+// on anything landing. Where a transfer *has* to land, the profile
+// declares a root the test owns (`comfyui_root`).
 // ---------------------------------------------------------------------
 
 /// A local server that handles every connection **at the same time**,
@@ -623,6 +631,12 @@ fn models_profile(name: &str, base_url: &str, entries: usize) -> Value {
         "capabilities": ["net.transfer"],
         "paths": ["/workspace/ComfyUI/models"],
         "http_allowlist": [base_url],
+        // A `models` phase needs the ComfyUI root in scope to compose a
+        // destination at all. The fixture declares it as already present
+        // rather than adding a `comfyui.install`, which would put a git
+        // clone — and the implicitly inserted restart and health poll —
+        // into a measurement about four transfers.
+        "assumes": { "comfyui_root": "/workspace/ComfyUI" },
         "phases": [{
             "type": "Models",
             "models_json": serde_json::to_string(&models).expect("models encode"),

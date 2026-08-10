@@ -11,12 +11,19 @@
 //!   subscriber would prove the event was emitted, not that it left the
 //!   program.
 //! - **What four at once looks like.** The concurrency lives in a
-//!   `models` phase, whose destinations are composed under the built-in
-//!   `/workspace/ComfyUI/models` root that a test cannot create — so a
-//!   four-way interleave is driven at the effect layer instead, with
-//!   the report ids (`1_models_<n>`) a `models` phase assigns. That the
-//!   phase assigns exactly those ids is
+//!   `models` phase, and a four-way interleave is driven at the effect
+//!   layer, with the report ids (`1_models_<n>`) a `models` phase
+//!   assigns. That the phase assigns exactly those ids is
 //!   `ast_apply::a_parallel_phase_reports_every_entry_once_in_declaration_order`.
+//!
+//!   Driving it at the effect layer used to be forced: a `models` phase
+//!   composed its destinations under a built-in `/workspace/ComfyUI`
+//!   root that a test cannot create. That is no longer true — a profile
+//!   declares its root now (`crate::resource`), and
+//!   `comfyui_root::a_skip_survives_the_fan_out` runs a real `models`
+//!   phase into a directory the test owns. It stays here anyway,
+//!   because what this file measures is byte-level progress events
+//!   during a transfer, and the effect layer is where those are emitted.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;

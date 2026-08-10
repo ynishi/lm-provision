@@ -68,6 +68,22 @@ pub enum ProfileNode {
         /// HTTP policy). Pattern = literal prefix with an optional
         /// single `*` confined to the authority component.
         http_allowlist: Vec<String>,
+        /// Resources the profile declares are **already present on the
+        /// target**, as `resource name → path` (spec 03 §Resource scope).
+        ///
+        /// The static half of the model: a phase's `requires` must be
+        /// bound by an earlier phase's `produces` *or* by an entry here
+        /// ([`crate::resource`]). This is what a profile provisioning
+        /// into a pod that already carries ComfyUI declares, instead of
+        /// writing a `comfyui.install` it does not want to run.
+        ///
+        /// Keys are [`crate::resource::Resource`] names; validate rejects
+        /// a key naming no resource, so a typo is an error rather than a
+        /// silently inert entry. Empty maps carry no canonical bytes, so
+        /// a profile declaring nothing here hashes exactly as it did
+        /// before the slot existed — the same rule `env` above carries,
+        /// for the same reason.
+        assumes: BTreeMap<String, String>,
         /// Sequential list of phases.
         phases: Vec<ProfileNode>,
     },
@@ -91,6 +107,17 @@ pub enum ProfileNode {
         ref_name: String,
         /// Optional repository owner/name.
         repo: Option<String>,
+        /// Where the checkout lands, and therefore what every phase
+        /// consuming ComfyUI reads (spec 02 §Resource-derived paths).
+        ///
+        /// This phase is the **producer** of the `comfyui_root` resource
+        /// ([`crate::resource`]): the models root, the custom-nodes root,
+        /// the venv interpreter and the entry point are all derived from
+        /// it rather than being separate constants. `None` produces the
+        /// built-in `/workspace/ComfyUI`, which is what every profile
+        /// written before the slot existed means — and it carries no
+        /// canonical bytes, so those profiles keep their hash.
+        install_dir: Option<String>,
     },
 
     /// `python.version_check`: Ensure Python version requirement

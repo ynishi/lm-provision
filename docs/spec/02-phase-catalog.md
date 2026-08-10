@@ -46,7 +46,7 @@ service.ready         ServiceReady
 | kind | payload | required capability |
 |---|---|---|
 | `system.apt` | `packages` list\<string\>, each shell-safe | `sh.exec` |
-| `comfyui.install` | `ref` string (required, shell-safe); `repo` string `"<owner>/<name>"` (default `comfyanonymous/ComfyUI`) | `sh.exec` |
+| `comfyui.install` | `ref` string (required, shell-safe); `repo` string `"<owner>/<name>"` (default `comfyanonymous/ComfyUI`); `install_dir` string (default `/workspace/ComfyUI`) — where the checkout lands, and what every ComfyUI-relative path derives from (§Resource-derived paths) | `sh.exec` |
 | `python.version_check` | `want` string (e.g. `"3.11"`); suppressed from the plan when `want` equals the default `3.12` | `sh.exec` |
 | `python.deps` | `deps` list\<string\> (shell-safe); `in_comfy_venv` bool (venv pip vs system pip); `force_reinstall` bool | `sh.exec` |
 | `custom_nodes` | `nodes` list of `{ name, repo = "<owner>/<name>", ref?, pip? bool }`, all strings shell-safe | `sh.exec` |
@@ -483,17 +483,47 @@ A `codegen` step emitting a `.d.lua` annotation file served the
 removed Lua authoring frontend and no longer exists (chapter 07
 §MVP scope).
 
+### Resource-derived paths
+
+Every ComfyUI-relative path is derived from **one** root, the
+`comfyui_root` resource. `comfyui.install` produces it — its
+`install_dir`, or `/workspace/ComfyUI` when the phase declares none —
+and the phases that consume ComfyUI require it (chapter 01 §Assumed
+resources):
+
+| path | derivation |
+|---|---|
+| models root | `<comfyui_root>/models` |
+| custom nodes root | `<comfyui_root>/custom_nodes` |
+| venv pip | `<comfyui_root>/venv/bin/pip` |
+| venv python | `<comfyui_root>/venv/bin/python` |
+| entry point | `<comfyui_root>/main.py` |
+
+Requiring kinds: `models`, `custom_nodes`, `comfyui.restart`, and
+`python.deps` when it declares `in_comfy_venv`. A profile using any of
+them without producing or assuming the root is rejected (chapter 03
+§validate check 8b).
+
+**Nothing creates the venv.** `comfyui.install` clones and checks out;
+the three phases above reach into `<comfyui_root>/venv` regardless, and
+the predecessor implementation spells that directory `.venv`. Deriving
+the paths from the root does not fix this — it makes it visible, which
+is the step this vocabulary exists to enable. A `toolchain.python` kind
+producing a `Venv` resource is the fix, and is not in this catalog yet.
+
 ### Built-in path constants
 
-Dispatch emits hardcoded well-known paths for the ComfyUI lifecycle:
-install dir `/workspace/ComfyUI`, venv pip
-`/workspace/ComfyUI/venv/bin/pip`, models root
-`/workspace/ComfyUI/models`, custom nodes
-`/workspace/ComfyUI/custom_nodes`, service logs
+The paths that are **not** resource-derived remain fixed: service logs
 `/tmp/<name>.log`, service pid files `/tmp/<name>.pid`, ComfyUI log
-`/tmp/comfyui.log`, ComfyUI pid file `/tmp/comfyui.pid`. Profiles that
-use these kinds must declare `paths` roots covering them when the
-corresponding bridges gate on paths.
+`/tmp/comfyui.log`, ComfyUI pid file `/tmp/comfyui.pid`, and the
+`llm_models` default destination `/tmp/`. Profiles that use these kinds
+must declare `paths` roots covering them — and covering the resolved
+`comfyui_root` — when the corresponding bridges gate on paths.
+
+A transfer does **not** create its destination's parent directories, so
+a declared root has to already carry the subdirectory an entry names.
+Under `/workspace/ComfyUI` that was invisible, because a ComfyUI
+checkout ships a `models/` tree.
 
 The pid file of a launch always sits beside its log, differing only in
 extension: the poll that follows derives one path from the other's

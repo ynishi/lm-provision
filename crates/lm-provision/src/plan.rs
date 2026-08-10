@@ -306,11 +306,23 @@ fn payload_of(phase: &ProfileNode) -> Value {
     match phase {
         ProfileNode::Spec { .. } => Value::Object(Map::new()),
         ProfileNode::SystemApt { packages, .. } => json!({ "packages": packages }),
-        ProfileNode::ComfyUiInstall { ref_name, repo, .. } => {
+        ProfileNode::ComfyUiInstall {
+            ref_name,
+            repo,
+            install_dir,
+            ..
+        } => {
             let mut m = Map::new();
             m.insert("ref_name".into(), Value::String(ref_name.clone()));
             if let Some(v) = repo {
                 m.insert("repo".into(), Value::String(v.clone()));
+            }
+            // Emitted only when declared, like `repo`: the artifact
+            // shows what the author wrote. Where an undeclaring profile
+            // installs is the built-in root, which `02` states once
+            // rather than repeating into every plan.
+            if let Some(v) = install_dir {
+                m.insert("install_dir".into(), Value::String(v.clone()));
             }
             Value::Object(m)
         }
@@ -547,6 +559,7 @@ mod tests {
     fn spec(name: &str, phases: Vec<ProfileNode>) -> ProfileNode {
         let ids = IdGen::new();
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -704,6 +717,7 @@ mod tests {
                     in_comfy_venv: false,
                 },
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc123".into(),
                     repo: None,
@@ -773,6 +787,7 @@ mod tests {
         let plan = expand(&spec(
             "demo",
             vec![ProfileNode::ComfyUiInstall {
+                install_dir: None,
                 id: g.node(),
                 ref_name: "abc".into(),
                 repo: None,
@@ -799,6 +814,7 @@ mod tests {
             "demo",
             vec![
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc".into(),
                     repo: None,
@@ -833,6 +849,7 @@ mod tests {
             "demo",
             vec![
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc".into(),
                     repo: None,
@@ -867,6 +884,7 @@ mod tests {
             "demo",
             vec![
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc".into(),
                     repo: None,
