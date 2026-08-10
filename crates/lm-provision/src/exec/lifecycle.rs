@@ -78,7 +78,7 @@ use super::observe::{self, LocalObserve, PidFile, PROC_ROOT};
 use super::scheme::{self, parse_hf_uri, split_b2_uri};
 use super::{audit, effects, ExecError, ExecMode};
 use crate::profile_ast::ProfileNode;
-use crate::resource::{ComfyUiPaths, Resource, ResourceEnv};
+use crate::resource::{ComfyUiPaths, Resource, ResourceEnv, VenvPaths};
 
 /// `models` entry default subdir when neither `subdir` nor `kind` is set.
 const DEFAULT_MODEL_SUBDIR: &str = "checkpoints";
@@ -230,6 +230,15 @@ pub fn expand(payload: &ProfileNode, env: &ResourceEnv) -> Result<Vec<PlannedSte
             repo.as_deref(),
             &produced_root(payload),
         )),
+        ProfileNode::ToolchainPython {
+            requirements,
+            isolated,
+            ..
+        } => Ok(expand_toolchain_python(
+            requirements.as_deref(),
+            *isolated,
+            &comfyui_paths(payload, env)?,
+        )),
         ProfileNode::PythonVersionCheck { want, .. } => Ok(expand_python_version_check(want)),
         ProfileNode::PythonDeps {
             deps,
@@ -237,15 +246,20 @@ pub fn expand(payload: &ProfileNode, env: &ResourceEnv) -> Result<Vec<PlannedSte
             ..
         } => {
             let venv_pip = if *in_comfy_venv {
-                Some(comfyui_paths(payload, env)?.venv_pip())
+                Some(venv_paths(payload, env)?.pip())
             } else {
                 None
             };
             Ok(expand_python_deps(deps, venv_pip.as_deref()))
         }
-        ProfileNode::CustomNodes { nodes_json, .. } => {
-            expand_custom_nodes(nodes_json, &comfyui_paths(payload, env)?)
-        }
+        ProfileNode::CustomNodes { nodes_json, .. } => expand_custom_nodes(
+            nodes_json,
+            &comfyui_paths(payload, env)?,
+            // Only entries asking for a requirements install reach the
+            // venv, and `requires` conditions on the same thing — so a
+            // `custom_nodes` that only clones runs without one.
+            env.venv(),
+        ),
         ProfileNode::SyncPull {
             src,
             dst,
@@ -278,6 +292,7 @@ pub fn expand(payload: &ProfileNode, env: &ResourceEnv) -> Result<Vec<PlannedSte
             *port,
             extra_args,
             &comfyui_paths(payload, env)?,
+            &venv_paths(payload, env)?,
         )),
         ProfileNode::ComfyUiHealth {
             port, timeout_sec, ..
@@ -355,9 +370,21 @@ fn comfyui_paths(payload: &ProfileNode, env: &ResourceEnv) -> Result<ComfyUiPath
     })
 }
 
+/// The venv `payload` composes against, or the error naming that
+/// nothing made one — the sibling of [`comfyui_paths`], and the point
+/// where design §4.2's second example stops being nameless. Reaching a
+/// `pip` under a venv nothing created used to fail as `no such file`
+/// [実測: 旧 `lifecycle.rs:321` / `:365-372`].
+fn venv_paths(payload: &ProfileNode, env: &ResourceEnv) -> Result<VenvPaths, ExecError> {
+    env.venv().ok_or(ExecError::ResourceUnbound {
+        kind: crate::plan::kind_of(payload),
+        resource: Resource::Venv.as_str(),
+    })
+}
+
 /// The root `comfyui.install` itself creates, read off its own payload.
 fn produced_root(payload: &ProfileNode) -> ComfyUiPaths {
-    let root = crate::resource::produces(payload)
+    let root = crate::resource::produces(payload, &ResourceEnv::default())
         .map(|(_, path)| path)
         // Unreachable: the only caller matched `ComfyUiInstall`, which
         // `produces` always answers for. Kept total.
@@ -443,8 +470,84 @@ fn expand_python_version_check(want: &str) -> Vec<PlannedStep> {
     ]))]
 }
 
+/// The torch family, as an extended-POSIX regex over `requirements.txt`
+/// lines — **one source of truth, read by two phases**.
+///
+/// Every `requirements.txt` this provisioner installs is filtered
+/// through it first, and the reason is not tidiness. A GPU pod image
+/// ships a torch built against its own driver, and `toolchain.python`
+/// inherits it with `--system-site-packages`. But **inheritance loses
+/// to a wheel installed inside the venv**: the moment a requirements
+/// file pins `torch>=2.7`, pip satisfies it from PyPI, the CUDA the
+/// wheel wants no longer matches the driver the pod has, and the only
+/// symptom is `torch.cuda.is_available()` answering false — at launch,
+/// long after the phase that caused it reported success
+/// [実測: predecessor implementation `profile_service.rs:963-976`].
+///
+/// ComfyUI's own requirements pin it, and so do many custom nodes,
+/// which is why both phases filter. Keeping the pattern in one place is
+/// the point: two copies would let one phase's filter drift while the
+/// other silently kept undoing it.
+pub(crate) const TORCH_FAMILY_FILTER: &str = r"^[[:space:]]*(torch|torchvision|torchaudio|xformers|bitsandbytes|triton)([[:space:]=<>~!;]|$)";
+
+/// `pip install -r <requirements>` with the torch family stripped on the
+/// way in, as one shell command.
+///
+/// The filter runs as a pipe rather than by rewriting the file: the
+/// requirements belong to the repository that shipped them, and editing
+/// a checkout to install it is a change the next `git` operation would
+/// have an opinion about.
+fn filtered_pip_install(pip: &str, requirements: &str) -> String {
+    format!("grep -viE '{TORCH_FAMILY_FILTER}' {requirements} | {pip} install -r /dev/stdin")
+}
+
+/// `toolchain.python` — create the venv, then install into it.
+///
+/// Two steps, and they are separate because their conditions are:
+/// creating a venv is done once and observable as a directory, while a
+/// requirements install has no honest condition at all (see below).
+///
+/// **The venv's condition is the weakest one in the catalog, and design
+/// §3.6 says why**: a venv carries no digest, so "there is an
+/// interpreter in it" is the whole of what can be observed. A profile
+/// that changes what it wants installed does not make an existing venv
+/// disagree — see the KNOWN LIMITATION on [`expand`]'s module.
+fn expand_toolchain_python(
+    requirements: Option<&str>,
+    isolated: bool,
+    paths: &ComfyUiPaths,
+) -> Vec<PlannedStep> {
+    let venv = VenvPaths::new(paths.venv_dir());
+    let mut argv = vec!["python3".to_string(), "-m".to_string(), "venv".to_string()];
+    // Inherited unless the profile asks otherwise — see the field's doc
+    // for why that is the way round it is.
+    if !isolated {
+        argv.push("--system-site-packages".to_string());
+    }
+    argv.push(venv.dir().to_string());
+
+    let mut steps = vec![PlannedStep::done_when(
+        Step::Sh(argv),
+        assert::Venv::new(venv.dir()).done(),
+    )];
+
+    if let Some(requirements) = requirements {
+        // No `done`: "the requirements are installed" is a statement
+        // about a venv's contents, and nothing here can observe those.
+        // Deriving one from the venv's existence would skip the install
+        // on the very first apply — the same reasoning `custom_nodes`
+        // records for its own pip step. `pip install -r` is idempotent,
+        // so running it every time is the honest cost.
+        steps.push(PlannedStep::always(sh_c(filtered_pip_install(
+            &venv.pip(),
+            requirements,
+        ))));
+    }
+    steps
+}
+
 /// `venv_pip` is `Some` exactly when the phase declared `in_comfy_venv`,
-/// in which case the caller has already resolved the bound root.
+/// in which case the caller has already resolved the bound venv.
 fn expand_python_deps(deps: &[String], venv_pip: Option<&str>) -> Vec<PlannedStep> {
     let pip = venv_pip.unwrap_or("pip");
     let mut argv = vec![pip.to_string(), "install".to_string()];
@@ -488,14 +591,17 @@ struct CustomNodeSpec {
 /// very first apply. The entity that could answer it does not exist
 /// yet, so the step runs every time — `pip install -r` being idempotent
 /// is what makes that acceptable, exactly as it is for `python.deps`.
-fn expand_custom_nodes(json: &str, paths: &ComfyUiPaths) -> Result<Vec<PlannedStep>, ExecError> {
+fn expand_custom_nodes(
+    json: &str,
+    paths: &ComfyUiPaths,
+    venv: Option<VenvPaths>,
+) -> Result<Vec<PlannedStep>, ExecError> {
     let nodes: Vec<CustomNodeSpec> =
         serde_json::from_str(json).map_err(|err| ExecError::EffectFailed {
             op: "custom_nodes".to_string(),
             message: format!("nodes_json parse: {err}"),
         })?;
     let custom_nodes_root = paths.custom_nodes_root();
-    let venv_pip = paths.venv_pip();
     let mut steps = Vec::with_capacity(nodes.len() * 2);
     for node in nodes {
         let node_dir = format!("{custom_nodes_root}/{}", node.name);
@@ -521,12 +627,22 @@ fn expand_custom_nodes(json: &str, paths: &ComfyUiPaths) -> Result<Vec<PlannedSt
             ));
         }
         if node.pip {
-            steps.push(PlannedStep::always(Step::Sh(vec![
-                venv_pip.clone(),
-                "install".to_string(),
-                "-r".to_string(),
-                format!("{node_dir}/requirements.txt"),
-            ])));
+            // `requires` answers `Venv` for exactly this case, so the
+            // phase does not reach here unbound. Kept total rather than
+            // unwrapped: an entry that asks for pip without a venv is
+            // reported as the unbound resource it is.
+            let venv = venv.clone().ok_or(ExecError::ResourceUnbound {
+                kind: "custom_nodes",
+                resource: Resource::Venv.as_str(),
+            })?;
+            // Filtered, for the reason `TORCH_FAMILY_FILTER` states: a
+            // custom node that pins a torch wheel would replace the
+            // pod's driver-matched one inside the venv, and the only
+            // symptom is a launch that never becomes ready.
+            steps.push(PlannedStep::always(sh_c(filtered_pip_install(
+                &venv.pip(),
+                &format!("{node_dir}/requirements.txt"),
+            ))));
         }
     }
     Ok(steps)
@@ -970,9 +1086,10 @@ fn expand_comfyui_restart(
     port: u16,
     extra_args: &[String],
     paths: &ComfyUiPaths,
+    venv: &VenvPaths,
 ) -> Vec<PlannedStep> {
     let mut argv = vec![
-        paths.venv_python(),
+        venv.python(),
         paths.main_py(),
         "--port".to_string(),
         port.to_string(),
@@ -1803,17 +1920,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The scope every phase below composes against: the built-in
-    /// ComfyUI root bound, as a preceding `comfyui.install` binds it.
+    /// ComfyUI root and the venv under it, as a preceding
+    /// `comfyui.install` and `toolchain.python` bind them.
     ///
     /// These tests are about what each kind composes, not about whether
-    /// the root is in scope — that is
-    /// [`expand_without_a_bound_root_fails_exactly_the_requiring_kinds`],
+    /// its resources are in scope — that is
+    /// [`expand_without_its_resources_fails_exactly_the_requiring_kinds`],
     /// which uses an empty environment on purpose.
     fn bound_env() -> ResourceEnv {
-        ResourceEnv::from_assumes(&BTreeMap::from([(
-            Resource::ComfyUiRoot.as_str().to_string(),
-            crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
-        )]))
+        ResourceEnv::from_assumes(&BTreeMap::from([
+            (
+                Resource::ComfyUiRoot.as_str().to_string(),
+                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
+            ),
+            (
+                Resource::Venv.as_str().to_string(),
+                format!("{}/.venv", crate::resource::COMFYUI_ROOT_DEFAULT),
+            ),
+        ]))
     }
 
     /// Shadows [`super::expand`] so the per-kind tests read as they did
@@ -1974,7 +2098,7 @@ mod tests {
         assert_eq!(
             effects(&steps),
             vec![Step::Sh(vec![
-                "/workspace/ComfyUI/venv/bin/pip".to_string(),
+                "/workspace/ComfyUI/.venv/bin/pip".to_string(),
                 "install".to_string(),
                 "torch".to_string(),
                 "vllm".to_string(),
@@ -2019,14 +2143,18 @@ mod tests {
             &steps[2].step,
             Step::Sh(a) if a[0] == "git" && a[3] == "checkout" && a[4] == "v2"
         ));
+        // The pip steps are `sh -c` now, because the requirements go
+        // through the torch-family filter on the way in
+        // (`TORCH_FAMILY_FILTER`).
         assert!(matches!(
             &steps[4].step,
-            Step::Sh(a) if a[0] == "/workspace/ComfyUI/venv/bin/pip"
+            Step::Sh(a) if a[0] == "sh" && a[2].contains("/workspace/ComfyUI/.venv/bin/pip")
         ));
         assert!(matches!(
             &steps[7].step,
-            Step::Sh(a) if a[0] == "/workspace/ComfyUI/venv/bin/pip"
-                && a[3] == "/workspace/ComfyUI/custom_nodes/full/requirements.txt"
+            Step::Sh(a) if a[0] == "sh"
+                && a[2].contains("/workspace/ComfyUI/.venv/bin/pip")
+                && a[2].contains("/workspace/ComfyUI/custom_nodes/full/requirements.txt")
         ));
     }
 
@@ -2185,7 +2313,7 @@ mod tests {
                 },
                 vec![Some(
                     "all[proc_alive(/tmp/comfyui.pid), \
-                     proc_argv(/tmp/comfyui.pid)=[/workspace/ComfyUI/venv/bin/python \
+                     proc_argv(/tmp/comfyui.pid)=[/workspace/ComfyUI/.venv/bin/python \
                      /workspace/ComfyUI/main.py --port 8188]]",
                 )],
             ),
@@ -2846,7 +2974,7 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(
             sh_command(&steps[0]),
-            "cd /workspace/ComfyUI && { nohup /workspace/ComfyUI/venv/bin/python \
+            "cd /workspace/ComfyUI && { nohup /workspace/ComfyUI/.venv/bin/python \
              /workspace/ComfyUI/main.py --port 8188 > /tmp/comfyui.log 2>&1 & \
              pid=$!; echo $pid > /tmp/comfyui.pid; sleep 1; \
              kill -0 $pid 2>/dev/null || { echo 'comfyui died immediately' >&2; \
@@ -2866,7 +2994,7 @@ mod tests {
         let steps = expand(&payload).expect("comfyui_restart expands");
         assert_eq!(
             sh_command(&steps[0]),
-            "cd /workspace/ComfyUI && { nohup /workspace/ComfyUI/venv/bin/python \
+            "cd /workspace/ComfyUI && { nohup /workspace/ComfyUI/.venv/bin/python \
              /workspace/ComfyUI/main.py --port 8188 --listen --highvram \
              > /tmp/comfyui.log 2>&1 & pid=$!; echo $pid > /tmp/comfyui.pid; sleep 1; \
              kill -0 $pid 2>/dev/null || { echo 'comfyui died immediately' >&2; \
@@ -2901,7 +3029,7 @@ mod tests {
                 assert::Service::new(
                     "/tmp/comfyui.pid",
                     vec![
-                        "/workspace/ComfyUI/venv/bin/python".to_string(),
+                        "/workspace/ComfyUI/.venv/bin/python".to_string(),
                         "/workspace/ComfyUI/main.py".to_string(),
                         "--port".to_string(),
                         "8188".to_string(),
@@ -4791,9 +4919,10 @@ mod tests {
     /// the root would reject profiles for a resource it does not use.
     ///
     /// So: over every kind, expanding with **nothing bound** must fail
-    /// exactly when `requires` names the root.
+    /// exactly when `requires` names anything at all — and the resource
+    /// it names must be the one the failure reports.
     #[test]
-    fn expand_without_a_bound_root_fails_exactly_the_requiring_kinds() {
+    fn expand_without_its_resources_fails_exactly_the_requiring_kinds() {
         let ids = IdGen::new();
         let empty = ResourceEnv::default();
         let kinds = vec![
@@ -4806,6 +4935,11 @@ mod tests {
                 ref_name: "master".into(),
                 repo: None,
                 install_dir: None,
+            },
+            ProfileNode::ToolchainPython {
+                id: node_id(&ids),
+                requirements: None,
+                isolated: false,
             },
             ProfileNode::PythonVersionCheck {
                 id: node_id(&ids),
@@ -4851,32 +4985,177 @@ mod tests {
 
         for phase in &kinds {
             let kind = crate::plan::kind_of(phase);
-            let needs_root = crate::resource::requires(phase).contains(&Resource::ComfyUiRoot);
-            let unbound = matches!(
-                super::expand(phase, &empty),
-                Err(ExecError::ResourceUnbound { .. })
-            );
-            assert_eq!(
-                needs_root,
-                unbound,
-                "{kind}: `requires` says it needs the root = {needs_root}, \
-                 but expanding with nothing bound {}",
-                if unbound { "failed" } else { "succeeded" }
-            );
+            let declared = crate::resource::requires(phase);
+            match super::expand(phase, &empty) {
+                Err(ExecError::ResourceUnbound { resource, .. }) => {
+                    assert!(
+                        !declared.is_empty(),
+                        "{kind}: expanding with nothing bound failed for {resource:?}, \
+                         but `requires` names nothing"
+                    );
+                    assert_eq!(
+                        resource,
+                        declared[0].as_str(),
+                        "{kind}: the failure must name the first resource `requires` lists"
+                    );
+                }
+                other => assert!(
+                    declared.is_empty(),
+                    "{kind}: `requires` names {declared:?}, but expanding with nothing \
+                     bound produced {other:?}"
+                ),
+            }
         }
 
         // And the whole point of the error: it names the resource.
-        let err = super::expand(&kinds[6], &empty).expect_err("models needs the root");
+        let err = super::expand(&kinds[7], &empty).expect_err("models needs the root");
         assert_eq!(
             err.to_string(),
             "models requires resource 'comfyui_root', which no earlier phase produces \
              and profile.assumes does not declare"
         );
+
+        // The venv is named by its own consumers, not folded into the
+        // root's message — which is the difference between "install
+        // ComfyUI somewhere" and "make the venv".
+        let mut rooted = ResourceEnv::default();
+        rooted.bind(&kinds[1]);
+        let err = super::expand(&kinds[10], &rooted).expect_err("restart needs the venv");
+        assert_eq!(
+            err.to_string(),
+            "comfyui.restart requires resource 'venv', which no earlier phase produces \
+             and profile.assumes does not declare"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // toolchain.python: what it composes.
+    // -----------------------------------------------------------------
+
+    fn toolchain(requirements: Option<&str>, isolated: bool) -> ProfileNode {
+        ProfileNode::ToolchainPython {
+            id: IdGen::new().node(),
+            requirements: requirements.map(str::to_string),
+            isolated,
+        }
+    }
+
+    /// **The default is the whole point.** A pod's driver-matched torch
+    /// lives in the host interpreter's site-packages, so a venv that
+    /// says nothing inherits it; only a profile that asks is cut off.
+    #[test]
+    fn a_venv_inherits_the_hosts_packages_unless_the_profile_asks_otherwise() {
+        let steps = expand(&toolchain(None, false)).expect("toolchain.python expands");
+        assert_eq!(
+            steps[0].step,
+            Step::Sh(vec![
+                "python3".into(),
+                "-m".into(),
+                "venv".into(),
+                "--system-site-packages".into(),
+                "/workspace/ComfyUI/.venv".into(),
+            ])
+        );
+
+        let steps = expand(&toolchain(None, true)).expect("toolchain.python expands");
+        assert_eq!(
+            steps[0].step,
+            Step::Sh(vec![
+                "python3".into(),
+                "-m".into(),
+                "venv".into(),
+                "/workspace/ComfyUI/.venv".into(),
+            ]),
+            "an isolated venv is the exception, and drops the flag"
+        );
+    }
+
+    /// A venv that is already there is not created again, and the
+    /// condition says which observation decided that.
+    #[test]
+    fn an_existing_venv_is_not_created_again() {
+        let steps = expand(&toolchain(None, false)).expect("toolchain.python expands");
+        let condition = steps[0]
+            .done
+            .as_ref()
+            .expect("the create step carries a condition");
+        assert_eq!(
+            condition,
+            &assert::Assert::FileExists {
+                path: "/workspace/ComfyUI/.venv/bin/python".into(),
+            },
+            "presence of the interpreter is the whole of a venv's identity"
+        );
+    }
+
+    /// **The requirements install carries no condition, deliberately.**
+    /// A venv's contents are not observable, so a condition derived
+    /// from the venv's existence would skip the install for ever after
+    /// the first apply — including when the profile's requirements
+    /// changed.
+    #[test]
+    fn the_requirements_install_runs_every_time_and_filters_the_torch_family() {
+        let steps = expand(&toolchain(
+            Some("/workspace/ComfyUI/requirements.txt"),
+            false,
+        ))
+        .expect("toolchain.python expands");
+        assert_eq!(steps.len(), 2);
+        assert!(
+            steps[1].done.is_none(),
+            "nothing here can observe what is inside a venv"
+        );
+        let Step::Sh(argv) = &steps[1].step else {
+            panic!("the install is a shell step: {:?}", steps[1].step);
+        };
+        assert_eq!(argv[0], "sh");
+        assert!(
+            argv[2].contains("grep -viE") && argv[2].contains("torch"),
+            "the torch family is stripped before pip sees it: {}",
+            argv[2]
+        );
+        assert!(
+            argv[2].contains("/workspace/ComfyUI/.venv/bin/pip install -r /dev/stdin"),
+            "{}",
+            argv[2]
+        );
+
+        let bare = expand(&toolchain(None, false)).expect("toolchain.python expands");
+        assert_eq!(bare.len(), 1, "no requirements, no install step");
+    }
+
+    /// **Both phases that pip-install a `requirements.txt` filter it,
+    /// and they filter it the same way.** A custom node that pinned a
+    /// torch wheel would undo the inheritance just as surely as
+    /// ComfyUI's own requirements would, and the symptom is identical:
+    /// a launch that never becomes ready.
+    #[test]
+    fn every_requirements_install_goes_through_the_same_filter() {
+        let toolchain_argv = match &expand(&toolchain(Some("/r.txt"), false)).unwrap()[1].step {
+            Step::Sh(argv) => argv[2].clone(),
+            other => panic!("{other:?}"),
+        };
+        let nodes = expand(&ProfileNode::CustomNodes {
+            id: IdGen::new().node(),
+            nodes_json: r#"[{"name":"n","repo":"o/r","pip":true}]"#.into(),
+        })
+        .expect("custom_nodes expands");
+        let nodes_argv = match &nodes[1].step {
+            Step::Sh(argv) => argv[2].clone(),
+            other => panic!("{other:?}"),
+        };
+
+        assert!(toolchain_argv.contains(TORCH_FAMILY_FILTER));
+        assert!(
+            nodes_argv.contains(TORCH_FAMILY_FILTER),
+            "the custom-node install used to skip the filter entirely: {nodes_argv}"
+        );
     }
 
     /// A declared install dir moves every derived path with it — the
-    /// five constants this replaced could not disagree, because there is
-    /// one input.
+    /// constants this replaced could not disagree, because there is one
+    /// input. The venv moves with it too, one resource further along:
+    /// `toolchain.python` puts it under whatever root is bound.
     #[test]
     fn a_declared_install_dir_moves_every_comfyui_path() {
         let ids = IdGen::new();
@@ -4886,8 +5165,14 @@ mod tests {
             repo: None,
             install_dir: Some("/opt/comfy".into()),
         };
+        let toolchain = ProfileNode::ToolchainPython {
+            id: node_id(&ids),
+            requirements: None,
+            isolated: false,
+        };
         let mut env = ResourceEnv::default();
         env.bind(&install);
+        env.bind(&toolchain);
 
         // The producer clones into its own declared dir.
         let steps = super::expand(&install, &ResourceEnv::default()).expect("install expands");
@@ -4921,7 +5206,7 @@ mod tests {
             super::expand(&restart, &env).expect("restart expands")
         );
         assert!(
-            rendered.contains("/opt/comfy/venv/bin/python"),
+            rendered.contains("/opt/comfy/.venv/bin/python"),
             "{rendered}"
         );
         assert!(rendered.contains("/opt/comfy/main.py"), "{rendered}");
@@ -4933,7 +5218,7 @@ mod tests {
             in_comfy_venv: true,
         };
         let rendered = format!("{:?}", super::expand(&deps, &env).expect("deps expands"));
-        assert!(rendered.contains("/opt/comfy/venv/bin/pip"), "{rendered}");
+        assert!(rendered.contains("/opt/comfy/.venv/bin/pip"), "{rendered}");
 
         let nodes = ProfileNode::CustomNodes {
             id: node_id(&ids),
@@ -4941,6 +5226,6 @@ mod tests {
         };
         let rendered = format!("{:?}", super::expand(&nodes, &env).expect("nodes expands"));
         assert!(rendered.contains("/opt/comfy/custom_nodes/n"), "{rendered}");
-        assert!(rendered.contains("/opt/comfy/venv/bin/pip"), "{rendered}");
+        assert!(rendered.contains("/opt/comfy/.venv/bin/pip"), "{rendered}");
     }
 }

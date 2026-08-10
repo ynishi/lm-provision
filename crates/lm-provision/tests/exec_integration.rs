@@ -254,7 +254,14 @@ async fn dry_run_traces_every_traceable_lifecycle_op() {
 
     let ids = IdGen::new();
     let program = ProfileNode::Spec {
-        assumes: Default::default(),
+        // Every resource declared present: this fixture is about which
+        // ops leave a trace line, so its phases need their resources
+        // bound to compose steps at all, and the producing phases would
+        // add trace lines of their own.
+        assumes: std::collections::BTreeMap::from([
+            ("comfyui_root".to_string(), "/workspace/ComfyUI".to_string()),
+            ("venv".to_string(), "/workspace/ComfyUI/.venv".to_string()),
+        ]),
         id: ids.node(),
         name: "lifecycle-traceable".to_string(),
         version: None,

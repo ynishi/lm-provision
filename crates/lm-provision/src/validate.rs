@@ -1108,21 +1108,31 @@ mod tests {
     /// test that carries a phase, masking the check each one is about.
     /// Its own coverage builds the `Spec` inline with the narrow lists
     /// it wants to see denied.
-    /// A permissive root: every capability declared, every path and URL
-    /// allowed, and the ComfyUI root assumed present.
+    /// Every resource the catalog knows about, assumed present.
     ///
-    /// The root is bound here for the same reason the allowlists are
-    /// wide open — these fixtures are about one check each, and a phase
-    /// rejected by check 8b before reaching the check under test would
-    /// pass or fail for the wrong reason. Check 8b's own fixtures build
-    /// their roots explicitly.
+    /// Fixtures that are about one check each use this so that check 8b
+    /// does not reject a phase before it reaches the check under test.
+    /// Check 8b's own fixtures build their scope explicitly.
+    fn all_resources_assumed() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
+                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
+            ),
+            (
+                crate::resource::Resource::Venv.as_str().to_string(),
+                format!("{}/.venv", crate::resource::COMFYUI_ROOT_DEFAULT),
+            ),
+        ])
+    }
+
+    /// A permissive root: every capability declared, every path and URL
+    /// allowed, and every resource assumed present — for the same
+    /// reason the allowlists are wide open.
     fn spec(name: &str, phases: Vec<ProfileNode>) -> ProfileNode {
         let ids = IdGen::new();
         ProfileNode::Spec {
-            assumes: BTreeMap::from([(
-                crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
-                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
-            )]),
+            assumes: all_resources_assumed(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -1931,16 +1941,14 @@ mod tests {
         }
     }
 
-    /// Bind the ComfyUI root without adding an install phase — what a
-    /// profile provisioning into a prepared pod declares. Fixtures that
-    /// are about one consuming phase use this so the assertion stays
-    /// about that phase rather than about an install's own derivation.
+    /// Bind every resource without adding the phases that produce them
+    /// — what a profile provisioning into a prepared pod declares.
+    /// Fixtures about one consuming phase use this so the assertion
+    /// stays about that phase rather than about a producer's own
+    /// derivation.
     fn assuming_comfyui(mut node: ProfileNode) -> ProfileNode {
         if let ProfileNode::Spec { assumes, .. } = &mut node {
-            assumes.insert(
-                crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
-                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
-            );
+            assumes.extend(all_resources_assumed());
         }
         node
     }
@@ -2124,7 +2132,7 @@ mod tests {
     /// `in_comfy_venv`; a plain `pip install` needs nothing from
     /// ComfyUI, and rejecting it would be the check overreaching.
     #[test]
-    fn python_deps_outside_the_venv_needs_no_root() {
+    fn python_deps_outside_the_venv_needs_nothing() {
         let g = ids();
         let outside = ProfileNode::PythonDeps {
             id: g.node(),
@@ -2142,7 +2150,7 @@ mod tests {
             Err(ValidateError::UnboundResource {
                 index: 1,
                 kind: "python.deps",
-                resource: "comfyui_root",
+                resource: "venv",
             })
         );
     }

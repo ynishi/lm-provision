@@ -82,14 +82,15 @@ const DIRECT_OPS: [&str; 7] = [
     "mount_umount",
 ];
 
-/// The fifteen lifecycle ops handled through [`lifecycle::expand`].
+/// The sixteen lifecycle ops handled through [`lifecycle::expand`].
 ///
 /// `pub(crate)` so [`super::steps`] can pin its variant → op-name map
 /// against this list; the two are written out separately and nothing
 /// else would stop them drifting.
-pub(crate) const LIFECYCLE_OPS: [&str; 15] = [
+pub(crate) const LIFECYCLE_OPS: [&str; 16] = [
     "system_apt",
     "comfyui_install",
+    "toolchain_python",
     "python_version_check",
     "python_deps",
     "custom_nodes",
@@ -105,7 +106,7 @@ pub(crate) const LIFECYCLE_OPS: [&str; 15] = [
     "service_ready",
 ];
 
-/// Build the 22-op registry over a shared [`ExecContext`].
+/// Build the 23-op registry over a shared [`ExecContext`].
 pub fn profile_op_registry(ctx: Arc<ExecContext>) -> Arc<OpRegistry<ProfileValue>> {
     let mut registry = OpRegistry::new();
     for &name in DIRECT_OPS.iter().chain(LIFECYCLE_OPS.iter()) {
@@ -2410,16 +2411,23 @@ mod tests {
         }
     }
 
-    /// Declares the ComfyUI root as already present: these fixtures are
+    /// Declares every resource as already present: these fixtures are
     /// about fan-out shape, so their `models` / `custom_nodes` phases
-    /// need a bound root to compose steps at all, and adding an install
-    /// phase would put a third phase into assertions about two.
+    /// need their resources bound to compose steps at all, and adding
+    /// the producing phases would put more phases into assertions about
+    /// two.
     fn spec(phases: Vec<ProfileNode>, ids: &IdGen) -> ProfileNode {
         ProfileNode::Spec {
-            assumes: std::collections::BTreeMap::from([(
-                crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
-                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
-            )]),
+            assumes: std::collections::BTreeMap::from([
+                (
+                    crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
+                    crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
+                ),
+                (
+                    crate::resource::Resource::Venv.as_str().to_string(),
+                    format!("{}/.venv", crate::resource::COMFYUI_ROOT_DEFAULT),
+                ),
+            ]),
             id: ids.node(),
             name: "parallel".into(),
             version: None,
@@ -2523,7 +2531,14 @@ mod tests {
         };
         assert_eq!(argv(0)[1], "clone");
         assert_eq!(argv(1)[3], "checkout");
-        assert_eq!(argv(2)[1], "install");
+        // The pip step is `sh -c`, because the requirements go through
+        // the torch-family filter on the way in.
+        assert_eq!(argv(2)[0], "sh");
+        assert!(
+            argv(2)[2].contains("pip install -r /dev/stdin"),
+            "{:?}",
+            argv(2)
+        );
         // Nothing but the fanned-out phase names a reducer.
         assert!(lifecycle_reducer_registry(&plan)
             .resolve(&par_reducer_id(nodes_id), FailPolicy::CollectAll)

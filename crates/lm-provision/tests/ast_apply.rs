@@ -1935,6 +1935,9 @@ fn the_plan_artifact_and_the_apply_report_run_the_same_phases_in_the_same_order(
     let expected = vec![
         "system.apt".to_string(),
         "comfyui.install".to_string(),
+        // Inserted beside the restart, because the restart runs its
+        // interpreter (chapter 02 §Canonical phase ordering).
+        "toolchain.python".to_string(),
         "comfyui.restart".to_string(),
         "comfyui.health".to_string(),
         "sh.exec".to_string(),

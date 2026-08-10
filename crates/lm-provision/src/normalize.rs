@@ -97,6 +97,7 @@ fn normalize_phases(phases: &[ProfileNode], mut ids: IdMinter) -> Vec<ProfileNod
         match phase {
             ProfileNode::SystemApt { .. } => buckets.system_apt.push(phase.clone()),
             ProfileNode::ComfyUiInstall { .. } => buckets.comfyui_install.push(phase.clone()),
+            ProfileNode::ToolchainPython { .. } => buckets.toolchain_python.push(phase.clone()),
             // Suppressed: asserting the default version against itself
             // cannot fail. The test is a literal equality against the
             // default, not an analysis of which wants are vacuous
@@ -145,6 +146,10 @@ fn normalize_phases(phases: &[ProfileNode], mut ids: IdMinter) -> Vec<ProfileNod
     let mut out = Vec::with_capacity(phases.len() + 2);
     out.append(&mut buckets.system_apt);
     out.append(&mut buckets.comfyui_install);
+    // After the checkout it puts the venv inside, before every phase
+    // that reaches into one (`crate::resource`). There is no other slot
+    // it could take.
+    out.append(&mut buckets.toolchain_python);
     out.append(&mut buckets.python_version_check);
     out.append(&mut buckets.python_deps);
     out.append(&mut buckets.custom_nodes);
@@ -161,15 +166,47 @@ fn normalize_phases(phases: &[ProfileNode], mut ids: IdMinter) -> Vec<ProfileNod
     out
 }
 
-/// Apply the implicit-insertion rule to the restart / health buckets.
+/// Apply the implicit-insertion rule to the toolchain / restart / health
+/// buckets.
 ///
-/// The guard is per phase, not "neither was declared": a profile that
+/// The guard is per phase, not "none was declared": a profile that
 /// declares only the restart still gets its health poll. The inserted
 /// step carries the port of the other one when that was declared, and
 /// the default port when neither was (`02` §Canonical phase ordering).
+///
+/// ## Why the venv is inserted too
+///
+/// The rule already says a checkout implies a launch. A launch runs the
+/// venv's interpreter, so **a checkout implies a venv** by the same
+/// step — and the alternative was worse than verbose: the inserted
+/// restart requires the `venv` resource, so without this a profile that
+/// wrote nothing but `comfyui.install` would be rejected for a phase
+/// its author never wrote. Inserting a launch while withholding what
+/// the launch needs is half a rule.
+///
+/// The inserted phase installs the checkout's own `requirements.txt`,
+/// which is what makes the result startable rather than merely present;
+/// the predecessor implementation does the same three things in one
+/// script [実測: `profile_service.rs:1061-1082`]. A profile that wants
+/// a bare venv, a different requirements file, or an isolated one
+/// writes its own `toolchain.python` and this inserts nothing.
 fn insert_comfyui_lifecycle(buckets: &mut Buckets, ids: &mut IdMinter) {
     if buckets.comfyui_install.is_empty() {
         return;
+    }
+
+    if buckets.toolchain_python.is_empty() {
+        let root = buckets
+            .comfyui_install
+            .first()
+            .and_then(|install| crate::resource::produces(install, &Default::default()))
+            .map(|(_, path)| path)
+            .unwrap_or_else(|| crate::resource::COMFYUI_ROOT_DEFAULT.to_string());
+        buckets.toolchain_python.push(ProfileNode::ToolchainPython {
+            id: ids.next(),
+            requirements: Some(crate::resource::ComfyUiPaths::new(root).requirements_txt()),
+            isolated: false,
+        });
     }
 
     if buckets.comfyui_restart.is_empty() {
@@ -265,6 +302,7 @@ fn max_node_id(node: &ProfileNode) -> u64 {
 struct Buckets {
     system_apt: Vec<ProfileNode>,
     comfyui_install: Vec<ProfileNode>,
+    toolchain_python: Vec<ProfileNode>,
     python_version_check: Vec<ProfileNode>,
     python_deps: Vec<ProfileNode>,
     custom_nodes: Vec<ProfileNode>,
@@ -373,13 +411,29 @@ mod tests {
         let normalized = normalize(&root);
         assert_eq!(
             kinds(&normalized),
-            vec!["comfyui.install", "comfyui.restart", "comfyui.health"],
+            vec![
+                "comfyui.install",
+                // The launch runs the venv's interpreter, so the rule
+                // that inserts a launch inserts what it runs.
+                "toolchain.python",
+                "comfyui.restart",
+                "comfyui.health"
+            ],
         );
         let ProfileNode::Spec { phases, .. } = &normalized else {
             unreachable!()
         };
-        assert_eq!(port_of(&phases[1]), Some(DEFAULT_COMFYUI_PORT));
         assert_eq!(port_of(&phases[2]), Some(DEFAULT_COMFYUI_PORT));
+        assert_eq!(port_of(&phases[3]), Some(DEFAULT_COMFYUI_PORT));
+        assert!(
+            matches!(
+                &phases[1],
+                ProfileNode::ToolchainPython { requirements: Some(r), isolated: false, .. }
+                    if r == "/workspace/ComfyUI/requirements.txt"
+            ),
+            "the inserted venv installs the checkout's own requirements: {:?}",
+            phases[1]
+        );
     }
 
     /// The guard is per phase: declaring only the restart still gets a
@@ -404,8 +458,10 @@ mod tests {
         let ProfileNode::Spec { phases, .. } = &normalized else {
             unreachable!()
         };
-        assert_eq!(kinds(&normalized).len(), 3);
-        assert_eq!(port_of(&phases[2]), Some(9999));
+        // install + inserted toolchain.python + declared restart +
+        // inserted health.
+        assert_eq!(kinds(&normalized).len(), 4);
+        assert_eq!(port_of(&phases[3]), Some(9999));
     }
 
     #[test]

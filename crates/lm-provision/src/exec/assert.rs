@@ -1302,6 +1302,66 @@ impl Done for Checkout {
     }
 }
 
+/// One Python virtual environment, by the directory it lives in.
+///
+/// **The weakest entity in the catalog, and design §3.6 predicted
+/// exactly this.** The other three carry an identity strong enough to
+/// notice a mismatch — a [`ModelFile`] can be digested, a [`Checkout`]
+/// can be asked which ref it holds, a [`Service`] can be asked what
+/// argv it was launched with. A venv can be asked none of that: it is a
+/// directory of files with no manifest of what should be in it, and
+/// nothing observable distinguishes one built from a different
+/// requirements list.
+///
+/// So the identity is presence, and the limitation is stated rather
+/// than papered over:
+///
+/// ```text
+/// KNOWN LIMITATION — a venv's contents are not observed.
+///
+/// Changing what a profile installs into a venv does not make an
+/// existing venv unsatisfied, so the create step is skipped and the
+/// old contents stay. Reprovisioning onto a pod whose venv was built
+/// from a different requirements list needs the directory removed
+/// first. This is a missing observation, not an intended behaviour;
+/// what would fix it is a manifest to compare against, which nothing
+/// writes today.
+/// ```
+///
+/// The requirements install beside it carries no condition at all and
+/// therefore runs every time, which is what keeps a *changed*
+/// requirements file from being ignored — the venv is stale, its
+/// contents are not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Venv {
+    dir: PathBuf,
+}
+
+impl Venv {
+    /// A virtual environment at `dir`.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+}
+
+impl Done for Venv {
+    /// There is an interpreter in it.
+    ///
+    /// **`<dir>/bin/python`, not `<dir>`** — the same choice
+    /// [`Checkout`] makes and for the same reason. A directory can
+    /// exist without being a venv: `python3 -m venv` interrupted part
+    /// way, or an operator's `mkdir`. Answering "finished" for one of
+    /// those would skip the create and leave every phase after it
+    /// invoking a `pip` that is not there. Asking for the interpreter
+    /// costs the same and is a true statement — and it is the very file
+    /// the phases downstream go on to execute.
+    fn done(&self) -> Assert {
+        Assert::FileExists {
+            path: self.dir.join("bin").join("python"),
+        }
+    }
+}
+
 /// One server a launch phase puts on the pod.
 ///
 /// Shared by `comfyui.restart` and `service.start` — the recurrence

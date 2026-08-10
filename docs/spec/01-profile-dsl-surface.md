@@ -250,7 +250,23 @@ Keys are resource names; the vocabulary is one entry today:
 
 | resource | produced by | what derives from it |
 |---|---|---|
-| `comfyui_root` | `comfyui.install` (its `install_dir`, defaulting to `/workspace/ComfyUI`) | the models root, the custom-nodes root, the venv `pip` / `python`, and `main.py` (chapter 02 §Resource-derived paths) |
+| `comfyui_root` | `comfyui.install` (its `install_dir`, defaulting to `/workspace/ComfyUI`) | the models root, the custom-nodes root, `main.py`, and where the venv goes (chapter 02 §Resource-derived paths) |
+| `venv` | `toolchain.python`, which places it at `<comfyui_root>/.venv` | the `pip` and `python` every venv-reaching phase invokes |
+
+**A producer may place what it makes relative to something it
+requires** — `toolchain.python` needs the root before it can say where
+the venv is — so the second column is not a function of the phase
+alone.
+
+`venv`'s identity is weaker than the others', and the limitation is
+stated rather than papered over: a venv carries no digest, so
+"there is one" is all that can be observed about it. Changing what a
+profile installs into a venv does not make an existing one disagree,
+so the create step is skipped and the old contents stay;
+reprovisioning onto a pod whose venv was built from a different
+requirements list needs the directory removed first. The requirements
+install beside it carries no condition and therefore runs every time,
+which is what keeps a *changed* requirements file from being ignored.
 
 The rule is a **scope check**, applied over the phases in canonical
 order (chapter 02 §Canonical phase ordering), not over the order they

@@ -71,6 +71,7 @@ pub(crate) fn lifecycle_op_name(node: &ProfileNode) -> Option<&'static str> {
     let name = match node {
         ProfileNode::SystemApt { .. } => "system_apt",
         ProfileNode::ComfyUiInstall { .. } => "comfyui_install",
+        ProfileNode::ToolchainPython { .. } => "toolchain_python",
         ProfileNode::PythonVersionCheck { .. } => "python_version_check",
         ProfileNode::PythonDeps { .. } => "python_deps",
         ProfileNode::CustomNodes { .. } => "custom_nodes",

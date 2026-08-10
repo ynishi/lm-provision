@@ -25,11 +25,12 @@ spells `ComfyUi`, and `hooks.post_install` drops its group).
 ```
 system.apt            SystemApt             sh.exec         ShExec
 comfyui.install       ComfyUiInstall        fs.write        FsWrite
-python.version_check  PythonVersionCheck    net.http_get    NetHttpGet
-python.deps           PythonDeps            net.http_post   NetHttpPost
-custom_nodes          CustomNodes           net.transfer    NetTransfer
-sync.pull             SyncPull              mount.bind      MountBind
-sync.push             SyncPush              mount.umount    MountUmount
+toolchain.python      ToolchainPython       net.http_get    NetHttpGet
+python.version_check  PythonVersionCheck    net.http_post   NetHttpPost
+python.deps           PythonDeps            net.transfer    NetTransfer
+custom_nodes          CustomNodes           mount.bind      MountBind
+sync.pull             SyncPull              mount.umount    MountUmount
+sync.push             SyncPush
 staging.push          StagingPush
 models                Models
 llm_models            LlmModels
@@ -47,6 +48,7 @@ service.ready         ServiceReady
 |---|---|---|
 | `system.apt` | `packages` list\<string\>, each shell-safe | `sh.exec` |
 | `comfyui.install` | `ref` string (required, shell-safe); `repo` string `"<owner>/<name>"` (default `comfyanonymous/ComfyUI`); `install_dir` string (default `/workspace/ComfyUI`) — where the checkout lands, and what every ComfyUI-relative path derives from (§Resource-derived paths) | `sh.exec` |
+| `toolchain.python` | `requirements` string optional (a `requirements.txt` to install into the venv, filtered — §Torch-family filter); `isolated` bool (default `false`: the venv **inherits** the host interpreter's packages) | `sh.exec` |
 | `python.version_check` | `want` string (e.g. `"3.11"`); suppressed from the plan when `want` equals the default `3.12` | `sh.exec` |
 | `python.deps` | `deps` list\<string\> (shell-safe); `in_comfy_venv` bool (venv pip vs system pip); `force_reinstall` bool | `sh.exec` |
 | `custom_nodes` | `nodes` list of `{ name, repo = "<owner>/<name>", ref?, pip? bool }`, all strings shell-safe | `sh.exec` |
@@ -135,7 +137,8 @@ in this fixed order (the numbering is part of the contract; the `6_`
 slot is intentionally unused):
 
 ```
-1_system_apt → 2_comfyui_install → 3a_python_version_check →
+1_system_apt → 2_comfyui_install → 2b_toolchain_python →
+3a_python_version_check →
 3_python_deps → 4_custom_nodes → 5_sync_routes → 7_models →
 7b_llm_models → 8_post_install → 9_comfyui_restart →
 10_comfyui_health → 11_service_<N>_start / 11_service_<N>_ready →
@@ -158,11 +161,22 @@ Rules:
   would carry `11_service_<N>_ready`, and unlike a shared bucket id
   that number is what tells two services apart.
 - Implicit insertion: when `comfyui.install` is present, whichever of
-  `comfyui.restart` / `comfyui.health` the profile did not declare is
-  inserted. The guard is per phase, not "neither was declared" — a
-  profile that declares only the restart still gets its health poll.
-  The inserted step carries the port of the other one when that was
-  declared, and the default port when neither was.
+  `toolchain.python` / `comfyui.restart` / `comfyui.health` the profile
+  did not declare is inserted. The guard is per phase, not "none was
+  declared" — a profile that declares only the restart still gets its
+  health poll. The restart / health pair carries the port of the other
+  one when that was declared, and the default port when neither was.
+
+  **The venv is inserted for the same reason the restart is.** The rule
+  already reads "a checkout implies a launch"; a launch runs the venv's
+  interpreter, so a checkout implies a venv. Inserting the launch while
+  withholding what it runs would reject a profile that wrote nothing
+  but `comfyui.install` — for a phase its author never wrote. The
+  inserted `toolchain.python` installs the checkout's own
+  `requirements.txt`, which is what makes the result startable rather
+  than merely present. A profile that wants a bare venv, a different
+  requirements file, or an isolated one declares its own and nothing is
+  inserted.
 - `python.version_check` with `want == "3.12"` (the default) is
   suppressed. The test is a literal equality against the default
   rather than an analysis of which wants are vacuous: the step's own
@@ -491,25 +505,53 @@ Every ComfyUI-relative path is derived from **one** root, the
 and the phases that consume ComfyUI require it (chapter 01 §Assumed
 resources):
 
-| path | derivation |
-|---|---|
-| models root | `<comfyui_root>/models` |
-| custom nodes root | `<comfyui_root>/custom_nodes` |
-| venv pip | `<comfyui_root>/venv/bin/pip` |
-| venv python | `<comfyui_root>/venv/bin/python` |
-| entry point | `<comfyui_root>/main.py` |
+| path | resource | derivation |
+|---|---|---|
+| models root | `comfyui_root` | `<comfyui_root>/models` |
+| custom nodes root | `comfyui_root` | `<comfyui_root>/custom_nodes` |
+| entry point | `comfyui_root` | `<comfyui_root>/main.py` |
+| venv directory | `comfyui_root` | `<comfyui_root>/.venv` — where `toolchain.python` puts it |
+| venv pip | `venv` | `<venv>/bin/pip` |
+| venv python | `venv` | `<venv>/bin/python` |
 
-Requiring kinds: `models`, `custom_nodes`, `comfyui.restart`, and
-`python.deps` when it declares `in_comfy_venv`. A profile using any of
-them without producing or assuming the root is rejected (chapter 03
-§validate check 8b).
+The last two are derived from the **bound venv**, not from the root: a
+profile that assumes a venv somewhere else gets that one. The venv
+directory row is where `toolchain.python` places what it creates when
+nothing has bound one already.
 
-**Nothing creates the venv.** `comfyui.install` clones and checks out;
-the three phases above reach into `<comfyui_root>/venv` regardless, and
-the predecessor implementation spells that directory `.venv`. Deriving
-the paths from the root does not fix this — it makes it visible, which
-is the step this vocabulary exists to enable. A `toolchain.python` kind
-producing a `Venv` resource is the fix, and is not in this catalog yet.
+Requiring kinds:
+
+| kind | requires | when |
+|---|---|---|
+| `models` | `comfyui_root` | always |
+| `toolchain.python` | `comfyui_root` | always — it puts the venv inside |
+| `comfyui.restart` | `comfyui_root`, `venv` | always |
+| `python.deps` | `venv` | only under `in_comfy_venv` |
+| `custom_nodes` | `comfyui_root` | always |
+| `custom_nodes` | + `venv` | when an entry sets `pip` |
+
+A profile using any of them without producing or assuming what it
+requires is rejected (chapter 03 §validate check 8b).
+
+#### Torch-family filter
+
+Every `requirements.txt` this provisioner installs — ComfyUI's own via
+`toolchain.python`, and each custom node's — is filtered first:
+
+```
+^[[:space:]]*(torch|torchvision|torchaudio|xformers|bitsandbytes|triton)([[:space:]=<>~!;]|$)
+```
+
+A GPU pod image ships a torch built against its own driver, and a venv
+created without `isolated` inherits it. **Inheritance loses to a wheel
+installed inside the venv**: a requirements file pinning `torch>=2.7`
+has pip satisfy it from PyPI, the wheel's CUDA no longer matches the
+driver, and the only symptom is `torch.cuda.is_available()` answering
+false at launch — long after the phase that caused it reported success.
+
+The filter is a pipe (`grep -viE '<pattern>' <file> | pip install -r
+/dev/stdin`) rather than a rewrite: the requirements belong to the
+repository that shipped them.
 
 ### Built-in path constants
 
@@ -552,7 +594,7 @@ choices (§Spawn-and-poll invocations).
 
 ## Stability
 
-- The 22-kind catalog and per-kind payload field sets: **provisional**
+- The 23-kind catalog and per-kind payload field sets: **provisional**
   through Phase H (additive growth expected; removals are breaking).
 - Canonical phase ids, fixed ordering, implicit-insertion rules:
   **stable** (hash and report ids depend on them).
@@ -571,7 +613,7 @@ choices (§Spawn-and-poll invocations).
 
 ## MVP scope
 
-Ships in Phase F: all 22 kinds above through
+Ships in Phase F: all 23 kinds above through
 validate → plan → dispatch → apply --dry-run; real-exec coverage for
 `sh.exec`-routed kinds, `fs.write`, `net.http_get` / `net.http_post`,
 `net.transfer` download/upload, `mount.bind` / `mount.umount`

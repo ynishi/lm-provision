@@ -120,6 +120,45 @@ pub enum ProfileNode {
         install_dir: Option<String>,
     },
 
+    /// `toolchain.python`: create the virtual environment ComfyUI runs
+    /// in, and install what it needs into it.
+    ///
+    /// The **producer** of the `venv` resource ([`crate::resource`]).
+    /// Before it existed, three phases reached into a venv nothing
+    /// created — the consumer-with-no-producer shape design §4.3 names,
+    /// invisible because the path was a host constant.
+    #[dsl_exec(apply = "toolchain_python")]
+    ToolchainPython {
+        /// Stable node ID.
+        id: NodeId,
+        /// A `requirements.txt` to install into the venv once it exists.
+        ///
+        /// ComfyUI does not run without its own dependencies, and
+        /// nothing else in the catalog installs them, so this is what
+        /// takes a checkout from "cloned" to "startable". `None`
+        /// creates the venv and installs nothing.
+        requirements: Option<String>,
+        /// Cut the venv off from the host interpreter's packages.
+        ///
+        /// **Phrased as the exception because inheriting is what a GPU
+        /// pod needs.** The image ships a torch built against its own
+        /// driver; a venv that cannot see it makes `pip install` fetch
+        /// a wheel that usually wants a newer CUDA than the pod has,
+        /// and the failure surfaces only as `torch.cuda.is_available()`
+        /// returning false at launch — silently, long after the phase
+        /// that caused it reported success
+        /// [実測: predecessor implementation `profile_service.rs:1047-1051`].
+        ///
+        /// So the default has to be "inherit", and an absent `bool` is
+        /// `false` — hence the negative sense, rather than a
+        /// `system_site_packages` that would default to the broken
+        /// arrangement. `Option<bool>` would have carried the positive
+        /// sense with a tri-state, but dsl-kit 0.11's canonical grammar
+        /// has no value production for it
+        /// [実測: `dsl_kit::schema_gen::unsupported_field`].
+        isolated: bool,
+    },
+
     /// `python.version_check`: Ensure Python version requirement
     #[dsl_exec(apply = "python_version_check")]
     PythonVersionCheck {

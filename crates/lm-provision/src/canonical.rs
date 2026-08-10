@@ -274,6 +274,17 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             CanonValue::Object(fields)
         }
 
+        ProfileNode::ToolchainPython {
+            id: _,
+            requirements,
+            isolated,
+        } => {
+            let mut fields = variant_object("ToolchainPython");
+            insert_optional_str(&mut fields, "requirements", requirements);
+            fields.insert("isolated".into(), CanonValue::Bool(*isolated));
+            CanonValue::Object(fields)
+        }
+
         ProfileNode::PythonVersionCheck { id: _, want } => {
             let mut fields = variant_object("PythonVersionCheck");
             fields.insert("want".into(), CanonValue::Str(want.clone()));
@@ -1880,6 +1891,61 @@ mod tests {
         assert!(
             with.contains(r#""assumes":{"comfyui_root":"/opt/comfy"}"#),
             "{with}"
+        );
+    }
+
+    /// A kind added to the catalog cannot move any existing profile's
+    /// hash, because a profile that does not use it has no node of that
+    /// variant to encode. What has to be checked is the new variant's
+    /// **own** encoding: `requirements` omitted when undeclared, and
+    /// `isolated` always present.
+    ///
+    /// `isolated` is emitted even when `false` on purpose — it is a
+    /// plain `bool`, so there is no "unset" to distinguish, and the
+    /// alternative (omit when `false`) would make two different
+    /// spellings of the same profile hash differently.
+    #[test]
+    fn toolchain_python_encodes_what_the_author_declared() {
+        let gen = IdGen::new();
+        let node = |requirements: Option<&str>, isolated: bool| ProfileNode::ToolchainPython {
+            id: new_id(&gen),
+            requirements: requirements.map(str::to_string),
+            isolated,
+        };
+
+        assert_eq!(
+            encode(&node(None, false)),
+            r#"{"isolated":false,"type":"ToolchainPython"}"#
+        );
+        assert_eq!(
+            encode(&node(Some("/r.txt"), true)),
+            r#"{"isolated":true,"requirements":"/r.txt","type":"ToolchainPython"}"#
+        );
+        // Same declaration, same bytes; different declaration, different
+        // bytes.
+        assert_eq!(
+            encode(&node(Some("/r.txt"), true)),
+            encode(&node(Some("/r.txt"), true))
+        );
+        assert_ne!(
+            encode(&node(Some("/r.txt"), true)),
+            encode(&node(Some("/r.txt"), false))
+        );
+    }
+
+    /// The venv is bound by name like any other resource, so a profile
+    /// that assumes one carries it in the same slot `comfyui_root` uses.
+    #[test]
+    fn a_venv_can_be_assumed_like_any_other_resource() {
+        let gen = IdGen::new();
+        let mut spec = empty_spec(&gen, "demo");
+        if let ProfileNode::Spec { assumes, .. } = &mut spec {
+            assumes.insert("venv".into(), "/opt/comfy/.venv".into());
+        }
+        assert!(
+            encode(&spec).contains(r#""assumes":{"venv":"/opt/comfy/.venv"}"#),
+            "{}",
+            encode(&spec)
         );
     }
 
