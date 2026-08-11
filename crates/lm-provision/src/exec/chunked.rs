@@ -29,6 +29,22 @@
 //! [`hf_transfer/src/lib.rs`] — and HuggingFace has deprecated it now
 //! that Xet is the storage backend.
 //!
+//! # Where re-resolving is unnecessary, it is still cheap
+//!
+//! Range-scoped signing is not universal. CivitAI's presigned URL covers
+//! only the host (`X-Amz-SignedHeaders=host`), so one resolved location
+//! serves any range for its 24-hour life, and a downloader that resolves
+//! once works perfectly against it [実測: 2026-08-11, three disjoint
+//! ranges of a 2.13 GB model on one resolved URL, all `206`].
+//!
+//! This route re-resolves there too, and pays a redirect per chunk for
+//! it. That is deliberate: the alternative is a rule about which hosts
+//! may be trusted to serve a second range, which is a list to maintain
+//! and to be wrong about. The cost was measured rather than assumed —
+//! thirty rapid re-resolutions at eight concurrent against CivitAI, all
+//! `206`, no rate limiting [実測: same day] — and a redirect against a
+//! 10 MiB chunk is not the expensive part of a download.
+//!
 //! # The numbers are HuggingFace's own
 //!
 //! [`CONCURRENCY`] and [`CHUNK_SIZE`] are not tuned here and are not

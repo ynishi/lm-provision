@@ -79,9 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     one, and without the retry that single drop discards every other
     chunk's work. Measured: the first run without retries died 2 minutes
     into a 32-chunk fetch.
-  - Verified end to end against HuggingFace: 335 MB over 32 chunks, and
-    the assembled file's sha256 equals the hash HuggingFace publishes
-    for it.
+  - Verified end to end against **both** suppliers these profiles name,
+    each time by comparing the assembled file's sha256 against the hash
+    the supplier publishes for it: HuggingFace, 335 MB over 32 chunks;
+    CivitAI, 37 MB over 4. That check is the one that matters when
+    sixteen writers share one file.
+  - Range-scoped signing is **HuggingFace's**, not everyone's. CivitAI
+    signs only the host, so one resolved URL there serves any range and
+    a resolve-once downloader works fine against it — which is where
+    aria2c's 28x was measured, and there is no reason to doubt it. This
+    route re-resolves anyway rather than keeping a list of hosts that
+    may be trusted to serve a second range; thirty rapid re-resolutions
+    at eight concurrent against CivitAI drew no rate limiting.
 - **A download splits across connections when the pod can.** A pod is
   billed for as long as it is up, so a transfer that takes 25 minutes is
   25 minutes paid for provisioning that produced nothing; carrying one

@@ -10,11 +10,20 @@
 //! single connection, exactly like the in-process stream, with a
 //! package install and an RPC daemon in front of it.
 //!
-//! It is also the worse of the two against the supplier this repo
-//! actually fetches from: aria2c resolves the redirect once and splits
-//! against the result, and HuggingFace signs that result for one byte
-//! range, so every split past the first is refused. `chunked` does not
-//! have that problem because it never reuses a resolved location.
+//! **It is not broken in general — it is broken against HuggingFace.**
+//! aria2c resolves the redirect once and splits against the result,
+//! which is exactly right for a supplier whose signed URL is not scoped
+//! to a range. CivitAI is one: its R2 presign covers only the host
+//! (`X-Amz-SignedHeaders=host`), so one resolved URL serves any range
+//! for its 24-hour life [実測: 2026-08-11, three disjoint ranges of a
+//! 2.13 GB model on one resolved URL, all `206`]. That is where the 28x
+//! this route was built for was measured, and there is no reason to
+//! doubt it. HuggingFace is the exception, and it is also the supplier
+//! most of these profiles name.
+//!
+//! `chunked` covers both, because never reusing a resolved location is
+//! correct everywhere and merely unnecessary where reuse would also
+//! have worked.
 //!
 //! So this module is a deletion waiting for a decision, not a fallback.
 //! It is still here because removing a route two commits after adding
