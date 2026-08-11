@@ -179,20 +179,32 @@ those options are deferred, not withdrawn.
 - Effect (download): GET streamed to the `dst` file (never fully
   buffered, 16 MiB cap); on any failure the partial file is removed.
   The report carries the byte count and destination.
-- **Two download mechanisms, one step.** When `aria2c` resolves on the
-  pod's `PATH` the transfer is carried by it, splitting one file across
-  16 connections; otherwise the in-process stream above carries it. The
-  choice is made per transfer (so a profile that installs `aria2c`
-  partway through gets the faster route for what follows) and is
-  announced as a `net.transfer.route` audit event naming the route and
-  the reason — a fallback is allowed, a *silent* fallback is not,
-  because the two differ by more than an order of magnitude on a large
-  weight and a slow run must not be indistinguishable from an
-  unavoidable one.
-  - Nothing installs `aria2c`. Acquiring it is the profile's decision,
-    written with `sh.exec`; composing the install into `models` would
-    make every weight-downloading profile require `sh.exec`, widening
-    the boundary the capability list exists to hold.
+- **Two download mechanisms, one step.** A large file from a supplier
+  that serves ranges is fetched in parallel chunks; everything else is
+  the single stream above. The first request decides which: it asks for
+  the opening range, so a `206` carrying `Content-Range` gives both the
+  total and the first chunk, and a `200` is the whole body on the path
+  it was taking anyway — **no probe request is spent either way**. The
+  choice is announced as a `net.transfer.route` audit event naming the
+  route and the reason, because a slow run must not be
+  indistinguishable from an unavoidable one.
+  - **Each chunk requests the profile's URL and follows its own
+    redirect**, never a location resolved for an earlier range. A
+    supplier may sign the redirect target for one byte range —
+    HuggingFace documents exactly this and documents that a `Range`
+    outside it fails authorization — so reusing a resolved location is
+    what makes a parallel download fail against them. Nothing here
+    caches or rewrites a signed URL.
+  - Chunk size and concurrency are matched to HuggingFace's own client
+    (10 MiB, 16 in flight). Concurrency is bounded because an unbounded
+    fan-out is rude, not because a limit is documented — none is.
+  - A chunk that fails is retried with backoff. Over a multi-gigabyte
+    file one of sixteen connections will drop, and one drop must not
+    discard the rest.
+  - Nothing is installed on the pod for this. The `aria2c` route
+    described in earlier revisions is no longer reached: it needs range
+    support to split, which is the same condition that routes the
+    transfer to the chunked path instead.
   - **Nothing above this changes with the route.** The step is the same
     step with the same condition, so a re-applied profile skips a
     finished download either way; `sha256` is verified by that

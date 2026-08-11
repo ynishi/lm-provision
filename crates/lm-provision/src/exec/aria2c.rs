@@ -1,6 +1,26 @@
 //! The `aria2c` download route — one weight split across many
 //! connections, with progress read back over aria2c's JSON-RPC.
 //!
+//! # UNREACHABLE — kept pending a decision, not in service
+//!
+//! **Nothing calls this.** [`super::chunked`] landed after it and takes
+//! every transfer whose supplier serves ranges, which is the only kind
+//! of supplier aria2c could have split anyway. What is left for this
+//! route is suppliers that refuse ranges — against which it is a
+//! single connection, exactly like the in-process stream, with a
+//! package install and an RPC daemon in front of it.
+//!
+//! It is also the worse of the two against the supplier this repo
+//! actually fetches from: aria2c resolves the redirect once and splits
+//! against the result, and HuggingFace signs that result for one byte
+//! range, so every split past the first is refused. `chunked` does not
+//! have that problem because it never reuses a resolved location.
+//!
+//! So this module is a deletion waiting for a decision, not a fallback.
+//! It is still here because removing a route two commits after adding
+//! it is the kind of change that should be asked about rather than
+//! slipped in.
+//!
 //! # Why a second route at all
 //!
 //! A pod is billed for as long as it is up, so a transfer that takes 25

@@ -56,6 +56,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chunk and the last, carrying bytes / total / percent / elapsed. No
   rate and no estimate: an ETA asserts the next minutes look like the
   last, and nothing here has looked at the network to say so.
+- **A large download is fetched in parallel ranges, by the provisioner
+  itself.** Sixteen requests of 10 MiB at a time, assembled with
+  positioned writes into a preallocated file. Nothing is installed on
+  the pod and no external process is involved; the first request is the
+  probe, so a supplier that does not serve ranges costs no extra round
+  trip and takes the single-stream path it always would have.
+  - **Every chunk requests the URL the profile named and follows its own
+    redirect.** That is the whole design. HuggingFace signs its redirect
+    target for *one byte range* and documents that requesting outside it
+    fails authorization, so a downloader that resolves once and splits
+    against the result — `aria2c`, and `hf_transfer` too — has every
+    range after the first refused. Re-resolving per chunk is what their
+    own protocol asks for.
+  - Both constants are HuggingFace's own: 16 is the default of
+    `HF_XET_NUM_CONCURRENT_RANGE_GETS`, 10 MiB is `DOWNLOAD_CHUNK_SIZE`.
+    There is no documented limit on concurrent connections to the Hub —
+    the published quotas are request counts per five-minute window — so
+    these are matched to the supplier's own client rather than tuned.
+  - A chunk that fails is retried five times with backoff, because
+    sixteen connections held across a multi-gigabyte transfer will drop
+    one, and without the retry that single drop discards every other
+    chunk's work. Measured: the first run without retries died 2 minutes
+    into a 32-chunk fetch.
+  - Verified end to end against HuggingFace: 335 MB over 32 chunks, and
+    the assembled file's sha256 equals the hash HuggingFace publishes
+    for it.
 - **A download splits across connections when the pod can.** A pod is
   billed for as long as it is up, so a transfer that takes 25 minutes is
   25 minutes paid for provisioning that produced nothing; carrying one

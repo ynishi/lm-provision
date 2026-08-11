@@ -38,6 +38,7 @@ pub mod aria2c;
 pub mod assert;
 pub mod audit;
 pub mod capgate;
+pub mod chunked;
 pub(crate) mod demand;
 pub mod effects;
 pub mod lifecycle;

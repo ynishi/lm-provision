@@ -553,26 +553,23 @@ async fn download(
     read_timeout: Duration,
     progress: ProgressSink<'_>,
 ) -> Result<TransferOutcome, ExecError> {
-    // The choice is made per transfer rather than once at startup so a
-    // pod that installs aria2c partway through a profile — which is what
-    // `toolchain.cli` does — gets the fast route for the weights that
-    // come after it.
-    if super::aria2c::available() {
-        super::audit::transfer_route(dst, "aria2c", "on PATH");
-        return super::aria2c::download(url, dst, progress).await;
-    }
-    // Falling back is allowed; falling back **quietly** is not. Without
-    // this line a transfer that took 25 minutes instead of 54 seconds
-    // looks exactly like one that was always going to.
-    super::audit::transfer_route(
-        dst,
-        "in-process",
-        &format!("'{}' is not on PATH", super::aria2c::BIN),
-    );
-
     let client = client("net_transfer", |builder| builder.read_timeout(read_timeout))?;
+
+    // **The first chunk is the probe.** Asking for the opening range
+    // rather than the whole file costs nothing when the supplier does
+    // not serve ranges — it answers `200` with the body, which is the
+    // single-stream route with the request it was going to make anyway
+    // — and when it does serve them the answer carries both the total
+    // (`Content-Range`) and the first chunk's bytes. A separate HEAD or
+    // one-byte probe would have spent a round trip to learn the same
+    // thing, and on a supplier behind a redirect that round trip is the
+    // expensive kind.
     let response = client
         .get(url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", super::chunked::CHUNK_SIZE - 1),
+        )
         .send()
         .await
         .map_err(|err| ExecError::EffectFailed {
@@ -588,6 +585,45 @@ async fn download(
         });
     }
 
+    // A `206` whose `Content-Range` names a total past this first chunk
+    // is a supplier that will serve the rest in parallel.
+    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        if let Some(total) = super::chunked::total_of(&response) {
+            if total >= super::chunked::MIN_TOTAL {
+                super::audit::transfer_route(
+                    dst,
+                    "chunked",
+                    &format!(
+                        "the supplier serves ranges; {} chunks of {} bytes, {} at a time",
+                        total.div_ceil(super::chunked::CHUNK_SIZE),
+                        super::chunked::CHUNK_SIZE,
+                        super::chunked::CONCURRENCY,
+                    ),
+                );
+                return chunked_download(&client, url, dst, total, response, progress).await;
+            }
+        }
+    }
+
+    // Everything else is one body to write down: a `200` from a
+    // supplier that ignored the range header, or a `206` for a file
+    // small enough that the first chunk was all of it.
+    //
+    // aria2c is **not** reached from here, and after this route landed
+    // there is nowhere left for it to be reached from: it needs range
+    // support to split, and range support is exactly the condition that
+    // sends the transfer above instead. See the `super::aria2c` module
+    // doc for that route's own account of itself.
+    super::audit::transfer_route(
+        dst,
+        "in-process",
+        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            "the whole file fits in one chunk"
+        } else {
+            "the supplier did not offer ranges"
+        },
+    );
+
     let bytes = stream_to_file(response, dst, progress)
         .await
         .map_err(|message| ExecError::EffectFailed {
@@ -595,6 +631,70 @@ async fn download(
             message,
         })?;
 
+    Ok(TransferOutcome {
+        bytes,
+        dst: dst.to_string(),
+    })
+}
+
+/// [`super::chunked::download`] with the destination's lifecycle around
+/// it: the parent directory, the partial-file guard, and the final
+/// `finished` report.
+///
+/// The file is created once and preallocated to its full length so that
+/// sixteen positioned writes land in a file that is already the right
+/// size, rather than sixteen writers each extending it.
+async fn chunked_download(
+    client: &reqwest::Client,
+    url: &str,
+    dst: &str,
+    total: u64,
+    first: reqwest::Response,
+    progress: ProgressSink<'_>,
+) -> Result<TransferOutcome, ExecError> {
+    if let Some(parent) = std::path::Path::new(dst).parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| ExecError::EffectFailed {
+                    op: "net_transfer".to_string(),
+                    message: format!("failed creating '{}': {err}", parent.display()),
+                })?;
+        }
+    }
+
+    let mut guard = PartialFile::new(dst);
+    let file = std::fs::File::create(dst).map_err(|err| ExecError::EffectFailed {
+        op: "net_transfer".to_string(),
+        message: format!("failed creating '{dst}': {err}"),
+    })?;
+    guard.arm();
+    file.set_len(total).map_err(|err| ExecError::EffectFailed {
+        op: "net_transfer".to_string(),
+        message: format!("failed sizing '{dst}': {err}"),
+    })?;
+
+    // On the error path the guard is still armed, so a file with a hole
+    // in it leaves with the error rather than staying behind to be
+    // mistaken for a finished one by the next apply's condition — which
+    // matters more here than for a single stream, since a failed chunk
+    // leaves a file of exactly the right *length*.
+    let bytes = super::chunked::download(
+        client,
+        url,
+        std::sync::Arc::new(file),
+        total,
+        first,
+        progress,
+    )
+    .await?;
+
+    guard.keep();
+    progress(TransferProgress {
+        written: bytes,
+        total: Some(bytes),
+        finished: true,
+    });
     Ok(TransferOutcome {
         bytes,
         dst: dst.to_string(),
