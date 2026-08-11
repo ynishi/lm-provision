@@ -15,6 +15,25 @@
 //! Neither substitutes for the other, which is why the 16 here is not a
 //! number borrowed from that constant's doc.
 //!
+//! **Measured here, that 28x is 1.89x** — 73 s against a 138 s mean for
+//! 4.27 GB, and only **1.10x** when the destination is the pod's
+//! `/workspace` network mount rather than its container disk [実測:
+//! 2026-08-11, `workspace/tasks/aria2c-bench/results.md`, five runs on
+//! one A40 pod with the in-process route measured on both sides of the
+//! aria2c one]. A ratio describes both of its ends, and the in-process
+//! route on that pod already ran at 27-31 MB/s where the reference's
+//! 25 minutes implies single digits — most of what splitting recovers
+//! there was never lost here.
+//!
+//! The `/workspace` figure is the one that bites, because that is where
+//! ComfyUI's models go. It is not the mount running out of throughput:
+//! `dd` writes it at 402 MB/s. What differs is the shape of the writing
+//! — one sequential writer against sixteen at scattered offsets — and a
+//! distributed filesystem has less reason to absorb the second. That
+//! reading is consistent with the numbers and **is not isolated**;
+//! varying the split count on the mount is the experiment that would
+//! settle it, and it has not been run.
+//!
 //! # What stays the same
 //!
 //! **The transcript is route-invariant.** Progress cadence — the first
@@ -45,23 +64,43 @@
 //! `tellStatus` includes the partial one. The one that moves smoothly is
 //! `tellStatus`.
 //!
+//! # The daemon is driven, not watched
+//!
+//! The URL is handed over with `aria2.addUri` rather than written on the
+//! command line, and that is the correction of a bug this module shipped
+//! with. Passing the URL as an argument makes the obvious completion
+//! signal the process exiting — but `--enable-rpc` turns aria2c into a
+//! server, and **a server does not exit when its queue empties**. On a
+//! real pod that read as: the file downloaded correctly and quickly, and
+//! then the transfer hung forever waiting for a process that was, by
+//! design, waiting for it [実測: 2026-08-11, pod rp28mal23gofv9 — 4.27 GB
+//! complete on disk, aria2c and its caller both alive 10 minutes later].
+//!
+//! `addUri` returns a gid, which is a *handle on this download*.
+//! `tellStatus(gid)` then answers for it whether it is active, waiting or
+//! finished, so completion is read from the download rather than inferred
+//! from the process — and `aria2.shutdown` ends the daemon when its one
+//! job is done. It also closes a race the argv form could not: a download
+//! that finishes between two polls never appears in `tellActive`, and
+//! nothing in that reading distinguishes "not started" from "already
+//! done".
+//!
 //! # One daemon per transfer
 //!
 //! The plan proposed a daemon shared by the (up to `MAX_CONCURRENT_STEPS`)
 //! transfers in flight. This does the opposite, because the sharing buys
 //! almost nothing and costs the hard part: a shared daemon needs a
 //! registry, a refcount deciding when it may exit, a port and secret
-//! threaded down to each call site, and a gid to tell whose bytes are
-//! whose. A daemon per transfer has none of those — `tellActive` returns
-//! exactly one download, so there is nothing to disambiguate — and the
-//! thing it wastes is one process spawn against a multi-gigabyte
-//! download.
+//! threaded down to each call site, and — since one daemon would hold
+//! several gids — a way to tell whose bytes are whose. A daemon per
+//! transfer has none of those, and the thing it wastes is one process
+//! spawn against a multi-gigabyte download.
 
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::effects::{ProgressSink, TransferOutcome, TransferProgress};
 use super::ExecError;
@@ -79,7 +118,9 @@ use super::ExecError;
 /// ```
 ///
 /// (the binary is `aria2c`, the package is `aria2`; `update` first
-/// because a freshly pulled image can have empty package lists.)
+/// because a freshly pulled image can have empty package lists. That
+/// line takes about eight seconds on a stock pytorch image
+/// [実測: 2026-08-11, Ubuntu 22.04.5, aria2 1.36.0, 7.7 s].)
 ///
 /// Composing that install into `models` was tried and reverted — see
 /// `lifecycle::cli_install_command` for why.
@@ -91,7 +132,7 @@ pub const BIN: &str = "aria2c";
 /// 16 is the reference workload's figure and it transfers to here
 /// unchanged: it is a count of connections per file, measured on
 /// per-file transfer time, which is exactly the quantity this route
-/// controls. `--split` caps the pieces and `--max-connection-per-server`
+/// controls. `split` caps the pieces and `max-connection-per-server`
 /// caps the connections; both are set because a lower
 /// `max-connection-per-server` silently clamps a higher `split`.
 const SPLIT: &str = "16";
@@ -114,6 +155,16 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Deadline for one JSON-RPC round trip to a daemon on loopback.
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the daemon has to answer its first request before this gives
+/// up on it.
+///
+/// Binding a port and opening a listener is sub-second work; this is
+/// slack for a loaded pod, not a budget anything is expected to use. It
+/// is bounded because the alternative to a deadline here is a transfer
+/// that hangs when the daemon never comes up, which is the failure this
+/// module already shipped once.
+const RPC_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Distinguishes the RPC secrets of daemons started in the same
 /// nanosecond, which two concurrent transfers can be.
@@ -138,14 +189,15 @@ pub fn available() -> bool {
 
 /// GET `url` into `dst` with `aria2c`, reporting to `progress`.
 ///
-/// Reports carry `finished: false` until the process exits, then one
-/// final `finished: true` with the size the file actually reached —
-/// the same shape and the same ordering the in-process route produces,
+/// Reports carry `finished: false` while the download runs, then one
+/// final `finished: true` with the size the file actually reached — the
+/// same shape and the same ordering the in-process route produces,
 /// because [`super::audit::TransferTranscript`] reads both.
 ///
-/// A non-zero exit is an **error, not a fallback**. By then aria2c has
-/// resolved the URL and tried; failing there is the download failing,
-/// and retrying it in-process would only hide which route is broken.
+/// A download that ends in `error` is an **error, not a fallback**. By
+/// then aria2c has resolved the URL and tried; failing there is the
+/// download failing, and retrying it in-process would only hide which
+/// route is broken.
 pub async fn download(
     url: &str,
     dst: &str,
@@ -162,39 +214,36 @@ pub async fn download(
     let secret = secret();
 
     let mut child = Command::new(BIN)
-        .args(argv(url, &dir.to_string_lossy(), &name, port, &secret))
+        .args(daemon_argv(port, &secret))
         .stdin(Stdio::null())
         // aria2c's own summary is the display this route is avoiding;
         // the transcript is the transfer's voice.
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|err| match err.kind() {
             ErrorKind::NotFound => failed(format!("'{BIN}' is not on PATH")),
             _ => failed(format!("spawn '{BIN}': {err}")),
         })?;
 
-    let outcome = watch(&mut child, port, &secret, progress).await;
+    let driven = drive(
+        &mut child,
+        port,
+        &secret,
+        url,
+        &dir.to_string_lossy(),
+        &name,
+        progress,
+    )
+    .await;
 
-    // Whatever happened, the daemon does not outlive this call. A poll
-    // that failed or a caller that went away must not leave a process
-    // holding a port and writing to a file nobody is waiting for.
-    if outcome.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return outcome.map(|_| unreachable!());
-    }
+    // The daemon does not outlive this call on any path. It is asked to
+    // stop first so it can flush its control file, and killed if it does
+    // not — a leftover holding a port and a half-written file is the
+    // worst of the states this can end in.
+    stop(&mut child, port, &secret).await;
 
-    let status = child
-        .wait()
-        .map_err(|err| failed(format!("wait for '{BIN}': {err}")))?;
-    if !status.success() {
-        let code = status
-            .code()
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "signal".to_string());
-        return Err(failed(format!("'{BIN}' exited with status {code}")));
-    }
+    driven?;
 
     let bytes = tokio::fs::metadata(dst)
         .await
@@ -213,68 +262,275 @@ pub async fn download(
     })
 }
 
-/// Poll the daemon until the child exits, offering the transcript a
-/// report each time.
-///
-/// The child is checked **before** the RPC on each turn so a download
-/// that finished between two polls is not asked about a daemon that has
-/// already shut down.
-async fn watch(
+/// Wait for the daemon, hand it the download, and follow that one gid to
+/// a terminal state.
+async fn drive(
     child: &mut Child,
     port: u16,
     secret: &str,
+    url: &str,
+    dir: &str,
+    name: &str,
     progress: ProgressSink<'_>,
 ) -> Result<(), ExecError> {
     let client = reqwest::Client::builder()
         .timeout(RPC_TIMEOUT)
+        // The daemon is on loopback. A proxy configured for the outside
+        // world has no business between this process and its own child,
+        // and honouring one here would route a localhost call into
+        // whatever the environment happens to name.
+        .no_proxy()
         .build()
         .map_err(|err| failed(format!("build the RPC client: {err}")))?;
     let endpoint = format!("http://127.0.0.1:{port}/jsonrpc");
 
+    await_daemon(&client, &endpoint, secret, child).await?;
+
+    let gid = rpc(
+        &client,
+        &endpoint,
+        secret,
+        "aria2.addUri",
+        vec![
+            serde_json::json!([url]),
+            serde_json::json!({
+                "dir": dir,
+                "out": name,
+                "split": SPLIT,
+                "max-connection-per-server": SPLIT,
+                "min-split-size": MIN_SPLIT_SIZE,
+                // Resume a partial file rather than restarting it, which
+                // is what makes a re-applied profile cheap after an
+                // interrupted run.
+                "continue": "true",
+                "allow-overwrite": "true",
+                "auto-file-renaming": "false",
+            }),
+        ],
+    )
+    .await
+    .map_err(|err| failed(format!("hand the download to '{BIN}': {err}")))?;
+    let gid = gid
+        .as_str()
+        .ok_or_else(|| failed(format!("'{BIN}' returned no download id")))?
+        .to_string();
+
+    let mut warned = false;
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
+        // A daemon that died takes its answer with it, and waiting out
+        // the transfer for one that will never reply is the hang this
+        // module is the correction of.
         match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(failed(format!(
+                    "'{BIN}' exited during the transfer with status {}",
+                    status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "signal".to_string())
+                )));
+            }
             Ok(None) => {}
             Err(err) => return Err(failed(format!("poll '{BIN}': {err}"))),
         }
 
-        // A failed poll is not a failed transfer. The daemon may not
-        // have bound its port yet on the first turn, and a dropped
-        // round trip costs one report out of a cadence that tolerates
-        // gaps by construction.
-        if let Some((written, total)) = poll(&client, &endpoint, secret).await {
-            progress(TransferProgress {
-                written,
-                total,
-                finished: false,
-            });
+        match status_of(&client, &endpoint, secret, &gid).await {
+            Ok(status) => {
+                progress(TransferProgress {
+                    written: status.completed,
+                    total: status.total,
+                    finished: false,
+                });
+                match status.state.as_str() {
+                    "complete" => return Ok(()),
+                    "error" => {
+                        return Err(failed(format!(
+                            "'{BIN}' reported the download failed: {}",
+                            status.message.as_deref().unwrap_or("no reason given")
+                        )));
+                    }
+                    "removed" | "paused" => {
+                        return Err(failed(format!(
+                            "'{BIN}' left the download {}",
+                            status.state
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            // A dropped round trip costs one report out of a cadence
+            // built to tolerate gaps, so it does not end the transfer.
+            // It is said out loud once, though: the first version of
+            // this module swallowed these, and a transfer whose progress
+            // had silently stopped being read looked exactly like one
+            // that was merely slow.
+            Err(err) => {
+                if !warned {
+                    warned = true;
+                    tracing::warn!(
+                        op = "net.transfer.progress",
+                        route = "aria2c",
+                        reason = err.as_str(),
+                        "progress is degraded: the transfer continues, its reporting does not"
+                    );
+                }
+            }
         }
     }
 }
 
-/// One `aria2.tellActive`, reduced to the two numbers the transcript
-/// needs. `None` when the daemon could not be reached or said nothing
-/// useful.
+/// Poll `aria2.getVersion` until the daemon answers.
 ///
-/// `totalLength` is `0` while aria2c has not yet learned the size, and
-/// that is reported as "no declared total" rather than as zero — the
-/// same thing a supplier without `Content-Length` produces on the
-/// in-process route, so the consumer sees one shape.
-async fn poll(
+/// Any answer will do — this asks whether the server is listening and
+/// whether this process's token is the one it wants, and getting that
+/// wrong is worth knowing before a multi-gigabyte transfer rather than
+/// after it.
+async fn await_daemon(
     client: &reqwest::Client,
     endpoint: &str,
     secret: &str,
-) -> Option<(u64, Option<u64>)> {
+    child: &mut Child,
+) -> Result<(), ExecError> {
+    let deadline = Instant::now() + RPC_STARTUP_TIMEOUT;
+    loop {
+        // Kept for the deadline message: giving up is worth reporting
+        // with the last reason it was still refusing, since "did not
+        // answer" and "answered Unauthorized" are different bugs.
+        let last = match rpc(client, endpoint, secret, "aria2.getVersion", vec![]).await {
+            Ok(_) => return Ok(()),
+            Err(err) => err,
+        };
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(failed(format!(
+                "'{BIN}' exited before accepting a download, with status {}",
+                status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_string())
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(failed(format!(
+                "'{BIN}' did not answer its RPC within {} s: {last}",
+                RPC_STARTUP_TIMEOUT.as_secs()
+            )));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// What `aria2.tellStatus` says about one download.
+struct Status {
+    /// Bytes written so far, partial piece included.
+    completed: u64,
+    /// The declared size, absent until aria2c has learned it.
+    ///
+    /// aria2c reports `0` before it knows, and that is passed on as "no
+    /// declared total" rather than as zero — the same thing a supplier
+    /// without `Content-Length` produces on the in-process route, so the
+    /// consumer sees one shape.
+    total: Option<u64>,
+    /// `active` / `waiting` / `paused` / `error` / `complete` / `removed`.
+    state: String,
+    /// Why, when `state` is `error`.
+    message: Option<String>,
+}
+
+/// One `aria2.tellStatus` for `gid`, reduced to what the transfer needs.
+async fn status_of(
+    client: &reqwest::Client,
+    endpoint: &str,
+    secret: &str,
+    gid: &str,
+) -> Result<Status, String> {
+    let value = rpc(
+        client,
+        endpoint,
+        secret,
+        "aria2.tellStatus",
+        vec![
+            serde_json::json!(gid),
+            serde_json::json!(["status", "completedLength", "totalLength", "errorMessage"]),
+        ],
+    )
+    .await?;
+
+    Ok(Status {
+        completed: value
+            .get("completedLength")
+            .and_then(number)
+            .ok_or("tellStatus returned no completedLength")?,
+        total: value
+            .get("totalLength")
+            .and_then(number)
+            .filter(|it| *it > 0),
+        state: value
+            .get("status")
+            .and_then(|it| it.as_str())
+            .ok_or("tellStatus returned no status")?
+            .to_string(),
+        message: value
+            .get("errorMessage")
+            .and_then(|it| it.as_str())
+            .map(|it| it.to_string()),
+    })
+}
+
+/// Ask the daemon to stop, then make sure it did.
+///
+/// Best effort throughout: this runs on the failure paths too, where the
+/// daemon may already be gone or may never have answered, and a problem
+/// shutting it down must not replace the error that got us here.
+async fn stop(child: &mut Child, port: u16, secret: &str) {
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(RPC_TIMEOUT)
+        .no_proxy()
+        .build()
+    {
+        let endpoint = format!("http://127.0.0.1:{port}/jsonrpc");
+        let _ = rpc(&client, &endpoint, secret, "aria2.shutdown", vec![]).await;
+    }
+
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// One JSON-RPC call, returning the `result` member.
+///
+/// The token is prepended to `params` here rather than at every call
+/// site, since every method this module uses takes it first and
+/// forgetting it reads as `Unauthorized` rather than as a mistake.
+///
+/// Errors come back as strings because every caller either reports them
+/// verbatim or ignores them; none branches on the kind.
+async fn rpc(
+    client: &reqwest::Client,
+    endpoint: &str,
+    secret: &str,
+    method: &str,
+    params: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut full = Vec::with_capacity(params.len() + 1);
+    full.push(serde_json::json!(format!("token:{secret}")));
+    full.extend(params);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": "lm-provision",
-        "method": "aria2.tellActive",
-        "params": [
-            format!("token:{secret}"),
-            ["completedLength", "totalLength"],
-        ],
+        "method": method,
+        "params": full,
     });
 
     // Serialised here rather than through `reqwest`'s `json` feature:
@@ -284,22 +540,27 @@ async fn poll(
     let text = client
         .post(endpoint)
         .header("content-type", "application/json")
-        .body(serde_json::to_string(&body).ok()?)
+        .body(serde_json::to_string(&body).map_err(|err| err.to_string())?)
         .send()
         .await
-        .ok()?
+        .map_err(|err| format!("{method}: {err}"))?
         .text()
         .await
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        .map_err(|err| format!("{method}: reading the reply: {err}"))?;
 
-    let entry = value.get("result")?.as_array()?.first()?;
-    let written = number(entry.get("completedLength")?)?;
-    let total = entry
-        .get("totalLength")
-        .and_then(number)
-        .filter(|it| *it > 0);
-    Some((written, total))
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|err| format!("{method}: {err}"))?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|it| it.as_str())
+            .unwrap_or("no message");
+        return Err(format!("{method}: {message}"));
+    }
+    value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("{method}: the reply carried no result"))
 }
 
 /// aria2c reports byte counts as decimal **strings**, since they can
@@ -308,39 +569,29 @@ fn number(value: &serde_json::Value) -> Option<u64> {
     value.as_str()?.parse().ok()
 }
 
-/// The command line, as its own function so a test can read it without
-/// a daemon.
-fn argv(url: &str, dir: &str, name: &str, port: u16, secret: &str) -> Vec<String> {
+/// The daemon's command line — **no URL**. What to download arrives over
+/// the RPC, so that this process holds a gid for it.
+fn daemon_argv(port: u16, secret: &str) -> Vec<String> {
     vec![
         "--enable-rpc".to_string(),
         format!("--rpc-listen-port={port}"),
         format!("--rpc-secret={secret}"),
-        // The daemon exists to be asked one question by this process.
-        // Binding it wider would put it on the pod's network for the
-        // length of the transfer.
+        // The daemon exists to be asked by this process. Binding it
+        // wider would put it on the pod's network for the length of the
+        // transfer.
         "--rpc-listen-all=false".to_string(),
-        format!("--split={SPLIT}"),
-        format!("--max-connection-per-server={SPLIT}"),
-        format!("--min-split-size={MIN_SPLIT_SIZE}"),
-        // Resume a partial file rather than restarting it, which is what
-        // makes a re-applied profile cheap after an interrupted run.
-        "--continue=true".to_string(),
-        "--auto-file-renaming=false".to_string(),
-        "--allow-overwrite=true".to_string(),
-        // aria2c exits when the download it was given is done; without
-        // this the RPC daemon keeps it alive forever.
+        // A backstop, not the shutdown path: `aria2.shutdown` ends it in
+        // the normal case, and this is what keeps a daemon from
+        // outliving a caller that was killed before it could ask.
         format!("--stop-with-process={}", std::process::id()),
         // The console summary is the display this route does not read.
         "--summary-interval=0".to_string(),
         "--console-log-level=warn".to_string(),
-        format!("--dir={dir}"),
-        format!("--out={name}"),
-        url.to_string(),
     ]
 }
 
 /// Split a destination into the directory aria2c writes into and the
-/// name it writes, which is how `--dir` / `--out` want it.
+/// name it writes, which is how its `dir` / `out` options want it.
 fn split_dst(dst: &str) -> Result<(std::path::PathBuf, String), ExecError> {
     let path = Path::new(dst);
     let name = path
@@ -357,7 +608,8 @@ fn split_dst(dst: &str) -> Result<(std::path::PathBuf, String), ExecError> {
 /// Asking the OS for one and letting go of it leaves a window in which
 /// something else could take it; the alternative is a fixed port, which
 /// collides with the concurrent transfer next to it every time rather
-/// than rarely. A daemon that cannot bind fails loudly at spawn.
+/// than rarely. A daemon that cannot bind is caught by
+/// [`await_daemon`] rather than waited on forever.
 fn free_port() -> Result<u16, ExecError> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|err| failed(format!("find a free RPC port: {err}")))?;
@@ -398,26 +650,24 @@ fn failed(message: String) -> ExecError {
 mod tests {
     use super::*;
 
-    fn rendered() -> Vec<String> {
-        argv(
-            "https://example.test/w.safetensors",
-            "/root/models",
-            "w.safetensors",
-            6800,
-            "deadbeef",
-        )
+    #[test]
+    fn the_daemon_is_started_with_no_url() {
+        // The bug this shape corrects: with the URL on the command line,
+        // the only completion signal is the process exiting, and
+        // `--enable-rpc` is exactly the flag that stops it from doing
+        // that when the download is done.
+        let argv = daemon_argv(6800, "deadbeef");
+        assert!(
+            !argv.iter().any(|arg| arg.contains("://")),
+            "no URL belongs on the daemon's command line: {argv:?}"
+        );
+        assert!(!argv.iter().any(|arg| arg.starts_with("--dir=")));
+        assert!(!argv.iter().any(|arg| arg.starts_with("--out=")));
     }
 
     #[test]
-    fn argv_splits_one_file_across_connections() {
-        let argv = rendered();
-        assert!(argv.contains(&format!("--split={SPLIT}")));
-        assert!(argv.contains(&format!("--max-connection-per-server={SPLIT}")));
-    }
-
-    #[test]
-    fn argv_enables_rpc_on_the_chosen_port_behind_a_secret() {
-        let argv = rendered();
+    fn the_daemon_listens_on_the_chosen_port_behind_a_secret() {
+        let argv = daemon_argv(6800, "deadbeef");
         assert!(argv.contains(&"--enable-rpc".to_string()));
         assert!(argv.contains(&"--rpc-listen-port=6800".to_string()));
         assert!(argv.contains(&"--rpc-secret=deadbeef".to_string()));
@@ -425,16 +675,11 @@ mod tests {
     }
 
     #[test]
-    fn argv_writes_the_destination_the_caller_asked_for() {
-        let argv = rendered();
-        assert!(argv.contains(&"--dir=/root/models".to_string()));
-        assert!(argv.contains(&"--out=w.safetensors".to_string()));
-        assert_eq!(argv.last().unwrap(), "https://example.test/w.safetensors");
-    }
-
-    #[test]
-    fn argv_resumes_rather_than_restarting() {
-        assert!(rendered().contains(&"--continue=true".to_string()));
+    fn the_daemon_does_not_outlive_a_killed_caller() {
+        let argv = daemon_argv(6800, "deadbeef");
+        assert!(argv
+            .iter()
+            .any(|arg| arg.starts_with("--stop-with-process=")));
     }
 
     #[test]

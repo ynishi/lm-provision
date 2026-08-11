@@ -66,6 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transfers already running at once — that decides how many files move,
   this decides how many connections carry one — and neither replaces the
   other.
+  - **Measured, that 28x is 1.89x**, and only 1.10x when the destination
+    is the pod's network mount rather than its container disk — which is
+    where models actually go. The in-process route was already running
+    at 27-31 MB/s on the pod this was measured on, so most of what
+    splitting recovers on a slow link was never lost there. The mount is
+    not short of throughput (it takes 402 MB/s from `dd`); what it does
+    not absorb is sixteen writers at scattered offsets instead of one
+    sequential one. That last part is consistent with the numbers rather
+    than isolated by them.
   - **The step is the same step.** Same condition, so a re-applied
     profile still skips a finished download; `sha256` still verified by
     that condition reading the file; `net.transfer.progress` unchanged
