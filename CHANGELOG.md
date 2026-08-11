@@ -66,15 +66,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transfers already running at once — that decides how many files move,
   this decides how many connections carry one — and neither replaces the
   other.
-  - **Measured, that 28x is 1.89x**, and only 1.10x when the destination
-    is the pod's network mount rather than its container disk — which is
-    where models actually go. The in-process route was already running
-    at 27-31 MB/s on the pod this was measured on, so most of what
-    splitting recovers on a slow link was never lost there. The mount is
-    not short of throughput (it takes 402 MB/s from `dd`); what it does
-    not absorb is sixteen writers at scattered offsets instead of one
-    sequential one. That last part is consistent with the numbers rather
-    than isolated by them.
+  - **Measured, that 28x is 2-3x**: 293 s on one connection against
+    64-148 s on four or more, for the same 4.27 GB file. The reference's
+    25 minutes implies single-digit MB/s at its other end, and a ratio
+    describes both of its ends.
+  - The reason it is not 16x is the supplier. HuggingFace hands out
+    presigned URLs pinned to a byte range, and aria2c resolves the
+    redirect once and reuses it, so every split past the first is
+    refused — exactly `split - 1` refusals, every run. The transfer
+    opens 16 connections, peaks near 212 MB/s, then collapses to one and
+    crawls the rest.
+  - **The split count is not tuned.** Runs at fixed settings landed
+    anywhere in that 64-148 s spread, which is wider than the gap
+    between any two split values tried; splitting beats not splitting by
+    far more than the noise, and nothing separates 4 from 8 from 16.
   - **The step is the same step.** Same condition, so a re-applied
     profile still skips a finished download; `sha256` still verified by
     that condition reading the file; `net.transfer.progress` unchanged

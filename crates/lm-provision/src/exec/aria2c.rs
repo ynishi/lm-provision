@@ -15,24 +15,37 @@
 //! Neither substitutes for the other, which is why the 16 here is not a
 //! number borrowed from that constant's doc.
 //!
-//! **Measured here, that 28x is 1.89x** — 73 s against a 138 s mean for
-//! 4.27 GB, and only **1.10x** when the destination is the pod's
-//! `/workspace` network mount rather than its container disk [実測:
-//! 2026-08-11, `workspace/tasks/aria2c-bench/results.md`, five runs on
-//! one A40 pod with the in-process route measured on both sides of the
-//! aria2c one]. A ratio describes both of its ends, and the in-process
-//! route on that pod already ran at 27-31 MB/s where the reference's
-//! 25 minutes implies single digits — most of what splitting recovers
-//! there was never lost here.
+//! **Measured here, splitting is worth roughly 2-3x, not 28x** — 293 s
+//! on one connection against 64-148 s on four or more, for the same
+//! 4.27 GB file [実測: 2026-08-11,
+//! `workspace/tasks/aria2c-bench/results.md`]. The reference's 25
+//! minutes implies single-digit MB/s at its other end, and a ratio
+//! describes both of its ends.
 //!
-//! The `/workspace` figure is the one that bites, because that is where
-//! ComfyUI's models go. It is not the mount running out of throughput:
-//! `dd` writes it at 402 MB/s. What differs is the shape of the writing
-//! — one sequential writer against sixteen at scattered offsets — and a
-//! distributed filesystem has less reason to absorb the second. That
-//! reading is consistent with the numbers and **is not isolated**;
-//! varying the split count on the mount is the experiment that would
-//! settle it, and it has not been run.
+//! **The 64-148 s is not a range across settings — it is the spread at
+//! *fixed* settings.** Seven runs of the same file on the same pod with
+//! `split` at 8 or 16 landed anywhere in it, which is wider than any
+//! difference between those two values. So: splitting beats not
+//! splitting by a margin far outside that noise, and **which** split
+//! count is best is not something this data can say. 16 stays because
+//! nothing here argues it down, not because it was shown to win.
+//!
+//! # Why the gain is 2-3x and not 16x
+//!
+//! HuggingFace's CDN hands out presigned URLs whose policy **pins a byte
+//! range** (`"ByteRange":{"ExpectedHeader":"bytes=3732930560-..."}`), and
+//! aria2c resolves the redirect once and reuses that URL for every
+//! split. Connections asking for other ranges are refused, and the count
+//! of refusals is exactly `split - 1`, every run: 3 at `--split=4`, 7 at
+//! 8, 15 at 16 [実測: same runs]. Watched live, the transfer opens 16
+//! connections, peaks near 212 MB/s, then **collapses to one** as the
+//! refusals land and crawls the remainder.
+//!
+//! So the split is real and it does help, but against this supplier it
+//! is a fast opening rather than sixteen sustained streams. A route that
+//! held all of them would have to re-resolve the redirect per range —
+//! which is what HuggingFace's own `hf_transfer` does, and is the shape
+//! to reach for if this ever needs to be faster.
 //!
 //! # What stays the same
 //!
@@ -135,6 +148,15 @@ pub const BIN: &str = "aria2c";
 /// controls. `split` caps the pieces and `max-connection-per-server`
 /// caps the connections; both are set because a lower
 /// `max-connection-per-server` silently clamps a higher `split`.
+///
+/// **It is not tuned, and one attempt to tune it failed to say
+/// anything.** A sweep over 1 / 4 / 8 / 16 put 8 well ahead of 16 (103 s
+/// against 148 s); repeating just those two put them level and then
+/// reversed them (101 / 140 for 8, 99 / 64 for 16). Every value above 1
+/// beat 1 by a wide margin, and nothing separated the values above 1
+/// from each other [実測: 2026-08-11,
+/// `workspace/tasks/aria2c-bench/results.md`]. Picking a new constant
+/// off the first of those passes would have been reading noise.
 const SPLIT: &str = "16";
 
 /// The smallest piece aria2c will cut. Below this it declines to split
