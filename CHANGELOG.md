@@ -56,6 +56,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chunk and the last, carrying bytes / total / percent / elapsed. No
   rate and no estimate: an ETA asserts the next minutes look like the
   last, and nothing here has looked at the network to say so.
+- **`sync.pull` converges too.** A second apply no longer re-downloads a
+  file that is already there. Its condition is the same `ModelFile` a
+  `models` entry without a declared digest carries — the kinds are
+  spelled differently and that was never a reason for one to skip and
+  the other to fetch the same bytes again.
+  - All three of its routes, including the `hf` one where `dst` names a
+    *directory* and the file lands at `<dst>/<path_in_repo>`. That
+    asymmetry nearly cost the route its condition; composing the landed
+    path was cheaper than living with one kind that converges and its
+    neighbour that does not.
+  - A CLI-routed step can now carry a completion condition while its
+    install guard keeps its own, so a converged pod skips both: the
+    install because the tool is on `PATH`, the download because the file
+    is there.
 - **A large download is fetched in parallel ranges, by the provisioner
   itself.** Sixteen requests of 10 MiB at a time, assembled with
   positioned writes into a preallocated file. Nothing is installed on

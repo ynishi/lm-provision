@@ -549,11 +549,25 @@ fn ensure_cli(bin: &str) -> Option<PlannedStep> {
 /// Prepend [`ensure_cli`] for the CLI `argv` invokes, so a routed step
 /// is always two steps: make the tool available, then use it.
 fn cli_steps(argv: Vec<String>) -> Vec<PlannedStep> {
+    cli_steps_with(argv, None)
+}
+
+/// [`cli_steps`] for an invocation whose result *is* observable.
+///
+/// The guard keeps its own condition — whether the tool is on `PATH` —
+/// and the invocation gets `done`, so a converged pod skips both: the
+/// install because the binary is there, the download because the file
+/// is. `None` leaves the invocation unconditional, which is the shape
+/// for a CLI whose effect nothing here can look at.
+fn cli_steps_with(argv: Vec<String>, done: Option<assert::Assert>) -> Vec<PlannedStep> {
     let mut steps = Vec::with_capacity(2);
     if let Some(first) = argv.first() {
         steps.extend(ensure_cli(first));
     }
-    steps.push(PlannedStep::always(Step::Sh(argv)));
+    steps.push(match done {
+        Some(done) => PlannedStep::done_when(Step::Sh(argv), done),
+        None => PlannedStep::always(Step::Sh(argv)),
+    });
     steps
 }
 
@@ -769,26 +783,38 @@ fn expand_sync_pull(
         // destination file exactly as an `https://` one does. The step
         // carries the resolved URL, which is what the dry-run trace and
         // the report then show.
-        // A `sync.pull` names an arbitrary source and destination and
-        // declares no digest, so there is no entity to ask and nothing
-        // to skip on.
-        return Ok(vec![PlannedStep::always(Step::Transfer {
-            src: scheme::download_url("sync_pull", src, revision)?,
-            dst: dst.to_string(),
-        })]);
+        // A `sync.pull` declares no digest, but it does name the file it
+        // writes — and "the file is there" is a `ModelFile` whose digest
+        // half is absent, which is exactly the condition a `models`
+        // entry without `sha256` already carries. The entity does not
+        // care that this kind is spelled differently.
+        return Ok(vec![PlannedStep::done_when(
+            Step::Transfer {
+                src: scheme::download_url("sync_pull", src, revision)?,
+                dst: dst.to_string(),
+            },
+            assert::ModelFile::new(dst.to_string(), None).done(),
+        )]);
     }
 
     // Non-empty env → credential-carrying download routed to the native
     // CLI over sh.exec (spec 02 §Dispatch routing).
     if let Some(rest) = src.strip_prefix("b2://") {
         let (bucket, path) = split_b2_uri(rest, "sync_pull", src)?;
-        return Ok(cli_steps(vec![
-            "b2".to_string(),
-            "download-file-by-name".to_string(),
-            bucket.to_string(),
-            path.to_string(),
-            dst.to_string(),
-        ]));
+        // `b2 download-file-by-name` takes the destination as a file
+        // path, so the same `ModelFile` the direct route uses applies
+        // verbatim — the credential changes which tool moves the bytes,
+        // not what "finished" looks like afterwards.
+        return Ok(cli_steps_with(
+            vec![
+                "b2".to_string(),
+                "download-file-by-name".to_string(),
+                bucket.to_string(),
+                path.to_string(),
+                dst.to_string(),
+            ],
+            Some(assert::ModelFile::new(dst.to_string(), None).done()),
+        ));
     }
     if let Some(rest) = src.strip_prefix("hf://") {
         let (owner, repo, url_rev, path_in_repo) = parse_hf_uri(rest, "sync_pull", src)?;
@@ -801,6 +827,14 @@ fn expand_sync_pull(
                 message: format!("hf:// download URI is missing the file path segment: {src}"),
             });
         };
+        // On this route `dst` is a directory and the file lands at
+        // `<dst>/<path_in_repo>` (below). That is still one named file,
+        // so the condition is the same entity — it just has to be
+        // composed rather than read off the payload. Without this the
+        // asymmetry in `dst` would have cost the route its `done`, which
+        // is the kind of thing that makes one kind converge and its
+        // neighbour not.
+        let landed = format!("{}/{path_in_repo}", dst.trim_end_matches('/'));
         // The URL-carried revision wins over the payload's (spec 02
         // §Dispatch routing: "a URL-carried revision wins over
         // opts.revision") — the URL is the more specific address.
@@ -821,15 +855,21 @@ fn expand_sync_pull(
             argv.push("--revision".to_string());
             argv.push(rev);
         }
-        return Ok(cli_steps(argv));
+        return Ok(cli_steps_with(
+            argv,
+            Some(assert::ModelFile::new(landed, None).done()),
+        ));
     }
     // Any other scheme (e.g. https://) with a non-empty env stays on the
     // plain download path — env is inert for a bridge download (spec 02
     // §Dispatch routing: only b2/hf route to a CLI).
-    Ok(vec![PlannedStep::always(Step::Transfer {
-        src: src.to_string(),
-        dst: dst.to_string(),
-    })])
+    Ok(vec![PlannedStep::done_when(
+        Step::Transfer {
+            src: src.to_string(),
+            dst: dst.to_string(),
+        },
+        assert::ModelFile::new(dst.to_string(), None).done(),
+    )])
 }
 
 /// Route a `staging.push` upload (spec 02 §Dispatch routing).
@@ -2395,7 +2435,7 @@ mod tests {
                     env: Default::default(),
                     revision: None,
                 },
-                vec![None],
+                vec![Some("exists(/workspace/m.bin)")],
             ),
             (
                 ProfileNode::SyncPush {
@@ -2538,10 +2578,13 @@ mod tests {
             steps,
             // A `sync.pull` derives no entity, so it keeps running
             // every time.
-            vec![PlannedStep::always(Step::Transfer {
-                src: "https://example.com/m.bin".to_string(),
-                dst: "/workspace/m.bin".to_string(),
-            })]
+            vec![PlannedStep::done_when(
+                Step::Transfer {
+                    src: "https://example.com/m.bin".to_string(),
+                    dst: "/workspace/m.bin".to_string(),
+                },
+                assert::ModelFile::new("/workspace/m.bin".to_string(), None).done(),
+            )]
         );
     }
 
@@ -2582,10 +2625,14 @@ mod tests {
         };
         assert_eq!(
             expand(&payload).expect("public hf:// resolves"),
-            vec![PlannedStep::always(Step::Transfer {
-                src: "https://huggingface.co/owner/repo/resolve/main/model.safetensors".to_string(),
-                dst: "/workspace/model.safetensors".to_string(),
-            })],
+            vec![PlannedStep::done_when(
+                Step::Transfer {
+                    src: "https://huggingface.co/owner/repo/resolve/main/model.safetensors"
+                        .to_string(),
+                    dst: "/workspace/model.safetensors".to_string(),
+                },
+                assert::ModelFile::new("/workspace/model.safetensors".to_string(), None).done(),
+            )],
         );
     }
 
@@ -2603,10 +2650,14 @@ mod tests {
         };
         assert_eq!(
             expand(&payload).expect("public hf:// resolves"),
-            vec![PlannedStep::always(Step::Transfer {
-                src: "https://huggingface.co/owner/repo/resolve/v2/model.safetensors".to_string(),
-                dst: "/workspace/model.safetensors".to_string(),
-            })],
+            vec![PlannedStep::done_when(
+                Step::Transfer {
+                    src: "https://huggingface.co/owner/repo/resolve/v2/model.safetensors"
+                        .to_string(),
+                    dst: "/workspace/model.safetensors".to_string(),
+                },
+                assert::ModelFile::new("/workspace/model.safetensors".to_string(), None).done(),
+            )],
         );
     }
 
@@ -2789,10 +2840,13 @@ mod tests {
         let steps = expand(&payload).expect("https + env stays on the plain download path");
         assert_eq!(
             steps,
-            vec![PlannedStep::always(Step::Transfer {
-                src: "https://example.com/m.bin".to_string(),
-                dst: "/workspace/m.bin".to_string(),
-            })]
+            vec![PlannedStep::done_when(
+                Step::Transfer {
+                    src: "https://example.com/m.bin".to_string(),
+                    dst: "/workspace/m.bin".to_string(),
+                },
+                assert::ModelFile::new("/workspace/m.bin".to_string(), None).done(),
+            )]
         );
     }
 
@@ -4597,6 +4651,56 @@ mod tests {
             },
             assert::ModelFile::new(dst, sha256).done(),
         )
+    }
+
+    /// The same UC one kind over: **a second `sync.pull` does not
+    /// download again either.**
+    ///
+    /// `sync.pull` declares no digest, so its condition is the existence
+    /// half of the same entity `models` uses — which is the point. The
+    /// kinds are spelled differently and name their destinations
+    /// differently, and neither of those is a reason for one to converge
+    /// and the other to re-fetch a weight every apply.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_sync_pull_skips_a_file_already_there() {
+        const BODY: &[u8] = b"pulled bytes";
+        let dir = scratch_dir("skip-on-sync-pull");
+        let dst = dir.join("pulled.bin");
+        let (url, served) = serving_local_server(BODY);
+        let ids = IdGen::new();
+        let payload = ProfileNode::SyncPull {
+            id: node_id(&ids),
+            src: url,
+            dst: dst.to_string_lossy().into_owned(),
+            env: Default::default(),
+            revision: None,
+        };
+        let steps = expand(&payload).expect("sync.pull expands");
+        let step = steps.first().expect("one step");
+        let env = BTreeMap::new();
+
+        let first = execute_step(step, StepLabel::flat("sync.pull"), &env)
+            .await
+            .expect("the first pull downloads");
+        assert_eq!(first.bytes, Some(BODY.len() as u64));
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+
+        let second = execute_step(step, StepLabel::flat("sync.pull"), &env)
+            .await
+            .expect("the second pull skips");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the second apply must not ask the server again",
+        );
+        assert_eq!(second.bytes, None, "nothing was transferred");
+        let note = second.note.expect("a skipped step carries a note");
+        assert!(
+            note.contains(&format!("exists({})=satisfied", dst.display())),
+            "the skip names what was true: {note}",
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// The UC this stage exists for: **a second apply does not download
