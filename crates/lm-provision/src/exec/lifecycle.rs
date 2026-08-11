@@ -490,6 +490,55 @@ fn expand_python_version_check(want: &str) -> Vec<PlannedStep> {
 /// other silently kept undoing it.
 pub(crate) const TORCH_FAMILY_FILTER: &str = r"^[[:space:]]*(torch|torchvision|torchaudio|xformers|bitsandbytes|triton)([[:space:]=<>~!;]|$)";
 
+/// The command that puts `bin` on `PATH` when it is not there.
+///
+/// One entry per CLI a dispatch route can select. There is no
+/// `toolchain.cli` phase and no `Cli` resource: **which CLI a phase
+/// needs is decided by its route, not by its author**. A `sync.pull`
+/// with an `hf://` source and a credential `env` goes to the hf CLI
+/// (spec 02 §Dispatch routing) — the profile never says so, and asking
+/// it to declare the tool would be asking it to restate a choice the
+/// dispatcher already made, which is the same reason `requires` is
+/// fixed per kind rather than authored (`crate::resource`).
+fn cli_install_command(bin: &str) -> Option<&'static str> {
+    match bin {
+        "hf" => Some("pip install -q huggingface_hub"),
+        "b2" => Some("pip install -q b2"),
+        _ => None,
+    }
+}
+
+/// A step that makes `bin` available, placed immediately before the
+/// step that invokes it.
+///
+/// This is design §4.2's second example — "`hf` が PATH に無いのに
+/// `hf download` を叩いて `command not found`" — and the shape of the
+/// answer is the predecessor implementation's: guard at the point of
+/// use, not a declaration to check
+/// (measured: `profile_service.rs:1279` / `:1356`).
+///
+/// **No `done`.** "Is this command on PATH" would be a new predicate,
+/// and the check the guard already performs *is* that predicate — a
+/// condition here would run `command -v` to decide whether to run
+/// `command -v`. The whole step is a no-op when the tool is present.
+fn ensure_cli(bin: &str) -> Option<PlannedStep> {
+    let install = cli_install_command(bin)?;
+    Some(PlannedStep::always(sh_c(format!(
+        "command -v {bin} >/dev/null 2>&1 || {install}"
+    ))))
+}
+
+/// Prepend [`ensure_cli`] for the CLI `argv` invokes, so a routed step
+/// is always two steps: make the tool available, then use it.
+fn cli_steps(argv: Vec<String>) -> Vec<PlannedStep> {
+    let mut steps = Vec::with_capacity(2);
+    if let Some(first) = argv.first() {
+        steps.extend(ensure_cli(first));
+    }
+    steps.push(PlannedStep::always(Step::Sh(argv)));
+    steps
+}
+
 /// `pip install -r <requirements>` with the torch family stripped on the
 /// way in, as one shell command.
 ///
@@ -715,13 +764,13 @@ fn expand_sync_pull(
     // CLI over sh.exec (spec 02 §Dispatch routing).
     if let Some(rest) = src.strip_prefix("b2://") {
         let (bucket, path) = split_b2_uri(rest, "sync_pull", src)?;
-        return Ok(vec![PlannedStep::always(Step::Sh(vec![
+        return Ok(cli_steps(vec![
             "b2".to_string(),
             "download-file-by-name".to_string(),
             bucket.to_string(),
             path.to_string(),
             dst.to_string(),
-        ]))]);
+        ]));
     }
     if let Some(rest) = src.strip_prefix("hf://") {
         let (owner, repo, url_rev, path_in_repo) = parse_hf_uri(rest, "sync_pull", src)?;
@@ -754,7 +803,7 @@ fn expand_sync_pull(
             argv.push("--revision".to_string());
             argv.push(rev);
         }
-        return Ok(vec![PlannedStep::always(Step::Sh(argv))]);
+        return Ok(cli_steps(argv));
     }
     // Any other scheme (e.g. https://) with a non-empty env stays on the
     // plain download path — env is inert for a bridge download (spec 02
@@ -778,13 +827,13 @@ fn expand_staging_push(
 ) -> Result<Vec<PlannedStep>, ExecError> {
     if let Some(rest) = dst.strip_prefix("b2://") {
         let (bucket, path) = split_b2_uri(rest, "staging_push", dst)?;
-        return Ok(vec![PlannedStep::always(Step::Sh(vec![
+        return Ok(cli_steps(vec![
             "b2".to_string(),
             "upload-file".to_string(),
             bucket.to_string(),
             src.to_string(),
             path.to_string(),
-        ]))]);
+        ]));
     }
     if let Some(rest) = dst.strip_prefix("hf://") {
         let (owner, repo, url_rev, path_in_repo) = parse_hf_uri(rest, "staging_push", dst)?;
@@ -802,7 +851,7 @@ fn expand_staging_push(
             argv.push("--revision".to_string());
             argv.push(rev);
         }
-        return Ok(vec![PlannedStep::always(Step::Sh(argv))]);
+        return Ok(cli_steps(argv));
     }
     // An `https://` dst is an HTTP PUT over the net.transfer bridge; the
     // step carries the pair unresolved and the bridge reads the
@@ -954,7 +1003,7 @@ fn expand_llm_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
         // a different entity from `ModelFile`'s single file. hf-cli's
         // own cache makes a repeat cheap, which is why this is a
         // deferral rather than a defect.
-        steps.push(PlannedStep::always(Step::Sh(argv)));
+        steps.extend(cli_steps(argv));
     }
     Ok(steps)
 }
@@ -1998,6 +2047,29 @@ mod tests {
         steps.iter().map(|planned| planned.step.clone()).collect()
     }
 
+    /// The effects of a CLI-routed phase, with the leading `ensure_cli`
+    /// guard checked and dropped.
+    ///
+    /// Every route to a native CLI composes two steps — make the tool
+    /// available, then use it — and what these tests are about is the
+    /// second. Asserting the guard once here keeps each argv test
+    /// stating its own argv, and keeps the guard from being dropped
+    /// silently: a route that stopped emitting it fails on the first
+    /// line of this helper rather than passing.
+    fn effects_after_cli_guard(steps: &[PlannedStep], bin: &str) -> Vec<Step> {
+        let effects = effects(steps);
+        let (guard, rest) = effects.split_first().expect("a routed phase has steps");
+        assert_eq!(
+            guard,
+            &sh_c(format!(
+                "command -v {bin} >/dev/null 2>&1 || {}",
+                cli_install_command(bin).expect("a routed CLI has an install command")
+            )),
+            "the route must make {bin} available before invoking it"
+        );
+        rest.to_vec()
+    }
+
     /// The condition of a phase's `index`-th step, as rendered.
     fn condition(steps: &[PlannedStep], index: usize) -> Option<String> {
         steps[index].done.as_ref().map(assert::describe)
@@ -2317,7 +2389,11 @@ mod tests {
                     env: Default::default(),
                     revision: None,
                 },
-                vec![None],
+                // Two steps on a CLI route: the guard that makes `b2`
+                // available, then the upload. Neither carries a
+                // condition — the guard is its own check, and an
+                // upload's destination is remote.
+                vec![None, None],
             ),
             (
                 ProfileNode::Models {
@@ -2331,7 +2407,8 @@ mod tests {
                     id: node_id(&ids),
                     models_json: r#"[{"src":"hf://owner/repo"}]"#.into(),
                 },
-                vec![None],
+                // Guard then download, per entry.
+                vec![None, None],
             ),
             (
                 ProfileNode::PostInstall {
@@ -2527,7 +2604,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("b2 + env expands to a CLI step");
         assert_eq!(
-            effects(&steps),
+            effects_after_cli_guard(&steps, "b2"),
             vec![Step::Sh(vec![
                 "b2".to_string(),
                 "download-file-by-name".to_string(),
@@ -2561,7 +2638,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("hf + env expands to a CLI step");
         assert_eq!(
-            effects(&steps),
+            effects_after_cli_guard(&steps, "hf"),
             vec![Step::Sh(vec![
                 "hf".to_string(),
                 "download".to_string(),
@@ -2596,7 +2673,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("hf + env + @rev expands");
         assert_eq!(
-            effects(&steps),
+            effects_after_cli_guard(&steps, "hf"),
             vec![Step::Sh(vec![
                 "hf".to_string(),
                 "download".to_string(),
@@ -2630,7 +2707,7 @@ mod tests {
             revision: Some("abc123".to_string()),
         };
         let steps = expand(&payload).expect("hf + env + payload revision expands");
-        match &steps[0].step {
+        match &effects_after_cli_guard(&steps, "hf")[0] {
             Step::Sh(argv) => {
                 assert_eq!(argv[argv.len() - 2..], ["--revision", "abc123"]);
             }
@@ -2724,7 +2801,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("b2 staging upload expands to a CLI step");
         assert_eq!(
-            effects(&steps),
+            effects_after_cli_guard(&steps, "b2"),
             vec![Step::Sh(vec![
                 "b2".to_string(),
                 "upload-file".to_string(),
@@ -2747,7 +2824,7 @@ mod tests {
         };
         let steps = expand(&payload).expect("hf staging upload expands to a CLI step");
         assert_eq!(
-            effects(&steps),
+            effects_after_cli_guard(&steps, "hf"),
             vec![Step::Sh(vec![
                 "hf".to_string(),
                 "upload".to_string(),
@@ -2771,7 +2848,7 @@ mod tests {
             revision: Some("optsrev".to_string()),
         };
         let steps = expand(&payload).expect("hf staging upload expands");
-        match &steps[0].step {
+        match &effects_after_cli_guard(&steps, "hf")[0] {
             Step::Sh(argv) => {
                 assert_eq!(argv[2], "owner/repo");
                 // The URL-carried @urlrev wins over the opts revision.
@@ -2906,28 +2983,33 @@ mod tests {
             ]"#
             .to_string(),
         };
-        let steps = expand(&payload).expect("llm_models expands");
+        // Each entry is its own routed pair, so the phase is
+        // guard, download, guard, download.
+        let steps = effects(&expand(&payload).expect("llm_models expands"));
+        let guard =
+            sh_c("command -v hf >/dev/null 2>&1 || pip install -q huggingface_hub".to_string());
         assert_eq!(
-            steps[0].step,
-            Step::Sh(vec![
-                "hf".to_string(),
-                "download".to_string(),
-                "owner/repo".to_string(),
-                "--local-dir".to_string(),
-                "/tmp/".to_string(),
-            ])
-        );
-        assert_eq!(
-            steps[1].step,
-            Step::Sh(vec![
-                "hf".to_string(),
-                "download".to_string(),
-                "owner/repo".to_string(),
-                "--local-dir".to_string(),
-                "/models/x/".to_string(),
-                "--revision".to_string(),
-                "abc123".to_string(),
-            ])
+            steps,
+            vec![
+                guard.clone(),
+                Step::Sh(vec![
+                    "hf".to_string(),
+                    "download".to_string(),
+                    "owner/repo".to_string(),
+                    "--local-dir".to_string(),
+                    "/tmp/".to_string(),
+                ]),
+                guard,
+                Step::Sh(vec![
+                    "hf".to_string(),
+                    "download".to_string(),
+                    "owner/repo".to_string(),
+                    "--local-dir".to_string(),
+                    "/models/x/".to_string(),
+                    "--revision".to_string(),
+                    "abc123".to_string(),
+                ]),
+            ]
         );
     }
 

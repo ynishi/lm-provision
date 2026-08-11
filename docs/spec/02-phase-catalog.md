@@ -238,6 +238,23 @@ Dispatch turns each planned step into one or more bridge invocations
   old entry point prints a deprecation notice and exits 1 — observed
   live on a fresh pod, 2026-08-01. The argument shape is unchanged.)
 
+  **A routed step is two steps**: one that puts the CLI on `PATH` if it
+  is not there, then the invocation.
+
+  ```
+  command -v hf >/dev/null 2>&1 || pip install -q huggingface_hub
+  command -v b2 >/dev/null 2>&1 || pip install -q b2
+  ```
+
+  There is no phase kind for this and nothing to declare. Which CLI a
+  step needs is decided by the route, and the route is decided by the
+  source scheme and whether `env` carries credentials — all of which
+  the dispatcher already reads off the payload. Asking a profile to
+  also declare the tool would be asking it to restate a choice it did
+  not make. The guard carries no completion condition: the check it
+  performs *is* the condition, and it is a no-op when the tool is
+  present.
+
   **`dst` means different things on these two routes.** `b2` takes the
   destination file path; `hf` exposes no output-file flag
   at all, only `--local-dir`, so the file lands at

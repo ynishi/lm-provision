@@ -102,6 +102,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A cancelled transfer takes its partial file with it**, so a
   destination is either absent or complete and the next apply's
   condition is answering about a whole file.
+- **A CLI-routed step puts its CLI on `PATH` first.** `sync.pull`,
+  `staging.push` and `llm_models` route to `b2` / `hf` when the source
+  scheme and a credential `env` say so, and reached for a tool the pod
+  need not have: `command not found`, on a binary the profile never
+  named. Each routed step now composes a guard ahead of the invocation.
+  No new kind and nothing to declare — which CLI is needed follows from
+  the route, and the route is already derived from the payload.
 - **A transfer creates the directory it is about to write into.** Under
   the built-in root this never showed — a ComfyUI checkout ships a
   `models/` tree — but a root a profile declares for itself ships

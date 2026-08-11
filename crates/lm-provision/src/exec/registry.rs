@@ -2586,9 +2586,12 @@ mod tests {
             }
             other => panic!("step {index} is {other:?}"),
         };
+        // Each entry is a routed pair — the guard that makes `hf`
+        // available, then the download — so the two downloads are at
+        // index 1 and 3.
         assert_eq!(
-            local_dir(0),
             local_dir(1),
+            local_dir(3),
             "two entries that declare no dst_dir land in one directory"
         );
         assert!(!steps_are_independent(steps));
