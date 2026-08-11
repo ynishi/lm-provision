@@ -47,12 +47,19 @@
 //! 10 MiB chunk is not the expensive part of a download.
 //!
 //! It is not merely affordable, it is faster than the alternative even
-//! where the alternative works: a 2.13 GB CivitAI model, alternating
-//! runs on one pod, **22 / 23 / 26 s here against 35 / 36 / 50 s for
-//! `aria2c -c -x16 -s16 -k 10M`** — the reference implementation's own
-//! flags — with the two ranges not overlapping, and both producing the
-//! same digest [実測: 2026-08-11,
-//! `workspace/tasks/aria2c-bench/results.md`].
+//! where the alternative works: a 2.13 GB CivitAI model fetched six
+//! times on one pod, alternating between this route and `aria2c -c -x16
+//! -s16 -k 10M --file-allocation=none` (the flags the predecessor
+//! implementation used), **22 / 23 / 26 s here against 35 / 36 / 50 s
+//! there** — 90 MB/s against 53 MB/s, the two spreads not overlapping,
+//! and both routes producing a file whose digest matches the one
+//! CivitAI publishes [実測: 2026-08-11].
+//!
+//! Alternating rather than one-then-the-other because these transfers
+//! have a wide run-to-run spread: seven runs of one 4.27 GB file at
+//! fixed settings landed anywhere between 64 s and 148 s. An earlier
+//! comparison of this kind was drawn from one sample per arm and had to
+//! be withdrawn when repeating it reversed the result.
 //!
 //! # The numbers are HuggingFace's own
 //!
@@ -91,10 +98,10 @@ pub const CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 ///
 /// It is **not** the `MAX_CONCURRENT_STEPS` of `crate::apply`, which
 /// counts files moving at once. Four files at sixteen ranges each is 64
-/// requests in flight — measured, and handled without rate limiting, a
-/// failed chunk or a retry: 8.53 GB in 27-34 s that way against
-/// 229-242 s one file at a time [実測: 2026-08-11,
-/// `workspace/tasks/aria2c-bench/results.md`].
+/// requests in flight, and that was measured rather than assumed: four
+/// 2.13 GB weights to one pod took **27-34 s** fetched together against
+/// **229-242 s** one at a time, with no rate limiting, no failed chunk
+/// and no retry on either shape [実測: 2026-08-11].
 ///
 /// The two axes **compound**. Each individual file finished faster with
 /// three others competing than with the link to itself, which says the

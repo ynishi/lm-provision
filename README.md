@@ -16,7 +16,7 @@ binary with zero dependencies on the target pod.
 
 ## Highlights
 
-- **Declarative phase catalog (22 kinds)** — system packages, Python
+- **Declarative phase catalog (23 kinds)** — system packages, Python
   toolchain, ComfyUI install / restart / health, generic service
   start / readiness, model prefetch, `https` / `hf://` / `b2://`
   transfers, filesystem writes, shell steps, hooks, and first-class

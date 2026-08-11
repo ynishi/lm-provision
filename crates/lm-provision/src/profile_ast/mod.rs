@@ -1,4 +1,4 @@
-//! The `ProfileNode` AST: the top-level `Spec` and the 22 phase catalog
+//! The `ProfileNode` AST: the top-level `Spec` and the 23 phase catalog
 //! kinds (spec 02).
 //!
 //! Sibling modules:

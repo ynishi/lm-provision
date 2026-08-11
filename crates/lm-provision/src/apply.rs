@@ -27,14 +27,21 @@ use crate::profile_ast::ProfileValue;
 /// [`crate::exec::chunked::CONCURRENCY`], which counts connections
 /// carrying *one* file: at 4 files of 16 ranges the transfer holds 64
 /// requests in flight, and a pod handles that without rate limiting, a
-/// failed chunk or a retry [実測: 2026-08-11, 8.53 GB in 27-34 s against
-/// 229-242 s one file at a time, `workspace/tasks/aria2c-bench/results.md`].
+/// failed chunk or a retry.
 ///
-/// The two axes **compound rather than trade off**, which that
-/// measurement is also the evidence for: each individual file finished
-/// *faster* with three others competing than with the link to itself, so
-/// what limits one file is the supplier's per-connection rate and the
-/// only way past it is more connections.
+/// The measurement, so the numbers below can be read without it: four
+/// 2.13 GB weights (8.53 GB) fetched to one pod, alternating between a
+/// single `models` phase — which fans out to this constant, so 4 files
+/// of 16 ranges — and four separate phases, which run one at a time.
+/// **27-34 s the first way, 229-242 s the second**, two rounds each,
+/// with the two shapes never overlapping [実測: 2026-08-11].
+///
+/// The two axes **compound rather than trade off**, and the per-file
+/// times are why: each file finished *faster* with three others
+/// competing (26-34 s) than with the link to itself (49-73 s). The pod
+/// is nowhere near its ceiling at 16 connections, so what limits one
+/// file is the supplier's per-connection rate, and the only way past it
+/// is more connections.
 ///
 /// So what is written here is still a bound rather than a tuning — it
 /// keeps a twenty-weight `models` phase from opening twenty sockets and
