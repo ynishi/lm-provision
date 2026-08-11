@@ -85,18 +85,25 @@ const URI_ROUTE_SCHEMES: &[&str] = &["b2", "hf", "https"];
 /// `sync.push`).
 const POD_ID_PLACEHOLDER: &str = "{pod_id}";
 
-/// The one `models` element field pair check 6 reads: the destination
-/// file name is spelled `dst` or `name`, and an element carrying
-/// neither has nowhere to download to (02 §Catalog kinds `models`).
-/// The rest of the element shape belongs to the expansion site
-/// (`crate::exec::lifecycle`), which owns the full `ModelItemSpec`.
+/// The `models` element fields check 6 reads: the destination file
+/// name (spelled `dst` or `name` — an element carrying neither has
+/// nowhere to download to, 02 §Catalog kinds `models`) and the declared
+/// content digest. The rest of the element shape belongs to the
+/// expansion site (`crate::exec::lifecycle`), which owns the full
+/// `ModelItemSpec`.
 #[derive(serde::Deserialize)]
 struct ModelItemShape {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     dst: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
 }
+
+/// The length of a SHA-256 rendered as hex
+/// (`crate::digest::hex_sha256`).
+const SHA256_HEX_LEN: usize = 64;
 
 /// A validate-stage rejection (first violation only,
 /// 03-pipeline-stage-artifacts.md §validate). Each `Display` string
@@ -216,6 +223,36 @@ pub enum ValidateError {
         service_index: u32,
     },
 
+    /// A `Spec.assumes` key names no resource (check 8b). A typo is an
+    /// error rather than an inert entry: the whole point of the slot is
+    /// to bind something, and a key that binds nothing would leave the
+    /// profile failing later with the resource still unbound — while
+    /// the author is looking at a line that says otherwise.
+    #[error("assumes[{name:?}] names no resource")]
+    UnknownAssumedResource {
+        /// The unrecognised key.
+        name: String,
+    },
+
+    /// A phase needs a resource that no earlier phase produces and that
+    /// `Spec.assumes` does not declare (check 8b, design §3.6).
+    ///
+    /// "Earlier" is canonical order, not written order: phases run in
+    /// the order [`crate::normalize`] imposes, so a profile that writes
+    /// `models` above `comfyui.install` is well-formed.
+    #[error(
+        "phases[{index}] ({kind}) requires resource {resource:?}, which no earlier phase \
+         produces and assumes does not declare"
+    )]
+    UnboundResource {
+        /// 1-based position of the offending phase in canonical order.
+        index: usize,
+        /// The consuming phase's catalog kind.
+        kind: &'static str,
+        /// The resource nothing bound.
+        resource: &'static str,
+    },
+
     /// An `env`-map [`ProfileNode::EnvSecret`] value names a secret that
     /// is not declared in `Spec.env_secrets` (check 6, spec 06
     /// §`env.ref` "checks `ref.name ∈ env_secrets`"). This check has no
@@ -278,6 +315,7 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         env_secrets,
         paths,
         http_allowlist,
+        assumes,
         phases,
         ..
     } = root
@@ -437,6 +475,42 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         }
     }
 
+    // Every remaining check reads the profile as it will *run*, not as
+    // it was written: `crate::normalize` fixes the phase order and
+    // inserts the implied restart / health poll.
+    let normalized = crate::normalize::normalize(root);
+
+    // Check 8b: resource scope (design §3.6). Every phase's `requires`
+    // must be bound by an earlier phase's `produces` or by `assumes`.
+    // One forward fold, no reordering — this is a scope check, not the
+    // per-kind dependency graph `02` §Stability rules out.
+    //
+    // It runs **before** check 9 because a phase whose root is unbound
+    // composes no steps, so it contributes no derived paths: check 9
+    // would pass vacuously and the profile would fail on the pod
+    // instead, with `no such file` rather than the resource's name.
+    for name in assumes.keys() {
+        if crate::resource::Resource::parse(name).is_none() {
+            return Err(ValidateError::UnknownAssumedResource { name: name.clone() });
+        }
+    }
+    if let ProfileNode::Spec {
+        phases: ordered, ..
+    } = &normalized
+    {
+        let mut env = crate::resource::ResourceEnv::from_assumes(assumes);
+        for (idx, phase) in ordered.iter().enumerate() {
+            if let Some(resource) = env.unbound(phase) {
+                return Err(ValidateError::UnboundResource {
+                    index: idx + 1,
+                    kind: crate::plan::kind_of(phase),
+                    resource: resource.as_str(),
+                });
+            }
+            env.bind(phase);
+        }
+    }
+
     // Check 9: `declared ⊇ derived` for the three allowlist-shaped
     // fields (spec 00 §Capability derivation). The walk runs over the
     // normalized AST, so an implicitly inserted step's demand — the
@@ -444,7 +518,7 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // though the author never wrote the step. The comparison reuses the
     // execution-time matchers, so "covered" means here exactly what it
     // will mean at the gate.
-    let derived = crate::derive::derive(&crate::normalize::normalize(root));
+    let derived = crate::derive::derive(&normalized);
     if let Some(capability) = derived
         .capabilities
         .iter()
@@ -753,6 +827,15 @@ fn check_phase(
         // `models_json` that does not parse stays an apply-time op
         // failure — that shape is authored input, and the parse error
         // carries a better message from the expansion site.
+        //
+        // A declared `sha256` is checked for shape here for a reason
+        // specific to what it now does: it is the only part of a
+        // `models` element that becomes a *completion condition*
+        // (`crate::exec::assert::ModelFile`), and a digest that no
+        // content can ever have is a condition that can never be
+        // satisfied. Left unchecked it does not fail — it downloads the
+        // weight again on every apply, silently, which is the exact
+        // behaviour declaring a digest was meant to end.
         ProfileNode::Models { models_json, .. } => {
             let Ok(items) = serde_json::from_str::<Vec<ModelItemShape>>(models_json) else {
                 return Ok(());
@@ -763,6 +846,21 @@ fn check_phase(
                         "phases[{index}].models[{}]: one of dst / name is required",
                         i + 1
                     )));
+                }
+                if let Some(sha256) = &item.sha256 {
+                    // Case is not policed: the comparison lowercases
+                    // the declared digest, so an uppercase spelling is
+                    // a legible profile, not a broken one.
+                    if sha256.len() != SHA256_HEX_LEN
+                        || !sha256.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err(ValidateError::PhaseShape(format!(
+                            "phases[{index}].models[{}].sha256: expected {SHA256_HEX_LEN} hex \
+                             characters, got {:?}",
+                            i + 1,
+                            sha256
+                        )));
+                    }
                 }
             }
             Ok(())
@@ -1010,9 +1108,31 @@ mod tests {
     /// test that carries a phase, masking the check each one is about.
     /// Its own coverage builds the `Spec` inline with the narrow lists
     /// it wants to see denied.
+    /// Every resource the catalog knows about, assumed present.
+    ///
+    /// Fixtures that are about one check each use this so that check 8b
+    /// does not reject a phase before it reaches the check under test.
+    /// Check 8b's own fixtures build their scope explicitly.
+    fn all_resources_assumed() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
+                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
+            ),
+            (
+                crate::resource::Resource::Venv.as_str().to_string(),
+                format!("{}/.venv", crate::resource::COMFYUI_ROOT_DEFAULT),
+            ),
+        ])
+    }
+
+    /// A permissive root: every capability declared, every path and URL
+    /// allowed, and every resource assumed present — for the same
+    /// reason the allowlists are wide open.
     fn spec(name: &str, phases: Vec<ProfileNode>) -> ProfileNode {
         let ids = IdGen::new();
         ProfileNode::Spec {
+            assumes: all_resources_assumed(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -1062,6 +1182,7 @@ mod tests {
         let mut declared_paths: Vec<String> = paths.iter().map(|s| (*s).to_string()).collect();
         declared_paths.push("/".to_string());
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -1299,6 +1420,7 @@ mod tests {
         let node = spec(
             "demo",
             vec![ProfileNode::ComfyUiInstall {
+                install_dir: None,
                 id: g.node(),
                 ref_name: "bad ref".into(),
                 repo: None,
@@ -1678,6 +1800,59 @@ mod tests {
 
     /// A `models_json` that does not parse stays an apply-time op
     /// failure — the expansion site owns that message.
+    /// A declared digest is now the file's completion condition, so a
+    /// malformed one is rejected before apply. Unchecked it would not
+    /// fail — it would re-download the weight on every apply, silently,
+    /// which is the behaviour declaring a digest is meant to end.
+    #[test]
+    fn a_malformed_models_digest_is_rejected() {
+        let good = "a".repeat(64);
+        for (label, spelling) in [
+            ("too short", "abc123".to_string()),
+            ("too long", "a".repeat(65)),
+            ("not hex", "g".repeat(64)),
+            ("prefixed", format!("sha256:{}", "a".repeat(57))),
+            ("empty", String::new()),
+        ] {
+            let g = ids();
+            let node = spec(
+                "demo",
+                vec![ProfileNode::Models {
+                    id: g.node(),
+                    models_json: format!(
+                        r#"[{{"src":"https://example.com/a.bin","name":"a.bin","sha256":"{spelling}"}}]"#
+                    ),
+                }],
+            );
+            let err = validate(&node).expect_err("a digest nothing can match is rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains("models[1].sha256"),
+                "{label}: the message must name the offending element: {message}",
+            );
+        }
+
+        // …and the well-formed spellings pass, upper case included:
+        // the comparison lowercases, so an uppercase digest is a
+        // legible profile rather than one that can never be satisfied.
+        for spelling in [good.clone(), good.to_uppercase()] {
+            let g = ids();
+            let node = spec(
+                "demo",
+                vec![ProfileNode::Models {
+                    id: g.node(),
+                    models_json: format!(
+                        r#"[{{"src":"https://example.com/a.bin","name":"a.bin","sha256":"{spelling}"}}]"#
+                    ),
+                }],
+            );
+            assert!(
+                validate(&node).is_ok(),
+                "a 64-char hex digest is well-formed however it is cased: {spelling}",
+            );
+        }
+    }
+
     #[test]
     fn an_unparsable_models_json_is_left_to_the_expansion_site() {
         let g = ids();
@@ -1752,6 +1927,7 @@ mod tests {
     ) -> ProfileNode {
         let ids = IdGen::new();
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: ids.node(),
             name: "declared".into(),
             version: None,
@@ -1765,8 +1941,21 @@ mod tests {
         }
     }
 
+    /// Bind every resource without adding the phases that produce them
+    /// — what a profile provisioning into a prepared pod declares.
+    /// Fixtures about one consuming phase use this so the assertion
+    /// stays about that phase rather than about a producer's own
+    /// derivation.
+    fn assuming_comfyui(mut node: ProfileNode) -> ProfileNode {
+        if let ProfileNode::Spec { assumes, .. } = &mut node {
+            assumes.extend(all_resources_assumed());
+        }
+        node
+    }
+
     fn install(g: &IdGen) -> ProfileNode {
         ProfileNode::ComfyUiInstall {
+            install_dir: None,
             id: g.node(),
             ref_name: "master".into(),
             repo: None,
@@ -1838,9 +2027,9 @@ mod tests {
         );
     }
 
-    /// `models` writes under a built-in root the author never spells
-    /// out, so the derivation is the only thing that can surface it
-    /// before apply (spec 02 §Built-in path constants).
+    /// `models` writes under a root the author never spells out, so the
+    /// derivation is the only thing that can surface it before apply
+    /// (spec 02 §Resource-derived paths).
     #[test]
     fn a_built_in_models_root_must_be_declared_too() {
         let g = ids();
@@ -1848,12 +2037,12 @@ mod tests {
             id: g.node(),
             models_json: r#"[{"src":"https://example.com/a.bin","dst":"a.bin"}]"#.into(),
         };
-        let denied = spec_declaring(
+        let denied = assuming_comfyui(spec_declaring(
             &["net.transfer"],
             &["/workspace/other"],
             &["https://*"],
             vec![phase.clone()],
-        );
+        ));
         assert_eq!(
             validate(&denied),
             Err(ValidateError::UndeclaredPath {
@@ -1861,13 +2050,160 @@ mod tests {
             })
         );
 
-        let allowed = spec_declaring(
+        let allowed = assuming_comfyui(spec_declaring(
             &["net.transfer"],
             &["/workspace/ComfyUI/models"],
             &["https://*"],
             vec![phase],
-        );
+        ));
         assert_eq!(validate(&allowed), Ok(()));
+    }
+
+    // -----------------------------------------------------------------
+    // Check 8b: resource scope.
+    // -----------------------------------------------------------------
+
+    /// A `Spec` with the declared lists wide open and **nothing
+    /// assumed** — the fixture the rest of this file's `spec` helper
+    /// deliberately is not, so scope can be the thing under test.
+    fn spec_assuming_nothing(phases: Vec<ProfileNode>) -> ProfileNode {
+        let mut node = spec("scope", phases);
+        if let ProfileNode::Spec { assumes, .. } = &mut node {
+            assumes.clear();
+        }
+        node
+    }
+
+    fn models_phase(g: &IdGen) -> ProfileNode {
+        ProfileNode::Models {
+            id: g.node(),
+            models_json: r#"[{"src":"https://e.example/a.bin","dst":"a.bin"}]"#.into(),
+        }
+    }
+
+    /// The shape design §4.2 says fails today without being named: a
+    /// phase reaching into a ComfyUI nothing installed.
+    #[test]
+    fn consuming_a_resource_nothing_produces_is_rejected() {
+        let g = ids();
+        assert_eq!(
+            validate(&spec_assuming_nothing(vec![models_phase(&g)])),
+            Err(ValidateError::UnboundResource {
+                index: 1,
+                kind: "models",
+                resource: "comfyui_root",
+            })
+        );
+    }
+
+    /// The author's fix is one line, and it is the line that says what
+    /// they meant: the pod already carries ComfyUI.
+    #[test]
+    fn assuming_the_resource_is_enough_to_bind_it() {
+        let g = ids();
+        assert_eq!(validate(&spec("assumed", vec![models_phase(&g)])), Ok(()));
+    }
+
+    /// Producing it works too, and is what a profile that provisions
+    /// from bare metal writes.
+    #[test]
+    fn an_install_phase_binds_the_root_for_the_phases_after_it() {
+        let g = ids();
+        assert_eq!(
+            validate(&spec_assuming_nothing(vec![install(&g), models_phase(&g)])),
+            Ok(())
+        );
+    }
+
+    /// **"Earlier" is canonical order, not written order.** `models`
+    /// written above `comfyui.install` still runs after it
+    /// ([`crate::normalize`]), so rejecting it would reject a profile
+    /// that works. Walking the phases as authored would do exactly that.
+    #[test]
+    fn a_consumer_written_above_its_producer_is_still_well_formed() {
+        let g = ids();
+        assert_eq!(
+            validate(&spec_assuming_nothing(vec![models_phase(&g), install(&g)])),
+            Ok(())
+        );
+    }
+
+    /// `python.deps` needs the venv only when it declares
+    /// `in_comfy_venv`; a plain `pip install` needs nothing from
+    /// ComfyUI, and rejecting it would be the check overreaching.
+    #[test]
+    fn python_deps_outside_the_venv_needs_nothing() {
+        let g = ids();
+        let outside = ProfileNode::PythonDeps {
+            id: g.node(),
+            deps: vec!["numpy".into()],
+            in_comfy_venv: false,
+        };
+        let inside = ProfileNode::PythonDeps {
+            id: g.node(),
+            deps: vec!["numpy".into()],
+            in_comfy_venv: true,
+        };
+        assert_eq!(validate(&spec_assuming_nothing(vec![outside])), Ok(()));
+        assert_eq!(
+            validate(&spec_assuming_nothing(vec![inside])),
+            Err(ValidateError::UnboundResource {
+                index: 1,
+                kind: "python.deps",
+                resource: "venv",
+            })
+        );
+    }
+
+    /// A key that binds nothing is an error, not an inert line. The
+    /// alternative would leave an author looking at a declaration while
+    /// the run fails for want of the very thing it claims to declare.
+    #[test]
+    fn an_assumes_key_naming_no_resource_is_rejected() {
+        let g = ids();
+        let mut node = spec_assuming_nothing(vec![models_phase(&g)]);
+        if let ProfileNode::Spec { assumes, .. } = &mut node {
+            assumes.insert("comfy_root".into(), "/workspace/ComfyUI".into());
+        }
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::UnknownAssumedResource {
+                name: "comfy_root".into()
+            })
+        );
+    }
+
+    /// A declared install dir moves what the profile must allowlist:
+    /// `declared ⊇ derived` is computed against the root actually bound,
+    /// so the old root no longer covers it.
+    #[test]
+    fn a_declared_install_dir_moves_what_paths_must_cover() {
+        let g = ids();
+        let elsewhere = ProfileNode::ComfyUiInstall {
+            id: g.node(),
+            ref_name: "master".into(),
+            repo: None,
+            install_dir: Some("/opt/comfy".into()),
+        };
+        let stale = spec_declaring(
+            crate::exec::capgate::KNOWN_CAPABILITIES.as_ref(),
+            &["/workspace/ComfyUI"],
+            &["http://*", "https://*"],
+            vec![elsewhere.clone(), models_phase(&g)],
+        );
+        assert!(
+            matches!(validate(&stale), Err(ValidateError::UndeclaredPath { .. })),
+            "declaring the old root no longer covers the new one: {:?}",
+            validate(&stale)
+        );
+
+        let moved = spec_declaring(
+            crate::exec::capgate::KNOWN_CAPABILITIES.as_ref(),
+            &["/opt/comfy"],
+            &["http://*", "https://*"],
+            vec![elsewhere, models_phase(&g)],
+        );
+        assert_eq!(validate(&moved), Ok(()));
     }
 
     // -----------------------------------------------------------------
@@ -2449,6 +2785,7 @@ mod tests {
                     packages: vec!["git".into(), "curl".into()],
                 },
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc123".into(),
                     repo: Some("comfyanonymous/ComfyUI".into()),

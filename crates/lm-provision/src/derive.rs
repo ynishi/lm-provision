@@ -54,22 +54,34 @@ pub struct Derived {
 /// apply-stage failure that names it. Reporting it here as a missing
 /// capability would name the wrong problem.
 pub fn derive(root: &ProfileNode) -> Derived {
-    let ProfileNode::Spec { phases, .. } = root else {
+    let ProfileNode::Spec {
+        phases, assumes, ..
+    } = root
+    else {
         return Derived::default();
     };
 
     let mut derived = Derived::default();
+    // The same scope fold `crate::exec::steps` runs, for the same
+    // reason: what paths a phase touches depends on the root bound at
+    // it, so a profile that installs ComfyUI somewhere else derives
+    // paths under *that* root and must declare it.
+    let mut env = crate::resource::ResourceEnv::from_assumes(assumes);
     for phase in phases {
         if let Some(capability) = demand::env_ref(phase) {
             derived.capabilities.insert(capability);
         }
-        match lifecycle::expand(phase) {
+        let expanded = lifecycle::expand(phase, &env);
+        env.bind(phase);
+        match expanded {
             // A lifecycle phase: its demand is the union of its
             // expanded steps' (the routes are decided by the payload,
             // so they are known statically).
             Ok(steps) => {
-                for step in &steps {
-                    if let Ok(demanded) = demand::step(step) {
+                for planned in &steps {
+                    // The demand is the *effect's*; a step's condition
+                    // adds none (see `demand::step`).
+                    if let Ok(demanded) = demand::step(&planned.step) {
                         derived.absorb(demanded);
                     }
                 }
@@ -105,6 +117,7 @@ mod tests {
     fn spec(phases: Vec<ProfileNode>) -> ProfileNode {
         let ids = IdGen::new();
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: ids.node(),
             name: "demo".into(),
             version: None,
@@ -122,6 +135,23 @@ mod tests {
         derive(&normalize(&spec(phases)))
     }
 
+    /// The same, for phases that consume ComfyUI without the fixture
+    /// carrying a `comfyui.install`. Declaring the root as already
+    /// present is what a profile provisioning into a prepared pod
+    /// writes; adding an install phase instead would drag its own
+    /// derived paths — and the implicitly inserted restart and health
+    /// poll — into assertions that are about one phase.
+    fn derive_normalized_assuming_comfyui(phases: Vec<ProfileNode>) -> Derived {
+        let mut root = spec(phases);
+        if let ProfileNode::Spec { assumes, .. } = &mut root {
+            assumes.insert(
+                crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
+                crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),
+            );
+        }
+        derive(&normalize(&root))
+    }
+
     /// The inserted health poll is the case the walk exists for: an
     /// author who wrote only `comfyui.install` never wrote the GET, so
     /// deriving from the authored list would miss `net.http_get`.
@@ -129,6 +159,7 @@ mod tests {
     fn an_implicit_health_poll_contributes_its_capability() {
         let ids = IdGen::new();
         let derived = derive_normalized(vec![ProfileNode::ComfyUiInstall {
+            install_dir: None,
             id: ids.node(),
             ref_name: "master".into(),
             repo: None,
@@ -192,7 +223,7 @@ mod tests {
     #[test]
     fn a_models_phase_derives_the_built_in_models_root() {
         let ids = IdGen::new();
-        let derived = derive_normalized(vec![ProfileNode::Models {
+        let derived = derive_normalized_assuming_comfyui(vec![ProfileNode::Models {
             id: ids.node(),
             models_json: r#"[{"src":"https://example.com/a.bin","dst":"a.bin"}]"#.into(),
         }]);

@@ -68,6 +68,22 @@ pub enum ProfileNode {
         /// HTTP policy). Pattern = literal prefix with an optional
         /// single `*` confined to the authority component.
         http_allowlist: Vec<String>,
+        /// Resources the profile declares are **already present on the
+        /// target**, as `resource name → path` (spec 03 §Resource scope).
+        ///
+        /// The static half of the model: a phase's `requires` must be
+        /// bound by an earlier phase's `produces` *or* by an entry here
+        /// ([`crate::resource`]). This is what a profile provisioning
+        /// into a pod that already carries ComfyUI declares, instead of
+        /// writing a `comfyui.install` it does not want to run.
+        ///
+        /// Keys are [`crate::resource::Resource`] names; validate rejects
+        /// a key naming no resource, so a typo is an error rather than a
+        /// silently inert entry. Empty maps carry no canonical bytes, so
+        /// a profile declaring nothing here hashes exactly as it did
+        /// before the slot existed — the same rule `env` above carries,
+        /// for the same reason.
+        assumes: BTreeMap<String, String>,
         /// Sequential list of phases.
         phases: Vec<ProfileNode>,
     },
@@ -91,6 +107,57 @@ pub enum ProfileNode {
         ref_name: String,
         /// Optional repository owner/name.
         repo: Option<String>,
+        /// Where the checkout lands, and therefore what every phase
+        /// consuming ComfyUI reads (spec 02 §Resource-derived paths).
+        ///
+        /// This phase is the **producer** of the `comfyui_root` resource
+        /// ([`crate::resource`]): the models root, the custom-nodes root,
+        /// the venv interpreter and the entry point are all derived from
+        /// it rather than being separate constants. `None` produces the
+        /// built-in `/workspace/ComfyUI`, which is what every profile
+        /// written before the slot existed means — and it carries no
+        /// canonical bytes, so those profiles keep their hash.
+        install_dir: Option<String>,
+    },
+
+    /// `toolchain.python`: create the virtual environment ComfyUI runs
+    /// in, and install what it needs into it.
+    ///
+    /// The **producer** of the `venv` resource ([`crate::resource`]).
+    /// Before it existed, three phases reached into a venv nothing
+    /// created — the consumer-with-no-producer shape design §4.3 names,
+    /// invisible because the path was a host constant.
+    #[dsl_exec(apply = "toolchain_python")]
+    ToolchainPython {
+        /// Stable node ID.
+        id: NodeId,
+        /// A `requirements.txt` to install into the venv once it exists.
+        ///
+        /// ComfyUI does not run without its own dependencies, and
+        /// nothing else in the catalog installs them, so this is what
+        /// takes a checkout from "cloned" to "startable". `None`
+        /// creates the venv and installs nothing.
+        requirements: Option<String>,
+        /// Cut the venv off from the host interpreter's packages.
+        ///
+        /// **Phrased as the exception because inheriting is what a GPU
+        /// pod needs.** The image ships a torch built against its own
+        /// driver; a venv that cannot see it makes `pip install` fetch
+        /// a wheel that usually wants a newer CUDA than the pod has,
+        /// and the failure surfaces only as `torch.cuda.is_available()`
+        /// returning false at launch — silently, long after the phase
+        /// that caused it reported success
+        /// (measured: predecessor implementation
+        /// `profile_service.rs:1047-1051`).
+        ///
+        /// So the default has to be "inherit", and an absent `bool` is
+        /// `false` — hence the negative sense, rather than a
+        /// `system_site_packages` that would default to the broken
+        /// arrangement. `Option<bool>` would have carried the positive
+        /// sense with a tri-state, but dsl-kit 0.11's canonical grammar
+        /// has no value production for it
+        /// (measured: `dsl_kit::schema_gen::unsupported_field`).
+        isolated: bool,
     },
 
     /// `python.version_check`: Ensure Python version requirement
@@ -552,8 +619,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_json_parse_build_and_engine_execution() {
+    /// Multi-threaded flavour because a lifecycle phase on the
+    /// synchronous engine driver hands each step to
+    /// `exec::effects::block_on_effect` — in **both** modes now, since a
+    /// dry run answers the step's condition and observing the host is
+    /// async (see [`create_profile_engine`]'s §Runtime).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_json_parse_build_and_engine_execution() {
         let id_gen = IdGen::new();
 
         // Complete JSON Profile containing lifecycle and direct operation phases

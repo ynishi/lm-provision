@@ -30,7 +30,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 nix = { workspace = true }
-ureq = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
 dsl-kit = { workspace = true }
 dsl-kit-macros = { workspace = true }
 dsl-kit-core = { workspace = true }

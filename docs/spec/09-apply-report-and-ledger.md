@@ -113,6 +113,62 @@ mirroring the "dry-run does policy / resolves secrets too" rule
 (spec 06 / 07) — a dry-run trace is what the profile *would* run,
 a real trace is what it *did*.
 
+One event per effect is the rule; `net.transfer.progress` (below) is
+the single exception, and it takes an `op` of its own so that a
+consumer partitioning by `op` is unaffected by it.
+
+#### Transfer progress
+
+A transfer is the one effect whose duration is measured in minutes,
+and a `models` phase runs up to four of them at once — so
+`net.transfer` is followed by repeated `net.transfer.progress`
+events while it runs. This is the only op that emits more than one
+event per invocation.
+
+```
+op          = "net.transfer.progress"
+kind        = <phase kind>
+mode        = "real"          -- a dry run performs no transfer
+step        = <report id>     -- "<phase_index>_<kind>[_<n>]"
+dst         = <destination path>
+bytes       = <written so far>
+total       = <declared total> | "unknown"
+percent     = <bytes/total>   | "unknown"
+elapsed_sec = <since the request>
+state       = "running" | "done"
+```
+
+- **`step` is the join to the report.** It is the id of the `steps`
+  entry the transfer will write, so an interleaved stream partitions
+  by it exactly: each partition is one transfer's whole account.
+  Without it, four concurrent transfers are one stream of numbers
+  that do not add up.
+- **Cadence: 15 s, on a clock.** Shorter than the transfer read
+  timeout (60 s) so that silence is readable — the events are driven
+  by arriving chunks, so a supplier that stopped is heard as nothing
+  further, and a reader needs a missing event to be news before the
+  timeout turns the transfer into an error. A bytes-based rule would
+  instead go quiet exactly when the supplier slowed down. Twenty
+  minutes at four concurrent transfers is ~330 lines.
+- **First and last always emit**, whatever the interval: the first so
+  that an operator learns the step, destination and declared size as
+  soon as bytes move, and the `"done"` one because it is the only
+  place the real size appears for a supplier that declared no
+  `Content-Length`, and because it closes one stream out of several.
+- **A stream that stops on `"running"` did not finish.** A failed or
+  cancelled transfer emits no `"done"` event.
+- **No rate, and no estimated time remaining.** Both are host
+  arithmetic dressed as observation: an average over twenty minutes
+  lags a stall by minutes, and an ETA from it is a prediction the pod
+  has no standing to make. `bytes` at a known cadence is the
+  measurement; a consumer wanting a rate differences two events.
+- **Append-only, never redrawn.** No ANSI progress bar and no
+  carriage return: the consumer is a driver capturing a pipe
+  (chapter 08), where a cursor move is a corrupted record.
+- The **apply report is unchanged** — progress belongs to the
+  transcript. The report is the result of an apply, not a running
+  commentary on one.
+
 Redaction rules:
 
 - Env keys: key **names** are logged; a name matching the
@@ -137,6 +193,12 @@ Redaction rules:
 - `sh.exec`: argv is logged verbatim (validate's shell-safety and
   the env-injection design keep secrets out of argv); stdin is
   logged as a byte count only.
+- `net.transfer.progress`: destination path, byte counts and elapsed
+  seconds only. It deliberately does **not** repeat the source URL —
+  a presigned link carries its credential in the query, and while the
+  one pre-effect `net.transfer` event does log it (above), repeating
+  it on every progress event would multiply that exposure for no
+  added information.
 - General redact helper: any (key, value) pair surfaced into logs
   passes the sensitive-key check; matching keys get `[REDACTED]`
   values.

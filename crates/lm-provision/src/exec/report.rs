@@ -42,6 +42,13 @@ use serde_json::{Map, Value};
 /// simple signature.
 pub type SharedReports = Arc<Mutex<Vec<StepReport>>>;
 
+/// The position an entry was **declared** at: the phase's 1-based
+/// declaration index paired with the step's 1-based position inside it.
+///
+/// Only entries whose push order stopped carrying their declaration order
+/// need one — see [`StepReport::declared_at`].
+pub type DeclaredAt = (usize, usize);
+
 /// One executed (or dry-run-traced) step's report entry.
 ///
 /// Optional fields are emitted only when set (see [`StepReport::to_json`]),
@@ -87,6 +94,17 @@ pub struct StepReport {
     /// carry the machine-readable signal); [`StepReport::failure_reason`]
     /// reads it.
     pub reason: Option<String>,
+    /// Where the entry sits in **declaration** order, for entries the
+    /// push order no longer places correctly. Never serialized.
+    ///
+    /// A phase whose steps run at the same time appends its entries as
+    /// they *finish*, so the array order it produces is completion order.
+    /// A lifecycle sub-step therefore carries the position it was
+    /// declared at and [`in_declaration_order`] puts the array back.
+    /// `None` for every entry a single-threaded push already placed —
+    /// a direct op's phase entry, a phase-level failure — and those are
+    /// left exactly where they were pushed.
+    pub declared_at: Option<DeclaredAt>,
 }
 
 impl StepReport {
@@ -111,6 +129,7 @@ impl StepReport {
             dst: None,
             note: None,
             reason: None,
+            declared_at: None,
         }
     }
 
@@ -172,6 +191,44 @@ impl StepReport {
     }
 }
 
+/// Put the entries a parallel phase pushed out of order back into
+/// declaration order, in place.
+///
+/// **Why the array order is worth restoring at all.** A partial apply is
+/// readable because the report reads like the profile: the first entry is
+/// the first thing the profile asked for. Once a phase's steps run at the
+/// same time the array order becomes "whichever finished first", which is
+/// a fact about the network rather than about the profile — and the one
+/// thing a reader wants from a `models` phase of twenty weights is to
+/// find the third one third.
+///
+/// **Why a sort and not a reserved slot.** The ids already carry the
+/// order (`<phase_index>_<kind>_<n>`), so the key exists; reserving the
+/// row instead would mean the array had to hold rows for steps that have
+/// not answered yet, and a run that stops early would have to know which
+/// of those to drop.
+///
+/// The sort is confined to maximal runs of entries that carry a
+/// [`StepReport::declared_at`]: everything else keeps the position it was
+/// pushed at, so an entry with no declared position can neither move nor
+/// be moved past. [`slice::sort_by_key`] is stable, so entries sharing a
+/// position (none do today — the ids are unique) keep their push order.
+pub fn in_declaration_order(steps: &mut [StepReport]) {
+    let mut start = 0;
+    while start < steps.len() {
+        if steps[start].declared_at.is_none() {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < steps.len() && steps[end].declared_at.is_some() {
+            end += 1;
+        }
+        steps[start..end].sort_by_key(|entry| entry.declared_at);
+        start = end;
+    }
+}
+
 /// Build the top-level apply report envelope
 /// (`{ ok, dry_run, profile_name, steps, error? }`, mirroring
 /// `lua/lm/report.lua` `M.build`). `ok` is `true` iff `error` is absent.
@@ -229,6 +286,100 @@ mod tests {
         assert_eq!(r.failure_reason(), "boom");
         r.reason = Some("exit 3".to_string());
         assert_eq!(r.failure_reason(), "exit 3");
+    }
+
+    /// A declared position never serializes: it is how the array is
+    /// ordered, not something the report says.
+    #[test]
+    fn to_json_never_emits_the_declared_position() {
+        let mut r = StepReport::new(
+            "1_models_1".to_string(),
+            "models".to_string(),
+            "net.transfer",
+        );
+        r.declared_at = Some((1, 1));
+        let json = r.to_json();
+        assert!(json.get("declared_at").is_none());
+        assert_eq!(json.as_object().expect("object").len(), 5);
+    }
+
+    fn placed(id: &str, at: Option<DeclaredAt>) -> StepReport {
+        let mut entry = StepReport::new(id.to_string(), "models".to_string(), "net.transfer");
+        entry.declared_at = at;
+        entry
+    }
+
+    fn ids(steps: &[StepReport]) -> Vec<&str> {
+        steps.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    /// The case the parallel phase produces: entries pushed as they
+    /// finished, read back in the order the profile declared them.
+    #[test]
+    fn in_declaration_order_sorts_a_run_of_placed_entries() {
+        let mut steps = vec![
+            placed("1_models_3", Some((1, 3))),
+            placed("1_models_1", Some((1, 1))),
+            placed("1_models_2", Some((1, 2))),
+        ];
+        in_declaration_order(&mut steps);
+        assert_eq!(ids(&steps), vec!["1_models_1", "1_models_2", "1_models_3"]);
+    }
+
+    /// Two parallel phases in a row form one run, and sorting it does not
+    /// interleave them: the phase index is the first half of the key.
+    #[test]
+    fn in_declaration_order_keeps_two_adjacent_phases_apart() {
+        let mut steps = vec![
+            placed("2_models_2", Some((2, 2))),
+            placed("1_models_2", Some((1, 2))),
+            placed("2_models_1", Some((2, 1))),
+            placed("1_models_1", Some((1, 1))),
+        ];
+        in_declaration_order(&mut steps);
+        assert_eq!(
+            ids(&steps),
+            vec!["1_models_1", "1_models_2", "2_models_1", "2_models_2"]
+        );
+    }
+
+    /// An entry with no declared position is a fence: it neither moves
+    /// nor lets a placed entry cross it.
+    #[test]
+    fn in_declaration_order_leaves_unplaced_entries_where_they_were() {
+        let mut steps = vec![
+            placed("1_models_2", Some((1, 2))),
+            placed("1_models_1", Some((1, 1))),
+            placed("2_sh.exec", None),
+            placed("3_models_2", Some((3, 2))),
+            placed("3_models_1", Some((3, 1))),
+        ];
+        in_declaration_order(&mut steps);
+        assert_eq!(
+            ids(&steps),
+            vec![
+                "1_models_1",
+                "1_models_2",
+                "2_sh.exec",
+                "3_models_1",
+                "3_models_2"
+            ]
+        );
+    }
+
+    /// A wholly sequential report is untouched — the property that keeps
+    /// every pre-existing `step_ids` assertion true without amendment.
+    #[test]
+    fn in_declaration_order_is_the_identity_on_a_sequential_report() {
+        let before = vec![
+            placed("1_system.apt_1", Some((1, 1))),
+            placed("2_sh.exec", None),
+            placed("3_models_1", Some((3, 1))),
+            placed("3_models_2", Some((3, 2))),
+        ];
+        let mut after = before.clone();
+        in_declaration_order(&mut after);
+        assert_eq!(ids(&after), ids(&before));
     }
 
     #[test]

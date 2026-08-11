@@ -361,7 +361,7 @@ The following refinements are adopted.
   implementation of the schema-as-data decision. The `.d.lua` codegen
   half of the original decision went with the Lua frontend.
   Absorbed by 02.
-- **Shared vocabulary has one source of truth.** The 22 phase kinds
+- **Shared vocabulary has one source of truth.** The 23 phase kinds
   (enumerated in 02), `KNOWN_CAPABILITIES`, the secret-key substring
   set (used by 06 to reject secret-shaped `env` declarations), and
   the sensitive-key substring set (used by 09 for audit redaction)

@@ -51,9 +51,23 @@ impl Transport for LocalExecTransport {
         // Idempotent by content (08 §Session steps "ensure-binary"):
         // an already-identical destination skips the copy, so a
         // re-run converges without re-transfer.
-        let already_identical = match std::fs::read(&staged_binary) {
-            Ok(existing) => existing == std::fs::read(local_binary)?,
-            Err(_) => false,
+        //
+        // Compared by digest through `lm_provision::digest`, the same
+        // implementation the SSH transport's `sha256sum` comparison and
+        // the provisioner's own content predicate use. The two reasons
+        // this is not a `Vec<u8>` equality any more:
+        //
+        // - it read both whole files into memory, on the same artifact
+        //   the SSH path streams;
+        // - **it folded a failed read into "not identical"**. A staged
+        //   file that cannot be read is not a mismatch; it is a
+        //   question that did not get answered, and answering it "no"
+        //   makes a permission problem look like an ordinary re-copy
+        //   (design §4.1). `NotFound` — nothing staged yet — is a real
+        //   answer and still means copy.
+        let already_identical = match lm_provision::digest::of_file(&staged_binary)? {
+            Some(staged) => staged == crate::local_digest(local_binary)?,
+            None => false,
         };
         if !already_identical {
             std::fs::copy(local_binary, &staged_binary)?;

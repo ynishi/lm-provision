@@ -83,6 +83,7 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
         match phase {
             ProfileNode::SystemApt { .. } => buckets.system_apt.push(phase),
             ProfileNode::ComfyUiInstall { .. } => buckets.comfyui_install.push(phase),
+            ProfileNode::ToolchainPython { .. } => buckets.toolchain_python.push(phase),
             ProfileNode::PythonVersionCheck { .. } => buckets.python_version_check.push(phase),
             ProfileNode::PythonDeps { .. } => buckets.python_deps.push(phase),
             ProfileNode::CustomNodes { .. } => buckets.custom_nodes.push(phase),
@@ -153,6 +154,10 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
     // 2_comfyui_install
     for p in &buckets.comfyui_install {
         steps.push(step_value("2_comfyui_install", kind_of(p), payload_of(p)));
+    }
+    // 2b_toolchain_python
+    for p in &buckets.toolchain_python {
+        steps.push(step_value("2b_toolchain_python", kind_of(p), payload_of(p)));
     }
     // 3a_python_version_check — the default-value suppression already
     // ran in `crate::normalize`, so every survivor is emitted.
@@ -235,6 +240,7 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
 struct Buckets<'a> {
     system_apt: Vec<&'a ProfileNode>,
     comfyui_install: Vec<&'a ProfileNode>,
+    toolchain_python: Vec<&'a ProfileNode>,
     python_version_check: Vec<&'a ProfileNode>,
     python_deps: Vec<&'a ProfileNode>,
     custom_nodes: Vec<&'a ProfileNode>,
@@ -271,6 +277,7 @@ pub(crate) fn kind_of(phase: &ProfileNode) -> &'static str {
         ProfileNode::Spec { .. } => "",
         ProfileNode::SystemApt { .. } => "system.apt",
         ProfileNode::ComfyUiInstall { .. } => "comfyui.install",
+        ProfileNode::ToolchainPython { .. } => "toolchain.python",
         ProfileNode::PythonVersionCheck { .. } => "python.version_check",
         ProfileNode::PythonDeps { .. } => "python.deps",
         ProfileNode::CustomNodes { .. } => "custom_nodes",
@@ -306,12 +313,40 @@ fn payload_of(phase: &ProfileNode) -> Value {
     match phase {
         ProfileNode::Spec { .. } => Value::Object(Map::new()),
         ProfileNode::SystemApt { packages, .. } => json!({ "packages": packages }),
-        ProfileNode::ComfyUiInstall { ref_name, repo, .. } => {
+        ProfileNode::ComfyUiInstall {
+            ref_name,
+            repo,
+            install_dir,
+            ..
+        } => {
             let mut m = Map::new();
             m.insert("ref_name".into(), Value::String(ref_name.clone()));
             if let Some(v) = repo {
                 m.insert("repo".into(), Value::String(v.clone()));
             }
+            // Emitted only when declared, like `repo`: the artifact
+            // shows what the author wrote. Where an undeclaring profile
+            // installs is the built-in root, which `02` states once
+            // rather than repeating into every plan.
+            if let Some(v) = install_dir {
+                m.insert("install_dir".into(), Value::String(v.clone()));
+            }
+            Value::Object(m)
+        }
+        ProfileNode::ToolchainPython {
+            requirements,
+            isolated,
+            ..
+        } => {
+            let mut m = Map::new();
+            // `requirements` only when declared, like `repo` on the
+            // install phase; `isolated` always, because a reader of the
+            // artifact should not have to know which way the default
+            // runs to tell whether the venv inherits.
+            if let Some(v) = requirements {
+                m.insert("requirements".into(), Value::String(v.clone()));
+            }
+            m.insert("isolated".into(), Value::Bool(*isolated));
             Value::Object(m)
         }
         ProfileNode::PythonVersionCheck { want, .. } => json!({ "want": want }),
@@ -547,6 +582,7 @@ mod tests {
     fn spec(name: &str, phases: Vec<ProfileNode>) -> ProfileNode {
         let ids = IdGen::new();
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -704,6 +740,7 @@ mod tests {
                     in_comfy_venv: false,
                 },
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc123".into(),
                     repo: None,
@@ -720,6 +757,7 @@ mod tests {
             vec![
                 "1_system_apt",
                 "2_comfyui_install",
+                "2b_toolchain_python",
                 "3_python_deps",
                 "4_custom_nodes",
                 "5_sync_routes",
@@ -773,6 +811,7 @@ mod tests {
         let plan = expand(&spec(
             "demo",
             vec![ProfileNode::ComfyUiInstall {
+                install_dir: None,
                 id: g.node(),
                 ref_name: "abc".into(),
                 repo: None,
@@ -783,13 +822,16 @@ mod tests {
             step_ids(&plan),
             vec![
                 "2_comfyui_install",
+                "2b_toolchain_python",
                 "9_comfyui_restart",
                 "10_comfyui_health"
             ],
         );
+        // Index 1 is the inserted `toolchain.python`; the restart and
+        // the health poll follow it.
         let steps = plan["steps"].as_array().unwrap();
-        assert_eq!(steps[1]["payload"]["port"], json!(8188));
         assert_eq!(steps[2]["payload"]["port"], json!(8188));
+        assert_eq!(steps[3]["payload"]["port"], json!(8188));
     }
 
     #[test]
@@ -799,6 +841,7 @@ mod tests {
             "demo",
             vec![
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc".into(),
                     repo: None,
@@ -815,12 +858,13 @@ mod tests {
             step_ids(&plan),
             vec![
                 "2_comfyui_install",
+                "2b_toolchain_python",
                 "9_comfyui_restart",
                 "10_comfyui_health"
             ],
         );
         assert_eq!(
-            plan["steps"][2]["payload"]["port"],
+            plan["steps"][3]["payload"]["port"],
             json!(9001),
             "health must inherit the declared restart port",
         );
@@ -833,6 +877,7 @@ mod tests {
             "demo",
             vec![
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc".into(),
                     repo: None,
@@ -849,12 +894,13 @@ mod tests {
             step_ids(&plan),
             vec![
                 "2_comfyui_install",
+                "2b_toolchain_python",
                 "9_comfyui_restart",
                 "10_comfyui_health"
             ],
         );
         assert_eq!(
-            plan["steps"][1]["payload"]["port"],
+            plan["steps"][2]["payload"]["port"],
             json!(9002),
             "restart must inherit the declared health port",
         );
@@ -867,6 +913,7 @@ mod tests {
             "demo",
             vec![
                 ProfileNode::ComfyUiInstall {
+                    install_dir: None,
                     id: g.node(),
                     ref_name: "abc".into(),
                     repo: None,
@@ -883,8 +930,8 @@ mod tests {
                 },
             ],
         ));
-        assert_eq!(plan["steps"][1]["payload"]["port"], json!(1111));
-        assert_eq!(plan["steps"][2]["payload"]["port"], json!(2222));
+        assert_eq!(plan["steps"][2]["payload"]["port"], json!(1111));
+        assert_eq!(plan["steps"][3]["payload"]["port"], json!(2222));
     }
 
     #[test]

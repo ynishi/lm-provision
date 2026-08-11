@@ -50,3 +50,27 @@ pub mod local_exec;
 pub mod session;
 pub mod ssh;
 pub mod transport;
+
+/// The content digest of a local artifact this driver is about to push.
+///
+/// Both transports answer the same question before uploading — "is what
+/// is already over there the same bytes as this?" (08 §Session steps
+/// "ensure-binary") — and both now answer it through
+/// [`lm_provision::digest`], the workspace's single content-digest
+/// implementation. Before this they answered it two different ways: a
+/// local `format!("{:x}")` hash in [`ssh`], a whole-file `Vec<u8>`
+/// equality in [`local_exec`].
+///
+/// **An absent artifact is an error here, not a digest that fails to
+/// match.** The path names the binary the operator asked to push; if it
+/// is not there, nothing this function could return would be true, and
+/// the failure belongs at the input rather than downstream as a
+/// surprising re-upload.
+pub(crate) fn local_digest(path: &std::path::Path) -> Result<String, transport::TransportError> {
+    lm_provision::digest::of_file(path)?.ok_or_else(|| {
+        transport::TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no local artifact at {}", path.display()),
+        ))
+    })
+}

@@ -21,6 +21,27 @@ use super::{ProfileAst, ProfileNode, ProfileSemantics};
 /// with [`crate::exec::ExecError`] only when the profile declares a
 /// capability outside [`crate::exec::capgate::KNOWN_CAPABILITIES`]; the
 /// engine wiring itself is a host invariant and is asserted.
+///
+/// # Runtime
+///
+/// The returned engine is driven **synchronously** (`Stepper::step` /
+/// `run_to_yield_with_breakpoints`), which is the whole reason this
+/// entry point differs from [`crate::apply::run_apply_ast`]: a
+/// synchronous stepper cannot resolve a `Call`, so the AST it runs is
+/// the plain derived one, with lifecycle phases still on their ops.
+///
+/// **A multi-threaded tokio runtime must therefore be current whenever
+/// the profile has a lifecycle phase** — in *both* modes. Real mode
+/// always needed one (a transfer, a poll). Dry run needs one too now
+/// that it answers a step's completion condition rather than describing
+/// it, because observing the host is async
+/// (`exec::lifecycle::dry_run_step`). Both go through
+/// `exec::effects::block_on_effect`, which reports a missing or
+/// single-threaded runtime as an [`crate::exec::ExecError`] naming the
+/// requirement rather than panicking.
+///
+/// The MCP debugger host gets one from `#[tokio::main]`; a test needs
+/// `#[tokio::test(flavor = "multi_thread")]`.
 pub fn create_profile_engine(
     root: &ProfileNode,
     mode: crate::exec::ExecMode,

@@ -9,13 +9,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A completion condition per lifecycle step, and one vocabulary for
+  writing it.** Every kind used to answer "is this finished?" in its own
+  shape, or not at all: six ad-hoc forms across payload fields and host
+  Rust. There is now one `Assert` — an expression over predicates,
+  folding to four answers (`Satisfied` / `Unsatisfied` / `NotChecked` /
+  `CheckFailed`) rather than a boolean, because "I did not look" and
+  "I looked and could not tell" are different things to a reader of a
+  plan. Four entity types derive their own: `ModelFile` (present, and
+  matching a declared digest), `Checkout` (a repository is there and
+  holds the named ref), `Service` (the recorded process is alive and was
+  launched with exactly these arguments), `Venv` (there is an
+  interpreter in it).
+- **A second apply converges instead of repeating.** A model file that
+  is already there is not fetched again, a clone that exists is not
+  attempted again, a server already running with these arguments is not
+  relaunched, a venv that exists is not recreated. Each skip names the
+  part of the condition that held, so the report says what was true
+  rather than only that something was skipped.
+- **`toolchain.python`** (23rd catalog kind). Creates the virtual
+  environment ComfyUI runs in and installs a declared `requirements.txt`
+  into it. Inherits the host interpreter's packages unless the profile
+  sets `isolated` — a GPU pod's torch is built against its own driver,
+  and a venv that cannot see it makes pip fetch a wheel whose CUDA does
+  not match, which surfaces only as a launch that never becomes ready.
+- **Resources: `produces` / `requires` / `assumes`.** A phase can only
+  reach a path something created. `comfyui.install` produces
+  `comfyui_root` (its `install_dir`, defaulting to `/workspace/ComfyUI`),
+  `toolchain.python` produces `venv` under it, and the phases that
+  consume them require them back. `Spec.assumes` is where a profile
+  states that something is already present. Validate rejects a profile
+  whose requirement nothing binds — by resource name, before any effect
+  runs. The check is a scope check over the canonical phase order, not a
+  dependency graph: nothing is reordered.
+- **Every ComfyUI-relative path derives from one declared root.** The
+  models root, the custom-nodes root, the entry point and the venv were
+  six constants in host code that a profile could not see or point
+  elsewhere; they are now derivations of `comfyui_root`, and moving it
+  moves what `paths` must cover.
+- **Independent transfers in one `models` phase run at the same time.**
+  Independence is decided over the composed steps — transfers to
+  distinct destinations may overlap and nothing else may — so a phase
+  whose steps are not independent keeps its order.
+- **Byte-level progress while a transfer is still running.** A
+  `net.transfer.progress` event every fifteen seconds plus the first
+  chunk and the last, carrying bytes / total / percent / elapsed. No
+  rate and no estimate: an ETA asserts the next minutes look like the
+  last, and nothing here has looked at the network to say so.
+
 ### Changed
+
+- **Breaking (a profile that consumes ComfyUI must produce or assume
+  it).** A `models`, `custom_nodes`, `comfyui.restart` or venv-scoped
+  `python.deps` phase with no `comfyui.install` and no `assumes` entry
+  is now rejected at validate and at apply. The shape is real — a pod
+  that already carries ComfyUI — and the fix is one `assumes` line. It
+  used to compose a path under a root nothing had made and fail on the
+  pod with `no such file`.
+- **A checkout implies a venv, the way it already implied a launch.**
+  When `comfyui.install` is present, an undeclared `toolchain.python` is
+  inserted alongside the restart and health poll that were already being
+  inserted, installing the checkout's own `requirements.txt`. Inserting
+  a launch while withholding what it runs would have rejected a profile
+  consisting of nothing but `comfyui.install`, over a phase its author
+  never wrote.
+- **Every `requirements.txt` is filtered before pip sees it.** Lines
+  pinning the torch family are stripped, for ComfyUI's own requirements
+  and for each custom node's, through one shared pattern. A pin that
+  reaches pip replaces the pod's driver-matched torch inside the venv,
+  and the only symptom is `torch.cuda.is_available()` answering false at
+  launch. The custom-node install previously applied no filter at all.
+- **The venv is `.venv`**, matching the reference implementation. The
+  earlier `venv` spelling pointed at a directory nothing had ever
+  created.
+- **`net.transfer` carries a real model weight.** The 16 MiB cap is
+  gone, redirects are followed, and a read that stalls fails on a
+  deadline instead of hanging.
+- **`net.http_get` / `net.http_post` moved onto `Call`**, and dry-run
+  answers each step's condition rather than restating the step.
+- dsl-kit 0.10, then 0.11; the AST projection is no longer hand-built.
+
+### Fixed
+
+- **The venv's pip is brought current before anything is installed
+  through it.** The reference implementation does this between creating
+  the venv and its first install; porting that script left the line
+  behind. ComfyUI at `master` would not finish installing its
+  requirements in an hour, twice, on two pods; with pip upgraded first
+  the same profile finished in nine minutes and the pod went on to
+  produce an image. The comparison is not fully isolated — the fast run
+  also had a faster link — and the code comment says so.
+- **A cancelled transfer takes its partial file with it**, so a
+  destination is either absent or complete and the next apply's
+  condition is answering about a whole file.
 
 ### Deprecated
 
 ### Removed
-
-### Fixed
 
 ### Security
 

@@ -69,6 +69,13 @@ Checks, in order:
 8. No two `service.ready` phases share a service index — a second one
    under the same `service.start` would expand to a step id the first
    already carries (chapter 02 §Canonical phase ordering).
+8b. **Resource scope.** Every `Spec.assumes` key names a resource, and
+   every phase's `requires` is bound by an earlier phase's `produces`
+   or by `assumes` (chapter 01 §Assumed resources). One forward pass
+   over the phases **in canonical order**, so a profile that writes
+   `models` above `comfyui.install` is well-formed — the check asks
+   what the run will do, not what the file looks like. Nothing is
+   reordered by it.
 9. `declared ⊇ derived` for the three allowlist-shaped fields
    (chapter 00 §Capability derivation). The stage expands the profile
    the way apply will — implicit insertion applied, suppressed phases
@@ -81,10 +88,16 @@ Checks, in order:
    consequences worth stating: a phase the author never wrote counts
    (the health poll inserted beside a `comfyui.install` brings its
    `net.http_get` and its URL), and a destination the author never
-   spelled out counts too (`models` writes under a built-in path
-   constant, chapter 02 §Built-in path constants). A phase whose
-   expansion fails contributes nothing — it cannot run, and its own
-   error is the one worth reporting.
+   spelled out counts too (`models` writes under the resolved
+   `comfyui_root`, chapter 02 §Resource-derived paths — so declaring a
+   different `install_dir` moves what `paths` has to cover). A phase
+   whose expansion fails contributes nothing — it cannot run, and its
+   own error is the one worth reporting.
+
+   Check **8b** runs before this one, for that reason: a phase whose
+   required resource is unbound composes no steps, so it would
+   contribute no derived paths and this check would pass over it in
+   silence. See below.
 
 Because the AST payload is still a projection of the full spec-02
 catalog (`custom_nodes` / `models` / `llm_models` carry an opaque JSON

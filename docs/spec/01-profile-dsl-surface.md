@@ -100,6 +100,7 @@ An AI-native JSON representation ideal for programmatic generation and tool inte
 | `env_secrets` | list\<string\> | no | `{}` | secret allowlist; every `EnvSecret` reference must name an entry here |
 | `paths` | list\<string\> | no | `{}` | filesystem path root allowlist (chapter 05 §L3 path policy) |
 | `http_allowlist` | list\<string\> | no | `{}` | HTTP URL pattern allowlist (chapter 05 §L3 HTTP policy) |
+| `assumes` | table\<string, string\> | no | `{}` | resources already present on the target, as `resource name → path` (§Assumed resources below); a key naming no resource is rejected (chapter 03 §validate check 8b) |
 | `phases` | list\<ProfileNode\> | no | `{}` | phase nodes per chapter 02 |
 
 Optional fields (`Option<T>` / list-typed) may be omitted on the wire
@@ -116,7 +117,8 @@ the order these entries were written yield the same profile hash.
 as a sorted list: it is stored keyed by name and canonical emits it in
 key order, so no sort step applies — and an empty table is omitted
 from canonical entirely rather than emitted as `[]` (chapter 03
-§canonical). Phase order is semantic and is preserved by canonical.
+§canonical). `assumes` is a table under the same rule. Phase order is
+semantic and is preserved by canonical.
 
 The profile hash (chapter 03 §hash) is **frontend-independent**: the
 canonical text grammar and the JSON serde bridge that both build the
@@ -230,6 +232,64 @@ referenced*, never the resolved value.
 An empty `Spec.env` is omitted from canonical, so a profile that
 declares no entries here hashes exactly as it did while `env` was a
 bare allowlist `Vec<String>`.
+
+## Assumed resources (`Spec.assumes`)
+
+A phase can only reach a path something created. `Spec.assumes` is
+where a profile states that something already did:
+
+```text
+Spec(
+    name: "add-weights",
+    assumes: { comfyui_root: "/workspace/ComfyUI" },
+    phases: [ Models(models_json: "...") ]
+)
+```
+
+Keys are resource names; the vocabulary is one entry today:
+
+| resource | produced by | what derives from it |
+|---|---|---|
+| `comfyui_root` | `comfyui.install` (its `install_dir`, defaulting to `/workspace/ComfyUI`) | the models root, the custom-nodes root, `main.py`, and where the venv goes (chapter 02 §Resource-derived paths) |
+| `venv` | `toolchain.python`, which places it at `<comfyui_root>/.venv` | the `pip` and `python` every venv-reaching phase invokes |
+
+**A producer may place what it makes relative to something it
+requires** — `toolchain.python` needs the root before it can say where
+the venv is — so the second column is not a function of the phase
+alone.
+
+`venv`'s identity is weaker than the others', and the limitation is
+stated rather than papered over: a venv carries no digest, so
+"there is one" is all that can be observed about it. Changing what a
+profile installs into a venv does not make an existing one disagree,
+so the create step is skipped and the old contents stay;
+reprovisioning onto a pod whose venv was built from a different
+requirements list needs the directory removed first. The requirements
+install beside it carries no condition and therefore runs every time,
+which is what keeps a *changed* requirements file from being ignored.
+
+The rule is a **scope check**, applied over the phases in canonical
+order (chapter 02 §Canonical phase ordering), not over the order they
+were written:
+
+```text
+well-formed = every phase's `requires` is bound by an earlier phase's
+              `produces`, or by an entry in `assumes`
+```
+
+Nothing is reordered by it — it is one forward pass, and remains
+distinct from the per-kind dependency graph chapter 02 §Stability rules
+out. Which kinds require what is fixed per kind and not authored: a
+`models` phase needs somewhere to put a model whatever the profile
+says, so writing it down would be the same fact recorded twice.
+
+A profile that consumes ComfyUI without installing or assuming it is
+rejected at validate (check 8b) and, since apply does not run validate,
+at apply as well — in both cases naming the resource rather than
+failing later on a missing directory.
+
+An empty `assumes` is omitted from canonical, so a profile that
+declares nothing here keeps the hash it had before the slot existed.
 
 ## Escape / Fragment Policy
 

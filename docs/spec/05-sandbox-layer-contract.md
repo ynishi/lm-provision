@@ -106,11 +106,13 @@ dry-run and real alike.
 
 The same targets are what validate asserts `paths` covers **before**
 apply (chapter 00 §Capability derivation): the walk runs over the
-expanded plan, so a `models` destination under a built-in path constant
-(chapter 02 §Built-in path constants) — a path the author never spells
-out — has to be declared like any other. What used to be an unstated
-exemption for built-in constants is now a stated requirement, and it
-surfaces as a precondition error rather than as a denial on the pod.
+expanded plan, so a `models` destination under the resolved
+`comfyui_root` (chapter 02 §Resource-derived paths) — a path the author
+never spells out — has to be declared like any other. What used to be
+an unstated exemption for built-in constants is now a stated
+requirement, and it surfaces as a precondition error rather than as a
+denial on the pod. Declaring a different `install_dir` moves the
+destination, and therefore moves what `paths` has to cover.
 
 `sh.exec` puts writes structurally out of reach: a subprocess — `git
 clone`, a CLI downloader, `pip install` — writes wherever the pod's

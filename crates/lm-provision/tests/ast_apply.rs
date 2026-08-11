@@ -8,8 +8,15 @@
 //! carrying the AST exec layer's own step structure — one entry per
 //! direct-op phase, one per lifecycle sub-step, with honest `note` steps
 //! (see `lm_provision::exec::report`).
+//!
+//! `run_apply_ast` is `async` and its effect layer blocks the calling
+//! thread on the current runtime, so the in-process tests take
+//! `#[tokio::test(flavor = "multi_thread")]` — the flavour the CLI entry
+//! point builds. The tests that go through the binary instead
+//! (`assert_cmd`) exercise that wiring itself and stay synchronous.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use serde_json::{json, Value};
@@ -76,8 +83,8 @@ fn step_kinds(artifact: &Value) -> Vec<String> {
 // Dry-run report shape (envelope field names + AST step structure).
 // ---------------------------------------------------------------------
 
-#[test]
-fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
     let profile = json!({
         "type": "Spec",
         "name": "ast-apply-demo",
@@ -92,6 +99,7 @@ fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
     let path = write_json_profile("shape", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, true)
+        .await
         .expect("dry-run apply over a valid profile should produce a report");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -128,8 +136,112 @@ fn dry_run_report_has_the_legacy_envelope_and_ast_step_structure() {
     std::fs::remove_file(&path).ok();
 }
 
-#[test]
-fn lifecycle_note_step_is_honest_never_dispatch_pending() {
+/// A dry-run `models` step reaches the report with **the condition's
+/// answer**, not a description of the condition.
+///
+/// This is the end-to-end half of the move: a lifecycle step is its own
+/// `Call` node, so the dry-run arm runs in the host's async resolver and
+/// the (async) evaluator is reachable from it. Before that, the note
+/// here was a static sentence about the profile — equally true whatever
+/// the host looked like.
+///
+/// **Both entries name a destination that is not there**, and the
+/// report says so per step: `Unsatisfied`, i.e. "this transfers". The
+/// second one declares a `sha256` whose conjunct is `NotChecked` (a dry
+/// run does not read the file), and the fold still answers `Unsatisfied`
+/// — which is what makes a dry run able to say "this transfers" about a
+/// digest-carrying entry at all.
+///
+/// The *other* answer a present destination gets (`NotChecked` —
+/// undecided, because deciding it would mean reading the whole file) is
+/// pinned in `exec::lifecycle`'s
+/// `a_dry_run_answers_the_condition_and_tells_the_two_apart`, where the
+/// condition is exercised directly. What a real apply does with that
+/// answer — transfer the first time, skip the second — is
+/// `comfyui_root::a_second_apply_does_not_fetch_an_entry_that_is_already_there`,
+/// which a declared root made writable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_models_step_reports_the_conditions_answer() {
+    let digest = "a".repeat(64);
+    let profile = json!({
+        "type": "Spec",
+        "name": "models-dry-run",
+        "capabilities": ["net.transfer"],
+        "paths": ["/workspace/ComfyUI/models"],
+        "http_allowlist": ["https://example.com/"],
+        // The root has to be in scope for the phase to compose a
+        // destination; declaring it present keeps this about what the
+        // condition answers.
+        "assumes": { "comfyui_root": "/workspace/ComfyUI" },
+        "phases": [{
+            "type": "Models",
+            "models_json": format!(
+                r#"[{{"src":"https://example.com/a.bin","dst":"a.bin","subdir":"lora"}},
+                     {{"src":"https://example.com/b.bin","dst":"b.bin","subdir":"lora","sha256":"{digest}"}}]"#
+            ),
+        }]
+    });
+    let path = write_json_profile("models-dry-run", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, true)
+        .await
+        .expect("a dry run touches nothing and reports");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    // One report entry per composed step — the phase is a `Par` over two
+    // `Call` nodes now, and each suspended on its own. The condition is
+    // answered per step under the fan-out exactly as it was under the
+    // sequence: `done` lives in `lifecycle::run_step`, which the join
+    // policy does not touch.
+    assert_eq!(
+        step_ids(&report),
+        vec!["1_models_1", "1_models_2"],
+        "{report}"
+    );
+    let steps = report["steps"].as_array().expect("steps is an array");
+    for step in steps {
+        assert_eq!(step["op"], json!("net.transfer"));
+        assert_eq!(step["dry_run"], json!(true));
+    }
+
+    // (1) No digest declared: existence alone, and it is answerable in a
+    // dry run.
+    assert_eq!(
+        steps[0]["dst"],
+        json!("/workspace/ComfyUI/models/lora/a.bin"),
+        "the composed destination, which is also what the condition looks at",
+    );
+    let note = steps[0]["note"]
+        .as_str()
+        .expect("the condition's answer reaches the report");
+    assert_eq!(
+        note, "would transfer, not done: exists(/workspace/ComfyUI/models/lora/a.bin)=unsatisfied",
+        "an answer, not a description of what would decide it",
+    );
+
+    // (2) A digest declared: its conjunct stays unread, and the
+    // conjunction is still decided by existence.
+    let note = steps[1]["note"]
+        .as_str()
+        .expect("the condition's answer reaches the report");
+    assert!(
+        note.starts_with("would transfer, not done: "),
+        "a declared digest does not make an absent file undecided: {note}",
+    );
+    assert!(
+        note.contains("exists(/workspace/ComfyUI/models/lora/b.bin)=unsatisfied")
+            && note.contains(&format!(
+                "sha256(/workspace/ComfyUI/models/lora/b.bin)={digest}"
+            ))
+            && note.contains("=not-checked"),
+        "…and both conjuncts' answers are in the note: {note}",
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_note_step_is_honest_never_dispatch_pending() {
     let profile = json!({
         "type": "Spec",
         "name": "note-demo",
@@ -140,8 +252,9 @@ fn lifecycle_note_step_is_honest_never_dispatch_pending() {
     });
     let path = write_json_profile("note", &profile);
 
-    let report_json =
-        lm_provision::apply::run_apply_ast(&path, true).expect("dry-run apply should succeed");
+    let report_json = lm_provision::apply::run_apply_ast(&path, true)
+        .await
+        .expect("dry-run apply should succeed");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
     let ops = step_ops(&report);
@@ -164,8 +277,8 @@ fn lifecycle_note_step_is_honest_never_dispatch_pending() {
 // Real-mode end-to-end (harmless effects only).
 // ---------------------------------------------------------------------
 
-#[test]
-fn real_mode_runs_sh_exec_and_fs_write_for_real() {
+#[tokio::test(flavor = "multi_thread")]
+async fn real_mode_runs_sh_exec_and_fs_write_for_real() {
     let dir = temp_stem("real-effects");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let target = dir.join("out.txt");
@@ -185,6 +298,7 @@ fn real_mode_runs_sh_exec_and_fs_write_for_real() {
     let path = write_json_profile("real", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("real-mode apply over a harmless profile should succeed");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -219,8 +333,8 @@ fn real_mode_runs_sh_exec_and_fs_write_for_real() {
 /// these entries were strictly less informative than a direct op's
 /// (spec 09 §Apply report: the per-op field table applies to lifecycle
 /// sub-steps too).
-#[test]
-fn real_mode_lifecycle_substeps_carry_their_observations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn real_mode_lifecycle_substeps_carry_their_observations() {
     // `hooks.post_install` composes exactly one `sh.exec` sub-step out
     // of the script, so the assertion targets a lifecycle entry rather
     // than a direct op.
@@ -235,6 +349,7 @@ fn real_mode_lifecycle_substeps_carry_their_observations() {
     let path = write_json_profile("lifecycle-observations", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("a post_install echo should apply cleanly");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
     assert_eq!(report["ok"], json!(true));
@@ -271,8 +386,8 @@ fn real_mode_lifecycle_substeps_carry_their_observations() {
 /// The same entries under `--dry-run` carry inputs but **no**
 /// observations — nothing ran, so a status/stdout there would be
 /// fabricated.
-#[test]
-fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
     let profile = json!({
         "type": "Spec",
         "name": "lifecycle-dry",
@@ -283,8 +398,9 @@ fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
     });
     let path = write_json_profile("lifecycle-dry", &profile);
 
-    let report_json =
-        lm_provision::apply::run_apply_ast(&path, true).expect("dry-run apply succeeds");
+    let report_json = lm_provision::apply::run_apply_ast(&path, true)
+        .await
+        .expect("dry-run apply succeeds");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
     let step = &report["steps"].as_array().unwrap()[0];
@@ -302,8 +418,8 @@ fn dry_run_lifecycle_substeps_carry_inputs_but_no_observations() {
 // Fail-fast step collection + the legacy error form.
 // ---------------------------------------------------------------------
 
-#[test]
-fn a_failing_step_is_collected_and_stops_the_run() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_step_is_collected_and_stops_the_run() {
     let profile = json!({
         "type": "Spec",
         "name": "fail-demo",
@@ -316,6 +432,7 @@ fn a_failing_step_is_collected_and_stops_the_run() {
     let path = write_json_profile("fail", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("a step failure is captured in-report, not returned as Err");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -343,8 +460,8 @@ fn a_failing_step_is_collected_and_stops_the_run() {
 /// direct op: the exit code and the captured output that accompanied the
 /// failure belong in structured fields, not only quoted inside the
 /// `reason` text (spec 09 §Apply report).
-#[test]
-fn a_failing_lifecycle_substep_carries_its_partial_observation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_lifecycle_substep_carries_its_partial_observation() {
     let profile = json!({
         "type": "Spec",
         "name": "lifecycle-fail-observations",
@@ -357,6 +474,7 @@ fn a_failing_lifecycle_substep_carries_its_partial_observation() {
     let path = write_json_profile("lifecycle-fail-observations", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("a step failure is captured in-report, not returned as Err");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -394,8 +512,8 @@ fn a_failing_lifecycle_substep_carries_its_partial_observation() {
 /// --version` and calling itself advisory let a mismatch pass silently;
 /// the assert script fails the step, and the interpreter's real version
 /// reaches the report through the captured stderr.
-#[test]
-fn python_version_check_fails_the_run_on_a_mismatch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn python_version_check_fails_the_run_on_a_mismatch() {
     let profile = json!({
         "type": "Spec",
         "name": "version-mismatch",
@@ -408,6 +526,7 @@ fn python_version_check_fails_the_run_on_a_mismatch() {
     let path = write_json_profile("version-mismatch", &profile);
 
     let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
         .expect("a step failure is captured in-report");
     let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
 
@@ -428,6 +547,698 @@ fn python_version_check_fails_the_run_on_a_mismatch() {
     );
 
     std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------
+// A phase whose steps are independent runs them at the same time.
+//
+// The claim is about wall-clock, so one of these measures it. The others
+// are about what the parallelism must *not* cost: the report still reads
+// in the order the profile was written, every entry is still there, and a
+// denial that every step discovers is still stated once.
+//
+// Every entry below assumes the built-in `/workspace/ComfyUI` root and
+// transfers under it, a directory these tests do not create — so each
+// transfer reaches the server, waits for it, and then fails on the
+// destination. That is deliberate: the delay under test is the server's,
+// and it is spent before the failure, so the measurement does not depend
+// on anything landing. Where a transfer *has* to land, the profile
+// declares a root the test owns (`comfyui_root`).
+// ---------------------------------------------------------------------
+
+/// A local server that handles every connection **at the same time**,
+/// holding each for however long `delay` says the requested entry takes.
+///
+/// One thread per connection is what makes the measurement mean
+/// something: a client that opens the connections one after another pays
+/// the sum of the delays, and a client that opens them together pays the
+/// longest.
+fn concurrent_server(
+    serves: usize,
+    delay: fn(usize) -> Duration,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        let mut open = Vec::with_capacity(serves);
+        for _ in 0..serves {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            open.push(std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let entry = entry_number(&String::from_utf8_lossy(&buf[..read]));
+                std::thread::sleep(delay(entry));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }));
+        }
+        for worker in open {
+            let _ = worker.join();
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// The `<n>` of the `/<n>.bin` a request line asked for, so a server can
+/// answer a named entry rather than "whichever arrived first".
+fn entry_number(request: &str) -> usize {
+    request
+        .split('/')
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A profile whose single `models` phase declares `entries` weights,
+/// numbered `1.bin` … `<entries>.bin` in declaration order.
+fn models_profile(name: &str, base_url: &str, entries: usize) -> Value {
+    let models: Vec<Value> = (1..=entries)
+        .map(|n| {
+            json!({
+                "src": format!("{base_url}/{n}.bin"),
+                "dst": format!("{n}.bin"),
+                "subdir": "lora",
+            })
+        })
+        .collect();
+    json!({
+        "type": "Spec",
+        "name": name,
+        "capabilities": ["net.transfer"],
+        "paths": ["/workspace/ComfyUI/models"],
+        "http_allowlist": [base_url],
+        // A `models` phase needs the ComfyUI root in scope to compose a
+        // destination at all. The fixture declares it as already present
+        // rather than adding a `comfyui.install`, which would put a git
+        // clone — and the implicitly inserted restart and health poll —
+        // into a measurement about four transfers.
+        "assumes": { "comfyui_root": "/workspace/ComfyUI" },
+        "phases": [{
+            "type": "Models",
+            "models_json": serde_json::to_string(&models).expect("models encode"),
+        }]
+    })
+}
+
+fn declared_ids(entries: usize) -> Vec<String> {
+    (1..=entries).map(|n| format!("1_models_{n}")).collect()
+}
+
+/// **The measurement.** Four entries against a server that holds every
+/// request for the same time: run one after another that is four delays,
+/// run together it is one.
+///
+/// The bounds are deliberately far from each other. The lower one is what
+/// makes the upper one mean anything — it proves the run really waited on
+/// the server rather than failing before it reached one — and the upper
+/// one sits at three delays, half way between the one a parallel run
+/// spends and the four a sequential run would, so neither a slow machine
+/// nor a fast one moves the verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_models_phase_transfers_its_entries_at_the_same_time() {
+    const ENTRIES: usize = 4;
+    const DELAY: Duration = Duration::from_millis(400);
+
+    let (base_url, server) = concurrent_server(ENTRIES, |_| DELAY);
+    let profile = models_profile("models-parallel", &base_url, ENTRIES);
+    let path = write_json_profile("models-parallel", &profile);
+
+    let started = Instant::now();
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
+        .expect("a run that reaches its steps produces a report");
+    let elapsed = started.elapsed();
+    server.join().expect("the server thread finishes");
+
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+    assert_eq!(step_ids(&report), declared_ids(ENTRIES), "{report}");
+
+    assert!(
+        elapsed >= DELAY,
+        "the run did not wait on the server at all ({elapsed:?}); the measurement below \
+         would prove nothing"
+    );
+    assert!(
+        elapsed < DELAY * 3,
+        "{ENTRIES} entries took {elapsed:?}; one after another they would take \
+         {:?}, together about {DELAY:?}",
+        DELAY * ENTRIES as u32
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// The report reads in the order the profile was written even though the
+/// entries answered in the reverse of it: entry 1 is held longest, so it
+/// finishes last, and it is still the first row.
+///
+/// The same run pins the join policy: nothing is cancelled when a sibling
+/// fails, so all four entries answered and all four are in the report,
+/// each with its own reason — and the envelope's one `error` line names
+/// the first of them in declaration order rather than the first to fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parallel_phase_reports_every_entry_once_in_declaration_order() {
+    const ENTRIES: usize = 4;
+
+    let (base_url, server) = concurrent_server(ENTRIES, |n| {
+        Duration::from_millis(80 * (ENTRIES.saturating_sub(n) + 1) as u64)
+    });
+    let profile = models_profile("models-order", &base_url, ENTRIES);
+    let path = write_json_profile("models-order", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
+        .expect("a run that reaches its steps produces a report");
+    server.join().expect("the server thread finishes");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    assert_eq!(step_ids(&report), declared_ids(ENTRIES), "{report}");
+
+    let steps = report["steps"].as_array().expect("steps is an array");
+    assert_eq!(steps.len(), ENTRIES, "{report}");
+    for step in steps {
+        assert_eq!(step["op"], json!("net.transfer"), "{step}");
+        assert_eq!(
+            step["ok"],
+            json!(false),
+            "the built-in models root is not there, so every entry fails on it: {step}"
+        );
+    }
+    assert_eq!(report["ok"], json!(false), "{report}");
+    assert!(
+        report["error"]
+            .as_str()
+            .expect("a failing run carries an error line")
+            .starts_with("step 1_models_1 (models) failed:"),
+        "{report}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A denial every step of a parallel phase discovers is reported **once**.
+///
+/// The preflight is a pure function of the phase, so under a `Seq` only
+/// the first step ever reaches it (the engine stops) while under a `Par`
+/// every sibling reaches the same verdict. Four copies of one sentence,
+/// all carrying the phase's single id, would be a report contradicting
+/// its own rule that ids are unique within it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denial_every_parallel_step_hits_is_reported_once() {
+    let mut profile = models_profile("models-denied", "http://127.0.0.1:9/", 4);
+    // Nothing declared, so every step's source is refused before any of
+    // them reaches the network.
+    profile["http_allowlist"] = json!([]);
+    let path = write_json_profile("models-denied", &profile);
+
+    let report_json = lm_provision::apply::run_apply_ast(&path, false)
+        .await
+        .expect("a denied run still produces a report");
+    let report: Value = serde_json::from_str(&report_json).expect("report is JSON");
+
+    assert_eq!(step_ids(&report), vec!["1_models"], "{report}");
+    assert_eq!(report["ok"], json!(false), "{report}");
+
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------
+// The two routes agree (DC 8), for each moved op.
+//
+// The point of moving one op at a time onto dsl-kit's `Call` /
+// `AsyncEffectResolver` surface is that the move is *checkable*: the same
+// profile driven through the legacy op and through the new `Call` route
+// has to produce the same report. These are the checks — one pair (real
+// + dry-run) per moved op, plus the shared gate check below.
+// ---------------------------------------------------------------------
+
+/// Serve `payload` to the first `serves` connections, so two apply runs
+/// can hit the **same** URL — a second server would take a second port,
+/// and the port is in the report (`steps[].src`).
+fn twice_serving_server(
+    payload: &'static str,
+    serves: usize,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        for _ in 0..serves {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_transfer_routes_produce_the_same_report() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let payload = "the-weight-behind-the-url";
+    let (base_url, server) = twice_serving_server(payload, 2);
+
+    let dir = temp_stem("transfer-routes");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let target = dir.join("weight.bin");
+    let target_str = target.to_string_lossy().into_owned();
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "transfer-routes",
+        "capabilities": ["net.transfer"],
+        "paths": [dir_str],
+        "http_allowlist": [base_url],
+        "phases": [
+            { "type": "NetTransfer", "src": format!("{base_url}/weight.bin"), "dst": target_str }
+        ]
+    });
+    let path = write_json_profile("transfer-routes", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Op)
+            .await
+            .expect("the op route produces a report"),
+    )
+    .expect("report is JSON");
+    assert_eq!(via_op["ok"], json!(true), "op route: {via_op}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the op route wrote the destination"),
+        payload
+    );
+    std::fs::remove_file(&target).ok();
+
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Call)
+            .await
+            .expect("the call route produces a report"),
+    )
+    .expect("report is JSON");
+    assert_eq!(via_call["ok"], json!(true), "call route: {via_call}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the call route wrote the destination"),
+        payload,
+        "the resolver ran the effect for real, not a rendering of it"
+    );
+
+    assert_eq!(
+        via_op, via_call,
+        "the two routes must be indistinguishable in the report"
+    );
+    // …and the report is the one a transfer writes, not an empty run.
+    let step = &via_call["steps"].as_array().expect("steps")[0];
+    assert_eq!(step["op"], json!("net.transfer"));
+    assert_eq!(step["bytes"], json!(payload.len()));
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+    server.join().expect("server thread joins");
+}
+
+/// Dry-run agrees too: the `Call` route renders the same trace entry the
+/// op does and reaches no effect — the resolver honours [`ExecMode`], it
+/// is not "the route that always transfers".
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_transfer_routes_agree_under_dry_run_and_reach_no_effect() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let dir = temp_stem("transfer-routes-dry");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let target = dir.join("weight.bin");
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "transfer-routes-dry",
+        "capabilities": ["net.transfer"],
+        "paths": [dir_str],
+        // Deliberately unreachable: a dry run must not connect.
+        "http_allowlist": ["http://127.0.0.1:1"],
+        "phases": [
+            { "type": "NetTransfer",
+              "src": "http://127.0.0.1:1/weight.bin",
+              "dst": target.to_string_lossy() }
+        ]
+    });
+    let path = write_json_profile("transfer-routes-dry", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Op)
+            .await
+            .expect("op route dry run"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Call)
+            .await
+            .expect("call route dry run"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(via_op["ok"], json!(true), "{via_op}");
+    assert_eq!(via_op, via_call, "dry-run reports must agree too");
+    assert_eq!(via_call["steps"][0]["dry_run"], json!(true));
+    assert!(!target.exists(), "a dry run touches no destination");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_http_get_routes_produce_the_same_report() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let (base_url, server) = twice_serving_server("pong", 2);
+    let url = format!("{base_url}/ping");
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-get-routes",
+        "capabilities": ["net.http_get"],
+        "http_allowlist": [base_url],
+        "phases": [
+            {
+                "type": "NetHttpGet",
+                "url": url,
+                // A header the resolver has to resolve for itself: the
+                // `Call` route bypasses `Op::apply`, so it carries the
+                // header pipe too, not just the request.
+                "headers": { "Accept": { "type": "EnvLiteral", "value": "text/plain" } },
+                "timeout_sec": 5
+            }
+        ]
+    });
+    let path = write_json_profile("http-get-routes", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Op)
+            .await
+            .expect("the op route produces a report"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Call)
+            .await
+            .expect("the call route produces a report"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(via_op["ok"], json!(true), "op route: {via_op}");
+    assert_eq!(via_call["ok"], json!(true), "call route: {via_call}");
+    assert_eq!(
+        via_op, via_call,
+        "the two routes must be indistinguishable in the report"
+    );
+    // …and the report is the one a request writes, not an empty run: the
+    // resolver reached the server and reported its status.
+    let step = &via_call["steps"].as_array().expect("steps")[0];
+    assert_eq!(step["op"], json!("net.http_get"));
+    assert_eq!(step["status"], json!(200));
+
+    std::fs::remove_file(&path).ok();
+    server.join().expect("server thread joins");
+}
+
+/// Dry-run agrees too, against a deliberately unreachable URL: a run that
+/// reports `ok` proves the resolver honours [`ExecMode`] rather than
+/// being "the route that always requests".
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_http_get_routes_agree_under_dry_run_and_reach_no_effect() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-get-routes-dry",
+        "capabilities": ["net.http_get"],
+        // Deliberately unreachable: a dry run must not connect.
+        "http_allowlist": ["http://127.0.0.1:1"],
+        "phases": [
+            { "type": "NetHttpGet", "url": "http://127.0.0.1:1/ping" }
+        ]
+    });
+    let path = write_json_profile("http-get-routes-dry", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Op)
+            .await
+            .expect("op route dry run"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Call)
+            .await
+            .expect("call route dry run"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(
+        via_op["ok"],
+        json!(true),
+        "a dry run reaches no effect, so the unreachable URL is fine: {via_op}"
+    );
+    assert_eq!(via_op, via_call, "dry-run reports must agree too");
+    assert_eq!(via_call["steps"][0]["dry_run"], json!(true));
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_http_post_routes_produce_the_same_report() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let (base_url, server) = twice_serving_server("accepted", 2);
+    let url = format!("{base_url}/v1/echo");
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-post-routes",
+        "capabilities": ["net.http_post"],
+        "http_allowlist": [base_url],
+        "phases": [
+            {
+                "type": "NetHttpPost",
+                "url": url,
+                "headers": { "Accept": { "type": "EnvLiteral", "value": "text/plain" } },
+                // The body form the resolver has to resolve for itself.
+                "body_json": "{\"n\":1}",
+                "timeout_sec": 5
+            }
+        ]
+    });
+    let path = write_json_profile("http-post-routes", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Op)
+            .await
+            .expect("the op route produces a report"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, false, EffectRoute::Call)
+            .await
+            .expect("the call route produces a report"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(via_op["ok"], json!(true), "op route: {via_op}");
+    assert_eq!(via_call["ok"], json!(true), "call route: {via_call}");
+    assert_eq!(
+        via_op, via_call,
+        "the two routes must be indistinguishable in the report"
+    );
+    let step = &via_call["steps"].as_array().expect("steps")[0];
+    assert_eq!(step["op"], json!("net.http_post"));
+    assert_eq!(step["status"], json!(200));
+
+    std::fs::remove_file(&path).ok();
+    server.join().expect("server thread joins");
+}
+
+/// The `net.http_post` twin of the GET dry-run check, with the body
+/// resolved (and reported by its form, never its content) in both routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_net_http_post_routes_agree_under_dry_run_and_reach_no_effect() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "http-post-routes-dry",
+        "capabilities": ["net.http_post"],
+        // Deliberately unreachable: a dry run must not connect.
+        "http_allowlist": ["http://127.0.0.1:1"],
+        "phases": [
+            {
+                "type": "NetHttpPost",
+                "url": "http://127.0.0.1:1/v1/echo",
+                "body": { "type": "EnvLiteral", "value": "payload" }
+            }
+        ]
+    });
+    let path = write_json_profile("http-post-routes-dry", &profile);
+
+    let via_op: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Op)
+            .await
+            .expect("op route dry run"),
+    )
+    .expect("report is JSON");
+    let via_call: Value = serde_json::from_str(
+        &lm_provision::apply::run_apply_ast_routed(&path, true, EffectRoute::Call)
+            .await
+            .expect("call route dry run"),
+    )
+    .expect("report is JSON");
+
+    assert_eq!(
+        via_op["ok"],
+        json!(true),
+        "a dry run reaches no effect, so the unreachable URL is fine: {via_op}"
+    );
+    assert_eq!(via_op, via_call, "dry-run reports must agree too");
+    assert_eq!(via_call["steps"][0]["dry_run"], json!(true));
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A capability the profile never declared must be denied on **both**
+/// routes. A `Call` bypasses `Op::apply`, so the resolver carries the L4
+/// gate and the L3 allowlists itself; without that the new route would be
+/// a hole only it has.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_call_route_is_gated_exactly_as_the_op_route_is() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    let dir = temp_stem("transfer-routes-denied");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let profile = json!({
+        "type": "Spec",
+        "name": "transfer-routes-denied",
+        // `net.transfer` is *not* declared.
+        "capabilities": ["sh.exec"],
+        "paths": [dir_str],
+        "http_allowlist": ["http://127.0.0.1:1"],
+        "phases": [
+            { "type": "NetTransfer",
+              "src": "http://127.0.0.1:1/weight.bin",
+              "dst": dir.join("weight.bin").to_string_lossy() }
+        ]
+    });
+    let path = write_json_profile("transfer-routes-denied", &profile);
+
+    for route in [EffectRoute::Op, EffectRoute::Call] {
+        let report: Value = serde_json::from_str(
+            &lm_provision::apply::run_apply_ast_routed(&path, false, route)
+                .await
+                .expect("a denial is captured in-report"),
+        )
+        .expect("report is JSON");
+        assert_eq!(report["ok"], json!(false), "{route:?}: {report}");
+        assert!(
+            report["error"]
+                .as_str()
+                .expect("error line")
+                .contains("net.transfer"),
+            "{route:?} names the undeclared capability: {report}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+/// The same for the two HTTP ops, on both of their gates: the L4
+/// capability the profile never declared, and the L3 `http_allowlist` the
+/// URL falls outside of. Both must deny on both routes, in real mode and
+/// under dry run (spec 07 "dry-run does policy").
+#[tokio::test(flavor = "multi_thread")]
+async fn the_call_route_gates_the_http_ops_exactly_as_the_op_route_does() {
+    use lm_provision::exec::registry::EffectRoute;
+
+    // (a) `net.http_get` / `net.http_post` undeclared: L4.
+    // (b) declared, but the URL is outside `http_allowlist`: L3.
+    let cases = [
+        (
+            "http-get-undeclared",
+            json!(["sh.exec"]),
+            json!(["http://127.0.0.1:1"]),
+            json!({ "type": "NetHttpGet", "url": "http://127.0.0.1:1/ping" }),
+            "net.http_get",
+        ),
+        (
+            "http-post-undeclared",
+            json!(["sh.exec"]),
+            json!(["http://127.0.0.1:1"]),
+            json!({ "type": "NetHttpPost", "url": "http://127.0.0.1:1/echo" }),
+            "net.http_post",
+        ),
+        (
+            "http-get-off-allowlist",
+            json!(["net.http_get"]),
+            json!(["http://127.0.0.1:1"]),
+            json!({ "type": "NetHttpGet", "url": "http://127.0.0.2:1/ping" }),
+            "http://127.0.0.2:1/ping",
+        ),
+        (
+            "http-post-off-allowlist",
+            json!(["net.http_post"]),
+            json!(["http://127.0.0.1:1"]),
+            json!({ "type": "NetHttpPost", "url": "http://127.0.0.2:1/echo" }),
+            "http://127.0.0.2:1/echo",
+        ),
+    ];
+
+    for (label, capabilities, http_allowlist, phase, named) in cases {
+        let profile = json!({
+            "type": "Spec",
+            "name": label,
+            "capabilities": capabilities,
+            "http_allowlist": http_allowlist,
+            "phases": [phase]
+        });
+        let path = write_json_profile(label, &profile);
+
+        for dry_run in [false, true] {
+            for route in [EffectRoute::Op, EffectRoute::Call] {
+                let report: Value = serde_json::from_str(
+                    &lm_provision::apply::run_apply_ast_routed(&path, dry_run, route)
+                        .await
+                        .expect("a denial is captured in-report"),
+                )
+                .expect("report is JSON");
+                assert_eq!(
+                    report["ok"],
+                    json!(false),
+                    "{label} {route:?} dry_run={dry_run}: {report}"
+                );
+                assert!(
+                    report["error"]
+                        .as_str()
+                        .expect("error line")
+                        .contains(named),
+                    "{label} {route:?} dry_run={dry_run} names {named}: {report}"
+                );
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1124,6 +1935,9 @@ fn the_plan_artifact_and_the_apply_report_run_the_same_phases_in_the_same_order(
     let expected = vec![
         "system.apt".to_string(),
         "comfyui.install".to_string(),
+        // Inserted beside the restart, because the restart runs its
+        // interpreter (chapter 02 §Canonical phase ordering).
+        "toolchain.python".to_string(),
         "comfyui.restart".to_string(),
         "comfyui.health".to_string(),
         "sh.exec".to_string(),

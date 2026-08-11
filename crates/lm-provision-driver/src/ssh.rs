@@ -26,8 +26,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use sha2::{Digest as _, Sha256};
-
 use crate::transport::{ExecOutput, PodPaths, Transport, TransportError};
 
 /// Remote user assumed when a caller does not name one (08 §Session
@@ -180,7 +178,15 @@ impl Transport for SshTransport {
 
     fn ensure_binary(&self, local_binary: &Path) -> Result<PathBuf, TransportError> {
         let dest = self.dest_binary(local_binary)?;
-        let local_sha = hex_sha256(&std::fs::read(local_binary)?);
+        // `lm_provision::digest` is the workspace's one content-digest
+        // implementation, shared with the profile hash and the Assert
+        // model's content predicate. This module used to carry its own
+        // `format!("{:x}")` spelling of the same thing — the same
+        // judgement written twice, which is what 08's "compare the
+        // pod-side sha256 to the local artifact's" needs exactly one
+        // of. It also streams, so the artifact is not read into memory
+        // whole.
+        let local_sha = crate::local_digest(local_binary)?;
         // `sha256sum` prints `<hex>  <path>`; a missing file exits
         // non-zero, which reads as "not identical" — exactly the
         // trigger for a push. Idempotency rule: 08 §Session steps
@@ -274,12 +280,6 @@ fn stdin_script(paths: &PodPaths, args: &[String], env: &BTreeMap<String, String
     words.extend(args.iter().map(|a| shell_quote(a)));
     script.push_str(&format!("exec {}\n", words.join(" ")));
     script
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]

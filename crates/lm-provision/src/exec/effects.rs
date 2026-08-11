@@ -10,8 +10,8 @@
 //! MVP scope (see plan.md §KNOWN LIMITATION):
 //! - `sh_exec` runs `std::process::Command`; a non-zero exit is returned
 //!   as `Ok(outcome)`, not an error — the caller decides.
-//! - `http_get` / `http_post` use `ureq` (sync, rustls) with redirect
-//!   following disabled, reporting the raw status. Both take an
+//! - `http_get` / `http_post` use `reqwest` (async, rustls) with
+//!   redirect following disabled, reporting the raw status. Both take an
 //!   [`HttpOpts`] carrying the caller-resolved request headers and an
 //!   optional deadline override (default 30 s).
 //! - `transfer` implements only `https://` download. `b2://` / `hf://`
@@ -23,23 +23,104 @@
 //!   which is not implemented yet and returns [`ExecError::Unsupported`].
 //! - `mount_bind` / `umount` are Linux-only; elsewhere they are
 //!   [`ExecError::Unsupported`].
+//!
+//! ## Caps and deadlines: five HTTP routes, three settings
+//!
+//! | route | body cap | whole-request timeout | read timeout |
+//! |---|---|---|---|
+//! | [`http_get`] | 16 MiB | `HttpOpts::timeout` (30 s default) | — |
+//! | [`http_post`] | 16 MiB | `HttpOpts::timeout` (30 s default) | — |
+//! | [`transfer`] download | — | — | [`TRANSFER_READ_TIMEOUT_SEC`] |
+//! | [`transfer`] upload | — | — | [`TRANSFER_READ_TIMEOUT_SEC`] |
+//! | `HttpPoll` probe (via [`http_get`]) | 16 MiB | 30 s | — |
+//!
+//! The three routes that keep the cap **buffer the body in memory**, so
+//! a cap is the right shape for them; the two that drop it stream to (or
+//! from) a file, where a 4 GiB weight is the normal case and a cap is
+//! simply a broken download.
+//!
+//! A *whole-request* deadline cannot serve a transfer at all: a value
+//! large enough not to kill a 4 GiB download is far too large to detect
+//! a supplier that stopped answering. What a transfer needs is a
+//! deadline that applies to **each read and resets on success**, which
+//! is `reqwest`'s `read_timeout` — and the reason this module is async
+//! (no blocking HTTP client exposes that primitive).
+//!
+//! [`TRANSFER_READ_TIMEOUT_SEC`] is not derived from any measurement; it
+//! is a value between "detects a stalled supplier" and "does not kill a
+//! slow CDN". It is a host-side constant, not a profile field.
+//!
+//! ## Progress
+//!
+//! The same two facts — no cap, a per-read deadline — mean a download
+//! that takes twenty minutes is the normal case. [`download`] therefore
+//! reports what it has written to a [`ProgressSink`] as it goes; what
+//! that becomes is the caller's business (the transcript's
+//! `net.transfer.progress` events, via
+//! [`super::audit::TransferTranscript`]). This module logs nothing
+//! itself — the audit lines were stripped out of these functions on the
+//! way over from the Lua bridges and are not coming back in through the
+//! byte loop.
+//!
+//! ## The synchronous seam
+//!
+//! `dsl_kit::Op::apply` is a synchronous trait method, so an op cannot
+//! await. [`block_on_effect`] is the single place the async effects
+//! below are driven from that seam; see its doc for the runtime it
+//! requires.
+//!
+//! It is a **residue**, not the design. dsl-kit's own answer is that
+//! "effects belong in `Call` children" (`dsl_kit::Op`) and that the host
+//! resolves them through an `AsyncEffectResolver`; the three
+//! single-effect network phases (`net.transfer` / `net.http_get` /
+//! `net.http_post`) have that route now (see [`super::registry`]'s
+//! module doc and [`crate::apply`]), and so does **every lifecycle
+//! step** ([`super::steps`]). All of them reach [`transfer`] /
+//! [`http_get`] / [`sh_exec`] by `await`, not through here.
+//!
+//! **The four call sites left all belong to the synchronous engine
+//! driver**, which is the thing that cannot await — not to any
+//! particular phase:
+//!
+//! - three are the routed network phases' legacy
+//!   [`super::registry::EffectRoute::Op`] branches, kept on purpose so
+//!   the two-routes-agree regression still has a route to compare;
+//! - one is a lifecycle step run from `ProfileOp::run_lifecycle`, which
+//!   is what `crate::profile_ast::create_profile_engine` reaches: that
+//!   engine is driven by a synchronous `Stepper` (the MCP debugger host,
+//!   the exec integration tests), and a synchronous stepper cannot
+//!   resolve a `Call`, so a lifecycle phase stays an `Apply` there.
+//!
+//! The count therefore tracks **how much still runs on the synchronous
+//! driver**, and goes to zero when that driver does — not when any
+//! individual phase moves.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::future::Future;
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use tokio::io::AsyncWriteExt;
 
 use super::ExecError;
 
 /// Per-stream capture tail cap (4 KiB).
 const TAIL_LIMIT: usize = 4 * 1024;
-/// HTTP response body cap (16 MiB) — bodies larger than this are an
-/// error rather than being buffered unbounded.
+/// In-memory HTTP response body cap (16 MiB) — bodies larger than this
+/// are an error rather than being buffered unbounded. It applies to the
+/// three routes that hold the body in memory, never to the two that
+/// stream a file (see the module doc's table).
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
-/// Read/download chunk size.
-const CHUNK_SIZE: usize = 64 * 1024;
 /// Default request timeout.
 const DEFAULT_TIMEOUT_SEC: f64 = 30.0;
+/// Per-read deadline on a [`transfer`], reset by every successful read.
+///
+/// Deliberately *not* a whole-request deadline: a transfer's total time
+/// is a function of the file's size and the link's speed, neither of
+/// which the host knows, while "nothing arrived for a minute" means the
+/// same thing for a 30 MiB LoRA and a 4 GiB checkpoint.
+const TRANSFER_READ_TIMEOUT_SEC: u64 = 60;
 
 /// Options for [`sh_exec`]. Carries the resolved env-injection map
 /// (spec 06 §Resolution: the caller resolves `env.ref` / literal slots
@@ -161,6 +242,52 @@ pub struct TransferOutcome {
     pub dst: String,
 }
 
+/// What a streaming download has moved, reported while it runs.
+///
+/// A 4 GiB weight is minutes of silence otherwise (see the module doc's
+/// §Progress), so [`download`] hands this out as the bytes land. It says
+/// only what was measured — no rate, no estimate; the caller decides what
+/// to make of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferProgress {
+    /// Bytes written to the destination so far.
+    pub written: u64,
+    /// The supplier's declared total, **absent when it declared none**.
+    /// `Content-Length` is optional, and a chunked or content-encoded
+    /// response has none to give, so a consumer must have an answer for
+    /// "how far along" that does not need this.
+    pub total: Option<u64>,
+    /// Whether this is the report of a finished transfer. It arrives
+    /// once, after the last byte is flushed — so a transfer that failed
+    /// or was cancelled never sends one, and the last thing heard from
+    /// it is a `false`.
+    pub finished: bool,
+}
+
+/// Where a streaming download reports its [`TransferProgress`].
+///
+/// The effect layer keeps no audit concern (see the module doc: the
+/// audit lines were stripped out of these functions on the way over from
+/// the Lua bridges), so the byte counter is handed out rather than
+/// logged here — [`super::audit::TransferTranscript`] is what turns it
+/// into the stderr transcript's events, and a test can pass a counter
+/// instead.
+///
+/// **Called once per received chunk**, which for a multi-gigabyte weight
+/// is six figures of calls: a sink does a clock read and a comparison,
+/// not I/O of its own.
+pub type ProgressSink<'a> = &'a (dyn Fn(TransferProgress) + Send + Sync);
+
+/// The function [`ignore_progress`] hands out, as a `static` so the
+/// reference to it is `'static` without a promotion rule doing the work.
+static IGNORE_PROGRESS: fn(TransferProgress) = |_| {};
+
+/// A sink that drops every report — for a caller that wants no
+/// transcript (a test, or a route that reports elsewhere).
+pub fn ignore_progress() -> ProgressSink<'static> {
+    &IGNORE_PROGRESS
+}
+
 /// Last `TAIL_LIMIT` bytes of `bytes`, lossily decoded to UTF-8.
 fn tail(bytes: &[u8]) -> String {
     let start = bytes.len().saturating_sub(TAIL_LIMIT);
@@ -196,25 +323,117 @@ pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError>
     })
 }
 
+/// Drive one async effect from the engine's synchronous `Op::apply`.
+///
+/// `dsl_kit::Op::apply` is a `fn`, not an `async fn`, so an op cannot
+/// await. Rather than spread that seam over every call site, it lives
+/// here: the four remaining callers — the `net_http_get` /
+/// `net_http_post` / `net_transfer` ops in [`super::registry`] (the
+/// legacy [`super::registry::EffectRoute::Op`] branch of three phases
+/// that also have a `Call` route), and one per lifecycle step in
+/// `ProfileOp::run_lifecycle` — hand their future to this function. All
+/// four are the synchronous engine driver; see the module doc.
+///
+/// **A caller with more than one thing to await hands over one future
+/// covering all of it**, rather than calling this once per await. The
+/// transfer step is the example: evaluating its completion condition
+/// and performing the transfer are both async, and both live inside the
+/// single future it passes here. Counting call sites is therefore a
+/// meaningful measure of how far the synchronous seam has spread.
+///
+/// Nothing on the `Call` route comes through here: a suspended effect is
+/// awaited by the host driver ([`crate::apply`]) on the runtime that is
+/// already turning it.
+///
+/// **A multi-threaded tokio runtime must be current.** Production gets
+/// one from the CLI entry point ([`crate::cli`] builds it and
+/// `block_on`s [`crate::apply::run_apply_ast`]); a test that drives an
+/// effect needs `#[tokio::test(flavor = "multi_thread")]`.
+/// `block_in_place` hands this worker's queued tasks to a sibling thread
+/// before blocking, which the current-thread flavour has no sibling to
+/// do — so both "no runtime" and "the wrong flavour" are reported as an
+/// [`ExecError`] naming the requirement, rather than left to tokio's own
+/// panic.
+pub(super) fn block_on_effect<T, E>(
+    op: &str,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: From<ExecError>,
+{
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Err(ExecError::EffectFailed {
+            op: op.to_string(),
+            message: "no tokio runtime is running: apply drives async effects and must be \
+                      called from inside a multi-threaded tokio runtime"
+                .to_string(),
+        }
+        .into());
+    };
+    if !matches!(
+        handle.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    ) {
+        return Err(ExecError::EffectFailed {
+            op: op.to_string(),
+            message: "the current tokio runtime is single-threaded: apply blocks the calling \
+                      thread on each effect and must be called from inside a multi-threaded \
+                      tokio runtime"
+                .to_string(),
+        }
+        .into());
+    }
+    tokio::task::block_in_place(|| handle.block_on(future))
+}
+
+/// Render `err` with its whole source chain.
+///
+/// `reqwest::Error`'s own `Display` is a category ("error sending
+/// request"); everything that identifies the failure — connection
+/// refused, a fired read timeout, a TLS rejection — is in the sources.
+/// Dropping them would turn every network failure into the same line.
+fn render(err: &reqwest::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        out.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    out
+}
+
+/// Build a one-request [`reqwest::Client`], applying `configure` on top
+/// of the defaults.
+fn client(
+    op: &str,
+    configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> Result<reqwest::Client, ExecError> {
+    configure(reqwest::Client::builder())
+        .build()
+        .map_err(|err| ExecError::EffectFailed {
+            op: op.to_string(),
+            message: format!("failed building the HTTP client: {}", render(&err)),
+        })
+}
+
 /// HTTP GET `url` with `opts`' resolved headers, reporting the raw
 /// status (redirects disabled).
-pub fn http_get(url: &str, opts: &HttpOpts) -> Result<HttpOutcome, ExecError> {
-    let mut builder = ureq::get(url);
+pub async fn http_get(url: &str, opts: &HttpOpts) -> Result<HttpOutcome, ExecError> {
+    let client = client("net_http_get", |builder| {
+        builder
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(opts.timeout())
+    })?;
+    let mut request = client.get(url);
     for (name, value) in &opts.headers {
-        builder = builder.header(name, value);
+        request = request.header(name, value);
     }
-    let request = builder
-        .config()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(opts.timeout()))
-        .build();
 
-    match request.call() {
-        Ok(response) => http_outcome(response),
+    match request.send().await {
+        Ok(response) => http_outcome(response).await,
         Err(err) => Err(ExecError::EffectFailed {
             op: "net_http_get".to_string(),
-            message: err.to_string(),
+            message: render(&err),
         }),
     }
 }
@@ -225,47 +444,47 @@ pub fn http_get(url: &str, opts: &HttpOpts) -> Result<HttpOutcome, ExecError> {
 /// `content_type` is the caller's derived value (spec 04
 /// §`net.http_post`: `application/json` for the `body_json` form,
 /// `application/octet-stream` otherwise). It is applied **only** when
-/// `opts` declares no `content-type` header of its own — `ureq`'s
-/// `header` appends rather than replaces, so an explicit header must
-/// suppress the derived one instead of racing it.
-pub fn http_post(
+/// `opts` declares no `content-type` header of its own — `header`
+/// appends rather than replaces, so an explicit header must suppress the
+/// derived one instead of racing it.
+pub async fn http_post(
     url: &str,
     body: &[u8],
     content_type: &str,
     opts: &HttpOpts,
 ) -> Result<HttpOutcome, ExecError> {
-    let mut builder = ureq::post(url);
+    let client = client("net_http_post", |builder| {
+        builder
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(opts.timeout())
+    })?;
+    let mut request = client.post(url);
     if !opts.declares_content_type() {
-        builder = builder.header("content-type", content_type);
+        request = request.header("content-type", content_type);
     }
     for (name, value) in &opts.headers {
-        builder = builder.header(name, value);
+        request = request.header(name, value);
     }
-    let request = builder
-        .config()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(opts.timeout()))
-        .build();
 
-    match request.send(body) {
-        Ok(response) => http_outcome(response),
+    match request.body(body.to_vec()).send().await {
+        Ok(response) => http_outcome(response).await,
         Err(err) => Err(ExecError::EffectFailed {
             op: "net_http_post".to_string(),
-            message: err.to_string(),
+            message: render(&err),
         }),
     }
 }
 
 /// Read the status + body tail off a completed HTTP response.
-fn http_outcome(response: ureq::http::Response<ureq::Body>) -> Result<HttpOutcome, ExecError> {
+async fn http_outcome(response: reqwest::Response) -> Result<HttpOutcome, ExecError> {
     let status = response.status().as_u16();
-    let mut body = response.into_body();
-    let reader = body.as_reader();
-    let bytes = read_capped(reader, MAX_BYTES).map_err(|message| ExecError::EffectFailed {
-        op: "net_http".to_string(),
-        message,
-    })?;
+    let bytes =
+        read_capped(response, MAX_BYTES)
+            .await
+            .map_err(|message| ExecError::EffectFailed {
+                op: "net_http".to_string(),
+                message,
+            })?;
     Ok(HttpOutcome {
         status,
         body_tail: tail(&bytes),
@@ -282,39 +501,79 @@ fn http_outcome(response: ureq::http::Response<ureq::Body>) -> Result<HttpOutcom
 /// [`super::lifecycle`], spec 02 §Dispatch routing) — and a `b2://`
 /// source fails with an error naming the endpoint no profile field
 /// declares, rather than a guessed host.
-pub fn transfer(src: &str, dst: &str) -> Result<TransferOutcome, ExecError> {
+/// `progress` receives a [`TransferProgress`] as the bytes land — see
+/// [`ProgressSink`]. **A download reports; an upload does not**: the
+/// request body of an upload is handed whole to `reqwest`
+/// ([`upload`]), so there is no loop here to count it, and inventing a
+/// counter for a route no profile reaches yet would be a shape without a
+/// caller.
+pub async fn transfer(
+    src: &str,
+    dst: &str,
+    progress: ProgressSink<'_>,
+) -> Result<TransferOutcome, ExecError> {
+    transfer_in(
+        src,
+        dst,
+        Duration::from_secs(TRANSFER_READ_TIMEOUT_SEC),
+        progress,
+    )
+    .await
+}
+
+/// [`transfer`] with the per-read deadline injected, so a test can prove
+/// a stalled supplier is detected without spending
+/// [`TRANSFER_READ_TIMEOUT_SEC`] doing it.
+async fn transfer_in(
+    src: &str,
+    dst: &str,
+    read_timeout: Duration,
+    progress: ProgressSink<'_>,
+) -> Result<TransferOutcome, ExecError> {
     match super::scheme::resolve("net_transfer", src, dst)? {
-        super::scheme::Transfer::Download { url } => download(&url, dst),
-        super::scheme::Transfer::Upload { url } => upload(src, &url),
+        super::scheme::Transfer::Download { url } => {
+            download(&url, dst, read_timeout, progress).await
+        }
+        super::scheme::Transfer::Upload { url } => upload(src, &url, read_timeout).await,
     }
 }
 
 /// GET `url`, streaming the body into the local `dst` path.
-fn download(url: &str, dst: &str) -> Result<TransferOutcome, ExecError> {
-    let request = ureq::get(url)
-        .config()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(Duration::from_secs_f64(DEFAULT_TIMEOUT_SEC)))
-        .build();
-
-    let response = request.call().map_err(|err| ExecError::EffectFailed {
-        op: "net_transfer".to_string(),
-        message: err.to_string(),
-    })?;
+///
+/// **Redirects are followed** (`reqwest`'s default limit of 10). A
+/// public weight is routinely served as a `3xx` to a CDN — HuggingFace
+/// resolves every LFS object that way — so a download that stops at the
+/// redirect writes the redirect's own body to `dst` and reports success.
+/// Following makes the success range `200..300` rather than `200..400`:
+/// once redirects are followed there is no route by which a `3xx` is the
+/// final status, so accepting one could only mean the entity was missed.
+async fn download(
+    url: &str,
+    dst: &str,
+    read_timeout: Duration,
+    progress: ProgressSink<'_>,
+) -> Result<TransferOutcome, ExecError> {
+    let client = client("net_transfer", |builder| builder.read_timeout(read_timeout))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| ExecError::EffectFailed {
+            op: "net_transfer".to_string(),
+            message: render(&err),
+        })?;
 
     let status = response.status().as_u16();
-    if !(200..400).contains(&status) {
+    if !(200..300).contains(&status) {
         return Err(ExecError::EffectFailed {
             op: "net_transfer".to_string(),
             message: format!("download responded with status {status}"),
         });
     }
 
-    let mut body = response.into_body();
-    let reader = body.as_reader();
-    let bytes =
-        stream_to_file(reader, dst, MAX_BYTES).map_err(|message| ExecError::EffectFailed {
+    let bytes = stream_to_file(response, dst, progress)
+        .await
+        .map_err(|message| ExecError::EffectFailed {
             op: "net_transfer".to_string(),
             message,
         })?;
@@ -327,34 +586,47 @@ fn download(url: &str, dst: &str) -> Result<TransferOutcome, ExecError> {
 
 /// PUT the local `src` file to `url`.
 ///
-/// The body is read into memory under the same 16 MiB cap the download
-/// path streams against: `ureq`'s `send` takes the bytes, and a capped
-/// read keeps a mistyped `src` from pulling an arbitrarily large file
-/// into the provisioner. `content_type` is deferred (chapter 04
-/// §`net.transfer`), so the request carries the octet-stream default.
-fn upload(src: &str, url: &str) -> Result<TransferOutcome, ExecError> {
-    let file = std::fs::File::open(src).map_err(|err| ExecError::EffectFailed {
-        op: "net_transfer".to_string(),
-        message: format!("open '{src}': {err}"),
-    })?;
-    let body = read_capped(file, MAX_BYTES).map_err(|message| ExecError::EffectFailed {
-        op: "net_transfer".to_string(),
-        message,
-    })?;
-
-    let request = ureq::put(url)
-        .header("content-type", "application/octet-stream")
-        .config()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(Duration::from_secs_f64(DEFAULT_TIMEOUT_SEC)))
-        .build();
-
-    let response = request
-        .send(&body[..])
+/// The file is **streamed**, not buffered: an upload's whole point is a
+/// weight, and reading one into memory to hand it over would cap the op
+/// at whatever the provisioner can hold. `Content-Length` is taken from
+/// the file's metadata so the request stays length-delimited rather than
+/// chunked. `content_type` is deferred (chapter 04 §`net.transfer`), so
+/// the request carries the octet-stream default.
+async fn upload(
+    src: &str,
+    url: &str,
+    read_timeout: Duration,
+) -> Result<TransferOutcome, ExecError> {
+    let file = tokio::fs::File::open(src)
+        .await
         .map_err(|err| ExecError::EffectFailed {
             op: "net_transfer".to_string(),
-            message: err.to_string(),
+            message: format!("open '{src}': {err}"),
+        })?;
+    let bytes = file
+        .metadata()
+        .await
+        .map_err(|err| ExecError::EffectFailed {
+            op: "net_transfer".to_string(),
+            message: format!("stat '{src}': {err}"),
+        })?
+        .len();
+
+    let client = client("net_transfer", |builder| {
+        builder
+            .redirect(reqwest::redirect::Policy::none())
+            .read_timeout(read_timeout)
+    })?;
+    let response = client
+        .put(url)
+        .header("content-type", "application/octet-stream")
+        .header(reqwest::header::CONTENT_LENGTH, bytes)
+        .body(reqwest::Body::from(file))
+        .send()
+        .await
+        .map_err(|err| ExecError::EffectFailed {
+            op: "net_transfer".to_string(),
+            message: render(&err),
         })?;
 
     let status = response.status().as_u16();
@@ -366,7 +638,7 @@ fn upload(src: &str, url: &str) -> Result<TransferOutcome, ExecError> {
     }
 
     Ok(TransferOutcome {
-        bytes: body.len() as u64,
+        bytes,
         dst: url.to_string(),
     })
 }
@@ -424,66 +696,174 @@ pub fn umount(_path: &str) -> Result<(), ExecError> {
     ))
 }
 
-/// Read `reader` to EOF in [`CHUNK_SIZE`] chunks, rejecting a body that
-/// would exceed `max_bytes`. Errors are returned as a message string.
-fn read_capped(mut reader: impl Read, max_bytes: u64) -> Result<Vec<u8>, String> {
+/// Buffer `response`'s body, rejecting one that would exceed
+/// `max_bytes`. Errors are returned as a message string.
+///
+/// The cap is checked *before* each chunk is appended, so an oversized
+/// body is refused rather than held and then complained about.
+async fn read_capped(mut response: reqwest::Response, max_bytes: u64) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    let mut chunk = [0u8; CHUNK_SIZE];
     loop {
-        let n = reader
-            .read(&mut chunk)
-            .map_err(|err| format!("failed reading response body: {err}"))?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() as u64 + n as u64 > max_bytes {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|err| format!("failed reading response body: {}", render(&err)))?;
+        let Some(chunk) = chunk else { break };
+        if buf.len() as u64 + chunk.len() as u64 > max_bytes {
             return Err(format!("response body exceeds max_bytes ({max_bytes})"));
         }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(&chunk);
     }
     Ok(buf)
 }
 
-/// Stream `reader` to `dst_path` in [`CHUNK_SIZE`] chunks, removing the
-/// partial file on any failure and rejecting a body over `max_bytes`.
-/// Errors are returned as a message string.
-fn stream_to_file(mut reader: impl Read, dst_path: &str, max_bytes: u64) -> Result<u64, String> {
-    let mut file = std::fs::File::create(dst_path)
-        .map_err(|err| format!("failed creating '{dst_path}': {err}"))?;
-    let mut total: u64 = 0;
-    let mut chunk = [0u8; CHUNK_SIZE];
+/// Removes a half-written destination unless the transfer that owns it
+/// finished.
+///
+/// A guard rather than a line on the error path, because **the failure
+/// that matters never reaches an error path**: cancelling an in-flight
+/// transfer is dropping its future, and a dropped future runs no more of
+/// its own code — only the `Drop` impls of what it was holding. Without
+/// one, the bytes written so far stay at the destination, and a `models`
+/// entry that declares no `sha256` has `FileExists { dst }` for its whole
+/// completion condition — so the next apply reads that truncated file as
+/// a finished weight.
+///
+/// It is armed *after* the file is created, so a failure to create one
+/// cannot delete a file this transfer never opened, and the removal is
+/// [`std::fs::remove_file`] rather than tokio's: `Drop` is synchronous
+/// and cannot await. It is one `unlink`.
+struct PartialFile<'a> {
+    /// The destination to remove while the transfer is unfinished.
+    path: &'a str,
+    /// Whether dropping this guard removes [`Self::path`]. False until
+    /// the file exists, and false again once the transfer has completed.
+    armed: bool,
+}
 
-    let result: Result<u64, String> = (|| {
-        loop {
-            let n = reader
-                .read(&mut chunk)
-                .map_err(|err| format!("failed reading response body: {err}"))?;
-            if n == 0 {
-                break;
-            }
-            total += n as u64;
-            if total > max_bytes {
-                return Err(format!("response body exceeds max_bytes ({max_bytes})"));
-            }
-            file.write_all(&chunk[..n])
-                .map_err(|err| format!("failed writing '{dst_path}': {err}"))?;
+impl<'a> PartialFile<'a> {
+    /// A disarmed guard for `path`; [`Self::arm`] once the file exists.
+    fn new(path: &'a str) -> Self {
+        Self { path, armed: false }
+    }
+
+    /// From here on, dropping this guard removes the destination.
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// The transfer completed: the destination stays.
+    ///
+    /// Takes `self` so that the guard is spent, not merely quieted — a
+    /// second completion cannot exist to be reasoned about.
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartialFile<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.path);
         }
-        Ok(total)
-    })();
+    }
+}
+
+/// Stream `response`'s body to `dst_path`, removing the partial file on
+/// any failure **and on cancellation**. Errors are returned as a message
+/// string.
+///
+/// Both removals are the one [`PartialFile`] guard: an error returns
+/// through it and a cancellation drops through it, so neither leaves a
+/// truncated destination and neither can remove it twice.
+///
+/// **No cap.** This is the path a model weight travels; the size that
+/// would have to be refused is the size that is normal here. What
+/// bounds the stream instead is the client's `read_timeout` — a supplier
+/// that stops sending fails, a supplier that keeps sending is allowed to
+/// finish.
+///
+/// **`progress` is told after every write, and once more when the last
+/// byte is flushed.** Reporting *after* the write is what makes the
+/// number honest: it is bytes that reached the destination, not bytes
+/// that arrived off the socket. The declared total is read off the
+/// response before the first chunk and repeated on every report, so a
+/// consumer never has to have kept the first one.
+///
+/// **A failed or cancelled transfer sends no finished report.** An error
+/// returns before it and a cancellation drops the future mid-`await`,
+/// which runs no more of this function — the same reason [`PartialFile`]
+/// is a guard. So "the last thing this stream said was not finished" is
+/// the truth about a stream that did not finish, and a reader does not
+/// need a separate failure event to know it.
+async fn stream_to_file(
+    mut response: reqwest::Response,
+    dst_path: &str,
+    progress: ProgressSink<'_>,
+) -> Result<u64, String> {
+    // Declared before the file so that it is dropped *after* it: the
+    // handle is closed before the destination is unlinked.
+    let mut guard = PartialFile::new(dst_path);
+    let mut file = tokio::fs::File::create(dst_path)
+        .await
+        .map_err(|err| format!("failed creating '{dst_path}': {err}"))?;
+    guard.arm();
+
+    // Read before the body is touched: `content_length` answers from the
+    // response's own `Content-Length`, and a supplier that declared none
+    // (chunked, or content-encoded) gives `None` here rather than a
+    // guess.
+    let declared = response.content_length();
+    let mut total: u64 = 0;
+    let result: Result<u64, String> = loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if let Err(err) = file.write_all(&chunk).await {
+                    break Err(format!("failed writing '{dst_path}': {err}"));
+                }
+                total += chunk.len() as u64;
+                progress(TransferProgress {
+                    written: total,
+                    total: declared,
+                    finished: false,
+                });
+            }
+            // The body ended. `tokio::fs::File` buffers, so the last
+            // write is only on disk once it is flushed — a destination
+            // reported as complete while its tail is still in memory
+            // would be a silently truncated weight.
+            Ok(None) => match file.flush().await {
+                Ok(()) => break Ok(total),
+                Err(err) => break Err(format!("failed writing '{dst_path}': {err}")),
+            },
+            Err(err) => break Err(format!("failed reading response body: {}", render(&err))),
+        }
+    };
 
     match result {
-        Ok(total) => Ok(total),
-        Err(err) => {
-            let _ = std::fs::remove_file(dst_path);
-            Err(err)
+        Ok(total) => {
+            guard.keep();
+            // After the flush, so the report and the destination agree.
+            progress(TransferProgress {
+                written: total,
+                total: declared,
+                finished: true,
+            });
+            Ok(total)
         }
+        // The guard is still armed, so returning through here removes the
+        // destination — the same line the cancellation path takes.
+        Err(err) => Err(err),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn unique_suffix() -> u128 {
         std::time::SystemTime::now()
@@ -581,8 +961,8 @@ mod tests {
         assert!(err.to_string().contains("fs_write"));
     }
 
-    #[test]
-    fn http_get_reports_the_status_from_a_local_server() {
+    #[tokio::test]
+    async fn http_get_reports_the_status_from_a_local_server() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
         let addr = listener.local_addr().expect("local addr");
         let handle = std::thread::spawn(move || {
@@ -601,7 +981,9 @@ mod tests {
         });
 
         let url = format!("http://{addr}/");
-        let outcome = http_get(&url, &HttpOpts::default()).expect("http_get should succeed");
+        let outcome = http_get(&url, &HttpOpts::default())
+            .await
+            .expect("http_get should succeed");
         assert_eq!(outcome.status, 200);
         assert!(outcome.body_tail.contains("pong"));
 
@@ -662,16 +1044,17 @@ mod tests {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    #[test]
-    fn http_get_sends_the_declared_headers() {
+    #[tokio::test]
+    async fn http_get_sends_the_declared_headers() {
         let (url, handle) = one_shot_server();
         let headers = BTreeMap::from([
             ("X-Demo".to_string(), "demo-value".to_string()),
             ("Authorization".to_string(), "Bearer tok".to_string()),
         ]);
 
-        let outcome =
-            http_get(&url, &HttpOpts::new(headers, None)).expect("http_get should succeed");
+        let outcome = http_get(&url, &HttpOpts::new(headers, None))
+            .await
+            .expect("http_get should succeed");
         assert_eq!(outcome.status, 200);
 
         let request = handle.join().expect("server thread joins").to_lowercase();
@@ -685,8 +1068,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn http_post_sends_the_body_with_the_derived_content_type() {
+    #[tokio::test]
+    async fn http_post_sends_the_body_with_the_derived_content_type() {
         let (url, handle) = one_shot_server();
         let outcome = http_post(
             &url,
@@ -694,6 +1077,7 @@ mod tests {
             "application/json",
             &HttpOpts::default(),
         )
+        .await
         .expect("http_post should succeed");
         assert_eq!(outcome.status, 200);
 
@@ -710,12 +1094,12 @@ mod tests {
         );
     }
 
-    /// `ureq`'s `header` appends rather than replaces, so a
-    /// `content-type` declared in `headers` must *suppress* the derived
-    /// one — not race it into a duplicated field (spec 04
-    /// §`net.http_post`: an explicit header wins).
-    #[test]
-    fn an_explicit_content_type_header_replaces_the_derived_one() {
+    /// `header` appends rather than replaces, so a `content-type`
+    /// declared in `headers` must *suppress* the derived one — not race
+    /// it into a duplicated field (spec 04 §`net.http_post`: an explicit
+    /// header wins).
+    #[tokio::test]
+    async fn an_explicit_content_type_header_replaces_the_derived_one() {
         let (url, handle) = one_shot_server();
         let headers = BTreeMap::from([(
             // Deliberately cased differently from the derived header's
@@ -729,6 +1113,7 @@ mod tests {
             "application/json",
             &HttpOpts::new(headers, None),
         )
+        .await
         .expect("http_post should succeed");
 
         let request = handle.join().expect("server thread joins").to_lowercase();
@@ -764,14 +1149,91 @@ mod tests {
         );
     }
 
+    /// A one-shot local server that answers the first request with a
+    /// `302` pointing at `/final`, and the second with `payload`.
+    ///
+    /// The redirect carries a body of its own, which is what a client
+    /// that does not follow redirects would write to the destination —
+    /// so the fixture distinguishes "followed the redirect" from
+    /// "reported the 3xx as a success".
+    fn redirecting_server(payload: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept the first request");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let decoy = "redirect-body-that-must-never-be-written";
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/final\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                decoy.len(),
+                decoy
+            );
+            stream
+                .write_all(redirect.as_bytes())
+                .expect("write the redirect");
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().expect("accept the redirected request");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write the payload");
+        });
+        (format!("http://{addr}/start"), handle)
+    }
+
+    /// A 3xx supplier must yield the *entity*, not the redirect.
+    ///
+    /// HuggingFace serves an LFS weight as a `302` to its CDN, so a
+    /// download that reports the redirect as a success writes the
+    /// redirect's own body to the destination and calls it a model file.
+    #[tokio::test]
+    async fn a_download_follows_a_redirect_and_writes_the_final_body() {
+        let payload = "the-entity-behind-the-redirect";
+        let (url, handle) = redirecting_server(payload);
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-redirect-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let outcome = transfer(&url, &dst_str, ignore_progress())
+            .await
+            .expect("a 302 supplier must still deliver");
+
+        assert_eq!(
+            std::fs::read_to_string(&dst).expect("the destination was written"),
+            payload,
+            "the redirect's own body must never reach the destination"
+        );
+        assert_eq!(outcome.bytes, payload.len() as u64);
+
+        std::fs::remove_file(&dst).ok();
+        handle.join().expect("server thread joins");
+    }
+
     /// A public `b2://` source still cannot resolve — but the failure
     /// now names the missing piece (the deployment's download endpoint)
     /// and the way around it, instead of reading as a blanket
     /// "not implemented" (chapter 04 §net.transfer).
-    #[test]
-    fn transfer_names_what_a_public_b2_source_is_missing() {
-        let err = transfer("b2://bucket/model.safetensors", "/tmp/model.safetensors")
-            .expect_err("b2:// source must be unsupported");
+    #[tokio::test]
+    async fn transfer_names_what_a_public_b2_source_is_missing() {
+        let err = transfer(
+            "b2://bucket/model.safetensors",
+            "/tmp/model.safetensors",
+            ignore_progress(),
+        )
+        .await
+        .expect_err("b2:// source must be unsupported");
         let message = err.to_string();
         assert!(
             message.contains("download endpoint") && message.contains("b2 CLI route"),
@@ -782,10 +1244,607 @@ mod tests {
     /// A `b2://` / `hf://` upload destination is CLI-routed by the
     /// lifecycle layer, so one arriving here is a routing bug and says
     /// so rather than attempting a PUT.
-    #[test]
-    fn transfer_rejects_a_cli_routed_upload_destination() {
-        let err = transfer("/workspace/out.bin", "hf://owner/repo/out.bin")
-            .expect_err("hf:// destination must not reach the bridge");
+    #[tokio::test]
+    async fn transfer_rejects_a_cli_routed_upload_destination() {
+        let err = transfer(
+            "/workspace/out.bin",
+            "hf://owner/repo/out.bin",
+            ignore_progress(),
+        )
+        .await
+        .expect_err("hf:// destination must not reach the bridge");
         assert!(err.to_string().contains("CLI-routed"), "{err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Caps: what the two streaming routes dropped, and what the three
+    // in-memory ones kept.
+    // -----------------------------------------------------------------
+
+    /// A size no in-memory route would accept: one byte past the 16 MiB
+    /// cap the three buffering routes still enforce.
+    const OVER_CAP: usize = 16 * 1024 * 1024 + 1;
+
+    /// A body of `len` bytes with a recognisable, position-dependent
+    /// fill, so a truncated or reordered transfer cannot pass by having
+    /// the right length.
+    fn payload_of(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Serve `body` once, with a `Content-Length`.
+    fn serving_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).expect("write head");
+            stream.write_all(&body).expect("write body");
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// A download must not be capped: the file the provisioner exists to
+    /// fetch is larger than any buffer it would be sane to hold, and the
+    /// old 16 MiB limit meant a real weight failed *and* took its
+    /// partial file with it.
+    #[tokio::test]
+    async fn a_download_past_the_in_memory_cap_completes_with_every_byte() {
+        let body = payload_of(20 * 1024 * 1024);
+        let (url, handle) = serving_server(body.clone());
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-big-download-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let outcome = transfer(&url, &dst_str, ignore_progress())
+            .await
+            .expect("a 20 MiB download must succeed");
+
+        assert_eq!(outcome.bytes, body.len() as u64);
+        assert_eq!(
+            std::fs::read(&dst).expect("the destination was written"),
+            body,
+            "every byte, in order"
+        );
+
+        std::fs::remove_file(&dst).ok();
+        handle.join().expect("server thread joins");
+    }
+
+    /// The counterpart: `http_get` buffers its body, so its cap stays.
+    /// Lifting it there would let a mistyped URL pull an arbitrarily
+    /// large response into the provisioner's memory.
+    #[tokio::test]
+    async fn http_get_still_refuses_a_body_past_the_in_memory_cap() {
+        let (url, handle) = serving_server(payload_of(OVER_CAP));
+
+        let err = http_get(&url, &HttpOpts::default())
+            .await
+            .expect_err("a body past the cap must be an error, not a buffer");
+        assert!(
+            err.to_string().contains("max_bytes"),
+            "the failure names the cap: {err}"
+        );
+
+        handle.join().expect("server thread joins");
+    }
+
+    /// An upload streams the file, so it is not capped either — the same
+    /// weight has to be able to travel back out.
+    #[tokio::test]
+    async fn an_upload_past_the_in_memory_cap_sends_every_byte() {
+        let body = payload_of(20 * 1024 * 1024);
+        let src = std::env::temp_dir().join(format!(
+            "lm-exec-big-upload-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::write(&src, &body).expect("write the source file");
+        let src_str = src.to_string_lossy().into_owned();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let expected = body.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let received = read_request_body(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write response");
+            assert_eq!(received, expected, "the whole file must reach the wire");
+        });
+
+        let outcome = transfer(&src_str, &format!("http://{addr}/put"), ignore_progress())
+            .await
+            .expect("a 20 MiB upload must succeed");
+        assert_eq!(outcome.bytes, body.len() as u64);
+
+        std::fs::remove_file(&src).ok();
+        handle.join().expect("server thread joins");
+    }
+
+    /// Read one request off `stream` and return its `Content-Length`
+    /// body.
+    fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        let mut want: Option<usize> = None;
+        let mut head_end = 0usize;
+        loop {
+            let n = stream.read(&mut chunk).expect("read request");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if want.is_none() {
+                let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                head_end = end + 4;
+                let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                want = Some(
+                    head.lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0),
+                );
+            }
+            if buf.len() - head_end >= want.unwrap_or(0) {
+                break;
+            }
+        }
+        buf[head_end..].to_vec()
+    }
+
+    // -----------------------------------------------------------------
+    // The per-read deadline
+    // -----------------------------------------------------------------
+
+    /// A supplier that accepts the connection, promises a body and then
+    /// sends nothing must fail on the per-read deadline rather than hang
+    /// until something else gives up.
+    ///
+    /// The deadline is injected (1 s) instead of spending the real
+    /// [`TRANSFER_READ_TIMEOUT_SEC`] proving the same thing; what the
+    /// assertion pins is that the *injected* value is what ended the
+    /// wait, from both sides — no earlier (so it is not some other
+    /// deadline firing) and not much later (so it fired at all).
+    #[tokio::test]
+    async fn a_supplier_that_stops_sending_fails_on_the_read_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Headers promising a body that never arrives. The
+            // connection is held open, so nothing but the read deadline
+            // can end the client's wait.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")
+                .expect("write head");
+            while !server_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-stalled-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let read_timeout = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let err = transfer_in(
+            &format!("http://{addr}/"),
+            &dst_str,
+            read_timeout,
+            ignore_progress(),
+        )
+        .await
+        .expect_err("a supplier that stops sending must fail");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= read_timeout,
+            "the deadline must not fire early ({elapsed:?}): {err}"
+        );
+        assert!(
+            elapsed < read_timeout * 5,
+            "the deadline must fire, not be waited out ({elapsed:?}): {err}"
+        );
+        assert!(
+            !dst.exists(),
+            "a failed transfer leaves no partial file behind"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("server thread joins");
+    }
+
+    // -----------------------------------------------------------------
+    // Cancellation
+    // -----------------------------------------------------------------
+
+    /// A transfer that is **cancelled** must leave no destination behind.
+    ///
+    /// Cancelling a future is dropping it, so the error path that removes
+    /// a partial file never runs — only a `Drop` impl does. What makes
+    /// the leftover worse than wasted bytes is how it reads: a `models`
+    /// entry declaring no `sha256` is complete when its destination
+    /// exists, so a truncated file left here is a finished weight to the
+    /// next apply.
+    ///
+    /// The drop is taken **explicitly** rather than by letting a timeout
+    /// swallow the future, so that what the assertion pins is the drop
+    /// itself: the file is observed present while the transfer is in
+    /// flight, then absent on the line after `drop`.
+    #[tokio::test]
+    async fn a_cancelled_transfer_removes_its_partial_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Promise far more than is sent: the first chunk arrives (so
+            // the destination is created and written) and the transfer
+            // then stays in flight, waiting for a body that never ends.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+            let _ = stream.write_all(&[b'w'; 4096]);
+            let _ = stream.flush();
+            while !server_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-cancelled-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        // A read deadline long enough that nothing but the drop can end
+        // this transfer.
+        let url = format!("http://{addr}/");
+        let mut transfer = Box::pin(transfer_in(
+            &url,
+            &dst_str,
+            Duration::from_secs(30),
+            ignore_progress(),
+        ));
+
+        // Drive it until the destination exists — that is the state a
+        // cancellation has to clean up.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !dst.exists() {
+            if let Ok(outcome) =
+                tokio::time::timeout(Duration::from_millis(25), &mut transfer).await
+            {
+                panic!("the transfer must still be in flight, got: {outcome:?}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the destination was never created, so nothing was cancelled"
+            );
+        }
+
+        drop(transfer);
+
+        assert!(
+            !dst.exists(),
+            "cancelling a transfer must not leave a partial file that the next \
+             apply would read as a finished download"
+        );
+
+        std::fs::remove_file(&dst).ok();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("server thread joins");
+    }
+
+    /// The guard must not double up with the error path: a transfer that
+    /// *fails* still removes its destination exactly once, and reports
+    /// the failure rather than whatever a second removal would have said.
+    #[tokio::test]
+    async fn a_failed_transfer_still_removes_its_partial_file_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Promise 1 MiB, send 4 KiB, hang up: the body ends early, so
+            // the read fails rather than timing out.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+            let _ = stream.write_all(&[b'w'; 4096]);
+            let _ = stream.flush();
+        });
+
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-truncated-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let err = transfer(&format!("http://{addr}/"), &dst_str, ignore_progress())
+            .await
+            .expect_err("a body that ends early is a failed download");
+        assert!(
+            err.to_string().contains("response body"),
+            "the failure names the read, not a cleanup: {err}"
+        );
+        assert!(
+            !dst.exists(),
+            "a failed transfer leaves no partial file behind"
+        );
+
+        handle.join().expect("server thread joins");
+    }
+
+    // -----------------------------------------------------------------
+    // Progress: what the byte loop hands out while it runs.
+    //
+    // These pin the *reports*, not the transcript — the cadence and the
+    // rendering are `super::audit`'s, and are tested there. What is
+    // proved here is that a download in flight says something at all,
+    // says it more than once, says it without a `Content-Length`, and
+    // does not claim to have finished when it did not.
+    // -----------------------------------------------------------------
+
+    /// A server that dribbles `chunks` pieces of `piece` bytes with
+    /// `gap` between them, so a download lasts long enough to be
+    /// reported on more than once.
+    ///
+    /// `declare_length` picks the two supplier shapes that matter:
+    /// with a `Content-Length` the total is known from the first byte,
+    /// and without one the body simply ends at the close — which is what
+    /// a chunked or content-encoded supplier looks like, and the case a
+    /// progress consumer must survive.
+    fn trickle_server(
+        chunks: usize,
+        piece: usize,
+        gap: Duration,
+        declare_length: bool,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let head = if declare_length {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    chunks * piece
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
+            };
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            for _ in 0..chunks {
+                std::thread::sleep(gap);
+                let _ = stream.write_all(&vec![b'x'; piece]);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// A sink that keeps every report, so a test can look at the whole
+    /// sequence rather than the last one.
+    fn recording_sink() -> (Arc<Mutex<Vec<TransferProgress>>>, impl Fn(TransferProgress)) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        (seen, move |progress| {
+            sink.lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(progress)
+        })
+    }
+
+    /// A transfer of any real size is minutes long, so the loop has to
+    /// report **during** it. The fixture makes "during" observable: the
+    /// body arrives in five pieces, and a download that only spoke at
+    /// the end would leave one report here instead of several.
+    #[tokio::test]
+    async fn a_download_reports_what_it_has_written_while_it_runs() {
+        const CHUNKS: usize = 5;
+        const PIECE: usize = 4096;
+        let (url, handle) = trickle_server(CHUNKS, PIECE, Duration::from_millis(60), true);
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-progress-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let (seen, sink) = recording_sink();
+        let outcome = transfer(&url, &dst_str, &sink)
+            .await
+            .expect("the trickled body must arrive");
+
+        let reports = seen.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        let running: Vec<_> = reports.iter().filter(|r| !r.finished).collect();
+        let finished: Vec<_> = reports.iter().filter(|r| r.finished).collect();
+
+        assert!(
+            running.len() >= 2,
+            "a download that reports only once has told the operator nothing about \
+             progress: {reports:?}"
+        );
+        assert_eq!(
+            finished.len(),
+            1,
+            "exactly one finished report closes a transfer: {reports:?}"
+        );
+        assert_eq!(finished[0].written, outcome.bytes);
+        assert_eq!(outcome.bytes, (CHUNKS * PIECE) as u64);
+
+        // Bytes only ever go up, and the declared total rides on every
+        // report so a consumer never has to have kept the first one.
+        let mut previous = 0;
+        for report in &reports {
+            assert!(report.written >= previous, "{reports:?}");
+            previous = report.written;
+            assert_eq!(report.total, Some((CHUNKS * PIECE) as u64), "{report:?}");
+        }
+
+        std::fs::remove_file(&dst).ok();
+        handle.join().expect("server thread joins");
+    }
+
+    /// `Content-Length` is optional, and HuggingFace's CDN is not the
+    /// only supplier that omits it. A download that reported nothing
+    /// without one would go silent exactly where the operator has least
+    /// other information.
+    #[tokio::test]
+    async fn a_supplier_that_declares_no_total_still_reports_its_bytes() {
+        const CHUNKS: usize = 4;
+        const PIECE: usize = 4096;
+        let (url, handle) = trickle_server(CHUNKS, PIECE, Duration::from_millis(60), false);
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-progress-untotalled-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let (seen, sink) = recording_sink();
+        let outcome = transfer(&url, &dst_str, &sink)
+            .await
+            .expect("a body that ends at the close is a complete body");
+
+        let reports = seen.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        assert!(!reports.is_empty(), "an untotalled download still reports");
+        for report in &reports {
+            assert_eq!(
+                report.total, None,
+                "no total was declared, so none is invented: {report:?}"
+            );
+        }
+        let finished = reports
+            .iter()
+            .find(|r| r.finished)
+            .expect("the transfer finished, so it said so");
+        assert_eq!(
+            finished.written,
+            (CHUNKS * PIECE) as u64,
+            "the finished report is where the real size finally appears"
+        );
+        assert_eq!(outcome.bytes, finished.written);
+
+        std::fs::remove_file(&dst).ok();
+        handle.join().expect("server thread joins");
+    }
+
+    /// A transfer that fails never reports finished — which is what
+    /// makes "the last thing this stream said was `running`" mean
+    /// something to a reader watching several at once.
+    #[tokio::test]
+    async fn a_failed_download_never_reports_that_it_finished() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Promise 1 MiB, send 4 KiB, hang up: enough to be reported
+            // on, not enough to finish.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+            let _ = stream.write_all(&[b'w'; 4096]);
+            let _ = stream.flush();
+        });
+
+        let dst = std::env::temp_dir().join(format!(
+            "lm-exec-progress-failed-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let dst_str = dst.to_string_lossy().into_owned();
+
+        let (seen, sink) = recording_sink();
+        transfer(&format!("http://{addr}/"), &dst_str, &sink)
+            .await
+            .expect_err("a body that ends early is a failed download");
+
+        let reports = seen.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        assert!(
+            !reports.is_empty(),
+            "the bytes that did arrive were reported: {reports:?}"
+        );
+        assert!(
+            reports.iter().all(|r| !r.finished),
+            "a failed transfer must not claim to have finished: {reports:?}"
+        );
+
+        handle.join().expect("server thread joins");
+    }
+
+    // -----------------------------------------------------------------
+    // The synchronous seam
+    // -----------------------------------------------------------------
+
+    /// The seam reports a missing runtime as a step failure naming the
+    /// requirement. Left to tokio it would be a panic from inside
+    /// `Op::apply`, which the engine has no way to turn into a report
+    /// entry.
+    #[test]
+    fn the_effect_bridge_reports_a_missing_runtime_instead_of_panicking() {
+        let err: ExecError = block_on_effect("net_transfer", async {
+            Err::<(), ExecError>(ExecError::Unsupported("unreached".to_string()))
+        })
+        .expect_err("no runtime is running here");
+        let message = err.to_string();
+        assert!(
+            message.contains("no tokio runtime is running"),
+            "the failure names what is missing: {message}"
+        );
+    }
+
+    /// …and the same for a runtime of the wrong flavour: the seam blocks
+    /// its thread, which a current-thread runtime has no sibling worker
+    /// to cover for.
+    #[tokio::test]
+    async fn the_effect_bridge_reports_a_single_threaded_runtime_instead_of_panicking() {
+        let err: ExecError = block_on_effect("net_transfer", async {
+            Err::<(), ExecError>(ExecError::Unsupported("unreached".to_string()))
+        })
+        .expect_err("the default #[tokio::test] runtime is single-threaded");
+        let message = err.to_string();
+        assert!(
+            message.contains("single-threaded"),
+            "the failure names the flavour: {message}"
+        );
+    }
+
+    /// Under the flavour the seam does require, the future runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_effect_bridge_drives_the_future_on_a_multi_threaded_runtime() {
+        let (url, handle) = one_shot_server();
+        let outcome = block_on_effect("net_http_get", http_get(&url, &HttpOpts::default()))
+            .expect("a multi-threaded runtime is what the seam asks for");
+        assert_eq!(outcome.status, 200);
+        handle.join().expect("server thread joins");
     }
 }

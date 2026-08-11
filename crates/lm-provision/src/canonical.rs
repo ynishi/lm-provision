@@ -58,8 +58,8 @@
 //! Decode is out of scope: the current ledger persists JSON Lines and
 //! does not require canonical→AST reconstruction.
 
+use crate::exec::assert::Assert;
 use crate::profile_ast::ProfileNode;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Intermediate canonical value.
@@ -88,15 +88,118 @@ pub fn encode(node: &ProfileNode) -> String {
 }
 
 /// SHA-256 of the [`encode`] bytes, lowercase hex, no prefix (64 chars).
+///
+/// The rendering lives in [`crate::digest::hex_sha256`], which is also
+/// what the Assert model's content predicate and the driver's
+/// `ensure-binary` check use — one implementation of "content
+/// identity" for the whole workspace.
 pub fn hash(node: &ProfileNode) -> String {
-    let bytes = encode(node);
-    let digest = Sha256::digest(bytes.as_bytes());
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        // `format!("{byte:02x}")` guarantees two lowercase hex chars.
-        hex.push_str(&format!("{byte:02x}"));
+    crate::digest::hex_sha256(encode(node).as_bytes())
+}
+
+/// Canonically encode an [`Assert`] to deterministic JSON bytes.
+///
+/// Same rules as [`encode`]: variant tag under `"type"`, object keys in
+/// lexicographic order (a `BTreeMap` by construction), array order
+/// preserved. A conjunction's children are **not** sorted — child order
+/// is the order the author wrote and the fold's tie-break rests on it
+/// (`exec::assert::fold_all`), so reordering would change which
+/// `CheckError` survives.
+///
+/// **This does not put anything into a profile's hash yet.** An Assert
+/// is not a `ProfileNode`, and at this stage every `done` is *derived*
+/// from the phase payload rather than authored — a derived value adds
+/// no information to the hash, and splicing one in would move the hash
+/// of every existing profile carrying that phase for no gain. What is
+/// fixed here is the encoding, so that when an authored `done` becomes
+/// a value node it hashes by an already-settled rule rather than one
+/// invented at that moment.
+pub fn encode_assert(assert: &Assert) -> String {
+    let mut out = String::new();
+    write_canon(&assert_to_canon(assert), &mut out);
+    out
+}
+
+/// `Assert` → [`CanonValue`], the counterpart of [`to_canon`].
+fn assert_to_canon(assert: &Assert) -> CanonValue {
+    match assert {
+        Assert::FileExists { path } => {
+            let mut fields = variant_object("FileExists");
+            fields.insert("path".into(), CanonValue::Str(path_string(path)));
+            CanonValue::Object(fields)
+        }
+        Assert::FileDigest {
+            path,
+            expected_sha256,
+        } => {
+            let mut fields = variant_object("FileDigest");
+            fields.insert(
+                "expected_sha256".into(),
+                CanonValue::Str(expected_sha256.clone()),
+            );
+            fields.insert("path".into(), CanonValue::Str(path_string(path)));
+            CanonValue::Object(fields)
+        }
+        Assert::GitTreeAt { dir, git_ref } => {
+            let mut fields = variant_object("GitTreeAt");
+            // The argv the predicate fires is *not* encoded: it is a
+            // fixed template of these two fields
+            // (`exec::assert::git_tree_at_argv`), so writing it would
+            // put a host implementation detail into bytes that are
+            // supposed to describe the condition — and a change to the
+            // template's flags would then move a profile's hash without
+            // the profile having changed.
+            fields.insert("dir".into(), CanonValue::Str(path_string(dir)));
+            fields.insert("git_ref".into(), CanonValue::Str(git_ref.clone()));
+            CanonValue::Object(fields)
+        }
+        Assert::ProcessAlive { pid_file } => {
+            let mut fields = variant_object("ProcessAlive");
+            fields.insert("pid_file".into(), CanonValue::Str(path_string(pid_file)));
+            CanonValue::Object(fields)
+        }
+        Assert::ProcessArgv { pid_file, argv } => {
+            let mut fields = variant_object("ProcessArgv");
+            // The argv **is** encoded, unlike `GitTreeAt`'s — and the
+            // difference is which side it belongs to. There the command
+            // is the host's, derived from the two fields by a fixed
+            // template; here it is the condition itself, the declaration
+            // that a launch must match. Two services differing only in
+            // an `extra_args` position are different conditions, so they
+            // have to be different bytes.
+            fields.insert(
+                "argv".into(),
+                CanonValue::Array(argv.iter().cloned().map(CanonValue::Str).collect()),
+            );
+            fields.insert("pid_file".into(), CanonValue::Str(path_string(pid_file)));
+            CanonValue::Object(fields)
+        }
+        Assert::All(children) => {
+            let mut fields = variant_object("All");
+            fields.insert(
+                "children".into(),
+                CanonValue::Array(children.iter().map(assert_to_canon).collect()),
+            );
+            CanonValue::Object(fields)
+        }
     }
-    hex
+}
+
+/// A path as canonical bytes.
+///
+/// [`Path::display`] is lossy for a non-UTF-8 path, which would make
+/// two different paths encode identically. Every path an Assert carries
+/// is built from a profile's UTF-8 payload, so the lossless conversion
+/// succeeds; the fallback exists so this is a total function and is
+/// marked in the bytes rather than silently producing a collision.
+fn path_string(path: &std::path::Path) -> String {
+    match path.to_str() {
+        Some(text) => text.to_string(),
+        // Not reachable from a profile (payload paths are UTF-8), and
+        // deliberately not a panic: canonical encoding is called from
+        // read-only stages.
+        None => format!("\u{fffd}non-utf8:{}", path.to_string_lossy()),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -115,6 +218,7 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             env_secrets,
             paths,
             http_allowlist,
+            assumes,
             phases,
         } => {
             let mut fields = variant_object("Spec");
@@ -134,6 +238,13 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             fields.insert("env_secrets".into(), sorted_string_array(env_secrets));
             fields.insert("http_allowlist".into(), sorted_string_array(http_allowlist));
             fields.insert("paths".into(), sorted_string_array(paths));
+            // Spec.assumes: `resource name → path`. Omitted when empty
+            // under the same rule as `env` above, so every profile
+            // written before resources existed keeps its hash — which is
+            // what makes this slot addable at all (the alternative,
+            // emitting `"assumes":{}`, would re-hash every profile in
+            // every ledger).
+            insert_str_map(&mut fields, "assumes", assumes);
             fields.insert(
                 "phases".into(),
                 CanonValue::Array(phases.iter().map(to_canon).collect()),
@@ -151,10 +262,26 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             id: _,
             ref_name,
             repo,
+            install_dir,
         } => {
             let mut fields = variant_object("ComfyUiInstall");
             fields.insert("ref_name".into(), CanonValue::Str(ref_name.clone()));
             insert_optional_str(&mut fields, "repo", repo);
+            // Omitted when undeclared, like `repo` beside it: a profile
+            // that never mentioned an install dir hashes as it did
+            // before the slot existed.
+            insert_optional_str(&mut fields, "install_dir", install_dir);
+            CanonValue::Object(fields)
+        }
+
+        ProfileNode::ToolchainPython {
+            id: _,
+            requirements,
+            isolated,
+        } => {
+            let mut fields = variant_object("ToolchainPython");
+            insert_optional_str(&mut fields, "requirements", requirements);
+            fields.insert("isolated".into(), CanonValue::Bool(*isolated));
             CanonValue::Object(fields)
         }
 
@@ -417,6 +544,27 @@ fn insert_env(fields: &mut BTreeMap<String, CanonValue>, env: &BTreeMap<String, 
     insert_value_map(fields, "env", env);
 }
 
+/// The scalar-valued counterpart of [`insert_value_map`]: insert `key`
+/// as an object of plain strings, or omit it entirely when `map` is
+/// empty. Same omit-when-empty rule, same reason — a keyed slot added
+/// after profiles were already being hashed must not move an
+/// undeclaring profile's bytes. `BTreeMap` iteration is already
+/// lexicographic by key.
+fn insert_str_map(
+    fields: &mut BTreeMap<String, CanonValue>,
+    key: &str,
+    map: &BTreeMap<String, String>,
+) {
+    if map.is_empty() {
+        return;
+    }
+    let mut obj = BTreeMap::new();
+    for (entry_key, value) in map {
+        obj.insert(entry_key.clone(), CanonValue::Str(value.clone()));
+    }
+    fields.insert(key.into(), CanonValue::Object(obj));
+}
+
 /// The keyed-slot counterpart of [`insert_when_non_empty`]: insert
 /// `key` as an object mapping each entry to its value node's canonical
 /// form, or omit it entirely when `map` is empty. [`insert_env`] is the
@@ -564,7 +712,9 @@ fn write_string(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::assert::Done as _;
     use dsl_kit::{IdGen, NodeId};
+    use sha2::{Digest, Sha256};
 
     fn new_id(gen: &IdGen) -> NodeId {
         gen.node()
@@ -572,6 +722,7 @@ mod tests {
 
     fn empty_spec(gen: &IdGen, name: &str) -> ProfileNode {
         ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(gen),
             name: name.into(),
             version: None,
@@ -611,6 +762,7 @@ mod tests {
         // are still Vec<String> and the encoder sorts them before
         // emission, so the parity check runs over those.
         let a = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -623,6 +775,7 @@ mod tests {
             phases: vec![],
         };
         let b = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -635,6 +788,339 @@ mod tests {
             phases: vec![],
         };
         assert_eq!(encode(&a), encode(&b));
+    }
+
+    // -----------------------------------------------------------------
+    // The `models` payload, before and after `sha256` was decoded
+    // -----------------------------------------------------------------
+
+    fn models_spec(gen: &IdGen, models_json: &str) -> ProfileNode {
+        ProfileNode::Spec {
+            assumes: Default::default(),
+            id: new_id(gen),
+            name: "p".into(),
+            version: None,
+            description: None,
+            capabilities: vec![],
+            env: BTreeMap::new(),
+            env_secrets: vec![],
+            paths: vec![],
+            http_allowlist: vec![],
+            phases: vec![ProfileNode::Models {
+                id: new_id(gen),
+                models_json: models_json.into(),
+            }],
+        }
+    }
+
+    /// **A profile's hash does not move because `sha256` is now read.**
+    ///
+    /// The reason is structural rather than lucky: the AST carries a
+    /// `models` payload as one opaque string, and the encoder writes
+    /// that string through. A declared `sha256` was therefore already
+    /// inside the hash — dropped only at expansion — and an undeclared
+    /// one adds nothing to drop. The pin below is the literal byte
+    /// stream, so a later change that splices a *derived* value (the
+    /// step's `done`, say) into the phase's encoding fails here rather
+    /// than silently re-hashing every existing profile.
+    #[test]
+    fn a_models_phase_encodes_from_its_payload_string_alone() {
+        let gen = IdGen::new();
+        let models_json = r#"[{"src":"https://ex/a.bin","dst":"a.bin"}]"#;
+
+        let expected_bytes = concat!(
+            "{",
+            "\"capabilities\":[],",
+            "\"env_secrets\":[],",
+            "\"http_allowlist\":[],",
+            "\"name\":\"p\",",
+            "\"paths\":[],",
+            "\"phases\":[{",
+            "\"models_json\":",
+            "\"[{\\\"src\\\":\\\"https://ex/a.bin\\\",\\\"dst\\\":\\\"a.bin\\\"}]\",",
+            "\"type\":\"Models\"",
+            "}],",
+            "\"type\":\"Spec\"",
+            "}",
+        );
+        assert_eq!(encode(&models_spec(&gen, models_json)), expected_bytes);
+
+        // Independently computed, as `hash_regression_fixed_input` does
+        // — routing it through the helper would compare the code under
+        // test with itself.
+        let computed = {
+            let d = Sha256::digest(expected_bytes.as_bytes());
+            let mut s = String::with_capacity(64);
+            for b in d {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        };
+        assert_eq!(hash(&models_spec(&gen, models_json)), computed);
+    }
+
+    /// The other side of the same fact: a declared `sha256` has always
+    /// been in the hash, because it is part of the payload string. It
+    /// hashes differently from the same profile without it — which is
+    /// what it should do, and did before this stage as well.
+    #[test]
+    fn a_declared_digest_is_inside_the_payload_string_and_so_inside_the_hash() {
+        let gen = IdGen::new();
+        let without = models_spec(&gen, r#"[{"src":"https://ex/a.bin","dst":"a.bin"}]"#);
+        let with = models_spec(
+            &gen,
+            r#"[{"src":"https://ex/a.bin","dst":"a.bin","sha256":"ab"}]"#,
+        );
+        assert_ne!(hash(&without), hash(&with));
+        assert!(
+            encode(&with).contains("sha256"),
+            "the declared digest is in the canonical bytes: {}",
+            encode(&with),
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The Assert encoding
+    // -----------------------------------------------------------------
+
+    /// Read canonical Assert bytes back into an [`Assert`].
+    ///
+    /// Test-only on purpose. Nothing in production decodes yet — no
+    /// profile can author a `done` — so shipping a reader would be
+    /// shipping an unused one. It exists here because "deterministic"
+    /// is a weaker claim than "lossless": bytes that collapse two
+    /// different conditions would still be deterministic, and only a
+    /// round trip catches that.
+    fn decode_assert(encoded: &str) -> Assert {
+        fn from_value(value: &serde_json::Value) -> Assert {
+            let tag = value["type"].as_str().expect("every node carries a type");
+            let path = || {
+                std::path::PathBuf::from(value["path"].as_str().expect("a path-bearing predicate"))
+            };
+            match tag {
+                "FileExists" => Assert::FileExists { path: path() },
+                "FileDigest" => Assert::FileDigest {
+                    path: path(),
+                    expected_sha256: value["expected_sha256"]
+                        .as_str()
+                        .expect("a digest predicate carries its expectation")
+                        .to_string(),
+                },
+                "GitTreeAt" => Assert::GitTreeAt {
+                    dir: std::path::PathBuf::from(
+                        value["dir"]
+                            .as_str()
+                            .expect("a git predicate carries its work tree"),
+                    ),
+                    git_ref: value["git_ref"]
+                        .as_str()
+                        .expect("a git predicate carries its ref")
+                        .to_string(),
+                },
+                "ProcessAlive" => Assert::ProcessAlive {
+                    pid_file: std::path::PathBuf::from(
+                        value["pid_file"]
+                            .as_str()
+                            .expect("a process predicate carries its pid file"),
+                    ),
+                },
+                "ProcessArgv" => Assert::ProcessArgv {
+                    pid_file: std::path::PathBuf::from(
+                        value["pid_file"]
+                            .as_str()
+                            .expect("a process predicate carries its pid file"),
+                    ),
+                    argv: value["argv"]
+                        .as_array()
+                        .expect("an argv predicate carries its argv")
+                        .iter()
+                        .map(|arg| {
+                            arg.as_str()
+                                .expect("every argv position is a string")
+                                .to_string()
+                        })
+                        .collect(),
+                },
+                "All" => {
+                    let children = value["children"]
+                        .as_array()
+                        .expect("a conjunction carries children");
+                    let (head, tail) = children.split_first().expect("children are non-empty");
+                    Assert::All(crate::exec::assert::NonEmpty::new(
+                        from_value(head),
+                        tail.iter().map(from_value).collect(),
+                    ))
+                }
+                other => panic!("unknown Assert tag {other}"),
+            }
+        }
+        from_value(&serde_json::from_str(encoded).expect("canonical bytes are JSON"))
+    }
+
+    /// Every shape the model can express today, including a nested
+    /// conjunction and two conditions that differ only in child order.
+    fn assert_samples() -> Vec<Assert> {
+        use crate::exec::assert::NonEmpty;
+        let exists = |path: &str| Assert::FileExists {
+            path: std::path::PathBuf::from(path),
+        };
+        let digest = |path: &str, hex: &str| Assert::FileDigest {
+            path: std::path::PathBuf::from(path),
+            expected_sha256: hex.to_string(),
+        };
+        let git = |dir: &str, git_ref: &str| Assert::GitTreeAt {
+            dir: std::path::PathBuf::from(dir),
+            git_ref: git_ref.to_string(),
+        };
+        let alive = |pid_file: &str| Assert::ProcessAlive {
+            pid_file: std::path::PathBuf::from(pid_file),
+        };
+        let argv = |pid_file: &str, argv: &[&str]| Assert::ProcessArgv {
+            pid_file: std::path::PathBuf::from(pid_file),
+            argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
+        };
+        vec![
+            exists("/a"),
+            exists("/b"),
+            digest("/a", "ab"),
+            digest("/a", "cd"),
+            digest("/b", "ab"),
+            // The two fields of the git predicate vary independently,
+            // so both have to reach the bytes.
+            git("/a", "v1"),
+            git("/a", "v2"),
+            git("/b", "v1"),
+            alive("/tmp/a.pid"),
+            alive("/tmp/b.pid"),
+            argv("/tmp/a.pid", &["srv"]),
+            argv("/tmp/b.pid", &["srv"]),
+            // Argv identity has to survive every way two launches can
+            // differ: an added argument, a changed value, and — the one
+            // a joined-string encoding would lose — the same arguments
+            // in another order.
+            argv("/tmp/a.pid", &["srv", "--listen"]),
+            argv("/tmp/a.pid", &["srv", "--port", "8188"]),
+            argv("/tmp/a.pid", &["srv", "--port", "8189"]),
+            argv("/tmp/a.pid", &["srv", "--listen", "--highvram"]),
+            argv("/tmp/a.pid", &["srv", "--highvram", "--listen"]),
+            argv("/tmp/a.pid", &[]),
+            Assert::All(NonEmpty::new(exists("/a"), vec![])),
+            Assert::All(NonEmpty::new(exists("/a"), vec![digest("/a", "ab")])),
+            // Same children, other order: the fold's tie-break depends
+            // on it, so the bytes must too.
+            Assert::All(NonEmpty::new(digest("/a", "ab"), vec![exists("/a")])),
+            Assert::All(NonEmpty::new(exists("/a/.git"), vec![git("/a", "v1")])),
+            Assert::All(NonEmpty::new(
+                alive("/tmp/a.pid"),
+                vec![argv("/tmp/a.pid", &["srv", "--port", "8188"])],
+            )),
+            Assert::All(NonEmpty::new(
+                Assert::All(NonEmpty::new(exists("/a"), vec![exists("/b")])),
+                vec![digest("/b", "ab")],
+            )),
+        ]
+    }
+
+    /// The same Assert encodes to the same bytes, and distinct Asserts
+    /// to distinct bytes.
+    #[test]
+    fn the_assert_encoding_is_deterministic_and_distinguishing() {
+        let samples = assert_samples();
+        for sample in &samples {
+            assert_eq!(
+                encode_assert(sample),
+                encode_assert(sample),
+                "the same Assert must encode identically: {sample:?}",
+            );
+        }
+        for (i, left) in samples.iter().enumerate() {
+            for right in samples.iter().skip(i + 1) {
+                assert_ne!(
+                    encode_assert(left),
+                    encode_assert(right),
+                    "different conditions must not share bytes: {left:?} / {right:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_assert_encoding_round_trips() {
+        for sample in assert_samples() {
+            assert_eq!(decode_assert(&encode_assert(&sample)), sample);
+        }
+    }
+
+    /// The literal bytes, so the shape is pinned rather than merely
+    /// self-consistent: variant tag under `"type"`, keys lexicographic,
+    /// children in author order.
+    #[test]
+    fn the_assert_encoding_has_the_same_shape_as_the_profile_encoding() {
+        let done = crate::exec::assert::ModelFile::new("/w/a.bin", Some("ab".into())).done();
+        assert_eq!(
+            encode_assert(&done),
+            concat!(
+                "{\"children\":[",
+                "{\"path\":\"/w/a.bin\",\"type\":\"FileExists\"},",
+                "{\"expected_sha256\":\"ab\",\"path\":\"/w/a.bin\",\"type\":\"FileDigest\"}",
+                "],\"type\":\"All\"}",
+            ),
+        );
+    }
+
+    /// The second entity's bytes, likewise pinned.
+    ///
+    /// **The argv the predicate fires is not in them.** It is a fixed
+    /// template of `dir` and `git_ref`, so encoding it would put a host
+    /// implementation detail into a description of the condition — and
+    /// a change to git's flags would then move a profile's hash without
+    /// the profile changing.
+    #[test]
+    fn the_git_predicate_encodes_its_two_fields_and_not_its_command() {
+        let done =
+            crate::exec::assert::Checkout::new("/workspace/ComfyUI", Some("v0.1.0".into())).done();
+        let encoded = encode_assert(&done);
+        assert_eq!(
+            encoded,
+            concat!(
+                "{\"children\":[",
+                "{\"path\":\"/workspace/ComfyUI/.git\",\"type\":\"FileExists\"},",
+                "{\"dir\":\"/workspace/ComfyUI\",\"git_ref\":\"v0.1.0\",\"type\":\"GitTreeAt\"}",
+                "],\"type\":\"All\"}",
+            ),
+        );
+        assert!(
+            !encoded.contains("--no-optional-locks") && !encoded.contains("diff"),
+            "the command is not part of the condition's bytes: {encoded}",
+        );
+    }
+
+    /// The third entity's bytes.
+    ///
+    /// **Here the argv *is* in them**, which is the opposite of the
+    /// git predicate above and for a reason worth pinning: git's
+    /// command is the host's, derived from the condition, while a
+    /// service's argv is the condition — the declaration a running
+    /// process has to match. It is encoded as an array, so two launches
+    /// differing only in the order of their arguments are different
+    /// bytes, exactly as they are different conditions.
+    #[test]
+    fn the_service_predicate_encodes_the_declared_argv_as_an_array() {
+        let done = crate::exec::assert::Service::new(
+            "/tmp/comfyui.pid",
+            vec!["python".into(), "--port".into(), "8188".into()],
+        )
+        .done();
+        assert_eq!(
+            encode_assert(&done),
+            concat!(
+                "{\"children\":[",
+                "{\"pid_file\":\"/tmp/comfyui.pid\",\"type\":\"ProcessAlive\"},",
+                "{\"argv\":[\"python\",\"--port\",\"8188\"],",
+                "\"pid_file\":\"/tmp/comfyui.pid\",\"type\":\"ProcessArgv\"}",
+                "],\"type\":\"All\"}",
+            ),
+        );
     }
 
     #[test]
@@ -651,6 +1137,7 @@ mod tests {
         };
 
         let a = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -663,6 +1150,7 @@ mod tests {
             phases: vec![apt(), sh()],
         };
         let b = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -689,6 +1177,7 @@ mod tests {
 
         // Some -> keys present with value
         let some = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: Some("1.0.0".into()),
@@ -746,6 +1235,7 @@ mod tests {
             },
         );
         let node = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -799,6 +1289,7 @@ mod tests {
     fn nested_spec_full_literal_encoding() {
         let gen = IdGen::new();
         let node = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "demo".into(),
             version: None,
@@ -876,6 +1367,10 @@ mod tests {
         );
         assert_eq!(encode(&empty_spec(&gen, "p")), expected_bytes);
         // sha256("{...}") — computed from expected_bytes.
+        // Deliberately inline rather than calling `hex_sha256`: this is
+        // the independent implementation the pin is checked against, and
+        // routing it through the helper would turn it into a copy of the
+        // code under test.
         let computed = {
             let d = Sha256::digest(expected_bytes.as_bytes());
             let mut s = String::with_capacity(64);
@@ -891,6 +1386,7 @@ mod tests {
     fn paths_and_http_allowlist_are_sorted_lexicographically() {
         let gen = IdGen::new();
         let node = ProfileNode::Spec {
+            assumes: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1346,5 +1842,131 @@ mod tests {
             name: "B2_KEY".into(),
         };
         assert_eq!(encode(&node), "{\"__secret\":\"B2_KEY\"}");
+    }
+
+    // -----------------------------------------------------------------
+    // Resource slots: addable only because they are omitted when empty.
+    // -----------------------------------------------------------------
+
+    /// **The condition that let `assumes` and `install_dir` exist at
+    /// all.** Every profile written before resources did carries neither,
+    /// and every one of those hashes is already in a ledger. If an empty
+    /// `assumes` emitted `"assumes":{}`, or an undeclared `install_dir`
+    /// emitted `null`, all of them would move at once.
+    #[test]
+    fn the_resource_slots_are_invisible_to_a_profile_that_declares_neither() {
+        let gen = IdGen::new();
+        let install = |dir: Option<&str>| ProfileNode::ComfyUiInstall {
+            id: new_id(&gen),
+            ref_name: "master".into(),
+            repo: None,
+            install_dir: dir.map(str::to_string),
+        };
+
+        let bytes = encode(&install(None));
+        assert!(
+            !bytes.contains("install_dir"),
+            "an undeclared install dir carries no bytes: {bytes}"
+        );
+        assert_eq!(
+            bytes, r#"{"ref_name":"master","type":"ComfyUiInstall"}"#,
+            "the encoding is exactly what it was before the slot existed"
+        );
+
+        let mut spec = empty_spec(&gen, "demo");
+        let without = encode(&spec);
+        assert!(
+            !without.contains("assumes"),
+            "an empty assumes carries no bytes: {without}"
+        );
+
+        // And declaring either one *does* move the hash — the slot is
+        // omitted because it is empty, not because it is ignored.
+        assert_ne!(encode(&install(Some("/opt/comfy"))), bytes);
+        if let ProfileNode::Spec { assumes, .. } = &mut spec {
+            assumes.insert("comfyui_root".into(), "/opt/comfy".into());
+        }
+        let with = encode(&spec);
+        assert_ne!(with, without);
+        assert!(
+            with.contains(r#""assumes":{"comfyui_root":"/opt/comfy"}"#),
+            "{with}"
+        );
+    }
+
+    /// A kind added to the catalog cannot move any existing profile's
+    /// hash, because a profile that does not use it has no node of that
+    /// variant to encode. What has to be checked is the new variant's
+    /// **own** encoding: `requirements` omitted when undeclared, and
+    /// `isolated` always present.
+    ///
+    /// `isolated` is emitted even when `false` on purpose — it is a
+    /// plain `bool`, so there is no "unset" to distinguish, and the
+    /// alternative (omit when `false`) would make two different
+    /// spellings of the same profile hash differently.
+    #[test]
+    fn toolchain_python_encodes_what_the_author_declared() {
+        let gen = IdGen::new();
+        let node = |requirements: Option<&str>, isolated: bool| ProfileNode::ToolchainPython {
+            id: new_id(&gen),
+            requirements: requirements.map(str::to_string),
+            isolated,
+        };
+
+        assert_eq!(
+            encode(&node(None, false)),
+            r#"{"isolated":false,"type":"ToolchainPython"}"#
+        );
+        assert_eq!(
+            encode(&node(Some("/r.txt"), true)),
+            r#"{"isolated":true,"requirements":"/r.txt","type":"ToolchainPython"}"#
+        );
+        // Same declaration, same bytes; different declaration, different
+        // bytes.
+        assert_eq!(
+            encode(&node(Some("/r.txt"), true)),
+            encode(&node(Some("/r.txt"), true))
+        );
+        assert_ne!(
+            encode(&node(Some("/r.txt"), true)),
+            encode(&node(Some("/r.txt"), false))
+        );
+    }
+
+    /// The venv is bound by name like any other resource, so a profile
+    /// that assumes one carries it in the same slot `comfyui_root` uses.
+    #[test]
+    fn a_venv_can_be_assumed_like_any_other_resource() {
+        let gen = IdGen::new();
+        let mut spec = empty_spec(&gen, "demo");
+        if let ProfileNode::Spec { assumes, .. } = &mut spec {
+            assumes.insert("venv".into(), "/opt/comfy/.venv".into());
+        }
+        assert!(
+            encode(&spec).contains(r#""assumes":{"venv":"/opt/comfy/.venv"}"#),
+            "{}",
+            encode(&spec)
+        );
+    }
+
+    /// `assumes` keys are already lexicographic in a `BTreeMap`, so two
+    /// profiles that declare the same bindings in different source order
+    /// hash the same — the property every keyed slot here carries.
+    #[test]
+    fn assumes_is_order_independent() {
+        let gen = IdGen::new();
+        let with = |pairs: &[(&str, &str)]| {
+            let mut spec = empty_spec(&gen, "demo");
+            if let ProfileNode::Spec { assumes, .. } = &mut spec {
+                for (k, v) in pairs {
+                    assumes.insert((*k).into(), (*v).into());
+                }
+            }
+            encode(&spec)
+        };
+        assert_eq!(
+            with(&[("comfyui_root", "/a"), ("other", "/b")]),
+            with(&[("other", "/b"), ("comfyui_root", "/a")])
+        );
     }
 }

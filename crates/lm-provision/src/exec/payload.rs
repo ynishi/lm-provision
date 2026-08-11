@@ -42,6 +42,7 @@ mod tests {
         let sh_id = ids.node();
 
         let root = ProfileNode::Spec {
+            assumes: Default::default(),
             id: root_id,
             name: "demo".to_string(),
             version: None,
