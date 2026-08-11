@@ -22,15 +22,24 @@ use crate::profile_ast::ProfileValue;
 /// How many suspended lifecycle steps the driver resolves at the same
 /// time.
 ///
-/// **There is no measurement behind this number.** The reference
-/// implementation's 28× came from `aria2c -c -x16 -s16`, and its 16 is
-/// how many connections *one* file is split across — a different axis
-/// from how many files are in flight, so it is not a value to borrow.
-/// Nothing in this repository has measured a pod's useful download
-/// concurrency, so what is written here is a bound, not a tuning: it
+/// **There is no measurement choosing this number**, and there is one
+/// showing it is not too high. It is a different axis from
+/// [`crate::exec::chunked::CONCURRENCY`], which counts connections
+/// carrying *one* file: at 4 files of 16 ranges the transfer holds 64
+/// requests in flight, and a pod handles that without rate limiting, a
+/// failed chunk or a retry [実測: 2026-08-11, 8.53 GB in 27-34 s against
+/// 229-242 s one file at a time, `workspace/tasks/aria2c-bench/results.md`].
+///
+/// The two axes **compound rather than trade off**, which that
+/// measurement is also the evidence for: each individual file finished
+/// *faster* with three others competing than with the link to itself, so
+/// what limits one file is the supplier's per-connection rate and the
+/// only way past it is more connections.
+///
+/// So what is written here is still a bound rather than a tuning — it
 /// keeps a twenty-weight `models` phase from opening twenty sockets and
 /// twenty file writers at once, and it is small enough that the wave the
-/// driver waits on is short.
+/// driver waits on is short. Where the knee is has not been looked for.
 ///
 /// It is a host-side constant and deliberately not a profile field, for
 /// the reason [`EffectRoute`] is not one either: the profile's bytes —

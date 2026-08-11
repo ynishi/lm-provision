@@ -89,10 +89,17 @@ pub const CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 /// to 64 from there)
 /// [[environment variables](https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables)].
 ///
-/// It is **not** the `MAX_CONCURRENT_STEPS` of `exec::apply`, which
+/// It is **not** the `MAX_CONCURRENT_STEPS` of `crate::apply`, which
 /// counts files moving at once. Four files at sixteen ranges each is 64
-/// requests in flight, which is worth knowing before either number is
-/// raised.
+/// requests in flight — measured, and handled without rate limiting, a
+/// failed chunk or a retry: 8.53 GB in 27-34 s that way against
+/// 229-242 s one file at a time [実測: 2026-08-11,
+/// `workspace/tasks/aria2c-bench/results.md`].
+///
+/// The two axes **compound**. Each individual file finished faster with
+/// three others competing than with the link to itself, which says the
+/// limit on one file is the supplier's per-connection rate rather than
+/// anything the pod is short of.
 pub const CONCURRENCY: usize = 16;
 
 /// Below this a file is fetched in one request.
