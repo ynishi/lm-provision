@@ -54,7 +54,7 @@ fn serving(serves: usize, body: &'static [u8]) -> (String, std::thread::JoinHand
 ///
 /// The `models/lora` subdirectory is created here, and that is not
 /// incidental: **`net.transfer` does not create its destination's parent
-/// directories** [実測: no `create_dir_all` on the download path in
+/// directories** (measured: no `create_dir_all` on the download path in
 /// `exec::effects`]. Under the built-in root that was invisible, because
 /// a ComfyUI checkout ships a `models/` tree; under a declared root
 /// nothing has made one. Whether a transfer should make its own

@@ -159,7 +159,7 @@ impl ComfyUiPaths {
     /// Where `toolchain.python` puts the venv it creates.
     ///
     /// **`.venv`, not `venv`** — the spelling the predecessor
-    /// implementation uses [実測: `profile_service.rs:1067`]. The
+    /// implementation uses (measured: `profile_service.rs:1067`). The
     /// earlier `venv` spelling pointed at a directory nothing has ever
     /// created, so correcting it breaks no installed base.
     pub fn venv_dir(&self) -> String {

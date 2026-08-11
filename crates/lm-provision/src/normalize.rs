@@ -187,7 +187,7 @@ fn normalize_phases(phases: &[ProfileNode], mut ids: IdMinter) -> Vec<ProfileNod
 /// The inserted phase installs the checkout's own `requirements.txt`,
 /// which is what makes the result startable rather than merely present;
 /// the predecessor implementation does the same three things in one
-/// script [実測: `profile_service.rs:1061-1082`]. A profile that wants
+/// script (measured: `profile_service.rs:1061-1082`). A profile that wants
 /// a bare venv, a different requirements file, or an isolated one
 /// writes its own `toolchain.python` and this inserts nothing.
 fn insert_comfyui_lifecycle(buckets: &mut Buckets, ids: &mut IdMinter) {

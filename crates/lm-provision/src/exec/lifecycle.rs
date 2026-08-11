@@ -374,7 +374,7 @@ fn comfyui_paths(payload: &ProfileNode, env: &ResourceEnv) -> Result<ComfyUiPath
 /// nothing made one — the sibling of [`comfyui_paths`], and the point
 /// where design §4.2's second example stops being nameless. Reaching a
 /// `pip` under a venv nothing created used to fail as `no such file`
-/// [実測: 旧 `lifecycle.rs:321` / `:365-372`].
+/// (measured, before this stage: `lifecycle.rs:321` / `:365-372`).
 fn venv_paths(payload: &ProfileNode, env: &ResourceEnv) -> Result<VenvPaths, ExecError> {
     env.venv().ok_or(ExecError::ResourceUnbound {
         kind: crate::plan::kind_of(payload),
@@ -482,7 +482,7 @@ fn expand_python_version_check(want: &str) -> Vec<PlannedStep> {
 /// wheel wants no longer matches the driver the pod has, and the only
 /// symptom is `torch.cuda.is_available()` answering false — at launch,
 /// long after the phase that caused it reported success
-/// [実測: predecessor implementation `profile_service.rs:963-976`].
+/// (measured: predecessor implementation `profile_service.rs:963-976`).
 ///
 /// ComfyUI's own requirements pin it, and so do many custom nodes,
 /// which is why both phases filter. Keeping the pattern in one place is
@@ -530,6 +530,41 @@ fn expand_toolchain_python(
         Step::Sh(argv),
         assert::Venv::new(venv.dir()).done(),
     )];
+
+    // **Upgrade pip before installing anything through it**, which is
+    // what the predecessor implementation does at the same point
+    // (measured: `profile_service.rs:1074`) and this one did not.
+    //
+    // `python3 -m venv` seeds whatever pip `ensurepip` carries — 24.0 on
+    // the pod image this was measured against, against 26.2.1 current.
+    //
+    // What was measured, on ComfyUI at `master`:
+    //
+    // | | pip | wall clock | venv |
+    // |---|---|---|---|
+    // | before | 24.0 | **over 60 min, unfinished** (2 runs) | 4.7 GB, still growing |
+    // | after | 26.2.1 | **8 min 59 s, complete** | 4.9 GB |
+    //
+    // **The two are not cleanly isolated**: the fast run also landed on
+    // a pod with a 3-4× faster link (16843 vs 4032 / 5618 Mbps). What
+    // rules bandwidth out as *the* cause is the rate — the slow runs
+    // moved 1.5 MB/s against a 504 MB/s link, two orders of magnitude
+    // below it, so they were not waiting on the network. The fast run
+    // managed 12 MB/s: 8× the throughput for 3-4× the link. Some of
+    // that gap is the newer resolver; how much is not established here.
+    //
+    // The claim this step rests on is the narrow one — the reference
+    // implementation upgrades pip here, this did not, and the omission
+    // was a difference from a working system rather than a decision.
+    //
+    // No `done`: pip is either current or it is not, and asking costs a
+    // process either way. It is idempotent and quick once satisfied.
+    steps.push(PlannedStep::always(Step::Sh(vec![
+        venv.pip(),
+        "install".to_string(),
+        "--upgrade".to_string(),
+        "pip".to_string(),
+    ])));
 
     if let Some(requirements) = requirements {
         // No `done`: "the requirements are installed" is a statement
@@ -5100,13 +5135,14 @@ mod tests {
             false,
         ))
         .expect("toolchain.python expands");
-        assert_eq!(steps.len(), 2);
+        // create venv → upgrade pip → install requirements.
+        assert_eq!(steps.len(), 3);
         assert!(
-            steps[1].done.is_none(),
+            steps[2].done.is_none(),
             "nothing here can observe what is inside a venv"
         );
-        let Step::Sh(argv) = &steps[1].step else {
-            panic!("the install is a shell step: {:?}", steps[1].step);
+        let Step::Sh(argv) = &steps[2].step else {
+            panic!("the install is a shell step: {:?}", steps[2].step);
         };
         assert_eq!(argv[0], "sh");
         assert!(
@@ -5121,7 +5157,34 @@ mod tests {
         );
 
         let bare = expand(&toolchain(None, false)).expect("toolchain.python expands");
-        assert_eq!(bare.len(), 1, "no requirements, no install step");
+        assert_eq!(
+            bare.len(),
+            2,
+            "no requirements, but the venv's pip is still brought current"
+        );
+    }
+
+    /// **The bundled pip is upgraded before anything is installed
+    /// through it**, which is the step the predecessor implementation
+    /// runs at the same point and this one did not.
+    ///
+    /// Omitting it was measured as the difference between an install
+    /// that did not finish in an hour and one that finished in nine
+    /// minutes; see [`expand_toolchain_python`] for the numbers and for
+    /// what that comparison does and does not isolate.
+    #[test]
+    fn the_venvs_pip_is_upgraded_before_it_installs_anything() {
+        let steps = expand(&toolchain(Some("/r.txt"), false)).expect("toolchain.python expands");
+        assert_eq!(
+            steps[1].step,
+            Step::Sh(vec![
+                "/workspace/ComfyUI/.venv/bin/pip".into(),
+                "install".into(),
+                "--upgrade".into(),
+                "pip".into(),
+            ]),
+            "the upgrade runs before the requirements install, not after"
+        );
     }
 
     /// **Both phases that pip-install a `requirements.txt` filter it,
@@ -5131,7 +5194,7 @@ mod tests {
     /// a launch that never becomes ready.
     #[test]
     fn every_requirements_install_goes_through_the_same_filter() {
-        let toolchain_argv = match &expand(&toolchain(Some("/r.txt"), false)).unwrap()[1].step {
+        let toolchain_argv = match &expand(&toolchain(Some("/r.txt"), false)).unwrap()[2].step {
             Step::Sh(argv) => argv[2].clone(),
             other => panic!("{other:?}"),
         };

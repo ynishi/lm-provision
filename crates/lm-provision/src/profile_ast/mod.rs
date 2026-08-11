@@ -147,7 +147,8 @@ pub enum ProfileNode {
         /// and the failure surfaces only as `torch.cuda.is_available()`
         /// returning false at launch — silently, long after the phase
         /// that caused it reported success
-        /// [実測: predecessor implementation `profile_service.rs:1047-1051`].
+        /// (measured: predecessor implementation
+        /// `profile_service.rs:1047-1051`).
         ///
         /// So the default has to be "inherit", and an absent `bool` is
         /// `false` — hence the negative sense, rather than a
@@ -155,7 +156,7 @@ pub enum ProfileNode {
         /// arrangement. `Option<bool>` would have carried the positive
         /// sense with a tri-state, but dsl-kit 0.11's canonical grammar
         /// has no value production for it
-        /// [実測: `dsl_kit::schema_gen::unsupported_field`].
+        /// (measured: `dsl_kit::schema_gen::unsupported_field`).
         isolated: bool,
     },
 
