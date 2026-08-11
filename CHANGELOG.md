@@ -106,9 +106,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `staging.push` and `llm_models` route to `b2` / `hf` when the source
   scheme and a credential `env` say so, and reached for a tool the pod
   need not have: `command not found`, on a binary the profile never
-  named. Each routed step now composes a guard ahead of the invocation.
-  No new kind and nothing to declare — which CLI is needed follows from
-  the route, and the route is already derived from the payload.
+  named. Each routed step now composes an install ahead of the
+  invocation, skipped when the tool resolves. No new kind and nothing
+  to declare — which CLI is needed follows from the route, and the
+  route is already derived from the payload.
+- **`Assert::CommandOnPath` and the `Cli` entity.** The fifth predicate
+  and the fourth entity: a name resolves on `PATH`. It is what makes
+  the install above a *conditioned* step rather than a `command -v … ||`
+  written inside the shell, where the report cannot see it. Evaluated
+  in dry-run too — a `PATH` lookup is a read, and cheaper than the git
+  predicate that already runs in both modes.
 - **A transfer creates the directory it is about to write into.** Under
   the built-in root this never showed — a ComfyUI checkout ships a
   `models/` tree — but a root a profile declares for itself ships

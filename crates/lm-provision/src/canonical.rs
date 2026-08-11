@@ -140,6 +140,14 @@ fn assert_to_canon(assert: &Assert) -> CanonValue {
             fields.insert("path".into(), CanonValue::Str(path_string(path)));
             CanonValue::Object(fields)
         }
+        Assert::CommandOnPath { bin } => {
+            let mut fields = variant_object("CommandOnPath");
+            // The `sh -c 'command -v …'` the predicate fires is a fixed
+            // template of this one field, and is left out for the same
+            // reason `GitTreeAt`'s argv is.
+            fields.insert("bin".into(), CanonValue::Str(bin.clone()));
+            CanonValue::Object(fields)
+        }
         Assert::GitTreeAt { dir, git_ref } => {
             let mut fields = variant_object("GitTreeAt");
             // The argv the predicate fires is *not* encoded: it is a
@@ -915,6 +923,12 @@ mod tests {
                     git_ref: value["git_ref"]
                         .as_str()
                         .expect("a git predicate carries its ref")
+                        .to_string(),
+                },
+                "CommandOnPath" => Assert::CommandOnPath {
+                    bin: value["bin"]
+                        .as_str()
+                        .expect("an on-path predicate carries its command name")
                         .to_string(),
                 },
                 "ProcessAlive" => Assert::ProcessAlive {

@@ -238,12 +238,12 @@ Dispatch turns each planned step into one or more bridge invocations
   old entry point prints a deprecation notice and exits 1 — observed
   live on a fresh pod, 2026-08-01. The argument shape is unchanged.)
 
-  **A routed step is two steps**: one that puts the CLI on `PATH` if it
-  is not there, then the invocation.
+  **A routed step is two steps**: an install, conditioned on the tool
+  not already being there, then the invocation.
 
   ```
-  command -v hf >/dev/null 2>&1 || pip install -q huggingface_hub
-  command -v b2 >/dev/null 2>&1 || pip install -q b2
+  pip install -q huggingface_hub   done: on_path(hf)
+  pip install -q b2                done: on_path(b2)
   ```
 
   There is no phase kind for this and nothing to declare. Which CLI a
@@ -251,9 +251,15 @@ Dispatch turns each planned step into one or more bridge invocations
   source scheme and whether `env` carries credentials — all of which
   the dispatcher already reads off the payload. Asking a profile to
   also declare the tool would be asking it to restate a choice it did
-  not make. The guard carries no completion condition: the check it
-  performs *is* the condition, and it is a no-op when the tool is
-  present.
+  not make.
+
+  The condition is an `Assert`, not a `||` inside the command. The
+  inline form runs the same test where nothing can read it: the step
+  always reports as having run, so a converged apply is
+  indistinguishable from a first one and `plan` cannot say whether an
+  install is coming. `Cli`'s completion condition is
+  `Assert::CommandOnPath`, a `PATH` lookup — evaluated in both modes,
+  because it is a read and a cheaper one than the git predicate's.
 
   **`dst` means different things on these two routes.** `b2` takes the
   destination file path; `hf` exposes no output-file flag

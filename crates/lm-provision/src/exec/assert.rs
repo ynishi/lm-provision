@@ -351,6 +351,45 @@ pub enum Assert {
         git_ref: String,
     },
 
+    /// `bin` resolves on `PATH`.
+    ///
+    /// The second command predicate, and the cheaper one: `command -v`
+    /// is a shell builtin that walks `PATH` and prints what it finds.
+    /// It starts nothing, so unlike asking the tool itself (`--help`,
+    /// `--version`) it costs no interpreter start-up and cannot be
+    /// affected by a tool that is present but broken — which is the
+    /// right boundary here, because what the step after it needs is a
+    /// resolvable name, and a tool that resolves and then fails is a
+    /// failure of that step with that step's own message.
+    ///
+    /// ## Why a predicate rather than `||` in the command
+    ///
+    /// `command -v x >/dev/null || install x` is the same test written
+    /// where nothing can see it. The step then always "runs", the
+    /// report always says it ran, and an operator reading a converged
+    /// apply cannot tell an install from a no-op. Ansible ranks the
+    /// equivalent three ways — a state-aware module, `command` with
+    /// `creates:`, and a `command -v` probe with `when:` — and puts the
+    /// inline probe last, with the standing advice that a shell command
+    /// carry its condition in the declared layer rather than inside the
+    /// string [理論値: docs.ansible.com command module `creates`].
+    /// Here the declared layer is this type.
+    ///
+    /// ## Why it runs in a dry run
+    ///
+    /// A `PATH` lookup is a read, and a cheaper one than
+    /// [`Assert::GitTreeAt`]'s `git` — which §3.7's cost axis already
+    /// admits in both modes. Answering `NotChecked` instead would make
+    /// `plan` say "might install a CLI" about a pod that has it.
+    CommandOnPath {
+        /// The command name, resolved against `PATH`.
+        ///
+        /// Never author input: the set is fixed by the dispatch routes
+        /// (`crate::exec::lifecycle`), so nothing an author writes
+        /// reaches the shell this composes.
+        bin: String,
+    },
+
     /// The process a launch recorded in `pid_file` is still running.
     ///
     /// This is where `Liveness` — the three-valued probe the readiness
@@ -489,6 +528,19 @@ fn git_tree_at_argv(dir: &Path, git_ref: &str) -> Vec<String> {
         git_ref.to_string(),
         "HEAD".to_string(),
         "--".to_string(),
+    ]
+}
+
+/// The command [`Assert::CommandOnPath`] fires.
+///
+/// `command -v` is POSIX and a shell builtin, so this needs a shell but
+/// starts nothing else. `which` was the alternative and is not in
+/// POSIX; on a minimal image it is the thing that might be missing.
+fn command_on_path_argv(bin: &str) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!("command -v {bin}"),
     ]
 }
 
@@ -877,6 +929,24 @@ pub async fn eval<O: Observe + Sync>(assert: &Assert, mode: ExecMode, obs: &O) -
             }
         }
 
+        Assert::CommandOnPath { bin } => {
+            // Both modes, for the same reason `GitTreeAt` is: a `PATH`
+            // lookup is a read, and a cheaper one than git's.
+            let outcome = match obs.command_status(&command_on_path_argv(bin)).await {
+                Ok(0) => AssertOutcome::Satisfied,
+                // `command -v` exits non-zero for "not found" and has
+                // no other failure of its own to report — it is a
+                // builtin, so there is no process that could fail to
+                // start. Anything non-zero is the answer "no".
+                Ok(_) => AssertOutcome::Unsatisfied,
+                Err(error) => AssertOutcome::CheckFailed(error),
+            };
+            AssertNode::Leaf {
+                id: AssertExecutionId::next(),
+                outcome,
+            }
+        }
+
         Assert::GitTreeAt { dir, git_ref } => {
             // Evaluated in both modes: the command is the predicate's
             // own, is read-only by construction, and costs about what a
@@ -1075,6 +1145,9 @@ fn write_assert(assert: &Assert, node: Option<&AssertNode>, out: &mut String) {
             expected_sha256,
         } => {
             out.push_str(&format!("sha256({})={expected_sha256}", path.display()));
+        }
+        Assert::CommandOnPath { bin } => {
+            out.push_str(&format!("on_path({bin})"));
         }
         Assert::GitTreeAt { dir, git_ref } => {
             out.push_str(&format!("git_tree({})={git_ref}", dir.display()));
@@ -1298,6 +1371,44 @@ impl Done for Checkout {
                     git_ref: git_ref.clone(),
                 }],
             )),
+        }
+    }
+}
+
+/// One command-line tool a dispatch route needs on `PATH`.
+///
+/// **The entity that made the venv's weakness visible by contrast.** A
+/// [`Venv`] can only be asked whether it exists, because a directory of
+/// files carries no manifest of what should be in it. A CLI can be
+/// asked the question that actually matters — does this name resolve —
+/// and the answer is the whole of what the step after it needs.
+///
+/// That is why installing one is a step with a condition rather than a
+/// shell `||`: the install is skippable, the report says which name was
+/// already there, and a dry run can tell an operator whether an install
+/// is coming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cli {
+    bin: String,
+}
+
+impl Cli {
+    /// A tool by the name a route invokes it under.
+    pub fn new(bin: impl Into<String>) -> Self {
+        Self { bin: bin.into() }
+    }
+}
+
+impl Done for Cli {
+    /// The name resolves.
+    ///
+    /// Not "and it runs": a tool that resolves and then fails belongs
+    /// to the step that invoked it, with that step's own error. Asking
+    /// `--version` here would start an interpreter to answer a question
+    /// about `PATH`.
+    fn done(&self) -> Assert {
+        Assert::CommandOnPath {
+            bin: self.bin.clone(),
         }
     }
 }
@@ -1869,6 +1980,10 @@ mod tests {
             dir: PathBuf::from("/repo"),
             git_ref: "v1".to_string(),
         };
+        let on_path = |reply| FakeHost::new(&[]).running(command_on_path_argv("hf"), reply);
+        let resolves = || Assert::CommandOnPath {
+            bin: "hf".to_string(),
+        };
         let launch = |state| FakeHost::new(&[]).launched("/tmp/svc.pid", state);
         let alive = || Assert::ProcessAlive {
             pid_file: PathBuf::from("/tmp/svc.pid"),
@@ -1961,6 +2076,35 @@ mod tests {
                 "git tree / git could not be started",
                 repo(HostCommand::Unrunnable),
                 at_v1(),
+                failed(UNRUNNABLE_DETAIL),
+                failed(UNRUNNABLE_DETAIL),
+            ),
+            // on path — 3 observations, answering the same in both
+            // modes. A `PATH` lookup is a read, so §3.7's leaf contract
+            // ("`DryRun` may answer `Satisfied` only where `Real`
+            // would") holds by the two columns being equal rather than
+            // by an argument.
+            (
+                "on path / resolves",
+                on_path(HostCommand::Exits(0)),
+                resolves(),
+                AssertOutcome::Satisfied,
+                AssertOutcome::Satisfied,
+            ),
+            (
+                // `command -v` is a builtin: a non-zero exit is the
+                // answer "no such name", never a tool that failed to
+                // start, so there is no `CheckFailed` row for it.
+                "on path / does not resolve",
+                on_path(HostCommand::Exits(1)),
+                resolves(),
+                AssertOutcome::Unsatisfied,
+                AssertOutcome::Unsatisfied,
+            ),
+            (
+                "on path / no shell to ask",
+                on_path(HostCommand::Unrunnable),
+                resolves(),
                 failed(UNRUNNABLE_DETAIL),
                 failed(UNRUNNABLE_DETAIL),
             ),

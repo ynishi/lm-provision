@@ -511,21 +511,28 @@ fn cli_install_command(bin: &str) -> Option<&'static str> {
 /// A step that makes `bin` available, placed immediately before the
 /// step that invokes it.
 ///
-/// This is design §4.2's second example — "`hf` が PATH に無いのに
-/// `hf download` を叩いて `command not found`" — and the shape of the
-/// answer is the predecessor implementation's: guard at the point of
-/// use, not a declaration to check
-/// (measured: `profile_service.rs:1279` / `:1356`).
+/// This is design §4.2's second example — reaching for `hf` on a pod
+/// where huggingface_hub was never installed, and failing as `command
+/// not found` on a binary the profile never named. The predecessor
+/// implementation answers it at the point of use rather than with a
+/// declaration (measured: `profile_service.rs:1279` / `:1356`), and so
+/// does this.
 ///
-/// **No `done`.** "Is this command on PATH" would be a new predicate,
-/// and the check the guard already performs *is* that predicate — a
-/// condition here would run `command -v` to decide whether to run
-/// `command -v`. The whole step is a no-op when the tool is present.
+/// **The condition is an [`assert::Cli`], not a `||` in the command.**
+/// Writing `command -v x || install x` puts the same test where nothing
+/// can read it: the step always runs, the report always says it ran,
+/// and a converged apply looks identical to a first one. Ansible ranks
+/// the three spellings — a state-aware module, `command` with
+/// `creates:`, and an inline probe — and puts the inline probe last,
+/// advising that a shell command carry its condition in the declared
+/// layer [理論値: docs.ansible.com command module `creates`]. The
+/// declared layer here is the Assert tree, so that is where it goes.
 fn ensure_cli(bin: &str) -> Option<PlannedStep> {
     let install = cli_install_command(bin)?;
-    Some(PlannedStep::always(sh_c(format!(
-        "command -v {bin} >/dev/null 2>&1 || {install}"
-    ))))
+    Some(PlannedStep::done_when(
+        sh_c(install.to_string()),
+        assert::Cli::new(bin).done(),
+    ))
 }
 
 /// Prepend [`ensure_cli`] for the CLI `argv` invokes, so a routed step
@@ -2057,14 +2064,20 @@ mod tests {
     /// silently: a route that stopped emitting it fails on the first
     /// line of this helper rather than passing.
     fn effects_after_cli_guard(steps: &[PlannedStep], bin: &str) -> Vec<Step> {
+        assert_eq!(
+            condition(steps, 0).as_deref(),
+            Some(format!("on_path({bin})").as_str()),
+            "the guard is skippable, and says which name it is asking about"
+        );
         let effects = effects(steps);
         let (guard, rest) = effects.split_first().expect("a routed phase has steps");
         assert_eq!(
             guard,
-            &sh_c(format!(
-                "command -v {bin} >/dev/null 2>&1 || {}",
-                cli_install_command(bin).expect("a routed CLI has an install command")
-            )),
+            &sh_c(
+                cli_install_command(bin)
+                    .expect("a routed CLI has an install command")
+                    .to_string()
+            ),
             "the route must make {bin} available before invoking it"
         );
         rest.to_vec()
@@ -2389,11 +2402,11 @@ mod tests {
                     env: Default::default(),
                     revision: None,
                 },
-                // Two steps on a CLI route: the guard that makes `b2`
-                // available, then the upload. Neither carries a
-                // condition — the guard is its own check, and an
-                // upload's destination is remote.
-                vec![None, None],
+                // Two steps on a CLI route. The guard is skippable —
+                // that is the whole point of it being a step rather
+                // than a `||` — and the upload is not: its destination
+                // is remote and nothing here observes it.
+                vec![Some("on_path(b2)"), None],
             ),
             (
                 ProfileNode::Models {
@@ -2407,8 +2420,10 @@ mod tests {
                     id: node_id(&ids),
                     models_json: r#"[{"src":"hf://owner/repo"}]"#.into(),
                 },
-                // Guard then download, per entry.
-                vec![None, None],
+                // Guard then download, per entry — the guard skippable,
+                // the download not (an `hf download` lands a whole
+                // snapshot and no entity here describes one).
+                vec![Some("on_path(hf)"), None],
             ),
             (
                 ProfileNode::PostInstall {
@@ -2986,8 +3001,7 @@ mod tests {
         // Each entry is its own routed pair, so the phase is
         // guard, download, guard, download.
         let steps = effects(&expand(&payload).expect("llm_models expands"));
-        let guard =
-            sh_c("command -v hf >/dev/null 2>&1 || pip install -q huggingface_hub".to_string());
+        let guard = sh_c("pip install -q huggingface_hub".to_string());
         assert_eq!(
             steps,
             vec![
