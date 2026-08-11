@@ -553,6 +553,23 @@ async fn download(
     read_timeout: Duration,
     progress: ProgressSink<'_>,
 ) -> Result<TransferOutcome, ExecError> {
+    // The choice is made per transfer rather than once at startup so a
+    // pod that installs aria2c partway through a profile — which is what
+    // `toolchain.cli` does — gets the fast route for the weights that
+    // come after it.
+    if super::aria2c::available() {
+        super::audit::transfer_route(dst, "aria2c", "on PATH");
+        return super::aria2c::download(url, dst, progress).await;
+    }
+    // Falling back is allowed; falling back **quietly** is not. Without
+    // this line a transfer that took 25 minutes instead of 54 seconds
+    // looks exactly like one that was always going to.
+    super::audit::transfer_route(
+        dst,
+        "in-process",
+        &format!("'{}' is not on PATH", super::aria2c::BIN),
+    );
+
     let client = client("net_transfer", |builder| builder.read_timeout(read_timeout))?;
     let response = client
         .get(url)

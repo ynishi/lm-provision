@@ -179,6 +179,31 @@ those options are deferred, not withdrawn.
 - Effect (download): GET streamed to the `dst` file (never fully
   buffered, 16 MiB cap); on any failure the partial file is removed.
   The report carries the byte count and destination.
+- **Two download mechanisms, one step.** When `aria2c` resolves on the
+  pod's `PATH` the transfer is carried by it, splitting one file across
+  16 connections; otherwise the in-process stream above carries it. The
+  choice is made per transfer (so a profile that installs `aria2c`
+  partway through gets the faster route for what follows) and is
+  announced as a `net.transfer.route` audit event naming the route and
+  the reason — a fallback is allowed, a *silent* fallback is not,
+  because the two differ by more than an order of magnitude on a large
+  weight and a slow run must not be indistinguishable from an
+  unavoidable one.
+  - Nothing installs `aria2c`. Acquiring it is the profile's decision,
+    written with `sh.exec`; composing the install into `models` would
+    make every weight-downloading profile require `sh.exec`, widening
+    the boundary the capability list exists to hold.
+  - **Nothing above this changes with the route.** The step is the same
+    step with the same condition, so a re-applied profile skips a
+    finished download either way; `sha256` is verified by that
+    condition reading the file, not by the transfer, so it holds for
+    both; and `net.transfer.progress` keeps its shape, cadence and
+    ordering (chapter 09) because the cadence lives in the transcript,
+    not in the mechanism. A consumer cannot tell from the event stream
+    which route ran.
+  - A non-zero `aria2c` exit is an error, not a fallback: by then the
+    URL was resolved and attempted, and retrying in-process would hide
+    which route is broken.
 - Effect (upload): PUT of the local `src` file to the destination URL,
   read under the same 16 MiB cap, sent as
   `application/octet-stream`. The report carries the byte count and the

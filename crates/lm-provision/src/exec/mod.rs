@@ -34,6 +34,7 @@ use dsl_kit::NodeId;
 
 use crate::profile_ast::ProfileNode;
 
+pub mod aria2c;
 pub mod assert;
 pub mod audit;
 pub mod capgate;

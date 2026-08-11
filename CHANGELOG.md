@@ -56,6 +56,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chunk and the last, carrying bytes / total / percent / elapsed. No
   rate and no estimate: an ETA asserts the next minutes look like the
   last, and nothing here has looked at the network to say so.
+- **A download splits across connections when the pod can.** A pod is
+  billed for as long as it is up, so a transfer that takes 25 minutes is
+  25 minutes paid for provisioning that produced nothing; carrying one
+  file over 16 connections took that to 54 seconds on the reference
+  workload. When `aria2c` resolves on the pod's `PATH` it carries the
+  transfer, and progress is read back from its JSON-RPC rather than
+  scraped from its console. This is a different axis from the four
+  transfers already running at once — that decides how many files move,
+  this decides how many connections carry one — and neither replaces the
+  other.
+  - **The step is the same step.** Same condition, so a re-applied
+    profile still skips a finished download; `sha256` still verified by
+    that condition reading the file; `net.transfer.progress` unchanged
+    in shape, cadence and ordering, because the cadence was always
+    decided by the transcript rather than by the transfer. A consumer
+    cannot tell from the event stream which mechanism ran.
+  - Which one ran is said once, by a new `net.transfer.route` event. A
+    pod without `aria2c` falls back — but not quietly, because a run
+    that fell back must not look like one that was always going to be
+    slow.
+  - Nothing installs `aria2c`; a profile that wants it says so with
+    `sh.exec`. Composing the install into `models` was tried and
+    reverted: it would make every weight-downloading profile require
+    the right to run commands as root, which is a wider boundary than a
+    faster download is worth.
 
 ### Changed
 

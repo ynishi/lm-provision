@@ -504,6 +504,20 @@ fn cli_install_command(bin: &str) -> Option<&'static str> {
     match bin {
         "hf" => Some("pip install -q huggingface_hub"),
         "b2" => Some("pip install -q b2"),
+        // `aria2c` is deliberately absent. It would belong here if a
+        // step invoked it, but the fast download route reaches it from
+        // inside the transfer (see [`super::aria2c`]) rather than as an
+        // argv, so there is no invocation to guard.
+        //
+        // Composing its install into `models` anyway was tried and
+        // reverted: `derive` walks the composed steps, so a shell step
+        // under `models` makes every weight-downloading profile demand
+        // `sh.exec`. Granting a phase whose job is "fetch these files"
+        // the right to run commands as root — to make that fetch faster
+        // — widens exactly the boundary the capability list exists to
+        // hold. A profile that wants the fast route says so in the
+        // phase that already runs commands (`sh.exec`), which is one
+        // line and no new vocabulary.
         _ => None,
     }
 }

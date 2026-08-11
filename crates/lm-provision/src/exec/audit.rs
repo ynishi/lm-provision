@@ -275,6 +275,31 @@ pub fn transfer_progress(
     );
 }
 
+/// Which mechanism carried one download, and why that one.
+///
+/// A transfer has two routes — `aria2c` splitting the file across
+/// connections, or the in-process stream — and they differ by more than
+/// an order of magnitude on a large weight. The choice is made from the
+/// pod's state (whether `aria2c` resolves on `PATH`), so it is not
+/// something a reader of the profile can work out, and a slow
+/// provisioning run with no line saying which route it took is
+/// indistinguishable from one that was always going to be slow.
+///
+/// This is deliberately **not** part of
+/// [`super::effects::TransferProgress`]: the progress events are
+/// identical between routes by design, and folding the route into them
+/// would let a consumer start depending on which one it got.
+pub fn transfer_route(dst: &str, route: &str, reason: &str) {
+    tracing::info!(
+        mode = mode_label(super::ExecMode::Real),
+        op = "net.transfer.route",
+        dst = dst,
+        route = route,
+        reason = reason,
+        "audit"
+    );
+}
+
 /// Turns one transfer's [`TransferProgress`] reports into
 /// [`transfer_progress`] events at [`TRANSFER_PROGRESS_INTERVAL_SEC`].
 ///
