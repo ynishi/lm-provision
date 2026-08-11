@@ -21,8 +21,8 @@ name = "lm-provision-mcp"
 path = "src/main.rs"
 
 [dependencies]
-lm-provision = { path = "../lm-provision", version = "0.4.0" }
-lm-provision-driver = { path = "../lm-provision-driver", version = "0.4.0" }
+lm-provision = { path = "../lm-provision", version = "0.5.0" }
+lm-provision-driver = { path = "../lm-provision-driver", version = "0.5.0" }
 rmcp = { workspace = true }
 tokio = { workspace = true }
 dsl-kit = { workspace = true }

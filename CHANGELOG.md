@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.5.0] - 2026-08-11
+
+### Added
+
 - **A completion condition per lifecycle step, and one vocabulary for
   writing it.** Every kind used to answer "is this finished?" in its own
   shape, or not at all: six ad-hoc forms across payload fields and host
