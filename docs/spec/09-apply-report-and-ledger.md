@@ -169,12 +169,15 @@ state       = "running" | "done"
   transcript. The report is the result of an apply, not a running
   commentary on one.
 - **The shape does not vary with the download mechanism.** A transfer
-  is carried either by `aria2c` or by the in-process stream
-  (chapter 04 §`net.transfer`), and the fields, cadence and ordering
-  above are the same for both — the cadence is decided by the
-  transcript, which reads whichever mechanism ran. Which one it was is
-  said once, by `net.transfer.route`, and never repeated here: folding
-  it into the progress events would invite a consumer to depend on it.
+  is carried either in parallel ranges or as one stream (chapter 04
+  §`net.transfer`), and the fields, cadence and ordering above are the
+  same for both — the cadence is decided by the transcript, which reads
+  whichever mechanism ran. The parallel route's `bytes` is the total
+  written across every chunk, so it rises smoothly even though no
+  single chunk is contiguous with the file's start. Which mechanism it
+  was is said once, by `net.transfer.route`, and never repeated here:
+  folding it into the progress events would invite a consumer to depend
+  on it.
 
 #### Transfer route
 
@@ -185,13 +188,13 @@ chosen and why.
 op     = "net.transfer.route"
 mode   = "real"          -- a dry run performs no transfer
 dst    = <destination path>
-route  = "aria2c" | "in-process"
+route  = "chunked" | "in-process"
 reason = <why that route>
 ```
 
-The choice is made from the pod's state rather than from the profile,
-so it cannot be worked out by reading the profile — and the two routes
-differ by more than an order of magnitude on a large weight. Without
+The choice is made from what the supplier answers rather than from the
+profile, so it cannot be worked out by reading the profile — and the
+two routes differ by a factor of several on a large weight. Without
 this line a run that fell back is indistinguishable from one that was
 always going to be slow.
 

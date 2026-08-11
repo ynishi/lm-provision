@@ -21,11 +21,12 @@
 //! disjoint ranges of a 4.27 GB weight, each fetched this way, all
 //! answered `206` [実測: 2026-08-11, `huggingface.co/.../resolve/main/`].
 //!
-//! **This is what `aria2c` cannot do**, and why the aria2c route posts
-//! exactly `split - 1` refusals against HuggingFace and collapses to a
-//! single connection mid-transfer: it resolves the redirect once and
-//! splits against the result. `hf_transfer` has the same shape — one
-//! probe `Range: bytes=0-0`, then every chunk reuses `redirected_url`
+//! **This is what a resolve-once downloader cannot do.** An `aria2c`
+//! route lived here before this one and posted exactly `split - 1`
+//! refusals against HuggingFace, collapsing to a single connection
+//! mid-transfer, because it resolves the redirect once and splits
+//! against the result. `hf_transfer` has the same shape — one probe
+//! `Range: bytes=0-0`, then every chunk reuses `redirected_url`
 //! [`hf_transfer/src/lib.rs`] — and HuggingFace has deprecated it now
 //! that Xet is the storage backend.
 //!
@@ -44,6 +45,14 @@
 //! thirty rapid re-resolutions at eight concurrent against CivitAI, all
 //! `206`, no rate limiting [実測: same day] — and a redirect against a
 //! 10 MiB chunk is not the expensive part of a download.
+//!
+//! It is not merely affordable, it is faster than the alternative even
+//! where the alternative works: a 2.13 GB CivitAI model, alternating
+//! runs on one pod, **22 / 23 / 26 s here against 35 / 36 / 50 s for
+//! `aria2c -c -x16 -s16 -k 10M`** — the reference implementation's own
+//! flags — with the two ranges not overlapping, and both producing the
+//! same digest [実測: 2026-08-11,
+//! `workspace/tasks/aria2c-bench/results.md`].
 //!
 //! # The numbers are HuggingFace's own
 //!

@@ -85,51 +85,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     CivitAI, 37 MB over 4. That check is the one that matters when
     sixteen writers share one file.
   - Range-scoped signing is **HuggingFace's**, not everyone's. CivitAI
-    signs only the host, so one resolved URL there serves any range and
-    a resolve-once downloader works fine against it — which is where
-    aria2c's 28x was measured, and there is no reason to doubt it. This
-    route re-resolves anyway rather than keeping a list of hosts that
-    may be trusted to serve a second range; thirty rapid re-resolutions
-    at eight concurrent against CivitAI drew no rate limiting.
-- **A download splits across connections when the pod can.** A pod is
-  billed for as long as it is up, so a transfer that takes 25 minutes is
-  25 minutes paid for provisioning that produced nothing; carrying one
-  file over 16 connections took that to 54 seconds on the reference
-  workload. When `aria2c` resolves on the pod's `PATH` it carries the
-  transfer, and progress is read back from its JSON-RPC rather than
-  scraped from its console. This is a different axis from the four
-  transfers already running at once — that decides how many files move,
-  this decides how many connections carry one — and neither replaces the
-  other.
-  - **Measured, that 28x is 2-3x**: 293 s on one connection against
-    64-148 s on four or more, for the same 4.27 GB file. The reference's
-    25 minutes implies single-digit MB/s at its other end, and a ratio
-    describes both of its ends.
-  - The reason it is not 16x is the supplier. HuggingFace hands out
-    presigned URLs pinned to a byte range, and aria2c resolves the
-    redirect once and reuses it, so every split past the first is
-    refused — exactly `split - 1` refusals, every run. The transfer
-    opens 16 connections, peaks near 212 MB/s, then collapses to one and
-    crawls the rest.
-  - **The split count is not tuned.** Runs at fixed settings landed
-    anywhere in that 64-148 s spread, which is wider than the gap
-    between any two split values tried; splitting beats not splitting by
-    far more than the noise, and nothing separates 4 from 8 from 16.
+    signs only the host, so one resolved URL there serves any range —
+    but this route re-resolves anyway rather than keeping a list of
+    hosts trusted to serve a second range, which would be a list to
+    maintain and to be wrong about. It is not merely affordable: on a
+    2.13 GB CivitAI model, alternating runs on one pod, this route took
+    22 / 23 / 26 s against 35 / 36 / 50 s for a resolve-once downloader
+    with the same connection count, the two ranges not overlapping.
   - **The step is the same step.** Same condition, so a re-applied
     profile still skips a finished download; `sha256` still verified by
     that condition reading the file; `net.transfer.progress` unchanged
-    in shape, cadence and ordering, because the cadence was always
-    decided by the transcript rather than by the transfer. A consumer
-    cannot tell from the event stream which mechanism ran.
-  - Which one ran is said once, by a new `net.transfer.route` event. A
-    pod without `aria2c` falls back — but not quietly, because a run
-    that fell back must not look like one that was always going to be
-    slow.
-  - Nothing installs `aria2c`; a profile that wants it says so with
-    `sh.exec`. Composing the install into `models` was tried and
-    reverted: it would make every weight-downloading profile require
-    the right to run commands as root, which is a wider boundary than a
-    faster download is worth.
+    in shape, cadence and ordering, because the cadence is decided by
+    the transcript rather than by the transfer. A consumer cannot tell
+    from the event stream which mechanism ran.
+  - Which one ran is said once, by a new `net.transfer.route` event.
+    Falling back to the single stream is allowed; falling back
+    *quietly* is not, because a slow run must not look like one that
+    was always going to be slow.
 
 ### Changed
 

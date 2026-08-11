@@ -277,13 +277,12 @@ pub fn transfer_progress(
 
 /// Which mechanism carried one download, and why that one.
 ///
-/// A transfer has two routes — `aria2c` splitting the file across
-/// connections, or the in-process stream — and they differ by more than
-/// an order of magnitude on a large weight. The choice is made from the
-/// pod's state (whether `aria2c` resolves on `PATH`), so it is not
-/// something a reader of the profile can work out, and a slow
-/// provisioning run with no line saying which route it took is
-/// indistinguishable from one that was always going to be slow.
+/// A transfer has two routes — parallel ranges, or the single stream —
+/// and they differ by a factor of several on a large weight. The choice
+/// is made from what the supplier answers rather than from anything the
+/// profile says, so it is not something a reader of the profile can work
+/// out, and a slow provisioning run with no line saying which route it
+/// took is indistinguishable from one that was always going to be slow.
 ///
 /// This is deliberately **not** part of
 /// [`super::effects::TransferProgress`]: the progress events are

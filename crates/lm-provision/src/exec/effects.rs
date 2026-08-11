@@ -608,12 +608,6 @@ async fn download(
     // Everything else is one body to write down: a `200` from a
     // supplier that ignored the range header, or a `206` for a file
     // small enough that the first chunk was all of it.
-    //
-    // aria2c is **not** reached from here, and after this route landed
-    // there is nowhere left for it to be reached from: it needs range
-    // support to split, and range support is exactly the condition that
-    // sends the transfer above instead. See the `super::aria2c` module
-    // doc for that route's own account of itself.
     super::audit::transfer_route(
         dst,
         "in-process",

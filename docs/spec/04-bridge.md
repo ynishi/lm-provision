@@ -201,10 +201,11 @@ those options are deferred, not withdrawn.
   - A chunk that fails is retried with backoff. Over a multi-gigabyte
     file one of sixteen connections will drop, and one drop must not
     discard the rest.
-  - Nothing is installed on the pod for this. The `aria2c` route
-    described in earlier revisions is no longer reached: it needs range
-    support to split, which is the same condition that routes the
-    transfer to the chunked path instead.
+  - Nothing is installed on the pod for this. An `aria2c` route
+    described in earlier revisions was removed: it needs range support
+    to split, which is the same condition that routes a transfer to the
+    chunked path instead, so there was nothing left for it to carry —
+    and where both worked it was the slower of the two.
   - **Nothing above this changes with the route.** The step is the same
     step with the same condition, so a re-applied profile skips a
     finished download either way; `sha256` is verified by that
@@ -213,9 +214,12 @@ those options are deferred, not withdrawn.
     ordering (chapter 09) because the cadence lives in the transcript,
     not in the mechanism. A consumer cannot tell from the event stream
     which route ran.
-  - A non-zero `aria2c` exit is an error, not a fallback: by then the
-    URL was resolved and attempted, and retrying in-process would hide
-    which route is broken.
+  - A chunk that fails every retry ends the whole transfer, and the
+    partial destination is removed. A file with a hole in it is worse
+    than a missing one, because the hole is found by whatever loads it
+    later — and the parallel route makes that failure mode reachable in
+    a way the single stream does not, since a failed chunk leaves a file
+    of exactly the right length.
 - Effect (upload): PUT of the local `src` file to the destination URL,
   read under the same 16 MiB cap, sent as
   `application/octet-stream`. The report carries the byte count and the
