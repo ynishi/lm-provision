@@ -801,6 +801,29 @@ async fn stream_to_file(
     dst_path: &str,
     progress: ProgressSink<'_>,
 ) -> Result<u64, String> {
+    // The destination's directory is created first, which is what the
+    // reference implementation does immediately before every model copy
+    // (measured: `profile_service.rs:1280` / `:1300`).
+    //
+    // A `models` entry names a subdirectory, and whether that
+    // subdirectory exists is a property of whatever produced the root —
+    // a ComfyUI checkout ships `models/checkpoints` but not
+    // `models/lora`, and a root a profile declared for itself ships
+    // nothing. Failing here would report `No such file or directory` on
+    // a path the author never wrote, for a directory that carries no
+    // decision: the transfer already knows exactly where it is going.
+    //
+    // Only the parent, and only as far as needed. The path itself has
+    // already been through the L3 path policy, so this cannot create a
+    // directory outside the declared roots.
+    if let Some(parent) = std::path::Path::new(dst_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| format!("failed creating directory for '{dst_path}': {err}"))?;
+        }
+    }
+
     // Declared before the file so that it is dropped *after* it: the
     // handle is closed before the destination is unlinked.
     let mut guard = PartialFile::new(dst_path);

@@ -562,10 +562,13 @@ The paths that are **not** resource-derived remain fixed: service logs
 must declare `paths` roots covering them — and covering the resolved
 `comfyui_root` — when the corresponding bridges gate on paths.
 
-A transfer does **not** create its destination's parent directories, so
-a declared root has to already carry the subdirectory an entry names.
-Under `/workspace/ComfyUI` that was invisible, because a ComfyUI
-checkout ships a `models/` tree.
+A transfer creates its destination's parent directories, which is what
+the predecessor implementation does immediately before every model copy.
+A `models` entry names a subdirectory, and whether that subdirectory
+exists is a property of whatever produced the root — a ComfyUI checkout
+ships `models/checkpoints` but not `models/lora`, and a root declared by
+a profile ships nothing. The path has already passed the `paths` policy
+by then, so no directory is created outside a declared root.
 
 The pid file of a launch always sits beside its log, differing only in
 extension: the poll that follows derives one path from the other's

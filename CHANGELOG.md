@@ -102,6 +102,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A cancelled transfer takes its partial file with it**, so a
   destination is either absent or complete and the next apply's
   condition is answering about a whole file.
+- **A transfer creates the directory it is about to write into.** Under
+  the built-in root this never showed — a ComfyUI checkout ships a
+  `models/` tree — but a root a profile declares for itself ships
+  nothing, and even a checkout has no `models/lora`. The failure was
+  `No such file or directory` on a path the author never wrote. The
+  destination has already passed the `paths` policy by then, so nothing
+  is created outside a declared root.
 
 ### Deprecated
 

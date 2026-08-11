@@ -52,22 +52,19 @@ fn serving(serves: usize, body: &'static [u8]) -> (String, std::thread::JoinHand
 
 /// A directory this process owns, used as the declared ComfyUI root.
 ///
-/// The `models/lora` subdirectory is created here, and that is not
-/// incidental: **`net.transfer` does not create its destination's parent
-/// directories** (measured: no `create_dir_all` on the download path in
-/// `exec::effects`]. Under the built-in root that was invisible, because
-/// a ComfyUI checkout ships a `models/` tree; under a declared root
-/// nothing has made one. Whether a transfer should make its own
-/// destination tree is a `net.transfer` question, not a resource-scope
-/// one, so this stage records it rather than deciding it — see the
-/// stage's Not Done.
+/// **Only the root is created — not the `models/lora` beneath it.** A
+/// declared root has nobody to ship a `models/` tree the way a ComfyUI
+/// checkout does, so the transfer makes its own destination directory;
+/// that it does is `a_transfer_makes_its_own_destination_directory`.
+/// This helper leaving the subdirectory absent is what keeps every test
+/// below exercising that.
 fn temp_root(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "lm-provision-comfyui-root-{label}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("models/lora")).expect("create the declared root");
+    std::fs::create_dir_all(&dir).expect("create the declared root");
     dir
 }
 
@@ -195,6 +192,7 @@ async fn a_second_apply_does_not_fetch_an_entry_that_is_already_there() {
 async fn a_skip_survives_the_fan_out() {
     let root = temp_root("fanout");
     let present = root.join("models/lora/a.bin");
+    std::fs::create_dir_all(present.parent().expect("parent")).expect("seed the subdir");
     std::fs::write(&present, b"already here").expect("seed the present entry");
 
     // One serve: only `b.bin` may reach the server.
@@ -280,5 +278,52 @@ async fn consuming_comfyui_without_producing_it_is_rejected_by_name() {
     assert!(
         message.contains("comfyui_root") && message.contains("models"),
         "validate names the phase and the resource: {message}"
+    );
+}
+
+/// **A transfer makes the directory it is about to write into.**
+///
+/// Under the built-in root this never showed: a ComfyUI checkout ships a
+/// `models/` tree, so the destination's parent happened to exist. A
+/// declared root has nobody to ship one, and a `models` entry naming a
+/// subdirectory ComfyUI does not create (`lora` beside the `checkpoints`
+/// that is there) has the same gap. Failing would report `No such file
+/// or directory` on a path the author never wrote, for a directory that
+/// carries no decision — the transfer knows exactly where it is going.
+///
+/// The path has already been through the L3 path policy by the time it
+/// gets here, so this cannot make a directory outside `paths`; that it
+/// cannot is `exec_integration`'s policy coverage, not this test's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_makes_its_own_destination_directory() {
+    let root = temp_root("mkdir");
+    let nested = root.join("models/deeply/nested/subdir");
+    assert!(!nested.exists(), "the fixture starts without the tree");
+
+    let (base, server) = serving(1, b"weights");
+    let models =
+        format!(r#"[{{"src":"{base}/w.bin","dst":"w.bin","subdir":"deeply/nested/subdir"}}]"#);
+    let profile = json!({
+        "type": "Spec",
+        "name": "mkdir-dst",
+        "capabilities": ["net.transfer"],
+        "paths": [root.to_string_lossy()],
+        "http_allowlist": [base],
+        "assumes": { "comfyui_root": root.to_string_lossy() },
+        "phases": [{ "type": "Models", "models_json": models }]
+    });
+    let path = write_profile("root-mkdir", &profile);
+
+    let report = expect_ok(
+        &lm_provision::apply::run_apply_ast(&path, false)
+            .await
+            .expect("the apply reaches the end"),
+    );
+    let _ = server.join();
+
+    assert_eq!(
+        std::fs::read(nested.join("w.bin")).expect("the entry landed"),
+        b"weights",
+        "{report}"
     );
 }
