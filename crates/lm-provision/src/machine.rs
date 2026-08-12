@@ -148,12 +148,56 @@ pub struct GpuRequirement {
     /// `0` is a machine with none, which is a real answer rather than an
     /// absent requirement — it is what a CPU-only profile says.
     pub count: u32,
-    /// The least memory each one must have, in gigabytes.
+    /// The least memory each one must have, in decimal gigabytes — the
+    /// number the vendor prints on the box.
+    ///
+    /// **Written in the vendor's unit because that is the only unit a
+    /// profile can be written in.** A machine does not exist when this is
+    /// read; all that exists is a catalogue of model names and published
+    /// capacities, and matching a published figure against a published
+    /// figure is the one comparison that needs no conversion. Established
+    /// catalogues do the same — SkyPilot carries the H200 at its
+    /// published 141 GB rather than its 144 GB of physical stacks.
+    ///
+    /// **It is not what the device will report.** A part sold as 48 GB
+    /// reports 46068 MiB [実測: 2026-08-12, `nvidia-smi` on an A40],
+    /// because ECC reserves about 6.25% of a GDDR6 framebuffer and
+    /// because MiB is not GB. So this is a floor on the published figure,
+    /// which [`observe`] treats as a *lower bound* on real memory rather
+    /// than as an equal — see [`gb_to_mib`] for why that direction is the
+    /// safe one.
     ///
     /// `None` when the profile does not care, which is different from
     /// zero: a profile that needs *a* GPU but not a particular size
     /// leaves this out rather than asking for 0 GB.
     pub min_vram_gb: Option<u32>,
+}
+
+/// Decimal gigabytes as the mebibytes a device reports.
+///
+/// **The one place the two units meet, and it converts in the safe
+/// direction.** A published capacity is ambiguous at the source: a part
+/// sold as "48 GB" carries 48 GiB of chips, and NVIDIA prints the same
+/// two letters either way. Reading it as decimal — the smaller of the two
+/// readings — makes the result a floor rather than a promise, so a
+/// selection can only ever under-estimate what a device carries.
+///
+/// Under-estimating turns away a machine that would have worked; the
+/// refusal names the way out (`provider.runpod.gpuTypeIds`) and costs
+/// nothing but a retry. Over-estimating promises memory that is not there
+/// and is found out after the machine is paid for.
+///
+/// Every part measured so far clears the bound it produces [実測:
+/// 2026-08-12 for the A40, vendor figures otherwise]:
+///
+/// | part | published | this bound | reported |
+/// |---|---|---|---|
+/// | A40 | 48 GB | 45776 MiB | 46068 MiB |
+/// | A100 80GB | 80 GB | 76293 MiB | 81920 MiB |
+/// | L4 | 24 GB | 22888 MiB | 23034 MiB |
+pub const fn gb_to_mib(gb: u32) -> u32 {
+    // u64 throughout: 5 GB already overflows u32 once multiplied out.
+    ((gb as u64 * 1_000_000_000) / 1_048_576) as u32
 }
 
 /// What a profile requires of the machine's storage.
@@ -637,8 +681,18 @@ pub struct MachineState {
     pub ports_observed: bool,
     /// How many accelerators the machine has.
     pub gpu_count: Option<u32>,
-    /// How much memory each one has, in gigabytes.
-    pub gpu_vram_gb: Option<u32>,
+    /// How much memory each one has, in **mebibytes**.
+    ///
+    /// Not gigabytes, because this is the machine's own number and MiB is
+    /// the unit machines report it in — `nvidia-smi`, NVML and every
+    /// framework built on them. Taking it in any other unit would mean
+    /// converting at each adapter, which is how a published 48 and a
+    /// reported 46068 end up compared to each other.
+    ///
+    /// An adapter that can only learn the model rather than read the
+    /// device supplies [`gb_to_mib`] of the published figure, which is a
+    /// lower bound and is documented there as such.
+    pub gpu_vram_mib: Option<u32>,
     /// Scratch space, in gigabytes.
     pub ephemeral_gb: Option<u32>,
     /// Space surviving a restart, in gigabytes.
@@ -726,10 +780,15 @@ pub fn observe(required: &Requirements, state: &MachineState) -> Vec<Finding> {
             state.gpu_count,
         ));
         if let Some(floor) = gpu.min_vram_gb {
+            // Converted here rather than at each adapter. The floor is
+            // written in the vendor's unit and the machine answers in
+            // its own, and the whole hazard is that both are called
+            // "GB" — so the two meet exactly once, in a named function
+            // that says which direction it rounds.
             findings.push(at_least(
                 format!("gpu.min_vram_gb={floor}"),
-                floor,
-                state.gpu_vram_gb,
+                gb_to_mib(floor),
+                state.gpu_vram_mib,
             ));
         }
     }
@@ -989,7 +1048,10 @@ mod tests {
             exposed: [(8188, Exposure::PublicHttp)].into_iter().collect(),
             ports_observed: true,
             gpu_count: Some(1),
-            gpu_vram_gb: Some(48),
+            // What the acquired part actually answered, verbatim
+            // [実測: 2026-08-12, `nvidia-smi` on an A40 sold as 48 GB].
+            // Not 48, because 48 is not a number any device says.
+            gpu_vram_mib: Some(46068),
             persistent_gb: Some(100),
             persistent_at: Some("/workspace".into()),
             image: Some("runpod/pytorch:2.4.0".into()),
@@ -1005,13 +1067,49 @@ mod tests {
         );
     }
 
+    /// **The bound has to fall below every part it describes.**
+    ///
+    /// A published capacity is two numbers wearing one label: the part
+    /// below is sold as "48 GB" and answers 46068 MiB [実測: 2026-08-12,
+    /// `nvidia-smi`], which is 48.3 decimal GB and 45.0 GiB. Reading the
+    /// label as decimal makes the conversion a floor; reading it as
+    /// binary would make it a promise, and 48 GiB is 49152 MiB — over
+    /// three gigabytes above what the part hands out.
+    ///
+    /// The direction is the whole safety property, and nothing else in
+    /// the type system holds it, so it is held here.
+    #[test]
+    fn the_published_figure_converts_to_less_than_the_part_reports() {
+        // model, published GB, what the part answers in MiB.
+        let measured = [
+            ("A40", 48, 46068),
+            ("A100 80GB", 80, 81920),
+            ("L4", 24, 23034),
+        ];
+        for (model, published, reports) in measured {
+            let bound = gb_to_mib(published);
+            assert!(
+                bound <= reports,
+                "{model}: {published} GB became {bound} MiB, above the {reports} MiB \
+                 it hands out — a floor written against this would pass on memory \
+                 that is not there"
+            );
+        }
+
+        assert_eq!(gb_to_mib(48), 45776, "decimal, not binary (48 GiB = 49152)");
+        assert_eq!(gb_to_mib(0), 0);
+        // Past where u32 would overflow mid-multiplication.
+        assert_eq!(gb_to_mib(4_000), 3_814_697);
+    }
+
     /// A floor is a floor: more than asked for satisfies it, less does
     /// not.
     #[test]
     fn a_machine_smaller_than_the_floor_is_unsatisfied() {
         let state = MachineState {
             gpu_count: Some(1),
-            gpu_vram_gb: Some(16),
+            // A 16 GB part, in the unit it reports.
+            gpu_vram_mib: Some(16376),
             ..MachineState::default()
         };
         let required = Requirements::from_slots(

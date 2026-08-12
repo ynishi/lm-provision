@@ -31,7 +31,8 @@
 use std::collections::BTreeMap;
 
 use lm_provision::machine::{
-    Answer, Capability, DiskRequirement, Exposure, GpuRequirement, MachineState, Requirements,
+    gb_to_mib, Answer, Capability, DiskRequirement, Exposure, GpuRequirement, MachineState,
+    Requirements,
 };
 
 /// A target that a machine can be placed on.
@@ -169,7 +170,16 @@ pub enum AcquisitionError {
 struct Gpu {
     /// The name the service's API expects.
     id: &'static str,
-    /// Memory per device, in gigabytes.
+    /// Memory per device as the vendor publishes it, in decimal
+    /// gigabytes.
+    ///
+    /// The published figure and not the reported one: a part sold as 48
+    /// answers 46068 MiB, and no row here could carry that number
+    /// honestly because it moves with ECC mode and driver. This is
+    /// matched against a profile's floor, which is written in the same
+    /// terms, and converted through
+    /// [`lm_provision::machine::gb_to_mib`] on the one path where a
+    /// device's own unit is wanted.
     vram_gb: u32,
 }
 
@@ -377,6 +387,13 @@ impl Infra for RunPodAdapter {
     /// asymmetry that put the catalogue in this adapter in the first
     /// place. A model outside it leaves the memory unobserved — `None`,
     /// not a guess.
+    ///
+    /// What the catalogue yields is a published figure, and what the
+    /// field wants is what the device reports, so it goes through
+    /// [`gb_to_mib`] and arrives as the lower bound that function
+    /// documents. This is inference from the model's spec rather than a
+    /// measurement, and it is bounded so it cannot claim more than the
+    /// part is sold as.
     fn read_state(&self, inspected: &serde_json::Value) -> MachineState {
         let number = |value: &serde_json::Value| value.as_u64().map(|it| it as u32);
         let text = |value: &serde_json::Value| value.as_str().map(str::to_string);
@@ -400,7 +417,7 @@ impl Infra for RunPodAdapter {
             }
         }
 
-        let gpu_vram_gb = inspected
+        let gpu_vram_mib = inspected
             .get("machine")
             .and_then(|it| it.get("gpuTypeId"))
             .and_then(|it| it.as_str())
@@ -408,7 +425,7 @@ impl Infra for RunPodAdapter {
                 RUNPOD_CATALOGUE
                     .iter()
                     .find(|it| it.id == model)
-                    .map(|it| it.vram_gb)
+                    .map(|it| gb_to_mib(it.vram_gb))
             });
 
         MachineState {
@@ -418,7 +435,7 @@ impl Infra for RunPodAdapter {
             // than "nobody looked".
             ports_observed: ports.is_some(),
             gpu_count: inspected.get("gpuCount").and_then(number),
-            gpu_vram_gb,
+            gpu_vram_mib,
             ephemeral_gb: inspected.get("containerDiskInGb").and_then(number),
             persistent_gb: inspected.get("volumeInGb").and_then(number),
             persistent_at: inspected.get("volumeMountPath").and_then(text),
@@ -1387,15 +1404,31 @@ mod tests {
     /// Memory is the one field that is looked up rather than read: the
     /// description names the model and never the size, which is the same
     /// asymmetry that put the catalogue in this adapter.
+    ///
+    /// It arrives in the unit a device reports, and below what a device
+    /// reports — the part measured here answers 46068 MiB [実測:
+    /// 2026-08-12, `nvidia-smi` on the acquired A40], and the bound this
+    /// produces stays under it. A bound that crept above the real figure
+    /// would let a floor pass on memory that is not there.
     #[test]
-    fn device_memory_comes_from_the_catalogue_and_absence_is_not_zero() {
+    fn device_memory_comes_from_the_catalogue_and_stays_under_what_the_part_reports() {
+        const A40_REPORTS_MIB: u32 = 46068;
+
         let known = RunPodAdapter.read_state(&inspected_pod());
-        assert_eq!(known.gpu_vram_gb, Some(48), "an A40 carries 48 GB");
+        assert_eq!(
+            known.gpu_vram_mib,
+            Some(45776),
+            "an A40 is sold as 48 GB, and that is a floor in the device's unit"
+        );
+        assert!(
+            known.gpu_vram_mib.unwrap() <= A40_REPORTS_MIB,
+            "the bound has to stay under the measurement, not over it"
+        );
 
         let mut unknown_model = inspected_pod();
         unknown_model["machine"]["gpuTypeId"] = serde_json::json!("NVIDIA SOMETHING NEW");
         assert_eq!(
-            RunPodAdapter.read_state(&unknown_model).gpu_vram_gb,
+            RunPodAdapter.read_state(&unknown_model).gpu_vram_mib,
             None,
             "a model outside the catalogue leaves the size unobserved, not zero"
         );
