@@ -227,6 +227,8 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             paths,
             http_allowlist,
             assumes,
+            requires_ports,
+            provider,
             phases,
         } => {
             let mut fields = variant_object("Spec");
@@ -253,6 +255,13 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             // emitting `"assumes":{}`, would re-hash every profile in
             // every ledger).
             insert_str_map(&mut fields, "assumes", assumes);
+            // Spec.requires_ports / Spec.provider: same omit-when-empty
+            // rule, for the same reason — a profile that names no
+            // machine requirement and attaches to no existing
+            // infrastructure hashes exactly as it did before either slot
+            // existed.
+            insert_str_map(&mut fields, "requires_ports", requires_ports);
+            insert_str_map(&mut fields, "provider", provider);
             fields.insert(
                 "phases".into(),
                 CanonValue::Array(phases.iter().map(to_canon).collect()),
@@ -731,6 +740,8 @@ mod tests {
     fn empty_spec(gen: &IdGen, name: &str) -> ProfileNode {
         ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(gen),
             name: name.into(),
             version: None,
@@ -771,6 +782,8 @@ mod tests {
         // emission, so the parity check runs over those.
         let a = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -784,6 +797,8 @@ mod tests {
         };
         let b = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -805,6 +820,8 @@ mod tests {
     fn models_spec(gen: &IdGen, models_json: &str) -> ProfileNode {
         ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(gen),
             name: "p".into(),
             version: None,
@@ -1152,6 +1169,8 @@ mod tests {
 
         let a = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1165,6 +1184,8 @@ mod tests {
         };
         let b = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1192,6 +1213,8 @@ mod tests {
         // Some -> keys present with value
         let some = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: Some("1.0.0".into()),
@@ -1250,6 +1273,8 @@ mod tests {
         );
         let node = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1304,6 +1329,8 @@ mod tests {
         let gen = IdGen::new();
         let node = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(&gen),
             name: "demo".into(),
             version: None,
@@ -1401,6 +1428,8 @@ mod tests {
         let gen = IdGen::new();
         let node = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1981,6 +2010,70 @@ mod tests {
         assert_eq!(
             with(&[("comfyui_root", "/a"), ("other", "/b")]),
             with(&[("other", "/b"), ("comfyui_root", "/a")])
+        );
+    }
+
+    /// **The reason both machine slots could be added at all.**
+    ///
+    /// A profile that declares no port requirement and attaches to no
+    /// existing infrastructure must hash exactly as it did before either
+    /// slot existed, or every profile in every ledger re-hashes and the
+    /// ledger stops being able to say "this is the same profile that ran
+    /// last time". `env` and `assumes` were added under the same rule.
+    #[test]
+    fn the_machine_slots_are_omitted_when_empty() {
+        let gen = IdGen::new();
+        let encoded = encode(&empty_spec(&gen, "demo"));
+        assert!(
+            !encoded.contains("requires_ports"),
+            "an empty requirement set must carry no canonical bytes: {encoded}"
+        );
+        assert!(
+            !encoded.contains("provider"),
+            "an empty provider set must carry no canonical bytes: {encoded}"
+        );
+    }
+
+    /// Present, they encode as sorted maps like every other keyed slot —
+    /// so the same requirements written in a different source order are
+    /// the same profile.
+    #[test]
+    fn the_machine_slots_encode_sorted_when_present() {
+        let gen = IdGen::new();
+        let with = |ports: &[(&str, &str)], provider: &[(&str, &str)]| {
+            let mut spec = empty_spec(&gen, "demo");
+            if let ProfileNode::Spec {
+                requires_ports,
+                provider: prov,
+                ..
+            } = &mut spec
+            {
+                for (k, v) in ports {
+                    requires_ports.insert((*k).into(), (*v).into());
+                }
+                for (k, v) in provider {
+                    prov.insert((*k).into(), (*v).into());
+                }
+            }
+            encode(&spec)
+        };
+
+        let encoded = with(
+            &[("8188", "public_http"), ("22", "raw_tcp")],
+            &[("runpod.networkVolumeId", "vol-1")],
+        );
+        assert!(
+            encoded.contains(r#""requires_ports":{"22":"raw_tcp","8188":"public_http"}"#),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains(r#""provider":{"runpod.networkVolumeId":"vol-1"}"#),
+            "{encoded}"
+        );
+
+        assert_eq!(
+            with(&[("8188", "public_http"), ("22", "raw_tcp")], &[]),
+            with(&[("22", "raw_tcp"), ("8188", "public_http")], &[]),
         );
     }
 }

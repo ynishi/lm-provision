@@ -68,6 +68,8 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         paths,
         http_allowlist,
         assumes,
+        requires_ports,
+        provider,
         phases,
     } = root
     else {
@@ -85,6 +87,8 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         paths: paths.clone(),
         http_allowlist: http_allowlist.clone(),
         assumes: assumes.clone(),
+        requires_ports: requires_ports.clone(),
+        provider: provider.clone(),
         phases: normalize_phases(phases, IdMinter::above(root)),
     }
 }
@@ -334,6 +338,8 @@ mod tests {
         let g = IdGen::new();
         ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: g.node(),
             name: "demo".into(),
             version: None,
@@ -507,6 +513,8 @@ mod tests {
             paths: Vec::new(),
             http_allowlist: Vec::new(),
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             phases: vec![install],
         };
         let root_id = root.node_id();

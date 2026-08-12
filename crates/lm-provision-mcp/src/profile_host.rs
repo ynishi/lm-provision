@@ -43,6 +43,8 @@ impl ProfileHost {
         let id_gen = IdGen::new();
         let program = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: id_gen.node(),
             name: "demo-comfyui-vllm-pod".to_string(),
             version: Some("0.0.0".to_string()),

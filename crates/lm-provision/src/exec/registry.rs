@@ -2374,6 +2374,8 @@ mod tests {
         let phase_ids = [ids.node(), ids.node(), ids.node()];
         let root = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: ids.node(),
             name: "routing".into(),
             version: None,
@@ -2440,6 +2442,8 @@ mod tests {
     /// two.
     fn spec(phases: Vec<ProfileNode>, ids: &IdGen) -> ProfileNode {
         ProfileNode::Spec {
+            requires_ports: Default::default(),
+            provider: Default::default(),
             assumes: std::collections::BTreeMap::from([
                 (
                     crate::resource::Resource::ComfyUiRoot.as_str().to_string(),

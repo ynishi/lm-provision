@@ -259,6 +259,8 @@ mod tests {
     /// compose steps at all, and an install phase would add its own.
     fn spec(phases: Vec<ProfileNode>, ids: &IdGen) -> ProfileNode {
         ProfileNode::Spec {
+            requires_ports: Default::default(),
+            provider: Default::default(),
             assumes: std::collections::BTreeMap::from([(
                 crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
                 crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),

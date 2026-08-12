@@ -118,6 +118,8 @@ mod tests {
         let ids = IdGen::new();
         ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: ids.node(),
             name: "demo".into(),
             version: None,

@@ -63,6 +63,7 @@ pub mod derive;
 pub mod digest;
 pub mod exec;
 pub mod frontend;
+pub mod machine;
 pub mod normalize;
 pub mod plan;
 pub mod profile_ast;

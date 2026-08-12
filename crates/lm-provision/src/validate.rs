@@ -234,6 +234,31 @@ pub enum ValidateError {
         name: String,
     },
 
+    /// A `requires_ports` entry cannot be read (check 8c).
+    ///
+    /// Refused rather than skipped: a requirement that is silently
+    /// dropped leaves the same machine as one that was never written,
+    /// while the author is looking at a line saying otherwise.
+    #[error(transparent)]
+    UnreadableRequirement {
+        /// Which entry, and why.
+        source: crate::machine::RequirementError,
+    },
+
+    /// A `provider` key carries no namespace (check 8c).
+    ///
+    /// The namespace is what tells an adapter whether a key is addressed
+    /// to it. Without one, every adapter would have to guess, and a key
+    /// meant for one target would be read by another.
+    #[error(
+        "provider[{key:?}] has no provider namespace (expected `<provider>.<key>`, \
+         e.g. `runpod.networkVolumeId`)"
+    )]
+    UnnamespacedProviderKey {
+        /// The key with no namespace.
+        key: String,
+    },
+
     /// A phase needs a resource that no earlier phase produces and that
     /// `Spec.assumes` does not declare (check 8b, design §3.6).
     ///
@@ -316,6 +341,8 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         paths,
         http_allowlist,
         assumes,
+        requires_ports,
+        provider,
         phases,
         ..
     } = root
@@ -492,6 +519,26 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     for name in assumes.keys() {
         if crate::resource::Resource::parse(name).is_none() {
             return Err(ValidateError::UnknownAssumedResource { name: name.clone() });
+        }
+    }
+
+    // Check 8c: the machine slots are readable (design §Requirements).
+    //
+    // Only well-formedness here — whether a *target* can satisfy them is
+    // a different question, asked once a target is known, and validate
+    // does not know one. What this refuses is a requirement nothing
+    // could ever read: a key that is not a port, a value that names no
+    // exposure, a provider key with no namespace.
+    //
+    // Refusing rather than skipping is the point. A requirement quietly
+    // dropped leaves exactly the machine this slot exists to stop
+    // shipping — one whose profile looks like it declared something.
+    crate::machine::Requirements::from_slot(requires_ports)
+        .map_err(|source| ValidateError::UnreadableRequirement { source })?;
+    for key in provider.keys() {
+        let namespace = key.split('.').next().unwrap_or("");
+        if namespace.is_empty() || namespace.len() == key.len() {
+            return Err(ValidateError::UnnamespacedProviderKey { key: key.clone() });
         }
     }
     if let ProfileNode::Spec {
@@ -1133,6 +1180,8 @@ mod tests {
         let ids = IdGen::new();
         ProfileNode::Spec {
             assumes: all_resources_assumed(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -1183,6 +1232,8 @@ mod tests {
         declared_paths.push("/".to_string());
         ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -1928,6 +1979,8 @@ mod tests {
         let ids = IdGen::new();
         ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: ids.node(),
             name: "declared".into(),
             version: None,
@@ -2171,6 +2224,86 @@ mod tests {
                 name: "comfy_root".into()
             })
         );
+    }
+
+    /// Well-formed machine requirements pass, and are *only* checked for
+    /// readability here — whether some target can provide `public_http`
+    /// is a question about a target, and validate does not know one.
+    #[test]
+    fn readable_machine_slots_validate() {
+        let g = ids();
+        let mut node = spec("machine-slots", vec![models_phase(&g)]);
+        if let ProfileNode::Spec {
+            requires_ports,
+            provider,
+            ..
+        } = &mut node
+        {
+            requires_ports.insert("8188".into(), "public_http".into());
+            requires_ports.insert("22".into(), "raw_tcp".into());
+            provider.insert("runpod.networkVolumeId".into(), "vol-1".into());
+        }
+        assert_eq!(validate(&node), Ok(()));
+    }
+
+    /// An entry nothing can read is refused rather than skipped, for the
+    /// same reason an `assumes` key naming no resource is: skipping it
+    /// leaves the author looking at a declaration that does nothing.
+    #[test]
+    fn an_unreadable_port_requirement_is_rejected() {
+        let g = ids();
+        let with = |key: &str, value: &str| {
+            let mut node = spec("machine-slots", vec![models_phase(&g)]);
+            if let ProfileNode::Spec { requires_ports, .. } = &mut node {
+                requires_ports.insert(key.into(), value.into());
+            }
+            validate(&node)
+        };
+        assert_eq!(
+            with("http", "public_http"),
+            Err(ValidateError::UnreadableRequirement {
+                source: crate::machine::RequirementError::BadPort {
+                    port: "http".into()
+                }
+            })
+        );
+        assert_eq!(
+            with("8188", "https"),
+            Err(ValidateError::UnreadableRequirement {
+                source: crate::machine::RequirementError::BadExposure {
+                    port: 8188,
+                    exposure: "https".into()
+                }
+            })
+        );
+    }
+
+    /// The namespace is what routes a key to one adapter. Without it,
+    /// every adapter would have to guess whether a key was addressed to
+    /// it, and a value meant for one target would be read by another.
+    #[test]
+    fn a_provider_key_without_a_namespace_is_rejected() {
+        let g = ids();
+        let with = |key: &str| {
+            let mut node = spec("machine-slots", vec![models_phase(&g)]);
+            if let ProfileNode::Spec { provider, .. } = &mut node {
+                provider.insert(key.into(), "value".into());
+            }
+            validate(&node)
+        };
+        assert_eq!(
+            with("networkVolumeId"),
+            Err(ValidateError::UnnamespacedProviderKey {
+                key: "networkVolumeId".into()
+            })
+        );
+        assert_eq!(
+            with(".networkVolumeId"),
+            Err(ValidateError::UnnamespacedProviderKey {
+                key: ".networkVolumeId".into()
+            })
+        );
+        assert_eq!(with("runpod.networkVolumeId"), Ok(()));
     }
 
     /// A declared install dir moves what the profile must allowlist:

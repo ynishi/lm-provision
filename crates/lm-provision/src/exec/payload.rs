@@ -43,6 +43,8 @@ mod tests {
 
         let root = ProfileNode::Spec {
             assumes: Default::default(),
+            requires_ports: Default::default(),
+            provider: Default::default(),
             id: root_id,
             name: "demo".to_string(),
             version: None,

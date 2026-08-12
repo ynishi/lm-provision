@@ -84,6 +84,44 @@ pub enum ProfileNode {
         /// before the slot existed — the same rule `env` above carries,
         /// for the same reason.
         assumes: BTreeMap<String, String>,
+        /// What the machine itself must be, as `port number → exposure`
+        /// (spec 03 §Requirements).
+        ///
+        /// A profile already depends on the shape of the machine it runs
+        /// on: `comfyui.health` polls 8188 and cannot succeed unless the
+        /// machine exposes it. Until this slot existed that dependency
+        /// lived in whoever created the machine, so a profile could fail
+        /// for a reason the profile did not contain.
+        ///
+        /// The exposure is **what the workload needs**, not what a
+        /// platform offers: `public_http` (reachable over HTTPS from
+        /// outside) or `raw_tcp` (reachable over TCP). Each target
+        /// translates — a managed pod service to its own `8188/http`
+        /// form, a container runtime to `-p`. Naming the platform's form
+        /// here instead would make the profile that platform's.
+        ///
+        /// Keyed by port so that one port cannot carry two exposures:
+        /// the map shape is the invariant. Empty maps carry no canonical
+        /// bytes, as `env` and `assumes` above.
+        requires_ports: BTreeMap<String, String>,
+        /// References to infrastructure that already exists, as
+        /// `<provider>.<key> → value` (spec 03 §Provider references).
+        ///
+        /// The counterpart to `requires_ports`: that says what the
+        /// machine must be, this says what to attach it to. A network
+        /// volume, a subnet, a firewall tag — all of them name something
+        /// **this tool did not create and will not create**. Creating
+        /// infrastructure is where a provisioner becomes a second
+        /// Terraform; placing one machine into infrastructure that is
+        /// already there is not.
+        ///
+        /// The namespace is everything before the first `.`, and an
+        /// adapter reads only its own. A key belonging to a provider
+        /// that is not the one in use is neither an error nor silently
+        /// fine — it is unexamined, and says so.
+        ///
+        /// Empty maps carry no canonical bytes.
+        provider: BTreeMap<String, String>,
         /// Sequential list of phases.
         phases: Vec<ProfileNode>,
     },
