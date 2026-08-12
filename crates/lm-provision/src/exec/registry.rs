@@ -2375,6 +2375,7 @@ mod tests {
         let root = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: "routing".into(),
@@ -2443,6 +2444,7 @@ mod tests {
     fn spec(phases: Vec<ProfileNode>, ids: &IdGen) -> ProfileNode {
         ProfileNode::Spec {
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             assumes: std::collections::BTreeMap::from([
                 (

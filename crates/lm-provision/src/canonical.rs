@@ -228,6 +228,7 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             http_allowlist,
             assumes,
             requires_ports,
+            requires_gpu,
             provider,
             phases,
         } => {
@@ -261,6 +262,7 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             // infrastructure hashes exactly as it did before either slot
             // existed.
             insert_str_map(&mut fields, "requires_ports", requires_ports);
+            insert_str_map(&mut fields, "requires_gpu", requires_gpu);
             insert_str_map(&mut fields, "provider", provider);
             fields.insert(
                 "phases".into(),
@@ -741,6 +743,7 @@ mod tests {
         ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(gen),
             name: name.into(),
@@ -783,6 +786,7 @@ mod tests {
         let a = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
@@ -798,6 +802,7 @@ mod tests {
         let b = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
@@ -821,6 +826,7 @@ mod tests {
         ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(gen),
             name: "p".into(),
@@ -1170,6 +1176,7 @@ mod tests {
         let a = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
@@ -1185,6 +1192,7 @@ mod tests {
         let b = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
@@ -1214,6 +1222,7 @@ mod tests {
         let some = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
@@ -1274,6 +1283,7 @@ mod tests {
         let node = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
@@ -1330,6 +1340,7 @@ mod tests {
         let node = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(&gen),
             name: "demo".into(),
@@ -1429,6 +1440,7 @@ mod tests {
         let node = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: new_id(&gen),
             name: "p".into(),
@@ -2031,6 +2043,10 @@ mod tests {
         assert!(
             !encoded.contains("provider"),
             "an empty provider set must carry no canonical bytes: {encoded}"
+        );
+        assert!(
+            !encoded.contains("requires_gpu"),
+            "nor an empty accelerator requirement: {encoded}"
         );
     }
 

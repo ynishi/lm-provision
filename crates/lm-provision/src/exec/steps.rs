@@ -260,6 +260,7 @@ mod tests {
     fn spec(phases: Vec<ProfileNode>, ids: &IdGen) -> ProfileNode {
         ProfileNode::Spec {
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             assumes: std::collections::BTreeMap::from([(
                 crate::resource::Resource::ComfyUiRoot.as_str().to_string(),

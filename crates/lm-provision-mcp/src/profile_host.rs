@@ -44,6 +44,7 @@ impl ProfileHost {
         let program = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: id_gen.node(),
             name: "demo-comfyui-vllm-pod".to_string(),

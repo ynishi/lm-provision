@@ -124,6 +124,38 @@ pub struct PortRequirement {
     pub exposure: Exposure,
 }
 
+/// What a profile requires of the machine's accelerators.
+///
+/// **Neither field is a platform's word.** A managed pod service selects
+/// from its own catalogue of about fifty model names and has no VRAM
+/// field at all [実測: `PodCreateInput`, which carries `gpuTypeIds`,
+/// `gpuCount` and a `minRAMPerGPU` that is system RAM]; a container
+/// runtime's `--gpus` takes a count or device ids and cannot select on
+/// either model or VRAM. What a *workload* knows is how much memory its
+/// weights need and how many devices it will use, so that is what is
+/// written here.
+///
+/// Translating "at least 24 GB" into a set of model names is the
+/// adapter's work, because the catalogue is the adapter's knowledge —
+/// fifty rows that grow whenever the service adds hardware. Putting that
+/// table in the vocabulary would make every profile carry a copy of one
+/// vendor's price list, and it would go stale the way a hand-synchronised
+/// number does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuRequirement {
+    /// How many accelerators the workload will use.
+    ///
+    /// `0` is a machine with none, which is a real answer rather than an
+    /// absent requirement — it is what a CPU-only profile says.
+    pub count: u32,
+    /// The least memory each one must have, in gigabytes.
+    ///
+    /// `None` when the profile does not care, which is different from
+    /// zero: a profile that needs *a* GPU but not a particular size
+    /// leaves this out rather than asking for 0 GB.
+    pub min_vram_gb: Option<u32>,
+}
+
 /// What a profile requires of the machine it runs on.
 ///
 /// Ordered and de-duplicated by port: the profile's slot is keyed by
@@ -133,15 +165,64 @@ pub struct PortRequirement {
 pub struct Requirements {
     /// Ports that must be reachable, ascending.
     pub ports: Vec<PortRequirement>,
+    /// Accelerators, when the profile asks for any.
+    pub gpu: Option<GpuRequirement>,
 }
 
 impl Requirements {
-    /// Read a profile's `requires_ports` slot.
+    /// Read a profile's `requires_ports` and `requires_gpu` slots.
     ///
     /// Fails on the first malformed entry rather than dropping it: an
     /// unreadable requirement that is silently skipped is the same
     /// machine as one that was never declared, which is the failure this
     /// whole slot exists to remove.
+    pub fn from_slots(
+        ports: &BTreeMap<String, String>,
+        gpu: &BTreeMap<String, String>,
+    ) -> Result<Self, RequirementError> {
+        Ok(Self {
+            gpu: Self::gpu_from_slot(gpu)?,
+            ..Self::from_slot(ports)?
+        })
+    }
+
+    /// Read a profile's `requires_gpu` slot: `count` and, optionally,
+    /// `min_vram_gb`.
+    ///
+    /// A key that is neither is an error rather than an ignored line —
+    /// an author who writes `vram` should be told it is not a word here,
+    /// not have it mean nothing.
+    fn gpu_from_slot(
+        slot: &BTreeMap<String, String>,
+    ) -> Result<Option<GpuRequirement>, RequirementError> {
+        if slot.is_empty() {
+            return Ok(None);
+        }
+        let mut gpu = GpuRequirement::default();
+        let mut saw_count = false;
+        for (key, value) in slot {
+            let number: u32 = value.parse().map_err(|_| RequirementError::BadGpuValue {
+                key: key.clone(),
+                value: value.clone(),
+            })?;
+            match key.as_str() {
+                "count" => {
+                    gpu.count = number;
+                    saw_count = true;
+                }
+                "min_vram_gb" => gpu.min_vram_gb = Some(number),
+                _ => {
+                    return Err(RequirementError::UnknownGpuKey { key: key.clone() });
+                }
+            }
+        }
+        if !saw_count {
+            return Err(RequirementError::GpuWithoutCount);
+        }
+        Ok(Some(gpu))
+    }
+
+    /// Read a profile's `requires_ports` slot alone.
     pub fn from_slot(slot: &BTreeMap<String, String>) -> Result<Self, RequirementError> {
         let mut ports = Vec::with_capacity(slot.len());
         for (port, exposure) in slot {
@@ -161,12 +242,12 @@ impl Requirements {
             });
         }
         ports.sort();
-        Ok(Self { ports })
+        Ok(Self { ports, gpu: None })
     }
 
     /// Whether anything is required at all.
     pub fn is_empty(&self) -> bool {
-        self.ports.is_empty()
+        self.ports.is_empty() && self.gpu.is_none()
     }
 }
 
@@ -191,6 +272,113 @@ pub enum RequirementError {
         /// The unrecognised value.
         exposure: String,
     },
+
+    /// A `requires_gpu` value is not a number.
+    #[error("requires_gpu[{key}] = {value:?} is not a number")]
+    BadGpuValue {
+        /// Which entry.
+        key: String,
+        /// The unreadable value.
+        value: String,
+    },
+
+    /// A `requires_gpu` key names nothing.
+    #[error("requires_gpu[{key:?}] names nothing (expected one of: count, min_vram_gb)")]
+    UnknownGpuKey {
+        /// The unrecognised key.
+        key: String,
+    },
+
+    /// `requires_gpu` was written without saying how many.
+    ///
+    /// A memory floor with no count does not describe a machine: it is
+    /// unclear whether one accelerator is wanted or none, and the
+    /// difference is whether the profile can run at all.
+    #[error("requires_gpu declares no count (write `count`, using 0 for a machine with none)")]
+    GpuWithoutCount,
+}
+
+/// What an adapter answers when asked whether it can meet a requirement.
+///
+/// **Four answers, and they are the `AssertOutcome` four.** A target
+/// asked for an accelerator is not always in a position to say yes or
+/// no: a container runtime cannot select on memory size at all, and
+/// whether the host it lands on happens to have enough is a property of
+/// where it was run rather than of the adapter. Saying "no" there would
+/// refuse a machine that would have worked; saying "yes" would promise
+/// something never checked. The honest answer is that it was not
+/// examined, and this crate already had a word for that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// The target can meet it, by choosing the named things.
+    ///
+    /// **The selection is not a substitution.** Picking the models that
+    /// carry at least the requested memory is how the requirement is
+    /// satisfied, the way a scheduler asked for four CPUs picks a node
+    /// with at least four and says which. What the refusal rule forbids
+    /// is *lowering* a requirement — handing back plaintext where HTTPS
+    /// was asked for — and that is a different act from selecting
+    /// something that meets it.
+    ///
+    /// Empty when nothing had to be chosen.
+    Met {
+        /// What the adapter picked, named so the choice is legible.
+        using: Vec<String>,
+    },
+    /// The target cannot meet it, for the stated reason.
+    Unmet {
+        /// Why, in terms an author can act on.
+        reason: String,
+    },
+    /// The target has no means to decide this before running.
+    ///
+    /// Not a refusal and not an approval — the question is settled by
+    /// observing the machine, once there is one.
+    NotExamined {
+        /// Why it cannot be decided here.
+        reason: String,
+    },
+}
+
+impl Answer {
+    /// Nothing had to be chosen and it holds.
+    pub fn met() -> Self {
+        Self::Met { using: Vec::new() }
+    }
+
+    /// It holds, by choosing these.
+    pub fn met_using<I, S>(using: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Met {
+            using: using.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// It does not hold.
+    pub fn unmet(reason: impl Into<String>) -> Self {
+        Self::Unmet {
+            reason: reason.into(),
+        }
+    }
+
+    /// It cannot be decided here.
+    pub fn not_examined(reason: impl Into<String>) -> Self {
+        Self::NotExamined {
+            reason: reason.into(),
+        }
+    }
+
+    /// Whether this answer blocks the run.
+    ///
+    /// Only [`Answer::Unmet`] does. An unexamined requirement is carried
+    /// forward to be observed rather than treated as a failure — the
+    /// distinction that makes the fourth answer worth having.
+    pub fn blocks(&self) -> bool {
+        matches!(self, Self::Unmet { .. })
+    }
 }
 
 /// What a target can do, declared by its adapter.
@@ -390,6 +578,95 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("public_http"), "{rendered}");
         assert!(rendered.contains("raw_tcp"), "{rendered}");
+    }
+
+    fn gpu_slot(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        slot(pairs)
+    }
+
+    #[test]
+    fn a_gpu_requirement_reads_its_count_and_optional_floor() {
+        let read = Requirements::from_slots(
+            &slot(&[]),
+            &gpu_slot(&[("count", "2"), ("min_vram_gb", "24")]),
+        )
+        .expect("well-formed");
+        assert_eq!(
+            read.gpu,
+            Some(GpuRequirement {
+                count: 2,
+                min_vram_gb: Some(24)
+            })
+        );
+    }
+
+    /// A floor with no count does not describe a machine: whether one
+    /// accelerator is wanted or none is the difference between a profile
+    /// that can run and one that cannot.
+    #[test]
+    fn a_gpu_requirement_without_a_count_is_refused() {
+        assert_eq!(
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("min_vram_gb", "24")])),
+            Err(RequirementError::GpuWithoutCount)
+        );
+    }
+
+    /// Zero is a real answer — a machine with no accelerator, which is
+    /// what a CPU-only profile says — and is not the same as writing
+    /// nothing at all.
+    #[test]
+    fn zero_accelerators_is_a_requirement_and_absence_is_not() {
+        let declared = Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "0")]))
+            .expect("well-formed");
+        assert_eq!(
+            declared.gpu,
+            Some(GpuRequirement {
+                count: 0,
+                min_vram_gb: None
+            })
+        );
+        assert!(!declared.is_empty());
+
+        let absent = Requirements::from_slots(&slot(&[]), &gpu_slot(&[])).expect("well-formed");
+        assert_eq!(absent.gpu, None);
+        assert!(absent.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_gpu_key_names_the_alternatives() {
+        let err = Requirements::from_slots(&slot(&[]), &gpu_slot(&[("vram", "24")]))
+            .expect_err("vram is not a key here");
+        assert_eq!(
+            err,
+            RequirementError::UnknownGpuKey {
+                key: "vram".to_string()
+            }
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("count"), "{rendered}");
+        assert!(rendered.contains("min_vram_gb"), "{rendered}");
+    }
+
+    #[test]
+    fn a_gpu_value_that_is_not_a_number_is_refused() {
+        assert_eq!(
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "one")])),
+            Err(RequirementError::BadGpuValue {
+                key: "count".to_string(),
+                value: "one".to_string()
+            })
+        );
+    }
+
+    /// Only [`Answer::Unmet`] stops a run. Not having looked is carried
+    /// forward to be observed — which is the whole reason the answer has
+    /// four arms rather than two.
+    #[test]
+    fn only_a_refusal_blocks() {
+        assert!(!Answer::met().blocks());
+        assert!(!Answer::met_using(["NVIDIA A40"]).blocks());
+        assert!(!Answer::not_examined("cannot select on memory").blocks());
+        assert!(Answer::unmet("nothing carries that much").blocks());
     }
 
     const BOTH: Capability = Capability {

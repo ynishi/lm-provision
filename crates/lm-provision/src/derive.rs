@@ -119,6 +119,7 @@ mod tests {
         ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: "demo".into(),

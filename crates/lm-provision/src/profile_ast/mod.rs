@@ -104,6 +104,22 @@ pub enum ProfileNode {
         /// the map shape is the invariant. Empty maps carry no canonical
         /// bytes, as `env` and `assumes` above.
         requires_ports: BTreeMap<String, String>,
+        /// What the machine's accelerators must be: `count` and,
+        /// optionally, `min_vram_gb` (spec 03 §Requirements).
+        ///
+        /// Both are what the *workload* knows — how many devices it will
+        /// use and how much memory its weights need. Neither is a
+        /// platform's word: a managed pod service selects from its own
+        /// catalogue of model names and has no memory field at all, and
+        /// a container runtime's `--gpus` cannot select on either. The
+        /// translation from "at least 24 GB" to a set of model names is
+        /// the adapter's, because the catalogue is the adapter's.
+        ///
+        /// `count` is required whenever anything here is written, and
+        /// `0` is a real answer — a machine with no accelerator, which
+        /// is what a CPU-only profile says. Empty maps carry no
+        /// canonical bytes.
+        requires_gpu: BTreeMap<String, String>,
         /// References to infrastructure that already exists, as
         /// `<provider>.<key> → value` (spec 03 §Provider references).
         ///

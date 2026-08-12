@@ -69,6 +69,7 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         http_allowlist,
         assumes,
         requires_ports,
+        requires_gpu,
         provider,
         phases,
     } = root
@@ -88,6 +89,7 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         http_allowlist: http_allowlist.clone(),
         assumes: assumes.clone(),
         requires_ports: requires_ports.clone(),
+        requires_gpu: requires_gpu.clone(),
         provider: provider.clone(),
         phases: normalize_phases(phases, IdMinter::above(root)),
     }
@@ -339,6 +341,7 @@ mod tests {
         ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: g.node(),
             name: "demo".into(),
@@ -514,6 +517,7 @@ mod tests {
             http_allowlist: Vec::new(),
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             phases: vec![install],
         };

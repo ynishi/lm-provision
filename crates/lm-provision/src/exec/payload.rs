@@ -44,6 +44,7 @@ mod tests {
         let root = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: root_id,
             name: "demo".to_string(),

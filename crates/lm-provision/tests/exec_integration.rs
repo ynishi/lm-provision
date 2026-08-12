@@ -34,6 +34,7 @@ fn an_undeclared_capability_fails_the_op_even_in_dry_run() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "no-caps".to_string(),
@@ -83,6 +84,7 @@ fn dry_run_traces_every_direct_op() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "direct-7".to_string(),
@@ -190,6 +192,7 @@ fn real_mode_runs_sh_exec_and_summarises_the_result() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "real-sh".to_string(),
@@ -261,6 +264,7 @@ async fn dry_run_traces_every_traceable_lifecycle_op() {
     let ids = IdGen::new();
     let program = ProfileNode::Spec {
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         // Every resource declared present: this fixture is about which
         // ops leave a trace line, so its phases need their resources
@@ -455,6 +459,7 @@ async fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "staging-push".to_string(),
@@ -505,6 +510,7 @@ fn staging_push_is_denied_when_only_net_transfer_is_granted() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "staging-push-ungated".to_string(),
@@ -573,6 +579,7 @@ async fn sync_pull_demands_the_capability_of_the_route_its_payload_resolves_to()
         let program = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: "sync-pull-route".to_string(),
@@ -631,6 +638,7 @@ fn a_net_transfer_upload_gates_its_destination_on_the_http_allowlist() {
         let program = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: "upload-policy".to_string(),
@@ -688,6 +696,7 @@ fn a_public_hf_download_gates_on_the_resolved_host() {
         let program = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: "hf-policy".to_string(),
@@ -738,6 +747,7 @@ async fn lifecycle_steps_answer_to_the_path_and_http_allowlists() {
         let program = ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: "lifecycle-policy".to_string(),
@@ -827,6 +837,7 @@ fn sh_exec_undeclared_secret_fails_in_dry_run() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "undeclared-secret".to_string(),
@@ -880,6 +891,7 @@ fn sh_exec_injects_a_declared_secret_into_the_child_in_real_mode() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "inject-secret".to_string(),
@@ -956,6 +968,7 @@ async fn comfyui_health_polls_a_local_server_when_executing_effects() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "health".to_string(),
@@ -1012,6 +1025,7 @@ async fn http_poll_lifecycle_ops_are_gated_on_net_http_get_not_sh_exec() {
         ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: "poll-gate".to_string(),
@@ -1081,6 +1095,7 @@ fn fs_write_to_an_undeclared_path_root_fails_in_dry_run() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "no-paths".to_string(),
@@ -1131,6 +1146,7 @@ fn fs_write_under_a_declared_path_root_traces_in_dry_run() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "declared-paths".to_string(),
@@ -1170,6 +1186,7 @@ fn http_get_to_an_undeclared_url_fails_in_dry_run() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "no-http".to_string(),
@@ -1213,6 +1230,7 @@ fn net_transfer_denies_when_the_http_source_is_not_allowlisted() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "half-declared".to_string(),
@@ -1254,6 +1272,7 @@ fn mount_bind_denies_when_only_the_source_is_declared() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "half-mount".to_string(),
@@ -1376,6 +1395,7 @@ fn http_post_dry_run_resolves_the_secret_header_and_body_without_tracing_them() 
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "http-secrets".to_string(),
@@ -1447,6 +1467,7 @@ fn http_get_with_a_host_absent_header_secret_fails_in_dry_run() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "http-missing-secret".to_string(),
@@ -1495,6 +1516,7 @@ fn declaring_both_body_forms_fails_the_step_even_without_validate() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "http-both-bodies".to_string(),
@@ -1545,6 +1567,7 @@ async fn http_post_real_mode_sends_the_declared_headers_and_json_body() {
     let program = ProfileNode::Spec {
         assumes: Default::default(),
         requires_ports: Default::default(),
+        requires_gpu: Default::default(),
         provider: Default::default(),
         id: ids.node(),
         name: "http-real".to_string(),

@@ -342,6 +342,7 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         http_allowlist,
         assumes,
         requires_ports,
+        requires_gpu,
         provider,
         phases,
         ..
@@ -533,7 +534,7 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // Refusing rather than skipping is the point. A requirement quietly
     // dropped leaves exactly the machine this slot exists to stop
     // shipping — one whose profile looks like it declared something.
-    crate::machine::Requirements::from_slot(requires_ports)
+    crate::machine::Requirements::from_slots(requires_ports, requires_gpu)
         .map_err(|source| ValidateError::UnreadableRequirement { source })?;
     for key in provider.keys() {
         let namespace = key.split('.').next().unwrap_or("");
@@ -1181,6 +1182,7 @@ mod tests {
         ProfileNode::Spec {
             assumes: all_resources_assumed(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: name.into(),
@@ -1233,6 +1235,7 @@ mod tests {
         ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: name.into(),
@@ -1980,6 +1983,7 @@ mod tests {
         ProfileNode::Spec {
             assumes: Default::default(),
             requires_ports: Default::default(),
+            requires_gpu: Default::default(),
             provider: Default::default(),
             id: ids.node(),
             name: "declared".into(),
