@@ -681,14 +681,35 @@ pub struct Acquired {
     pub id: String,
     /// What the service said about it when last inspected.
     pub inspected: serde_json::Value,
+    /// What it said at creation, kept because some of it is never said
+    /// again — see [`Acquired::inspect`].
+    created: serde_json::Value,
     /// How to inspect and destroy it, with `{id}` still in place.
     acquisition: Acquisition,
 }
 
 impl Acquired {
     /// Ask the service what this machine is now.
+    ///
+    /// **What the fresh description leaves blank, the creation-time one
+    /// fills.** A managed pod service names the attached GPU model in
+    /// its create response and then returns `"machine": {}` from every
+    /// read-back afterwards — `get-pod` and `list-pods` both, for a
+    /// running pod and for stopped ones [実測: 2026-08-12, pod on an
+    /// RTX 4090]. Replacing the description wholesale threw away the
+    /// only statement the service ever made about which device this is,
+    /// so the memory the profile asked for came back `NotChecked` on
+    /// every real machine while passing in tests, whose fixture had been
+    /// written from a create response.
+    ///
+    /// Only blanks are filled: a key the fresh description carries wins,
+    /// however stale the other looks. A machine's model cannot change
+    /// under it, and a service that stops mentioning something has not
+    /// said it went away.
     pub fn inspect(&mut self) -> Result<&serde_json::Value, ExecuteError> {
-        self.inspected = run_json(&substitute(&self.acquisition.inspect, &self.id), None)?;
+        let mut fresh = run_json(&substitute(&self.acquisition.inspect, &self.id), None)?;
+        fill_blanks(&mut fresh, &self.created);
+        self.inspected = fresh;
         Ok(&self.inspected)
     }
 
@@ -767,9 +788,37 @@ pub fn acquire(acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
         .to_string();
     Ok(Acquired {
         id,
-        inspected: created,
+        inspected: created.clone(),
+        created,
         acquisition,
     })
+}
+
+/// Copy over what `fresh` does not say, from what `earlier` did.
+///
+/// A key is a blank when it is missing, `null`, or an empty object — the
+/// third because that is the shape a description takes when a service
+/// returns the container of a field without the field
+/// [実測: 2026-08-12, `"machine": {}` from `get-pod`]. Objects present on
+/// both sides are filled recursively, so one blank key inside a
+/// populated object is reached.
+///
+/// Anything `fresh` states stands. This only restores what nothing
+/// contradicted.
+fn fill_blanks(fresh: &mut serde_json::Value, earlier: &serde_json::Value) {
+    let (Some(fresh), Some(earlier)) = (fresh.as_object_mut(), earlier.as_object()) else {
+        return;
+    };
+    for (key, was) in earlier {
+        match fresh.get_mut(key) {
+            None => {
+                fresh.insert(key.clone(), was.clone());
+            }
+            Some(now) if now.is_null() => *now = was.clone(),
+            Some(now) if now.as_object().is_some_and(|it| it.is_empty()) => *now = was.clone(),
+            Some(now) => fill_blanks(now, was),
+        }
+    }
 }
 
 /// `{id}` replaced throughout.
@@ -1360,6 +1409,31 @@ mod tests {
     ///
     /// Taken from real responses rather than invented [実測: 2026-08-11,
     /// four pods created and destroyed while measuring transfers].
+    /// A create response, which is the one place the model is named.
+    fn created_pod() -> serde_json::Value {
+        serde_json::json!({
+            "id": "pod-id",
+            "desiredStatus": "RUNNING",
+            "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+            "gpuCount": 1,
+            "containerDiskInGb": 100,
+            "volumeInGb": 150,
+            "volumeMountPath": "/workspace",
+            "ports": ["8188/http", "22/tcp"],
+            "machine": {
+                "gpuTypeId": "NVIDIA A40",
+                "dataCenterId": "EU-SE-1"
+            }
+        })
+    }
+
+    /// A read-back, which is **not** the same shape.
+    ///
+    /// `machine` comes back empty and the model is gone
+    /// [実測: 2026-08-12, `get-pod` and `list-pods` against a running
+    /// pod]. This fixture used to carry the create response's `machine`
+    /// object, so the catalogue lookup passed here and never once ran on
+    /// a real machine.
     fn inspected_pod() -> serde_json::Value {
         serde_json::json!({
             "id": "pod-id",
@@ -1372,19 +1446,24 @@ mod tests {
             "ports": ["8188/http", "22/tcp"],
             "portMappings": { "22": 22016 },
             "publicIp": "203.0.113.10",
-            "machine": {
-                "gpuTypeId": "NVIDIA A40",
-                "dataCenterId": "EU-SE-1"
-            }
+            "machine": {}
         })
     }
 
-    /// **The loop closes.** What the requirements asked for, the request
-    /// carried, and the machine came back as — read with the same
-    /// vocabulary at both ends.
+    /// **The loop closes** — over what the service said across both of
+    /// its answers, which is what [`Acquired::inspect`] assembles.
+    ///
+    /// Not over the read-back alone: that one has no model in it, so the
+    /// memory requirement comes back `NotChecked` and the verdict with
+    /// it. The version of this test that used a create response as
+    /// though it were a read-back is why the gap survived to a real
+    /// machine.
     #[test]
     fn a_pod_description_reads_back_into_a_judgeable_state() {
-        let state = RunPodAdapter.read_state(&inspected_pod());
+        let mut described = inspected_pod();
+        fill_blanks(&mut described, &created_pod());
+
+        let state = RunPodAdapter.read_state(&described);
         assert!(state.ports_observed);
         assert_eq!(state.exposed.get(&8188), Some(&Exposure::PublicHttp));
         assert_eq!(state.exposed.get(&22), Some(&Exposure::RawTcp));
@@ -1414,7 +1493,7 @@ mod tests {
     fn device_memory_comes_from_the_catalogue_and_stays_under_what_the_part_reports() {
         const A40_REPORTS_MIB: u32 = 46068;
 
-        let known = RunPodAdapter.read_state(&inspected_pod());
+        let known = RunPodAdapter.read_state(&created_pod());
         assert_eq!(
             known.gpu_vram_mib,
             Some(45776),
@@ -1425,13 +1504,62 @@ mod tests {
             "the bound has to stay under the measurement, not over it"
         );
 
-        let mut unknown_model = inspected_pod();
+        let mut unknown_model = created_pod();
         unknown_model["machine"]["gpuTypeId"] = serde_json::json!("NVIDIA SOMETHING NEW");
         assert_eq!(
             RunPodAdapter.read_state(&unknown_model).gpu_vram_mib,
             None,
             "a model outside the catalogue leaves the size unobserved, not zero"
         );
+    }
+
+    /// **The bug this caught, and the only way it could have been
+    /// caught.** The read-back a real service gives has no model in it,
+    /// so a description read on its own cannot say how much memory the
+    /// machine has — which is what every real run got while the tests
+    /// passed against a create response.
+    #[test]
+    fn a_read_back_alone_cannot_say_what_the_device_is() {
+        assert_eq!(
+            RunPodAdapter.read_state(&inspected_pod()).gpu_vram_mib,
+            None,
+            "the service stopped naming the model, so nothing here knows it"
+        );
+
+        let mut restored = inspected_pod();
+        fill_blanks(&mut restored, &created_pod());
+        assert_eq!(
+            RunPodAdapter.read_state(&restored).gpu_vram_mib,
+            Some(45776),
+            "what the service said once is enough, and it said it at creation"
+        );
+    }
+
+    /// Filling blanks is not overwriting: the fresh description is the
+    /// one that is true, and only what it declines to say is restored.
+    #[test]
+    fn what_the_fresh_description_says_wins() {
+        let mut fresh = serde_json::json!({
+            "desiredStatus": "EXITED",
+            "volumeInGb": 0,
+            "machine": {},
+            "portMappings": { "22": 22016 },
+        });
+        fill_blanks(
+            &mut fresh,
+            &serde_json::json!({
+                "desiredStatus": "RUNNING",
+                "volumeInGb": 150,
+                "machine": { "gpuTypeId": "NVIDIA A40" },
+                "imageName": "runpod/pytorch:2.4.0",
+            }),
+        );
+
+        assert_eq!(fresh["desiredStatus"], "EXITED", "a stopped pod is stopped");
+        assert_eq!(fresh["volumeInGb"], 0, "zero is a statement, not a blank");
+        assert_eq!(fresh["machine"]["gpuTypeId"], "NVIDIA A40");
+        assert_eq!(fresh["imageName"], "runpod/pytorch:2.4.0");
+        assert_eq!(fresh["portMappings"]["22"], 22016);
     }
 
     /// A description with no ports field is one nobody looked at; a

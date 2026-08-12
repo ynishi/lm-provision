@@ -187,14 +187,19 @@ pub struct GpuRequirement {
 /// nothing but a retry. Over-estimating promises memory that is not there
 /// and is found out after the machine is paid for.
 ///
-/// Every part measured so far clears the bound it produces [実測:
-/// 2026-08-12 for the A40, vendor figures otherwise]:
+/// Every part measured so far clears the bound it produces:
 ///
-/// | part | published | this bound | reported |
-/// |---|---|---|---|
-/// | A40 | 48 GB | 45776 MiB | 46068 MiB |
-/// | A100 80GB | 80 GB | 76293 MiB | 81920 MiB |
-/// | L4 | 24 GB | 22888 MiB | 23034 MiB |
+/// | part | published | this bound | reported | ECC |
+/// |---|---|---|---|---|
+/// | A40 | 48 GB | 45776 MiB | 46068 MiB [実測: 2026-08-12] | on |
+/// | RTX 4090 | 24 GB | 22888 MiB | 24564 MiB [実測: 2026-08-12] | off |
+/// | A100 80GB | 80 GB | 76293 MiB | 81920 MiB [理論値: vendor] | — |
+///
+/// The two measured parts sit at opposite ends of the reserve: the A40
+/// gives up about 6.25% of its framebuffer to ECC checkbits and still
+/// clears the bound, and the RTX 4090 with ECC off — the most memory a
+/// part ever hands out — clears it by a wider margin. Neither direction
+/// puts the bound above what the device delivers.
 pub const fn gb_to_mib(gb: u32) -> u32 {
     // u64 throughout: 5 GB already overflows u32 once multiplied out.
     ((gb as u64 * 1_000_000_000) / 1_048_576) as u32
@@ -1080,11 +1085,14 @@ mod tests {
     /// the type system holds it, so it is held here.
     #[test]
     fn the_published_figure_converts_to_less_than_the_part_reports() {
-        // model, published GB, what the part answers in MiB.
+        // model, published GB, what the part answers in MiB. The first
+        // two are measured [実測: 2026-08-12, `nvidia-smi` on acquired
+        // machines]; the A40 runs ECC on and the 4090 runs it off, so
+        // the least and the most a part hands out are both here.
         let measured = [
             ("A40", 48, 46068),
+            ("RTX 4090", 24, 24564),
             ("A100 80GB", 80, 81920),
-            ("L4", 24, 23034),
         ];
         for (model, published, reports) in measured {
             let bound = gb_to_mib(published);
