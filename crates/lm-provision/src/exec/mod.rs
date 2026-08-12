@@ -6,8 +6,8 @@
 //! payload from the AST (dsl-kit does not pass leaf payloads into
 //! [`dsl_kit::Op::apply`]), [`effects`] carries the pure-Rust effect
 //! implementations (ported from the former `src/bridge/*` mlua bridges
-//! with the Lua layer stripped), and [`registry`] wires all 22 catalog
-//! ops onto the engine.
+//! with the Lua layer stripped), and [`registry`] wires every catalog
+//! op onto the engine.
 //!
 //! This is now the sole execution path: the former mlua stack
 //! (`src/bridge/`, `src/sandbox/`, `src/vm/`, ...) has been removed and

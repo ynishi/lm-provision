@@ -1,4 +1,4 @@
-//! The `ProfileNode` AST: the top-level `Spec` and the 23 phase catalog
+//! The `ProfileNode` AST: the top-level `Spec` and the phase catalog
 //! kinds (spec 02).
 //!
 //! Sibling modules:
@@ -25,7 +25,7 @@ pub mod semantics;
 pub use engine::{create_profile_engine, create_profile_engine_collecting};
 pub use semantics::{ProfileAst, ProfileSemantics, ProfileValue};
 
-/// Unified AST for provision profile declarations and 22 Phase catalog kinds (`02-phase-catalog.md`).
+/// Unified AST for provision profile declarations and the Phase catalog kinds (`02-phase-catalog.md`).
 #[derive(Debug, Clone, PartialEq, Eq, DslNode, DslSchema, DslBuild, DslExec)]
 pub enum ProfileNode {
     /// Top-level Profile Spec.

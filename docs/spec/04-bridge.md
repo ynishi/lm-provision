@@ -36,7 +36,7 @@ the first op handler is reachable:
                             declared lists      [chapter 05 L3]
 5. payload map + phase index build (NodeId → node, NodeId → 1-based
                             phase index + kind)
-6. op registry wiring     → all 22 catalog ops are registered
+6. op registry wiring     → every catalog op is registered
 7. engine step loop       → per op: payload lookup → capability check →
                             policy check → mode branch (dry-run trace /
                             real effect)

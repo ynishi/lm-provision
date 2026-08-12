@@ -16,7 +16,7 @@
 //! - [`frontend`] — parse a profile file (`.json` → serde bridge,
 //!   canonical text → PEG grammar, `.lua` → explicit rejection) into a
 //!   [`profile_ast::ProfileNode`] AST.
-//! - [`profile_ast`] — the `ProfileNode` AST (spec + the 23 phase catalog
+//! - [`profile_ast`] — the `ProfileNode` AST (spec + the phase catalog
 //!   kinds), the semantics adapter (`ProfileSemantics` / `ProfileValue`),
 //!   and the dsl-kit engine wiring that drives execution.
 //! - [`validate`] — the AST validate stage (03-pipeline-stage-artifacts.md

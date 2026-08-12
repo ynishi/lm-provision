@@ -1,4 +1,4 @@
-//! The 22-op [`OpRegistry`] wired onto the engine.
+//! The catalog [`OpRegistry`] wired onto the engine.
 //!
 //! Every catalog op is one `ProfileOp` handler sharing the same
 //! [`ExecContext`]. On each `apply` the handler recovers its payload
@@ -2280,6 +2280,28 @@ fn check_routed_demand(
 mod tests {
     use super::*;
     use dsl_kit::{DslNode as _, IdGen};
+
+    /// The catalog's size, pinned so that adding a kind cannot quietly
+    /// leave the two places that still state it behind.
+    ///
+    /// The number used to appear in five doc comments as well, and it
+    /// went stale the moment `toolchain.python` landed — twice, because
+    /// the first correction missed a capitalised spelling. Prose that
+    /// has to be hand-synchronised across files is a maintenance
+    /// liability with no reader value, so those are gone; the two that
+    /// remain are the ones a reader is actually served by, and this is
+    /// what keeps them honest.
+    #[test]
+    fn the_catalog_size_matches_what_the_docs_claim() {
+        assert_eq!(
+            DIRECT_OPS.len() + LIFECYCLE_OPS.len(),
+            23,
+            "the catalog changed size: update `README.md` (\"Declarative \
+             phase catalog (N kinds)\"), `docs/spec/00-overview.md` \
+             (\"The N phase kinds\") and `docs/spec/02-phase-catalog.md` \
+             (\"all N kinds above\") — and this assertion",
+        );
+    }
 
     /// Which phases the host can route, pinned directly.
     ///
