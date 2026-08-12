@@ -614,6 +614,183 @@ impl fmt::Display for AdmissionError {
 
 impl std::error::Error for AdmissionError {}
 
+/// What an adapter found when it looked at an actual machine.
+///
+/// **Every field is optional, and absent means "not observed" rather
+/// than "not there".** An adapter reports what it could see; a container
+/// runtime asked about a proxy in front of it has no way to look, and
+/// saying zero would be a claim it did not make.
+///
+/// This is the other half of the pair [`admit`] opens. Admission asks
+/// what a target *could* provide and runs before anything exists;
+/// this asks what a machine *does* provide and runs once one does. The
+/// requirements an adapter could not decide statically — a memory floor
+/// on a runtime that cannot select one — are settled here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineState {
+    /// How each port is actually reachable, by port number.
+    ///
+    /// A port absent from the map was not seen exposed; the map being
+    /// empty because nothing was looked at is [`Self::ports_observed`].
+    pub exposed: BTreeMap<u16, Exposure>,
+    /// Whether the exposure of ports could be observed at all.
+    pub ports_observed: bool,
+    /// How many accelerators the machine has.
+    pub gpu_count: Option<u32>,
+    /// How much memory each one has, in gigabytes.
+    pub gpu_vram_gb: Option<u32>,
+    /// Scratch space, in gigabytes.
+    pub ephemeral_gb: Option<u32>,
+    /// Space surviving a restart, in gigabytes.
+    pub persistent_gb: Option<u32>,
+    /// Where that space is mounted.
+    pub persistent_at: Option<String>,
+    /// The image the machine is running.
+    pub image: Option<String>,
+}
+
+/// One requirement, and what looking at the machine said about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    /// The requirement, in the words the profile wrote.
+    pub requirement: String,
+    /// What was found.
+    pub outcome: Outcome,
+}
+
+/// What observing one requirement concluded.
+///
+/// **The same three values [`crate::exec::assert::AssertOutcome`]
+/// carries** for the requirements it can see — and deliberately the same
+/// words, because "I looked and it is not so" and "I did not look" are
+/// the distinction this whole model exists to keep. The fourth,
+/// `CheckFailed`, belongs to an observation that broke; an adapter that
+/// cannot reach the platform reports that as an error rather than as a
+/// finding, so it does not appear here.
+///
+/// A separate type rather than the enum itself: that one names host
+/// predicates evaluated *on* the machine, and these are answers from a
+/// platform *about* one. Sharing the values without sharing the
+/// predicate set is the point — a provisioner running on the machine has
+/// no credentials to ask a platform anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The machine has it.
+    Satisfied,
+    /// The machine does not have it.
+    Unsatisfied,
+    /// Nothing here could tell.
+    NotChecked,
+}
+
+/// Compare what a profile requires against what a machine turned out to
+/// be.
+///
+/// Returns one finding per requirement, in the order a profile reads:
+/// image, accelerators, storage, ports. **Every requirement produces a
+/// finding**, including the ones nothing could see — an omitted line
+/// would read as a requirement that was met.
+pub fn observe(required: &Requirements, state: &MachineState) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    let compare = |name: String, want: &str, got: Option<&str>| Finding {
+        requirement: name,
+        outcome: match got {
+            None => Outcome::NotChecked,
+            Some(found) if found == want => Outcome::Satisfied,
+            Some(_) => Outcome::Unsatisfied,
+        },
+    };
+
+    let at_least = |name: String, floor: u32, got: Option<u32>| Finding {
+        requirement: name,
+        outcome: match got {
+            None => Outcome::NotChecked,
+            Some(found) if found >= floor => Outcome::Satisfied,
+            Some(_) => Outcome::Unsatisfied,
+        },
+    };
+
+    if let Some(image) = &required.image {
+        findings.push(compare(
+            format!("image={image}"),
+            image,
+            state.image.as_deref(),
+        ));
+    }
+
+    if let Some(gpu) = &required.gpu {
+        findings.push(at_least(
+            format!("gpu.count={}", gpu.count),
+            gpu.count,
+            state.gpu_count,
+        ));
+        if let Some(floor) = gpu.min_vram_gb {
+            findings.push(at_least(
+                format!("gpu.min_vram_gb={floor}"),
+                floor,
+                state.gpu_vram_gb,
+            ));
+        }
+    }
+
+    if let Some(disk) = &required.disk {
+        if let Some(gb) = disk.ephemeral_gb {
+            findings.push(at_least(
+                format!("disk.ephemeral_gb={gb}"),
+                gb,
+                state.ephemeral_gb,
+            ));
+        }
+        if let Some(gb) = disk.persistent_gb {
+            findings.push(at_least(
+                format!("disk.persistent_gb={gb}"),
+                gb,
+                state.persistent_gb,
+            ));
+        }
+        if let Some(path) = &disk.persistent_at {
+            findings.push(compare(
+                format!("disk.persistent_at={path}"),
+                path,
+                state.persistent_at.as_deref(),
+            ));
+        }
+    }
+
+    for port in &required.ports {
+        findings.push(Finding {
+            requirement: format!("ports[{}]={}", port.port, port.exposure),
+            outcome: if !state.ports_observed {
+                Outcome::NotChecked
+            } else if state.exposed.get(&port.port) == Some(&port.exposure) {
+                Outcome::Satisfied
+            } else {
+                Outcome::Unsatisfied
+            },
+        });
+    }
+
+    findings
+}
+
+/// Whether a machine is finished being what the profile asked for.
+///
+/// **`NotChecked` does not make it done.** A run that proceeds on
+/// requirements nothing looked at is a run whose failures arrive later
+/// and further from their cause — which is the shape this whole slot
+/// exists to remove. So the answer is three-valued too, and the caller
+/// decides what an unexamined machine is worth.
+pub fn verdict(findings: &[Finding]) -> Outcome {
+    if findings.iter().any(|it| it.outcome == Outcome::Unsatisfied) {
+        return Outcome::Unsatisfied;
+    }
+    if findings.iter().any(|it| it.outcome == Outcome::NotChecked) {
+        return Outcome::NotChecked;
+    }
+    Outcome::Satisfied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +968,104 @@ mod tests {
         assert!(!Answer::met_using(["NVIDIA A40"]).blocks());
         assert!(!Answer::not_examined("cannot select on memory").blocks());
         assert!(Answer::unmet("nothing carries that much").blocks());
+    }
+
+    fn required_all() -> Requirements {
+        Requirements::from_slots(
+            &slot(&[("8188", "public_http")]),
+            &slot(&[("count", "1"), ("min_vram_gb", "24")]),
+            &slot(&[("persistent_gb", "50"), ("persistent_at", "/workspace")]),
+            Some("runpod/pytorch:2.4.0"),
+        )
+        .expect("well-formed fixture")
+    }
+
+    /// **What stage 4 settles.** A memory floor a container adapter
+    /// could not decide at admission is decided here, by looking.
+    #[test]
+    fn looking_at_the_machine_settles_what_admission_could_not() {
+        let required = required_all();
+        let state = MachineState {
+            exposed: [(8188, Exposure::PublicHttp)].into_iter().collect(),
+            ports_observed: true,
+            gpu_count: Some(1),
+            gpu_vram_gb: Some(48),
+            persistent_gb: Some(100),
+            persistent_at: Some("/workspace".into()),
+            image: Some("runpod/pytorch:2.4.0".into()),
+            ..MachineState::default()
+        };
+        let findings = observe(&required, &state);
+        assert_eq!(verdict(&findings), Outcome::Satisfied, "{findings:#?}");
+        assert!(
+            findings.iter().any(
+                |it| it.requirement == "gpu.min_vram_gb=24" && it.outcome == Outcome::Satisfied
+            ),
+            "the floor admission left unexamined is now answered: {findings:#?}"
+        );
+    }
+
+    /// A floor is a floor: more than asked for satisfies it, less does
+    /// not.
+    #[test]
+    fn a_machine_smaller_than_the_floor_is_unsatisfied() {
+        let state = MachineState {
+            gpu_count: Some(1),
+            gpu_vram_gb: Some(16),
+            ..MachineState::default()
+        };
+        let required = Requirements::from_slots(
+            &slot(&[]),
+            &slot(&[("count", "1"), ("min_vram_gb", "24")]),
+            &slot(&[]),
+            None,
+        )
+        .unwrap();
+        let findings = observe(&required, &state);
+        assert_eq!(verdict(&findings), Outcome::Unsatisfied, "{findings:#?}");
+    }
+
+    /// **Nothing observed is not "done".** A machine nobody looked at
+    /// is not a machine that met the requirements, and treating it as
+    /// one is how a failure arrives later and further from its cause.
+    #[test]
+    fn an_unobserved_requirement_does_not_pass() {
+        let required = required_all();
+        let findings = observe(&required, &MachineState::default());
+        assert_eq!(verdict(&findings), Outcome::NotChecked, "{findings:#?}");
+        assert!(
+            findings.iter().all(|it| it.outcome == Outcome::NotChecked),
+            "{findings:#?}"
+        );
+    }
+
+    /// Every requirement gets a line, including the unseen ones — an
+    /// omitted finding reads as a requirement that was met.
+    #[test]
+    fn every_requirement_produces_a_finding() {
+        let findings = observe(&required_all(), &MachineState::default());
+        let names: Vec<&str> = findings.iter().map(|it| it.requirement.as_str()).collect();
+        assert!(names.contains(&"image=runpod/pytorch:2.4.0"), "{names:?}");
+        assert!(names.contains(&"gpu.count=1"), "{names:?}");
+        assert!(names.contains(&"gpu.min_vram_gb=24"), "{names:?}");
+        assert!(names.contains(&"disk.persistent_gb=50"), "{names:?}");
+        assert!(
+            names.contains(&"disk.persistent_at=/workspace"),
+            "{names:?}"
+        );
+        assert!(names.contains(&"ports[8188]=public_http"), "{names:?}");
+    }
+
+    /// One failure outranks any number of unexamined lines: a machine
+    /// known to be wrong is wrong whatever else went unlooked at.
+    #[test]
+    fn a_failure_outranks_an_unexamined_line() {
+        let required = required_all();
+        let state = MachineState {
+            image: Some("some/other:tag".into()),
+            ..MachineState::default()
+        };
+        assert_eq!(verdict(&observe(&required, &state)), Outcome::Unsatisfied);
     }
 
     const BOTH: Capability = Capability {
