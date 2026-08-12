@@ -1535,6 +1535,81 @@ mod tests {
         );
     }
 
+    /// **The plumbing, on what the service actually said.**
+    ///
+    /// The two strings below are the responses a real pod produced
+    /// [実測: 2026-08-12, an RTX 4090 pod created and released], trimmed
+    /// to the fields this reads. They go through the same
+    /// `acquire` → `inspect` → `read_state` chain a run uses, with the
+    /// commands replaced by ones that print them — so what is exercised
+    /// is the assembly rather than the network.
+    ///
+    /// The chain is where the bug was. `fill_blanks` was correct on its
+    /// own; nothing called it with the creation-time description,
+    /// because `inspect` had replaced that with the read-back.
+    #[test]
+    fn the_chain_a_run_uses_keeps_the_model_across_a_read_back() {
+        let created = r#"{
+            "id": "qp17o2cvstg1jh",
+            "desiredStatus": "RUNNING",
+            "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+            "gpuCount": 1, "containerDiskInGb": 50, "volumeInGb": 20,
+            "volumeMountPath": "/workspace",
+            "ports": ["8888/http", "22/tcp"],
+            "publicIp": "",
+            "machine": {"gpuTypeId": "NVIDIA GeForce RTX 4090", "location": "US"}
+        }"#;
+        // What get-pod gives back a minute later. Note `machine`.
+        let read_back = r#"{
+            "id": "qp17o2cvstg1jh",
+            "desiredStatus": "RUNNING",
+            "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+            "gpuCount": 1, "containerDiskInGb": 50, "volumeInGb": 20,
+            "volumeMountPath": "/workspace",
+            "ports": ["8888/http", "22/tcp"],
+            "portMappings": {"22": 16422},
+            "publicIp": "47.47.180.52",
+            "machine": {}
+        }"#;
+
+        let mut acquired = acquire(Acquisition {
+            create: vec!["echo".into(), created.into()],
+            body: None,
+            inspect: vec!["echo".into(), read_back.into()],
+            release: vec!["true".into()],
+        })
+        .expect("the create response names an id");
+        acquired.inspect().expect("the read-back parses");
+
+        let state = RunPodAdapter.read_state(&acquired.inspected);
+        assert_eq!(
+            state.gpu_vram_mib,
+            Some(22888),
+            "the model survived the read-back that stopped naming it"
+        );
+        assert_eq!(
+            acquired.inspected["publicIp"], "47.47.180.52",
+            "and the read-back's own words still won: it learned an address"
+        );
+
+        let required = Requirements::from_slots(
+            &BTreeMap::new(),
+            &[("count", "1"), ("min_vram_gb", "24")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &BTreeMap::new(),
+            Some("runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"),
+        )
+        .unwrap();
+        let findings = lm_provision::machine::observe(&required, &state);
+        assert_eq!(
+            lm_provision::machine::verdict(&findings),
+            lm_provision::machine::Outcome::Satisfied,
+            "this is the verdict a real acquire prints: {findings:#?}"
+        );
+    }
+
     /// Filling blanks is not overwriting: the fresh description is the
     /// one that is true, and only what it declines to say is restored.
     #[test]
