@@ -17,11 +17,13 @@
 //! stdout, the pod's stderr transcript is relayed to stderr — the
 //! same stream split the binary itself contracts (chapter 07).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+use lm_provision_driver::infra::{self, Infra as _, RunPodAdapter};
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
 use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
 
@@ -39,6 +41,58 @@ struct Cli {
 enum Command {
     /// Run one driver session against a pod over SSH.
     Apply(ApplyArgs),
+    /// Obtain a machine that meets a profile's requirements.
+    ///
+    /// **This spends money.** It is a subcommand of its own rather than
+    /// a flag on `apply` so that acquiring is something asked for, never
+    /// something that happens on the way to something else.
+    Acquire(AcquireArgs),
+    /// Give a machine back.
+    Release(ReleaseArgs),
+    /// Judge a machine that already exists against a profile.
+    ///
+    /// Reads a description the service gave and says, requirement by
+    /// requirement, whether the machine is what the profile asked for.
+    /// Nothing is created and nothing is destroyed.
+    Check(CheckArgs),
+}
+
+#[derive(Args)]
+struct CheckArgs {
+    /// The profile whose requirements to judge against.
+    #[arg(long = "profile")]
+    profile: PathBuf,
+
+    /// A file holding what the service said about the machine.
+    #[arg(long = "inspected")]
+    inspected: PathBuf,
+}
+
+#[derive(Args)]
+struct AcquireArgs {
+    /// Path to the profile whose requirements describe the machine.
+    #[arg(long = "profile")]
+    profile: PathBuf,
+
+    /// Show the request that would be sent, and send nothing.
+    ///
+    /// The default, because the other behaviour creates something
+    /// billable: an operator asking what this would do should not find
+    /// out by it having happened.
+    #[arg(long = "dry-run", default_value_t = true, action = clap::ArgAction::Set)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct ReleaseArgs {
+    /// The identifier the service gave the machine.
+    #[arg(long = "id")]
+    id: String,
+
+    /// The profile the machine was acquired from, which is where the
+    /// release command comes from.
+    #[arg(long = "profile")]
+    profile: PathBuf,
 }
 
 #[derive(Args)]
@@ -102,6 +156,213 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Apply(args) => run_apply(args),
+        Command::Acquire(args) => run_acquire(args),
+        Command::Release(args) => run_release(args),
+        Command::Check(args) => run_check(args),
+    }
+}
+
+fn run_check(args: CheckArgs) -> ExitCode {
+    let (required, _) = match requirements_of(&args.profile) {
+        Ok(parts) => parts,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let text = match std::fs::read_to_string(&args.inspected) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("error: reading {}: {err}", args.inspected.display());
+            return ExitCode::from(2);
+        }
+    };
+    let inspected: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("error: {} is not JSON: {err}", args.inspected.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    let state = RunPodAdapter.read_state(&inspected);
+    let findings = lm_provision::machine::observe(&required, &state);
+    let verdict = lm_provision::machine::verdict(&findings);
+    println!(
+        "{}",
+        serde_json::json!({
+            "verdict": format!("{verdict:?}"),
+            "findings": findings
+                .iter()
+                .map(|it| serde_json::json!({
+                    "requirement": it.requirement,
+                    "outcome": format!("{:?}", it.outcome),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    );
+    match verdict {
+        lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
+    }
+}
+
+/// Read a profile and render what its requirements ask of a machine.
+///
+/// Validate runs first, so an unreadable requirement is refused here
+/// rather than after a machine exists to be refused against.
+fn requirements_of(
+    profile: &std::path::Path,
+) -> Result<
+    (
+        lm_provision::machine::Requirements,
+        BTreeMap<String, String>,
+    ),
+    String,
+> {
+    let root = lm_provision::frontend::load_profile(profile).map_err(|err| err.to_string())?;
+    lm_provision::validate::validate(&root).map_err(|err| err.to_string())?;
+    let lm_provision::profile_ast::ProfileNode::Spec {
+        requires_ports,
+        requires_gpu,
+        requires_disk,
+        requires_image,
+        provider,
+        ..
+    } = &root
+    else {
+        return Err("the profile's root is not a Spec".to_string());
+    };
+    let required = lm_provision::machine::Requirements::from_slots(
+        requires_ports,
+        requires_gpu,
+        requires_disk,
+        requires_image.as_deref(),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok((required, provider.clone()))
+}
+
+fn run_acquire(args: AcquireArgs) -> ExitCode {
+    let (required, provider) = match requirements_of(&args.profile) {
+        Ok(parts) => parts,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let adapter = RunPodAdapter;
+    // Admission before anything is spent: a target that could never
+    // satisfy this should say so while the bill is still zero.
+    if let Err(refusal) = lm_provision::machine::admit(&required, &adapter.capability()) {
+        eprintln!("error: {refusal}");
+        return ExitCode::from(3);
+    }
+
+    let acquisition = match adapter.acquisition(&required, &provider) {
+        Ok(acquisition) => acquisition,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if args.dry_run {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dry_run": true,
+                "create": acquisition.create,
+                "body": acquisition.body,
+                "release": acquisition.release,
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let mut acquired = match infra::acquire(acquisition) {
+        Ok(acquired) => acquired,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The id goes out before anything else can fail. A machine that
+    // exists and whose identifier was never printed is a bill nobody can
+    // stop.
+    println!("{}", serde_json::json!({ "id": acquired.id }));
+
+    if let Err(err) = acquired.inspect() {
+        eprintln!(
+            "warning: created {} but could not inspect it: {err}",
+            acquired.id
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let state = adapter.read_state(&acquired.inspected);
+    let findings = lm_provision::machine::observe(&required, &state);
+    let verdict = lm_provision::machine::verdict(&findings);
+    println!(
+        "{}",
+        serde_json::json!({
+            "id": acquired.id,
+            "verdict": format!("{verdict:?}"),
+            "findings": findings
+                .iter()
+                .map(|it| serde_json::json!({
+                    "requirement": it.requirement,
+                    "outcome": format!("{:?}", it.outcome),
+                }))
+                .collect::<Vec<_>>(),
+            "release": acquired.id,
+        })
+    );
+
+    match verdict {
+        lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
+    }
+}
+
+fn run_release(args: ReleaseArgs) -> ExitCode {
+    let (required, provider) = match requirements_of(&args.profile) {
+        Ok(parts) => parts,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let acquisition = match RunPodAdapter.acquisition(&required, &provider) {
+        Ok(acquisition) => acquisition,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let argv: Vec<String> = acquisition
+        .release
+        .iter()
+        .map(|it| it.replace("{id}", &args.id))
+        .collect();
+    match std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            println!("{}", serde_json::json!({ "released": args.id }));
+            ExitCode::SUCCESS
+        }
+        Ok(status) => {
+            eprintln!("error: release exited with {status}");
+            ExitCode::FAILURE
+        }
+        Err(err) => {
+            eprintln!("error: could not run the release: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -244,7 +505,9 @@ mod tests {
             "profile.json",
             "--skip-install",
         ]);
-        let Command::Apply(args) = cli.command;
+        let Command::Apply(args) = cli.command else {
+            panic!("the parsed subcommand is `apply`");
+        };
         assert_eq!(args.remote_dir, PathBuf::from(DEFAULT_REMOTE_DIR));
 
         let (user, _, _) = parse_ssh_target("1.2.3.4:22").expect("host:port parses");

@@ -576,6 +576,159 @@ impl Infra for ContainerAdapter {
     }
 }
 
+/// A machine that exists because [`acquire`] made it.
+///
+/// Carries what it takes to give it back, so that a caller holding one
+/// of these never has to reconstruct how — the release is not something
+/// to work out after the fact.
+#[derive(Debug, Clone)]
+pub struct Acquired {
+    /// The identifier the service gave it.
+    pub id: String,
+    /// What the service said about it when last inspected.
+    pub inspected: serde_json::Value,
+    /// How to inspect and destroy it, with `{id}` still in place.
+    acquisition: Acquisition,
+}
+
+impl Acquired {
+    /// Ask the service what this machine is now.
+    pub fn inspect(&mut self) -> Result<&serde_json::Value, ExecuteError> {
+        self.inspected = run_json(&substitute(&self.acquisition.inspect, &self.id), None)?;
+        Ok(&self.inspected)
+    }
+
+    /// Destroy it.
+    ///
+    /// Takes `self`, so the handle is spent: a machine cannot be
+    /// released twice, and one that was released cannot be inspected
+    /// afterwards as though it were still there.
+    pub fn release(self) -> Result<(), ExecuteError> {
+        run(&substitute(&self.acquisition.release, &self.id), None).map(|_| ())
+    }
+}
+
+/// Something went wrong obtaining or inspecting a machine.
+#[derive(Debug, thiserror::Error)]
+pub enum ExecuteError {
+    /// The command could not be started.
+    #[error("could not run `{command}`: {source}")]
+    Spawn {
+        /// What was being run.
+        command: String,
+        /// Why it could not start.
+        source: std::io::Error,
+    },
+
+    /// It ran and failed.
+    #[error("`{command}` exited with status {status}: {stderr}")]
+    Failed {
+        /// What was run.
+        command: String,
+        /// How it exited.
+        status: String,
+        /// What it said about it.
+        stderr: String,
+    },
+
+    /// It succeeded and said something unreadable.
+    #[error("`{command}` returned no readable JSON: {detail}")]
+    Unreadable {
+        /// What was run.
+        command: String,
+        /// What could not be read.
+        detail: String,
+    },
+
+    /// The created machine has no identifier, so nothing could release
+    /// it.
+    ///
+    /// Reported rather than tolerated: a machine that exists and cannot
+    /// be named is the shape of a bill nobody can stop.
+    #[error("`{command}` created something without returning an id: {body}")]
+    Anonymous {
+        /// What was run.
+        command: String,
+        /// What came back instead.
+        body: String,
+    },
+}
+
+/// Create a machine from a rendered [`Acquisition`].
+///
+/// **This is the call that spends money.** It is a free function rather
+/// than a method on [`Infra`] so that rendering an acquisition and
+/// performing one are separate acts in the source as well as in the
+/// design: a caller that only wants to show an operator what would
+/// happen cannot reach this by accident.
+pub fn acquire(acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
+    let created = run_json(&acquisition.create, acquisition.body.as_deref())?;
+    let id = created
+        .get("id")
+        .and_then(|it| it.as_str())
+        .ok_or_else(|| ExecuteError::Anonymous {
+            command: acquisition.create.join(" "),
+            body: created.to_string(),
+        })?
+        .to_string();
+    Ok(Acquired {
+        id,
+        inspected: created,
+        acquisition,
+    })
+}
+
+/// `{id}` replaced throughout.
+fn substitute(argv: &[String], id: &str) -> Vec<String> {
+    argv.iter()
+        .map(|it| it.replace("{id}", id))
+        .collect::<Vec<_>>()
+}
+
+/// Run `argv`, optionally appending `body` as its last argument.
+fn run(argv: &[String], body: Option<&str>) -> Result<String, ExecuteError> {
+    let Some((program, rest)) = argv.split_first() else {
+        return Err(ExecuteError::Unreadable {
+            command: String::new(),
+            detail: "no command to run".to_string(),
+        });
+    };
+    let mut command = std::process::Command::new(program);
+    command.args(rest);
+    if let Some(body) = body {
+        command.arg(body);
+    }
+    let rendered = argv.join(" ");
+    let output = command.output().map_err(|source| ExecuteError::Spawn {
+        command: rendered.clone(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(ExecuteError::Failed {
+            command: rendered,
+            status: output
+                .status
+                .code()
+                .map(|it| it.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// [`run`], reading the output as JSON.
+fn run_json(argv: &[String], body: Option<&str>) -> Result<serde_json::Value, ExecuteError> {
+    let stdout = run(argv, body)?;
+    // The CLI prints its own progress before the payload, so the object
+    // is found rather than assumed to start at byte zero.
+    let start = stdout.find('{').unwrap_or(0);
+    serde_json::from_str(&stdout[start..]).map_err(|err| ExecuteError::Unreadable {
+        command: argv.join(" "),
+        detail: err.to_string(),
+    })
+}
+
 /// The `provider` keys addressed to somebody else.
 ///
 /// **Not an error, and not silently fine.** A key namespaced for another
