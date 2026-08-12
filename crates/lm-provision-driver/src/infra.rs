@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 
 use lm_provision::machine::{
-    Answer, Capability, DiskRequirement, Exposure, GpuRequirement, Requirements,
+    Answer, Capability, DiskRequirement, Exposure, GpuRequirement, MachineState, Requirements,
 };
 
 /// A target that a machine can be placed on.
@@ -90,6 +90,14 @@ pub trait Infra {
         required: &Requirements,
         provider: &BTreeMap<String, String>,
     ) -> Result<Acquisition, AcquisitionError>;
+
+    /// Read what [`Acquisition::inspect`] returned into the state
+    /// [`lm_provision::machine::observe`] judges.
+    ///
+    /// **Absent means not observed.** A field this cannot find is left
+    /// `None` rather than defaulted, because a zero would be a claim
+    /// about the machine that nothing made.
+    fn read_state(&self, inspected: &serde_json::Value) -> MachineState;
 }
 
 /// What to run to obtain a machine, and what to run to give it back.
@@ -377,6 +385,67 @@ impl Infra for RunPodAdapter {
             ],
         })
     }
+
+    /// Read the service's own pod description.
+    ///
+    /// The `ports` array comes back in the same `[port]/[protocol]` form
+    /// it went out in, so what the machine exposes is read with the same
+    /// vocabulary the requirement was written in.
+    ///
+    /// Device memory is the one field that has to be looked up rather
+    /// than read: the description names the model
+    /// (`machine.gpuTypeId`) and never the size, which is the same
+    /// asymmetry that put the catalogue in this adapter in the first
+    /// place. A model outside it leaves the memory unobserved — `None`,
+    /// not a guess.
+    fn read_state(&self, inspected: &serde_json::Value) -> MachineState {
+        let number = |value: &serde_json::Value| value.as_u64().map(|it| it as u32);
+        let text = |value: &serde_json::Value| value.as_str().map(str::to_string);
+
+        let mut exposed = BTreeMap::new();
+        let ports = inspected.get("ports").and_then(|it| it.as_array());
+        if let Some(ports) = ports {
+            for entry in ports.iter().filter_map(|it| it.as_str()) {
+                let Some((port, protocol)) = entry.split_once('/') else {
+                    continue;
+                };
+                let Ok(port) = port.parse::<u16>() else {
+                    continue;
+                };
+                let exposure = match protocol {
+                    "http" => Exposure::PublicHttp,
+                    "tcp" => Exposure::RawTcp,
+                    _ => continue,
+                };
+                exposed.insert(port, exposure);
+            }
+        }
+
+        let gpu_vram_gb = inspected
+            .get("machine")
+            .and_then(|it| it.get("gpuTypeId"))
+            .and_then(|it| it.as_str())
+            .and_then(|model| {
+                RUNPOD_CATALOGUE
+                    .iter()
+                    .find(|it| it.id == model)
+                    .map(|it| it.vram_gb)
+            });
+
+        MachineState {
+            exposed,
+            // The description carries the field whether or not anything
+            // is in it, so an empty list is "nothing exposed" rather
+            // than "nobody looked".
+            ports_observed: ports.is_some(),
+            gpu_count: inspected.get("gpuCount").and_then(number),
+            gpu_vram_gb,
+            ephemeral_gb: inspected.get("containerDiskInGb").and_then(number),
+            persistent_gb: inspected.get("volumeInGb").and_then(number),
+            persistent_at: inspected.get("volumeMountPath").and_then(text),
+            image: inspected.get("imageName").and_then(text),
+        }
+    }
 }
 
 /// A container runtime: the machine is a container, and whatever is in
@@ -495,6 +564,15 @@ impl Infra for ContainerAdapter {
             reason: "no transport reaches a container yet (spec 08 names `docker exec` \
                      as an extension point; it is not implemented)",
         })
+    }
+
+    /// Nothing observed, because nothing was acquired.
+    ///
+    /// This adapter renders no acquisition, so it is never handed
+    /// anything to read. An empty state is the honest answer: every
+    /// requirement comes back unexamined rather than met.
+    fn read_state(&self, _inspected: &serde_json::Value) -> MachineState {
+        MachineState::default()
     }
 }
 
@@ -899,6 +977,102 @@ mod tests {
             .expect_err("no transport reaches a container");
         let rendered = err.to_string();
         assert!(rendered.contains("docker exec"), "{rendered}");
+    }
+
+    /// The shape the service returns for a pod, with the fields this
+    /// reads and the identifying ones neutralised.
+    ///
+    /// Taken from real responses rather than invented [実測: 2026-08-11,
+    /// four pods created and destroyed while measuring transfers].
+    fn inspected_pod() -> serde_json::Value {
+        serde_json::json!({
+            "id": "pod-id",
+            "desiredStatus": "RUNNING",
+            "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+            "gpuCount": 1,
+            "containerDiskInGb": 100,
+            "volumeInGb": 150,
+            "volumeMountPath": "/workspace",
+            "ports": ["8188/http", "22/tcp"],
+            "portMappings": { "22": 22016 },
+            "publicIp": "203.0.113.10",
+            "machine": {
+                "gpuTypeId": "NVIDIA A40",
+                "dataCenterId": "EU-SE-1"
+            }
+        })
+    }
+
+    /// **The loop closes.** What the requirements asked for, the request
+    /// carried, and the machine came back as — read with the same
+    /// vocabulary at both ends.
+    #[test]
+    fn a_pod_description_reads_back_into_a_judgeable_state() {
+        let state = RunPodAdapter.read_state(&inspected_pod());
+        assert!(state.ports_observed);
+        assert_eq!(state.exposed.get(&8188), Some(&Exposure::PublicHttp));
+        assert_eq!(state.exposed.get(&22), Some(&Exposure::RawTcp));
+        assert_eq!(state.gpu_count, Some(1));
+        assert_eq!(state.ephemeral_gb, Some(100));
+        assert_eq!(state.persistent_gb, Some(150));
+        assert_eq!(state.persistent_at.as_deref(), Some("/workspace"));
+
+        let findings = lm_provision::machine::observe(&full_requirements(), &state);
+        assert_eq!(
+            lm_provision::machine::verdict(&findings),
+            lm_provision::machine::Outcome::Satisfied,
+            "{findings:#?}"
+        );
+    }
+
+    /// Memory is the one field that is looked up rather than read: the
+    /// description names the model and never the size, which is the same
+    /// asymmetry that put the catalogue in this adapter.
+    #[test]
+    fn device_memory_comes_from_the_catalogue_and_absence_is_not_zero() {
+        let known = RunPodAdapter.read_state(&inspected_pod());
+        assert_eq!(known.gpu_vram_gb, Some(48), "an A40 carries 48 GB");
+
+        let mut unknown_model = inspected_pod();
+        unknown_model["machine"]["gpuTypeId"] = serde_json::json!("NVIDIA SOMETHING NEW");
+        assert_eq!(
+            RunPodAdapter.read_state(&unknown_model).gpu_vram_gb,
+            None,
+            "a model outside the catalogue leaves the size unobserved, not zero"
+        );
+    }
+
+    /// A description with no ports field is one nobody looked at; a
+    /// description with an empty one exposed nothing. Those are
+    /// different answers.
+    #[test]
+    fn an_absent_ports_field_is_not_an_empty_one() {
+        let mut without = inspected_pod();
+        without.as_object_mut().unwrap().remove("ports");
+        assert!(!RunPodAdapter.read_state(&without).ports_observed);
+
+        let mut empty = inspected_pod();
+        empty["ports"] = serde_json::json!([]);
+        let state = RunPodAdapter.read_state(&empty);
+        assert!(state.ports_observed);
+        assert!(state.exposed.is_empty());
+    }
+
+    /// A machine that came back without what was asked for is caught by
+    /// looking, not by the run failing later somewhere else.
+    #[test]
+    fn a_machine_missing_a_port_is_unsatisfied() {
+        let mut missing = inspected_pod();
+        missing["ports"] = serde_json::json!(["22/tcp"]);
+        let findings = lm_provision::machine::observe(
+            &full_requirements(),
+            &RunPodAdapter.read_state(&missing),
+        );
+        assert_eq!(
+            lm_provision::machine::verdict(&findings),
+            lm_provision::machine::Outcome::Unsatisfied,
+            "{findings:#?}"
+        );
     }
 
     /// Keys for another target are reported, not dropped in silence: the
