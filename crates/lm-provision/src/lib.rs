@@ -36,10 +36,17 @@
 //! - [`digest`] — the crate's single SHA-256 implementation, shared by
 //!   the profile hash, the Assert model's content predicate, and the
 //!   driver's `ensure-binary` check.
-//! - [`exec`] — the mlua-free execution layer: the capability gate, the
-//!   declaration-derived path / HTTP / secret policies, the pure-Rust
-//!   effect implementations, and the per-step report builder
-//!   (05-sandbox-layer-contract.md, 09-apply-report-and-ledger.md).
+//! - [`exec`] — the execution layer, with no embedded scripting
+//!   runtime: the capability gate, the declaration-derived path / HTTP
+//!   / secret policies, the pure-Rust effect implementations, and the
+//!   per-step report builder (05-sandbox-layer-contract.md,
+//!   09-apply-report-and-ledger.md).
+//! - [`machine`] — what the machine itself must be, and the contract a
+//!   target implements to be judged against it: [`machine::admit`]
+//!   before one exists, [`machine::observe`] once one does.
+//! - [`normalize`] — the canonical phase order every stage reads,
+//!   imposed on a profile's as-written order.
+//! - [`derive`] — the `dsl_exec` attribute's expansion surface.
 //! - [`apply`] — host-side `plan → dispatch → apply → report` entry point
 //!   ([`apply::run_apply_ast`], 09-apply-report-and-ledger.md).
 //! - [`cli`] — subcommand / flag surface (07-cli.md).

@@ -1,5 +1,5 @@
 //! End-to-end exec-bridge tests driving a real dsl-kit engine over a
-//! `ProfileNode` AST (backlog D).
+//! `ProfileNode` AST.
 
 use std::convert::Infallible;
 use std::error::Error;

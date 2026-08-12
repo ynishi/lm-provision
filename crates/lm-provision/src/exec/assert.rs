@@ -1,5 +1,5 @@
 //! The Assert model: what an Assert answers, how answers compose, and
-//! how an Assert is evaluated (design.md §3, plan 段 A).
+//! how an Assert is evaluated.
 //!
 //! An Assert is an *expression*, not a closed list of cases. Evaluating
 //! one reads the host, so it can fail; "did not evaluate" and "could not
@@ -29,7 +29,7 @@
 //! `done:` of its own — every `done` is derived from the phase kind —
 //! so no `ProfileNode` carries an `Assert` and no profile's hash moves.
 //! The author-facing form is settled once three entities exist, so that
-//! it is not shaped by this one (design §5).
+//! it is not shaped by this one.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -372,7 +372,7 @@ pub enum Assert {
     /// `creates:`, and a `command -v` probe with `when:` — and puts the
     /// inline probe last, with the standing advice that a shell command
     /// carry its condition in the declared layer rather than inside the
-    /// string [理論値: docs.ansible.com command module `creates`].
+    /// string [documented: docs.ansible.com command module `creates`].
     /// Here the declared layer is this type.
     ///
     /// ## Why it runs in a dry run
@@ -434,7 +434,7 @@ pub enum Assert {
     /// this model, so "nothing was ever launched" and "the launch is
     /// gone" arrive as the same answer. Splitting them would need a
     /// fifth value or a payload on `Unsatisfied`, and the range is
-    /// fixed at four (design §3.2b) — so the distinction is left to
+    /// fixed at four — so the distinction is left to
     /// whoever reads the pid file, not to this answer.
     ProcessAlive {
         /// The pid file a launch wrote.
@@ -445,7 +445,7 @@ pub enum Assert {
     /// exactly `argv`.
     ///
     /// **This is the conjunct that makes a service's identity its
-    /// arguments** (design §3.4). A running server answering on its port
+    /// arguments**. A running server answering on its port
     /// is not evidence that *this profile's* server is running: the one
     /// that is up may have been launched with other arguments, and
     /// treating it as finished skips the restart and reports success for
@@ -624,7 +624,7 @@ pub struct AssertExecutionId(u64);
 
 /// Process-wide source of [`AssertExecutionId`]s.
 //
-// 段 B で決める: where numbering is issued from, and how it is aligned
+// Still open: where numbering is issued from, and how it is aligned
 // with the persistence of the execution record. The model only fixes
 // that every node has an id.
 static NEXT_ASSERT_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -1064,7 +1064,7 @@ impl AssertOutcome {
     /// A `CheckFailed` carries its detail: the whole reason the variant
     /// exists is that a report must show what broke, and a bare
     /// `check-failed` would be the `(skipped due to not_if)` granularity
-    /// this model was built to get away from (design §3.2b).
+    /// this model was built to get away from.
     pub fn label(&self) -> String {
         match self {
             AssertOutcome::Satisfied => "satisfied".to_string(),
@@ -1092,7 +1092,7 @@ pub fn describe(assert: &Assert) -> String {
 /// This is what a skipped step reports. Printing only the top answer
 /// would hide exactly what the fold hides — a `CheckFailed` sitting
 /// under an `Unsatisfied` sibling — which is why the evaluator returns
-/// a tree in the first place (design §3.2b').
+/// a tree in the first place.
 pub fn describe_execution(assert: &Assert, node: &AssertNode) -> String {
     let mut out = String::new();
     write_assert(assert, Some(node), &mut out);
@@ -1196,7 +1196,7 @@ fn write_assert(assert: &Assert, node: Option<&AssertNode>, out: &mut String) {
 /// Implementors are built from a phase payload, and the lifecycle layer
 /// asks for the `done` rather than assembling an `Assert` at each call
 /// site — so "what does a finished X look like" is answered once per
-/// kind of thing, not once per kind of phase (design §3.4: the payoff
+/// kind of thing, not once per kind of phase (the payoff
 /// is the conjunctions that recur across kinds).
 ///
 /// **The signature held for the second entity.** [`Checkout`] was
@@ -1218,7 +1218,7 @@ fn write_assert(assert: &Assert, node: Option<&AssertNode>, out: &mut String) {
 /// condition is always the conjunction. Three entities, two shapes, one
 /// signature, and nothing about the trait bent to admit any of them.
 ///
-/// What did *not* survive is the arity design §3.4 predicted for it
+/// What did *not* survive is the arity first predicted for it
 /// (pid ∧ cmdline ∧ 2xx): see [`Service::done`] for why the third
 /// conjunct is not here, and why leaving it out does not loosen what
 /// apply enforces.
@@ -1237,7 +1237,7 @@ pub trait Done {
 /// One file a `models` phase downloads.
 ///
 /// Its identity is the destination path plus, when the profile declares
-/// one, the content digest (design §3.6: a content-addressed file can
+/// one, the content digest (a content-addressed file can
 /// put the digest *in* its identity, so "present but different" is a
 /// different thing rather than the same thing in a different state).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1281,7 +1281,7 @@ impl Done for ModelFile {
     /// Existence is deliberately the weaker half: a half-written file
     /// from an interrupted download exists. A profile that declares a
     /// digest is protected from that; one that does not has asked for
-    /// existence and gets it (design §3.3: an entity type does not fix
+    /// existence and gets it (an entity type does not fix
     /// its own assert).
     fn done(&self) -> Assert {
         let exists = Assert::FileExists {
@@ -1353,7 +1353,7 @@ impl Done for Checkout {
     /// `.git`, fold row 1 makes the answer `Unsatisfied`, which is the
     /// difference between a plan that says "this will clone" and a plan
     /// that says it could not tell. The tree keeps git's failure
-    /// underneath either way (design §3.2b'), so nothing is hidden by
+    /// underneath either way, so nothing is hidden by
     /// deciding.
     ///
     /// The order is existence first, which is also the order a reader
@@ -1415,8 +1415,8 @@ impl Done for Cli {
 
 /// One Python virtual environment, by the directory it lives in.
 ///
-/// **The weakest entity in the catalog, and design §3.6 predicted
-/// exactly this.** The other three carry an identity strong enough to
+/// **The weakest entity in the catalog, and expected to be.** The
+/// other three carry an identity strong enough to
 /// notice a mismatch — a [`ModelFile`] can be digested, a [`Checkout`]
 /// can be asked which ref it holds, a [`Service`] can be asked what
 /// argv it was launched with. A venv can be asked none of that: it is a
@@ -1475,8 +1475,8 @@ impl Done for Venv {
 
 /// One server a launch phase puts on the pod.
 ///
-/// Shared by `comfyui.restart` and `service.start` — the recurrence
-/// design §3.4 gives as the reason for an entity to exist at all. Its
+/// Shared by `comfyui.restart` and `service.start` — recurrence across
+/// kinds is the reason for an entity to exist at all. Its
 /// identity is **the pid file the launch writes plus the argv it
 /// launches**: not the port, and not "something is answering on the
 /// port", because neither distinguishes this profile's server from
@@ -1549,7 +1549,7 @@ impl Done for Service {
     ///   condition and cannot be skipped, so a pod whose server never
     ///   answers still fails apply. Putting the same check in the guard
     ///   would duplicate it two seconds earlier, in a position where its
-    ///   answer would skip work rather than fail it (design §3.2c: a
+    ///   answer would skip work rather than fail it (a
     ///   poll is a step's execution strategy, not part of a predicate).
     /// - **It is the only conjunct that is not a local read.** Both of
     ///   these read one small file; an HTTP probe can hang, and a `plan`
@@ -1578,8 +1578,8 @@ impl Done for Service {
     /// running*. With both, the evaluated tree separates them —
     /// `proc_alive=unsatisfied` against `proc_alive=satisfied,
     /// proc_argv=unsatisfied` — which is the granularity this model
-    /// exists to keep (design §3.8, and the reason the evaluator returns
-    /// a tree at all in §3.2b'). A redundant conjunct that says nothing
+    /// exists to keep, and the reason the evaluator returns a tree at
+    /// all. A redundant conjunct that says nothing
     /// would be noise; this one says which of the two happened.
     ///
     /// Liveness first, which is also the order the news reads in: is it
@@ -1952,7 +1952,7 @@ mod tests {
     /// strongest available margin. The four observations are git's own
     /// documented exit shapes for `diff --quiet` (`0` no difference,
     /// `1` difference, other = git failed) plus the binary being
-    /// missing, which is an answer rather than an error (design §3.2b).
+    /// missing, which is an answer rather than an error.
     ///
     /// **The last two rows are this stage's**, and they hold by the same
     /// strongest margin: both are local reads of one small file, so
@@ -2472,8 +2472,8 @@ mod tests {
     /// **The subject is `<dir>/.git`, not `<dir>`.** A directory that
     /// exists without being a clone is a real state of a pod, and
     /// answering "finished" for it would skip the clone and leave every
-    /// later step working against an empty tree (design §3.3:
-    /// "`Checkout` は存在だけでは足りない").
+    /// later step working against an empty tree — existence alone is
+    /// not enough for a `Checkout`.
     #[test]
     fn a_checkout_without_a_ref_asks_for_the_repository_alone() {
         let done = Checkout::new("/workspace/ComfyUI", None).done();
@@ -2516,7 +2516,7 @@ mod tests {
     /// row 1 makes the whole condition `Unsatisfied`: **this will
     /// clone**, which is what a plan has to be able to say. The tree
     /// still carries git's failure underneath, so deciding hides
-    /// nothing (design §3.2b').
+    /// nothing.
     ///
     /// Both modes, because the command predicate does not change its
     /// answer between them — the dry run is as decided as the real run.

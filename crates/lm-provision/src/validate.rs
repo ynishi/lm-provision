@@ -260,7 +260,7 @@ pub enum ValidateError {
     },
 
     /// A phase needs a resource that no earlier phase produces and that
-    /// `Spec.assumes` does not declare (check 8b, design §3.6).
+    /// `Spec.assumes` does not declare (check 8b).
     ///
     /// "Earlier" is canonical order, not written order: phases run in
     /// the order [`crate::normalize`] imposes, so a profile that writes
@@ -510,7 +510,7 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // inserts the implied restart / health poll.
     let normalized = crate::normalize::normalize(root);
 
-    // Check 8b: resource scope (design §3.6). Every phase's `requires`
+    // Check 8b: resource scope. Every phase's `requires`
     // must be bound by an earlier phase's `produces` or by `assumes`.
     // One forward fold, no reordering — this is a scope check, not the
     // per-kind dependency graph `02` §Stability rules out.
@@ -525,7 +525,7 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         }
     }
 
-    // Check 8c: the machine slots are readable (design §Requirements).
+    // Check 8c: the machine slots are readable.
     //
     // Only well-formedness here — whether a *target* can satisfy them is
     // a different question, asked once a target is known, and validate
@@ -2151,8 +2151,8 @@ mod tests {
         }
     }
 
-    /// The shape design §4.2 says fails today without being named: a
-    /// phase reaching into a ComfyUI nothing installed.
+    /// The case that used to fail without being named: a phase
+    /// reaching into a ComfyUI nothing installed.
     #[test]
     fn consuming_a_resource_nothing_produces_is_rejected() {
         let g = ids();

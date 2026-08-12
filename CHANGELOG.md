@@ -9,13 +9,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A profile can say what the machine must be.** Until now a profile
+  described what to do to a machine that already existed and said
+  nothing about the machine itself, so the one part nobody could write
+  down was the part that had to be arranged by hand every time. Four
+  slots now carry it — `requires_ports`, `requires_gpu`, `requires_disk`,
+  `requires_image` — in the workload's own terms: how much memory the
+  weights need, how many devices, which storage survives a restart, and
+  whether a port has to be reachable over public HTTP or only as a raw
+  socket. Omitting a slot is not asking for zero; a profile that does not
+  care leaves it out and the target's own default applies.
+- **Requirements are matched against a target that answers for itself.**
+  A target says what it can provide (`Infra::capability`), what it can
+  select on, and — separately — what it cannot decide. That third answer
+  is the load-bearing one: a container runtime can pass a device count
+  through but has no way to ask for a memory size, and neither "yes" nor
+  "no" describes that. `admit` refuses before anything exists, `observe`
+  settles the rest by looking at the machine that does, and each
+  requirement produces a finding rather than being silently dropped.
+- **`acquire` / `release` / `check` on the driver.** Acquisition is a
+  subcommand of its own rather than a flag on `apply`, so obtaining a
+  machine is always something asked for; `--dry-run` defaults to on and
+  renders the request without sending it. `check` judges a machine that
+  already exists against a profile, requirement by requirement, creating
+  and destroying nothing.
+- **Two adapters, deliberately.** A managed pod service is the one this
+  provisions; a container runtime is here to keep the vocabulary honest,
+  because a requirement language designed against a single platform
+  records that platform's shape and calls it universal. The second is
+  what proves the refusal path is real: it is the one that cannot provide
+  public HTTP.
+- **`provider`** — a namespaced slot for the values one target has and
+  another has no word for (a pre-created network volume, a template).
+  Keys reach the adapter that owns the namespace verbatim; keys for a
+  target that is not this one are reported as unexamined rather than
+  dropped.
+- **The driver resolves its target's credential.** A tool that starts
+  machines owns the means of starting them, and there was no resolution
+  order at all — the environment still had to be arranged, by whoever
+  happened to be running the driver. Adapters now declare the variables
+  their target's tooling reads, by name, and the driver fills the
+  environment from an ordered search: what the process already has, then
+  `$LM_PROVISION_ENV_FILE`, `~/.config/lm-provision/.env`, `./.env`.
+  First writer wins. A missing one is refused before anything spends,
+  naming the variable and every place consulted — and distinguishing a
+  file that is absent from one that was read and did not define it. No
+  value is ever bound, formatted or logged.
+
 ### Changed
+
+- **Device memory is read in the unit devices report it in.** A part sold
+  as 48 GB answers 46068 MiB — 48.3 decimal GB, 45.0 GiB — because ECC
+  reserves about 6.25% of a GDDR6 framebuffer and because MiB is not GB.
+  Two quantities in two units were both called GB and compared to each
+  other. Machine state now carries mebibytes; a profile keeps writing the
+  vendor's decimal figure, because when a floor is read no machine exists
+  and a published number is all there is to match against. The two meet
+  once, in a conversion that reads the published label as decimal on
+  purpose: that is the smaller of the two readings, so a selection can
+  only under-estimate what a device carries.
+- **`MachineState.gpu_vram_gb` is now `gpu_vram_mib`.** Breaking, and the
+  point of the change above.
+- **`Infra` gained `credentials()`.** Breaking for any implementor
+  outside this crate.
+- **The catalog's size is stated in three places, not eight.** A number a
+  reader cannot act on was being hand-synchronised across doc comments
+  and specs; a test now names the three that remain and fails when a kind
+  is added.
+
+### Fixed
+
+- **A requirement the target could not meet used to reach the request
+  anyway.** A memory floor above every catalogued device dropped the
+  model selection and produced a body that looked well-formed — device
+  count present, selection absent — and exited zero, so the machine would
+  have been created without the thing that was asked for. The request is
+  now built from the adapter's answers rather than alongside them, which
+  closes the same hole on the storage axis before it had a case.
+- **A profile that declared no ports asked for none.** An empty list is a
+  claim that nothing should be exposed, and a profile that said nothing
+  never made it.
+- **What the service says once is no longer thrown away.** The managed
+  pod service names the attached device model in its create response and
+  then returns an empty `machine` object from every read-back afterwards.
+  Inspect replaced the description wholesale, so the memory a profile
+  asked for came back `NotChecked` on every real machine while the tests
+  passed — their fixture had been written from a create response, a shape
+  no read-back has. Inspect now fills only what the fresh description
+  declines to say.
+- **stdout carries exactly one machine-readable artifact again.**
+  `release` ran the service CLI with inherited stdout, so a release
+  printed the service's empty body and then its own JSON; `acquire`
+  printed the new machine's identifier and then the verdict. What the
+  service says now goes to stderr as `runpod-cli: <line>` — the GNU form,
+  naming the program that spoke — and says nothing when it has nothing to
+  say. The identifier still goes out the moment the machine exists,
+  because one whose identifier was never printed is a bill nobody can
+  stop; it goes to stderr, as the trace it is.
 
 ### Deprecated
 
 ### Removed
-
-### Fixed
 
 ### Security
 
@@ -405,3 +499,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface, phase catalog, pipeline stage artifacts, bridge, sandbox layer
   contract, secret handling, CLI, push-driver protocol, apply report and
   ledger, MCP.
+
+[Unreleased]: https://github.com/ynishi/lm-provision/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ynishi/lm-provision/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/ynishi/lm-provision/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/ynishi/lm-provision/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/ynishi/lm-provision/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ynishi/lm-provision/releases/tag/v0.1.0

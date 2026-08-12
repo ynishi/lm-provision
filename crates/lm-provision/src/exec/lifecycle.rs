@@ -181,7 +181,7 @@ pub struct PlannedStep {
     ///
     /// Evaluated before the step runs; an
     /// [`AssertOutcome::Satisfied`](assert::AssertOutcome::Satisfied)
-    /// answer skips it (design §3.1: the same predicate, used to skip
+    /// answer skips it (the same predicate, used to skip
     /// rather than to fail). Every other answer — including
     /// `NotChecked` and `CheckFailed` — runs the step, which is the
     /// safe direction.
@@ -280,7 +280,7 @@ pub fn expand(payload: &ProfileNode, env: &ResourceEnv) -> Result<Vec<PlannedSte
         // No `done`: `hooks.post_install` is the spec's sanctioned
         // escape hatch for raw shell, so only its author knows what
         // finishing it looks like — and an author cannot write a
-        // condition yet (design §3.4).
+        // condition yet.
         ProfileNode::PostInstall { script, .. } => Ok(vec![PlannedStep::always(Step::Sh(vec![
             "sh".to_string(),
             "-c".to_string(),
@@ -357,7 +357,7 @@ pub fn expand(payload: &ProfileNode, env: &ResourceEnv) -> Result<Vec<PlannedSte
 /// consumes ComfyUI without installing or assuming it has to fail here
 /// too — **naming the resource**, rather than silently composing against
 /// `/workspace/ComfyUI` and failing later with `no such file`, which is
-/// the shape design §4.2 calls "failing without being named".
+/// a failure the profile never named.
 ///
 /// Which kinds reach this function must agree with
 /// [`crate::resource::requires`]; nothing but a test would stop the two
@@ -372,7 +372,7 @@ fn comfyui_paths(payload: &ProfileNode, env: &ResourceEnv) -> Result<ComfyUiPath
 
 /// The venv `payload` composes against, or the error naming that
 /// nothing made one — the sibling of [`comfyui_paths`], and the point
-/// where design §4.2's second example stops being nameless. Reaching a
+/// where a nameless failure acquires a name. Reaching a
 /// `pip` under a venv nothing created used to fail as `no such file`
 /// (measured, before this stage: `lifecycle.rs:321` / `:365-372`).
 fn venv_paths(payload: &ProfileNode, env: &ResourceEnv) -> Result<VenvPaths, ExecError> {
@@ -428,7 +428,7 @@ fn expand_system_apt(packages: &[String]) -> Vec<PlannedStep> {
 ///
 /// This is the phase the stage exists for: without a condition, the
 /// `git clone` fails on the second apply because its destination is
-/// already there (design §4.4). The predecessor implementation guards
+/// already there. The predecessor implementation guards
 /// the same clone with `test -d {name} ||`; the condition here asks the
 /// stronger question — is there a *repository*, and is it at the ref
 /// the profile named.
@@ -522,7 +522,7 @@ fn cli_install_command(bin: &str) -> Option<&'static str> {
 /// A step that makes `bin` available, placed immediately before the
 /// step that invokes it.
 ///
-/// This is design §4.2's second example — reaching for `hf` on a pod
+/// Another failure that used to go unnamed — reaching for `hf` on a pod
 /// where huggingface_hub was never installed, and failing as `command
 /// not found` on a binary the profile never named. The predecessor
 /// implementation answers it at the point of use rather than with a
@@ -536,7 +536,7 @@ fn cli_install_command(bin: &str) -> Option<&'static str> {
 /// the three spellings — a state-aware module, `command` with
 /// `creates:`, and an inline probe — and puts the inline probe last,
 /// advising that a shell command carry its condition in the declared
-/// layer [理論値: docs.ansible.com command module `creates`]. The
+/// layer [documented: docs.ansible.com command module `creates`]. The
 /// declared layer here is the Assert tree, so that is where it goes.
 fn ensure_cli(bin: &str) -> Option<PlannedStep> {
     let install = cli_install_command(bin)?;
@@ -688,7 +688,7 @@ struct CustomNodeSpec {
 ///
 /// Unlike `comfyui.install` the clone and the checkout are **separate**
 /// steps, so each carries its own condition and the two are different
-/// (design §3.2e: a step's completion is not derived from its
+/// (a step's completion is not derived from its
 /// neighbours'):
 ///
 /// - the clone is finished once there is a repository at the node's
@@ -979,7 +979,7 @@ fn expand_models(json: &str, paths: &ComfyUiPaths) -> Result<Vec<PlannedStep>, E
         let dst = format!("{models_root}/{subdir}/{filename}");
         // The `done` is derived from the kind, not declared: a `models`
         // element is a `ModelFile`, and what a finished one looks like
-        // is that entity's business (design §3.4). A profile cannot
+        // is that entity's business. A profile cannot
         // write its own condition yet — that form is settled once three
         // entities exist, so it is not shaped by this one.
         let done = assert::ModelFile::new(dst.clone(), model.sha256).done();
@@ -1112,7 +1112,7 @@ fn expand_llm_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
 // ## Re-launching an already-running server
 //
 // What a second launch does on a pod where the first is still up was
-// recorded as unverified (design §4.4). It is measured now, against a
+// recorded as unverified. It is measured now, against a
 // real `sh`, by `a_second_launch_overwrites_the_pid_file_whether_or_not_it_survives`:
 //
 // - **the pid file is overwritten every time**, including when the
@@ -1142,7 +1142,7 @@ fn expand_llm_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
 // ## Why the poll phases keep no condition
 //
 // `comfyui.health` / `service.ready` are the post-conditions of the two
-// launches (design §4.1), and they stay phases rather than being
+// launches, and they stay phases rather than being
 // desugared into `Service`'s `done`. A poll is a time-axis operator,
 // not a predicate (§3.2c) — but the decisive part is the direction it
 // points. A phase's `done` *skips* work when it holds; these phases
@@ -1349,7 +1349,7 @@ fn expand_service_start(
     };
     // The same entity as `comfyui.restart`, against this service's own
     // pid file — which is what makes `Service` worth being an entity
-    // (design §3.4: the payoff is a conjunction that recurs across
+    // (the payoff is a conjunction that recurs across
     // kinds).
     let done = assert::Service::new(pid_path.clone(), argv.clone()).done();
     vec![PlannedStep::done_when(
@@ -1456,7 +1456,7 @@ pub struct StepResult {
     /// into the step entry (unlike `reason`). Chef prints
     /// `(skipped due to not_if)` and leaves the operator to go read the
     /// cookbook; a skip that does not say what was true is the same
-    /// thing (design §3.8).
+    /// thing.
     pub note: Option<String>,
 }
 
@@ -1587,7 +1587,7 @@ impl<'a> StepLabel<'a> {
 /// permission failure on the digest read, or a `git` that could not be
 /// started, would otherwise be invisible with the repeated work as its
 /// only symptom. The note carries the whole evaluated tree, which is
-/// what the tree exists for (design §3.2b').
+/// what the tree exists for.
 pub async fn execute_step(
     planned: &PlannedStep,
     label: StepLabel<'_>,
@@ -1695,7 +1695,7 @@ pub struct DryStep {
 /// always allowed better: [`assert::Assert::FileExists`] is a cheap
 /// observation and answers under
 /// [`ExecMode::DryRun`](super::ExecMode::DryRun), which is the same call
-/// Ansible's `creates` guard makes in check mode (design §3.7). What
+/// Ansible's `creates` guard makes in check mode. What
 /// stood in the way was the wiring — the evaluator is async and the
 /// dry-run arm sat behind the synchronous `dsl_kit::Op::apply` — and
 /// that is what [`super::steps`] removed.
@@ -1717,7 +1717,7 @@ pub struct DryStep {
 ///
 /// The whole evaluated tree reaches the note, not just the top answer:
 /// the fold hides a `CheckFailed` under an `Unsatisfied` sibling, and
-/// the tree is what exists to undo that (design §3.2b').
+/// the tree is what exists to undo that.
 ///
 /// **The table above was written for a transfer and now holds for a
 /// clone as well.** A `Checkout`'s condition answers in a dry run in
@@ -3240,7 +3240,7 @@ mod tests {
 
     /// The same entity for the other launch kind — which is the whole
     /// reason `Service` is an entity rather than an expression written
-    /// twice (design §3.4).
+    /// twice.
     #[test]
     fn expand_service_start_guards_its_launch_with_the_service_condition() {
         let ids = IdGen::new();
@@ -3965,7 +3965,7 @@ mod tests {
             .success()
     }
 
-    /// **The measurement design §4.4 recorded as unverified**: what a
+    /// **A question left unverified until this test**: what a
     /// second launch does on a pod where the first one is still
     /// running. Run against a real `sh`, because the answer is a
     /// property of the composed text rather than of anything readable
@@ -4737,7 +4737,7 @@ mod tests {
         assert_eq!(second.bytes, None, "nothing was transferred");
 
         // …and the skip says what was true, rather than Chef's bare
-        // `(skipped due to not_if)` (design §3.8).
+        // `(skipped due to not_if)`.
         let note = second.note.expect("a skipped step carries a note");
         assert!(note.starts_with("skipped, already done: "), "{note}");
         assert!(
@@ -4754,7 +4754,7 @@ mod tests {
 
     /// The other half: a destination whose content does not match the
     /// declared digest is **not** skipped. Present-but-different is a
-    /// different thing, not the same thing (design §3.6).
+    /// different thing, not the same thing.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_digest_mismatch_transfers_again() {
         const BODY: &[u8] = b"model weights";
@@ -4905,7 +4905,7 @@ mod tests {
     /// The same test also shows what it is protecting against — the
     /// identical command without the condition fails the second time,
     /// which is the `git clone` refusing a destination that already
-    /// exists (design §4.4).
+    /// exists.
     #[tokio::test]
     async fn a_second_apply_skips_the_clone_instead_of_failing_on_it() {
         let (dir, src, dst) = source_repo("checkout-second-apply");

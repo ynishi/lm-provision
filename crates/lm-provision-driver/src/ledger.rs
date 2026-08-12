@@ -1,12 +1,12 @@
 //! Append-only apply ledger (09-apply-report-and-ledger.md §Ledger):
 //! one row per driver-collected apply invocation, physically encoded as
 //! newline-delimited JSON (JSON Lines) — the ledger owner's internal
-//! choice (09 §Stability: "Ledger physical encoding: internal";
-//! plan.md §未確定事項 #3). A dependency-free flat file was chosen over
-//! an embedded SQLite table for this milestone: the row shape is fixed
-//! and tiny (four fields, one verbatim JSON blob), the only access
-//! patterns this milestone needs are "append one row" and "read every
-//! row back", and a SQL engine buys nothing over that for either.
+//! choice (09 §Stability: "Ledger physical encoding: internal", which
+//! leaves it open). A dependency-free flat file was chosen over an
+//! embedded SQLite table: the row shape is fixed and tiny (four
+//! fields, one verbatim JSON blob), the only access patterns are
+//! "append one row" and "read every row back", and a SQL engine buys
+//! nothing over that for either.
 //!
 //! ## Design
 //!
@@ -19,14 +19,14 @@
 //!   "deliberately not unique ... the full history is the value").
 //! - **JSON Lines**: one [`LedgerRow`] per line; [`list`] parses every
 //!   line back in file order and reverses it to the newest-first shape
-//!   downstream readers (chapter 10's `lm_ledger_list` / `lm_ledger_get`,
-//!   milestone M6) will want.
+//!   downstream readers want (chapter 10's `lm_ledger_list` /
+//!   `lm_ledger_get`).
 //! - **No file locking**: concurrent writers each issue one `O_APPEND`
 //!   write per row, which is atomic on POSIX for writes at or under
-//!   `PIPE_BUF` — adequate for this milestone's single-process driver
-//!   usage; multi-process concurrent-writer safety beyond that is an
+//!   `PIPE_BUF` — adequate for the single-process driver usage this
+//!   was built for; multi-process concurrent-writer safety beyond that is an
 //!   open item for whoever owns the ledger file path in a given
-//!   deployment (see plan.md §未確定事項).
+//!   deployment.
 
 use std::fs::OpenOptions;
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -72,17 +72,22 @@ pub enum LedgerError {
 /// "append-only"); a duplicate `(pod_id, profile_hash)` pair is
 /// accepted without complaint (09 §Ledger: "deliberately not unique").
 pub fn append(ledger_path: &Path, row: &LedgerRow) -> Result<(), LedgerError> {
-    let line = serde_json::to_string(row)?;
+    // The newline is part of the payload, and the write is one call.
+    // `writeln!` would issue two — the row, then the newline — and a
+    // concurrent appender landing between them would split a row,
+    // which is the interleaving the module doc says cannot happen.
+    let mut line = serde_json::to_string(row)?;
+    line.push('\n');
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(ledger_path)?;
-    writeln!(file, "{line}")?;
+    file.write_all(line.as_bytes())?;
     Ok(())
 }
 
-/// Read every row in `ledger_path`, newest first — the shape milestone
-/// M6's `lm_ledger_list` will build its response around (09 §Ledger). A
+/// Read every row in `ledger_path`, newest first — the shape
+/// `lm_ledger_list` builds its response around (09 §Ledger). A
 /// missing file is an empty ledger, not an error: a ledger with zero
 /// applies recorded yet is a valid, if uninteresting, state.
 pub fn list(ledger_path: &Path) -> Result<Vec<LedgerRow>, LedgerError> {

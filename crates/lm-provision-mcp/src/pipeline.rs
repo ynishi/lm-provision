@@ -7,8 +7,8 @@
 //! subcommands touches an effect or a pod (07-cli.md §Invocation: "none
 //! (read-only)"). Plain, `async`-free functions on purpose so tests can
 //! call them directly at the function level rather than through an MCP
-//! transport (task instruction; mirrors [`crate::apply_tool`] /
-//! [`crate::ledger_tools`]).
+//! transport — mirroring [`crate::apply_tool`] /
+//! [`crate::ledger_tools`].
 //!
 //! Each function returns `Result<serde_json::Value, String>` rather
 //! than a richer error enum: 10 §Error surface only asks that

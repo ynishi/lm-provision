@@ -1,4 +1,5 @@
-//! mlua-free execution layer for the `ProfileNode` DSL (backlog D).
+//! Execution layer for the `ProfileNode` DSL, with no embedded
+//! scripting runtime.
 //!
 //! Replaces the `profile_ast` mock `OpRegistry` (which only pushed the op
 //! name onto a log) with a real bridge: [`capgate`] enforces the
@@ -98,7 +99,7 @@ pub enum ExecError {
     },
 
     /// A phase needs a resource that no earlier phase produces and that
-    /// `profile.assumes` does not declare (design §3.6). A precondition
+    /// `profile.assumes` does not declare. A precondition
     /// class error: the phase cannot compose a step at all, because it
     /// has nowhere to put one.
     ///

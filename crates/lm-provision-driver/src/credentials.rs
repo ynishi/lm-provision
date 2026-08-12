@@ -7,7 +7,7 @@
 //! and on every target this drives, that means includes a credential.
 //! The service CLI this crate drives reads `RUNPOD_API_KEY` from its
 //! environment and offers no flag and no configuration file to pass it
-//! any other way [実測: 2026-08-12, `runpod-cli --help` lists
+//! any other way [measured: 2026-08-12, `runpod-cli --help` lists
 //! `--base-url` / `-o` / `--dry-run` / `-v` and nothing else]. So the
 //! only place a resolution order can live is the caller, and the caller
 //! is this.
@@ -15,7 +15,7 @@
 //! Leaving it out did not remove the problem, it moved it: the
 //! environment still had to be arranged, by whoever happened to be
 //! running the driver. That is the failure this module exists to close
-//! [実測: 2026-08-12, an operator went looking through another tool's
+//! [measured: 2026-08-12, an operator went looking through another tool's
 //! configuration for a key, found it, and hand-carried it into a
 //! subprocess to make an acquisition run].
 //!
@@ -24,15 +24,14 @@
 //! Ordered sources, first hit wins, nothing hardcoded. Every AWS SDK
 //! resolves credentials this way — "a series of places ... they check
 //! in order ... after valid credentials are found, the search is
-//! stopped" [理論値:
+//! stopped" [documented:
 //! <https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html>].
 //! Terraform lists a literal key in the provider block first in its own
 //! chain and marks it *not recommended*, pointing at environment
-//! variables and role-based sources instead [理論値:
+//! variables and role-based sources instead [documented:
 //! <https://developer.hashicorp.com/terraform/language/providers/configuration>].
-//! The reference implementation this repo's lifecycle work is measured
-//! against does the same, in the same order
-//! [実測: `vdsl-mcp/src/main.rs:7-44`].
+//! The provisioning tool this repo's lifecycle work was modelled on
+//! does the same, in the same order.
 //!
 //! # Values are never handled here
 //!

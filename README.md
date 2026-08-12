@@ -10,9 +10,9 @@ binary with zero dependencies on the target pod.
 
 | Crate | What it is |
 |---|---|
-| [`lm-provision`](crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. |
-| [`lm-provision-driver`](crates/lm-provision-driver) | Push driver: one-shot session over SSH — ensure-binary (idempotent SHA-256 push of the musl artifact), place profile, apply, collect report / transcript, append to the apply ledger. |
-| [`lm-provision-mcp`](crates/lm-provision-mcp) | MCP server exposing `lm_validate` / `lm_hash` / `lm_plan` and apply-ledger inspection as MCP tools. |
+| [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. |
+| [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push driver. `apply`: one-shot session over SSH — ensure-binary (idempotent SHA-256 push of the musl artifact), place profile, apply, collect report / transcript, append to the apply ledger. `acquire` / `release` / `check`: obtain a machine meeting the profile's declared requirements, give it back, or judge one that already exists. |
+| [`lm-provision-mcp`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-mcp) | MCP server exposing `lm_validate` / `lm_hash` / `lm_plan` and apply-ledger inspection as MCP tools. |
 
 ## Highlights
 
@@ -51,6 +51,12 @@ lm-provision apply profile.json --dry-run  # print steps, resolve secrets, no ef
 lm-provision-driver apply \
   --ssh root@<host>:<port> --key ~/.ssh/<key> \
   --profile profile.json --artifact target/x86_64-unknown-linux-musl/release/lm-provision
+
+# Obtain a machine the profile requires, then give it back.
+# --dry-run defaults to on: this renders the request and sends nothing.
+lm-provision-driver acquire --profile profile.json
+lm-provision-driver acquire --profile profile.json --dry-run false
+lm-provision-driver release --id <id> --profile profile.json
 ```
 
 ### MCP server: pod target registry
@@ -101,7 +107,7 @@ notes:
 
 ## Specifications
 
-External interfaces are specified in [`docs/spec/`](docs/spec) (00-10:
+External interfaces are specified in [`docs/spec/`](https://github.com/ynishi/lm-provision/blob/main/docs/spec) (00-10:
 profile DSL surface, phase catalog, pipeline stage artifacts, bridge,
 sandbox layer contract, secret handling, CLI, push-driver protocol,
 apply report and ledger, MCP). The implementation lands against those
@@ -111,7 +117,7 @@ specs; the specs are the normative surface.
 
 Dual-licensed under either of:
 
-- MIT License ([`LICENSE-MIT`](LICENSE-MIT))
-- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT License ([`LICENSE-MIT`](https://github.com/ynishi/lm-provision/blob/main/LICENSE-MIT))
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](https://github.com/ynishi/lm-provision/blob/main/LICENSE-APACHE))
 
 at your option.

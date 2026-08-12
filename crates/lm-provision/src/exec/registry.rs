@@ -106,7 +106,7 @@ pub(crate) const LIFECYCLE_OPS: [&str; 16] = [
     "service_ready",
 ];
 
-/// Build the 23-op registry over a shared [`ExecContext`].
+/// Build the op registry over a shared [`ExecContext`].
 pub fn profile_op_registry(ctx: Arc<ExecContext>) -> Arc<OpRegistry<ProfileValue>> {
     let mut registry = OpRegistry::new();
     for &name in DIRECT_OPS.iter().chain(LIFECYCLE_OPS.iter()) {
@@ -1393,7 +1393,7 @@ impl ProfileCallAst {
     /// **The children are a `Par` when the phase's steps are independent
     /// of one another, and a `Seq` otherwise** ([`steps_are_independent`]).
     /// A `Seq` phase is still run in written order, which is the basis on
-    /// which a partial apply is readable (design §2); a `Par` phase gives
+    /// which a partial apply is readable; a `Par` phase gives
     /// that up at the *engine* level and gets it back at the *report*
     /// level ([`super::report::in_declaration_order`]), which is where a
     /// reader actually needs it.

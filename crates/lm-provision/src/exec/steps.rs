@@ -164,7 +164,7 @@ impl StepPlan {
             return plan;
         };
         let mut next = max_node_id(root) + 1;
-        // The scope fold (design §3.6). This walk *is* the scope check's
+        // The scope fold. This walk *is* the scope check's
         // walk: phases in canonical order, each composing against what
         // earlier phases produced, then folding in its own `produces`.
         // A phase whose `requires` nothing bound fails to expand and so

@@ -8,14 +8,21 @@
 //! target. The crate split from `lm-provision` itself is an
 //! implementation judgment 08 §Stability leaves open ("driver
 //! implementation home ... internal — the protocol, not the caller, is
-//! the contract"; plan.md §Workspace / crate 構成).
+//! the contract").
 //!
-//! This crate never touches `lm.*` Lua domain logic or the sandboxed
-//! VM those modules run in — it only drives the already-frozen CLI
-//! contract (07-cli.md) of the Phase F `lm-provision` binary from the
-//! outside, through the transport-agnostic upload / invoke / collect
-//! shape 08 defines. Domain logic stays 100% on the Phase F side of
-//! that boundary (00 §Boundary and stack).
+//! **Applying a profile happens on the pod, never here.** That is
+//! driven through the already-frozen CLI contract (07-cli.md) of the
+//! Phase F `lm-provision` binary, from the outside, over the
+//! transport-agnostic upload / invoke / collect shape 08 defines — so
+//! no effect this crate causes is an effect it performs.
+//!
+//! What it does read from the library is the part an operator host has
+//! to know before it connects: [`session`] parses, validates and hashes
+//! the profile in process, because the host cannot run the musl
+//! artifact it is about to push and the hash has to be comparable to
+//! the pod's; [`infra`] reads the profile's machine requirements to
+//! decide what to acquire. Both are questions about a profile rather
+//! than execution of one.
 //!
 //! ## Modules
 //!
@@ -24,10 +31,11 @@
 //!   [`transport::TransportError`] types every implementation shares
 //!   (08 §Driver steps: "transport-agnostic ... SSH, provider exec API,
 //!   `docker exec` all satisfy it").
-//! - [`local_exec`] — [`local_exec::LocalExecTransport`], the one
-//!   [`transport::Transport`] implementation this crate ships: runs the
-//!   provisioner binary on the driver's own host. SSH / `docker exec`
-//!   transports are documented extension points, not shipped here.
+//!   Two implementations ship: [`local_exec`] and [`ssh`]. A
+//!   `docker exec` transport is a documented extension point and is
+//!   not among them.
+//! - [`local_exec`] — [`local_exec::LocalExecTransport`], which runs
+//!   the provisioner binary on the driver's own host.
 //! - [`driver`] — [`driver::run`], the upload → hash-integrity-check →
 //!   invoke → collect sequence (08 §Driver steps) driven against any
 //!   [`transport::Transport`], plus [`driver::hash_locally`] for the
@@ -41,6 +49,12 @@
 //! - [`session`] — [`session::run`], the session contract's steps 0-5
 //!   with per-step gates ([`session::StepPlan`]); the shape the
 //!   `lm-provision-driver` binary exposes as a one-shot CLI.
+//! - [`infra`] — [`infra::Infra`], the target a machine is placed on,
+//!   with one implementation per target: what it can provide, the
+//!   request that would obtain a machine meeting a profile's
+//!   requirements, and how to read one back and give it up.
+//! - [`credentials`] — where a target's credential is resolved from,
+//!   and what is reported when it is not there.
 
 #![warn(missing_docs)]
 

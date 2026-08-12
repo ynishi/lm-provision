@@ -19,7 +19,7 @@
 //! Resolve once and reuse, and every range after the first is refused.
 //! Resolve per chunk and each one arrives correctly scoped: three
 //! disjoint ranges of a 4.27 GB weight, each fetched this way, all
-//! answered `206` [実測: 2026-08-11, `huggingface.co/.../resolve/main/`].
+//! answered `206` [measured: 2026-08-11, `huggingface.co/.../resolve/main/`].
 //!
 //! **This is what a resolve-once downloader cannot do.** An `aria2c`
 //! route lived here before this one and posted exactly `split - 1`
@@ -35,7 +35,7 @@
 //! Range-scoped signing is not universal. CivitAI's presigned URL covers
 //! only the host (`X-Amz-SignedHeaders=host`), so one resolved location
 //! serves any range for its 24-hour life, and a downloader that resolves
-//! once works perfectly against it [実測: 2026-08-11, three disjoint
+//! once works perfectly against it [measured: 2026-08-11, three disjoint
 //! ranges of a 2.13 GB model on one resolved URL, all `206`].
 //!
 //! This route re-resolves there too, and pays a redirect per chunk for
@@ -43,7 +43,7 @@
 //! may be trusted to serve a second range, which is a list to maintain
 //! and to be wrong about. The cost was measured rather than assumed —
 //! thirty rapid re-resolutions at eight concurrent against CivitAI, all
-//! `206`, no rate limiting [実測: same day] — and a redirect against a
+//! `206`, no rate limiting [measured: same day] — and a redirect against a
 //! 10 MiB chunk is not the expensive part of a download.
 //!
 //! It is not merely affordable, it is faster than the alternative even
@@ -53,7 +53,7 @@
 //! implementation used), **22 / 23 / 26 s here against 35 / 36 / 50 s
 //! there** — 90 MB/s against 53 MB/s, the two spreads not overlapping,
 //! and both routes producing a file whose digest matches the one
-//! CivitAI publishes [実測: 2026-08-11].
+//! CivitAI publishes [measured: 2026-08-11].
 //!
 //! Alternating rather than one-then-the-other because these transfers
 //! have a wide run-to-run spread: seven runs of one 4.27 GB file at
@@ -101,7 +101,7 @@ pub const CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 /// requests in flight, and that was measured rather than assumed: four
 /// 2.13 GB weights to one pod took **27-34 s** fetched together against
 /// **229-242 s** one at a time, with no rate limiting, no failed chunk
-/// and no retry on either shape [実測: 2026-08-11].
+/// and no retry on either shape [measured: 2026-08-11].
 ///
 /// The two axes **compound**. Each individual file finished faster with
 /// three others competing than with the link to itself, which says the
@@ -122,7 +122,7 @@ pub const MIN_TOTAL: u64 = 2 * CHUNK_SIZE;
 /// drop discards every other chunk's work. Measured the hard way: the
 /// first run of this route against HuggingFace fetched 32 chunks and
 /// died on `range 31457280-41943039: reading the body`, having already
-/// spent two minutes [実測: 2026-08-11].
+/// spent two minutes [measured: 2026-08-11].
 ///
 /// 5 is `huggingface_hub`'s `max_retries` for its own chunked downloads
 /// [`file_download.py`], which also passes `parallel_failures=3`.

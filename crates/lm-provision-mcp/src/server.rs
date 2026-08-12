@@ -1,10 +1,10 @@
 //! MCP tool wiring (10-mcp.md §Tool set) over the plain, transport-free
 //! functions in [`crate::pipeline`] / [`crate::apply_tool`] /
-//! [`crate::ledger_tools`]. Every blocking call (Lua VM evaluation,
-//! subprocess spawn, ledger file I/O) runs through
-//! [`tokio::task::spawn_blocking`] rather than inline in an `async fn`
-//! (`rust-architecture-baseline.md` §Async/Concurrency: "blocking call
-//! を async 内で直叩き禁止").
+//! [`crate::ledger_tools`]. Every blocking call (subprocess spawn,
+//! ledger file I/O) runs through
+//! [`tokio::task::spawn_blocking`] rather than inline in an `async fn`:
+//! a blocking call made directly inside `async` stalls the runtime's
+//! worker thread.
 //!
 //! Every tool method below returns `Result<String, McpError>` (the
 //! tool's JSON output, pre-serialized) rather than manually building a
@@ -564,7 +564,7 @@ mod tests {
     }
 
     /// The pod's own stderr is the same problem one layer further in:
-    /// unit 2 put the remote `hash` exit code on the failure path, so
+    /// the remote `hash` exit code sits on the failure path, so
     /// whatever that invocation printed now reaches the client. The
     /// exit code survives — it is a number the pod chose, not something
     /// it said about its own filesystem.
@@ -601,7 +601,7 @@ mod tests {
     /// is a `SessionError::Transport` — the same class as an `ssh`
     /// failure, reached without inventing a transport.
     ///
-    /// The assertion distinguishes the two mappings: the pre-unit form
+    /// The assertion distinguishes the two mappings: the earlier form
     /// (`precondition_error(err.to_string())`) yields "apply session
     /// failed: transport error: i/o error: ...", which the negative
     /// assertion below rejects.
@@ -651,9 +651,9 @@ mod tests {
         std::fs::remove_file(&ledger_path).ok();
     }
 
-    /// Smoke test (task instruction): the `#[tool_router]` macro must
-    /// generate schema entries for exactly the six tools 10 §Tool set
-    /// specifies, under their spec-literal names.
+    /// The `#[tool_router]` macro must generate schema entries for
+    /// exactly the six tools 10 §Tool set specifies, under their
+    /// spec-literal names.
     #[test]
     fn tool_router_lists_exactly_the_six_spec_tools() {
         let router = LmProvisionServer::tool_router();
@@ -677,8 +677,8 @@ mod tests {
     }
 
     /// Every tool's generated JSON schema must at least carry its
-    /// declared required fields (task instruction: "schema が 6 tool
-    /// 分生成されることの smoke").
+    /// declared required fields — a schema is generated for each of the
+    /// six, and each one is complete.
     #[test]
     fn lm_apply_schema_requires_profile_path_and_pod_id() {
         let router = LmProvisionServer::tool_router();

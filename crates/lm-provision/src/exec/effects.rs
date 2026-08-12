@@ -7,7 +7,7 @@
 //! spawn a process, make an HTTP request, write a file, (un)mount a bind
 //! mount.
 //!
-//! MVP scope (see plan.md §KNOWN LIMITATION):
+//! Known limitations of this layer:
 //! - `sh_exec` runs `std::process::Command`; a non-zero exit is returned
 //!   as `Ok(outcome)`, not an error — the caller decides.
 //! - `http_get` / `http_post` use `reqwest` (async, rustls) with

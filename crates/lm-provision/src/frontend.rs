@@ -2,7 +2,7 @@
 //! AST.
 //!
 //! Two input formats are supported and picked purely by file
-//! extension (07-cli.md §File-format routing, plan §形式判定):
+//! extension (07-cli.md §File-format routing):
 //!
 //! - `.json` (case-insensitive) → JSON serde bridge
 //!   ([`dsl_kit_parse::serde_bridge::from_json_value`])

@@ -1,9 +1,10 @@
 //! Transport abstraction (08-push-driver-protocol.md §Driver steps):
 //! the byte-transport-agnostic upload / exec seam [`crate::driver::run`]
 //! drives. 08 names SSH, a provider exec API, and `docker exec` as
-//! transports that all satisfy the same protocol; this crate ships one
-//! implementation ([`crate::local_exec::LocalExecTransport`]) and keeps
-//! [`Transport`] itself as the extension point for the others (08
+//! transports that all satisfy the same protocol; this crate ships two
+//! ([`crate::ssh::SshTransport`] and
+//! [`crate::local_exec::LocalExecTransport`]) and keeps [`Transport`]
+//! itself as the extension point for the rest (08
 //! §Stability: "Driver implementation home ... internal — the
 //! protocol, not the caller, is the contract").
 

@@ -49,7 +49,7 @@ pub fn hex_sha256(bytes: &[u8]) -> String {
 /// "Nothing is there" is a fact about the target; "the read failed" is
 /// a fact about the attempt, and collapsing the second into the first
 /// is exactly what made the driver's `ensure_binary` unable to tell a
-/// permission failure from a content mismatch (design §4.1). Only
+/// permission failure from a content mismatch. Only
 /// [`io::ErrorKind::NotFound`] becomes `Ok(None)`; every other error
 /// stays an error for the caller to classify.
 ///

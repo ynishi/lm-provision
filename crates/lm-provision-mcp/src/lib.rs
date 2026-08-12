@@ -5,9 +5,9 @@
 //! The MCP server that exposes `lm-provision` to MCP clients
 //! (10-mcp.md) — in particular an external pod manager that delegates
 //! its provisioning half to this server while keeping pod lifecycle on
-//! its own side (08-push-driver-protocol.md §Purpose). Milestone M6 /
-//! Phase H, the last layer in plan.md's rollout: F (01-06, on-pod
-//! apply) → G (07-09, driver + ledger) → H (10, this crate).
+//! its own side (08-push-driver-protocol.md §Purpose). Phase H, the
+//! last layer to be built: F (01-06, on-pod apply) →
+//! G (07-09, driver + ledger) → H (10, this crate).
 //!
 //! Six tools (10 §Tool set), split across two call shapes:
 //!
@@ -27,7 +27,7 @@
 //! `#[tool_router]` / `#[tool]` macros over the plain functions in
 //! [`pipeline`] / [`apply_tool`] / [`ledger_tools`] — those functions
 //! are deliberately `rmcp`-free and directly testable at the function
-//! level (task instruction), independent of any MCP transport.
+//! level, independent of any MCP transport.
 //! [`config`] resolves the server's deployment configuration (binary
 //! path, default staging directory, ledger path, pod target registry)
 //! once at startup.

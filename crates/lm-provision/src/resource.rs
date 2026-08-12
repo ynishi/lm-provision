@@ -1,4 +1,4 @@
-//! Resources: the static half of the model (design §3.6).
+//! Resources: the static half of the model.
 //!
 //! A phase can only reach a path some earlier phase created. Until this
 //! module existed that fact lived nowhere: the ComfyUI install dir, its
@@ -8,10 +8,11 @@
 //! anyone reading one.
 //!
 //! ```text
-//! step が宣言する       produces : Resource*   requires : Resource*
-//! profile が宣言する    assumes  : Resource*
+//! a step declares      produces : Resource*   requires : Resource*
+//! a profile declares   assumes  : Resource*
 //!
-//! well-formed = すべての requires が、より前の produces か assumes で束縛されている
+//! well-formed = every `requires` is bound by an earlier `produces`,
+//!               or by `assumes`
 //! ```
 //!
 //! **This is a scope check, not graph analysis.** Nothing is reordered,
@@ -30,8 +31,8 @@
 //! `requires` is not in the AST because it is not a choice: that
 //! `models` needs somewhere to put a model is a property of the kind,
 //! not of the profile. Writing it down per profile would be the same
-//! fact recorded twice, which design §3.6 rules out for the `requires` /
-//! `assumes` pair for the same reason.
+//! fact recorded twice, which is what the `requires` / `assumes` split
+//! exists to avoid.
 //!
 //! ## "Earlier" means canonical order, not written order
 //!
@@ -63,7 +64,7 @@ pub enum Resource {
     /// The Python virtual environment ComfyUI runs in. Produced by
     /// `toolchain.python`, which places it under the root it requires.
     ///
-    /// **Its identity is weak, and design §3.6 says so up front**: a
+    /// **Its identity is weak, and deliberately so**: a
     /// venv has no digest, so "there is one" is the strongest thing
     /// that can be observed about it. Changing what a profile declares
     /// should be inside it does not make an existing one disagree.
@@ -321,8 +322,8 @@ impl ResourceEnv {
     /// The ComfyUI paths in scope, or `None` when nothing has bound the
     /// root. Callers that require the root treat `None` as an error
     /// rather than substituting the default: a profile that consumes
-    /// ComfyUI without installing it or assuming it is exactly the shape
-    /// design §4.2 says fails today without being named.
+    /// ComfyUI without installing it or assuming it is exactly the case
+    /// that used to fail without being named.
     pub fn comfyui(&self) -> Option<ComfyUiPaths> {
         self.resolve(Resource::ComfyUiRoot).map(ComfyUiPaths::new)
     }

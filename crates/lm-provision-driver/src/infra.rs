@@ -120,8 +120,8 @@ pub trait Infra {
 /// What to run to obtain a machine, and what to run to give it back.
 ///
 /// Both halves together, because an acquisition whose release is worked
-/// out later is an acquisition that leaks. This session produced two
-/// orphaned machines by hand for exactly that reason.
+/// out later is an acquisition that leaks — this repo has leaked two
+/// machines by hand for exactly that reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acquisition {
     /// The program and arguments that create the machine.
@@ -164,7 +164,7 @@ pub enum AcquisitionError {
     /// all — by whatever failed later. The first version of this code
     /// did exactly that: a memory floor beyond the catalogue dropped the
     /// model selection and returned a request that looked fine
-    /// [実測: 2026-08-12, `min_vram_gb: 512` produced a body with
+    /// [measured: 2026-08-12, `min_vram_gb: 512` produced a body with
     /// `gpuCount` and no `gpuTypeIds`, exit 0].
     #[error("{target} cannot meet a requirement: {reason}")]
     Unmet {
@@ -202,7 +202,7 @@ struct Gpu {
 /// A subset of the service's catalogue, largest-selling models first.
 ///
 /// **Deliberately partial.** The catalogue runs to about fifty entries
-/// [実測: `PodCreateInput.gpuTypeIds`, 49 values] and grows with the
+/// [measured: `PodCreateInput.gpuTypeIds`, 49 values] and grows with the
 /// service's hardware; carrying all of it here would be a second copy of
 /// somebody else's list, going stale on their release schedule rather
 /// than this repo's. What is here is enough to select against, and an
@@ -250,7 +250,7 @@ const RUNPOD_CATALOGUE: &[Gpu] = &[
 /// `tcp` and selects **how the port is exposed** rather than what speaks
 /// over it: `http` puts the port behind the service's own HTTPS reverse
 /// proxy, `tcp` maps it to a public port on the machine's address
-/// [実測: 2026-08-11 — `8188/http` answered on a proxied `https://` URL,
+/// [measured: 2026-08-11 — `8188/http` answered on a proxied `https://` URL,
 /// `22/tcp` answered on a mapped port of the public IP].
 ///
 /// That is why a bare port number is not enough vocabulary. Rendering
@@ -287,7 +287,7 @@ impl Infra for RunPodAdapter {
 
     /// The service CLI takes its key from the environment and from
     /// nowhere else: it has no `--api-key` and reads no configuration
-    /// file [実測: 2026-08-12, `runpod-cli --help` offers `--base-url`,
+    /// file [measured: 2026-08-12, `runpod-cli --help` offers `--base-url`,
     /// `-o`, `--dry-run`, `-v`]. So a resolution order can only exist
     /// out here, and naming the variable is how it gets one.
     fn credentials(&self) -> &'static [&'static str] {
@@ -727,7 +727,7 @@ impl Acquired {
     /// fills.** A managed pod service names the attached GPU model in
     /// its create response and then returns `"machine": {}` from every
     /// read-back afterwards — `get-pod` and `list-pods` both, for a
-    /// running pod and for stopped ones [実測: 2026-08-12, pod on an
+    /// running pod and for stopped ones [measured: 2026-08-12, pod on an
     /// RTX 4090]. Replacing the description wholesale threw away the
     /// only statement the service ever made about which device this is,
     /// so the memory the profile asked for came back `NotChecked` on
@@ -831,7 +831,7 @@ pub fn acquire(acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
 /// A key is a blank when it is missing, `null`, or an empty object — the
 /// third because that is the shape a description takes when a service
 /// returns the container of a field without the field
-/// [実測: 2026-08-12, `"machine": {}` from `get-pod`]. Objects present on
+/// [measured: 2026-08-12, `"machine": {}` from `get-pod`]. Objects present on
 /// both sides are filled recursively, so one blank key inside a
 /// populated object is reached.
 ///
@@ -1200,7 +1200,7 @@ mod tests {
 
     /// **Every field this emits exists in the service's schema, with the
     /// right type, and every model named is in its enumeration**
-    /// [実測: 2026-08-12, checked against the OpenAPI description the
+    /// [measured: 2026-08-12, checked against the OpenAPI description the
     /// service's own CLI is generated from].
     ///
     /// Pinned here rather than left to a live call, because a live call
@@ -1271,7 +1271,7 @@ mod tests {
     /// to drop the model selection and return a request that looked
     /// perfectly well-formed — `gpuCount` present, `gpuTypeIds` absent,
     /// exit 0 — so a machine would have been created without the thing
-    /// that was asked for [実測: 2026-08-12, before this arm existed].
+    /// that was asked for [measured: 2026-08-12, before this arm existed].
     ///
     /// Silently dropping an unsatisfiable requirement is the exact sin
     /// the rest of this module argues against. It got in because the
@@ -1439,7 +1439,7 @@ mod tests {
     /// The shape the service returns for a pod, with the fields this
     /// reads and the identifying ones neutralised.
     ///
-    /// Taken from real responses rather than invented [実測: 2026-08-11,
+    /// Taken from real responses rather than invented [measured: 2026-08-11,
     /// four pods created and destroyed while measuring transfers].
     /// A create response, which is the one place the model is named.
     fn created_pod() -> serde_json::Value {
@@ -1462,7 +1462,7 @@ mod tests {
     /// A read-back, which is **not** the same shape.
     ///
     /// `machine` comes back empty and the model is gone
-    /// [実測: 2026-08-12, `get-pod` and `list-pods` against a running
+    /// [measured: 2026-08-12, `get-pod` and `list-pods` against a running
     /// pod]. This fixture used to carry the create response's `machine`
     /// object, so the catalogue lookup passed here and never once ran on
     /// a real machine.
@@ -1517,7 +1517,7 @@ mod tests {
     /// asymmetry that put the catalogue in this adapter.
     ///
     /// It arrives in the unit a device reports, and below what a device
-    /// reports — the part measured here answers 46068 MiB [実測:
+    /// reports — the part measured here answers 46068 MiB [measured:
     /// 2026-08-12, `nvidia-smi` on the acquired A40], and the bound this
     /// produces stays under it. A bound that crept above the real figure
     /// would let a floor pass on memory that is not there.
@@ -1570,7 +1570,7 @@ mod tests {
     /// **The plumbing, on what the service actually said.**
     ///
     /// The two strings below are the responses a real pod produced
-    /// [実測: 2026-08-12, an RTX 4090 pod created and released], trimmed
+    /// [measured: 2026-08-12, an RTX 4090 pod created and released], trimmed
     /// to the fields this reads. They go through the same
     /// `acquire` → `inspect` → `read_state` chain a run uses, with the
     /// commands replaced by ones that print them — so what is exercised
@@ -1582,7 +1582,7 @@ mod tests {
     #[test]
     fn the_chain_a_run_uses_keeps_the_model_across_a_read_back() {
         let created = r#"{
-            "id": "qp17o2cvstg1jh",
+            "id": "pod-id",
             "desiredStatus": "RUNNING",
             "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
             "gpuCount": 1, "containerDiskInGb": 50, "volumeInGb": 20,
@@ -1593,14 +1593,14 @@ mod tests {
         }"#;
         // What get-pod gives back a minute later. Note `machine`.
         let read_back = r#"{
-            "id": "qp17o2cvstg1jh",
+            "id": "pod-id",
             "desiredStatus": "RUNNING",
             "imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
             "gpuCount": 1, "containerDiskInGb": 50, "volumeInGb": 20,
             "volumeMountPath": "/workspace",
             "ports": ["8888/http", "22/tcp"],
             "portMappings": {"22": 16422},
-            "publicIp": "47.47.180.52",
+            "publicIp": "203.0.113.10",
             "machine": {}
         }"#;
 
@@ -1620,7 +1620,7 @@ mod tests {
             "the model survived the read-back that stopped naming it"
         );
         assert_eq!(
-            acquired.inspected["publicIp"], "47.47.180.52",
+            acquired.inspected["publicIp"], "203.0.113.10",
             "and the read-back's own words still won: it learned an address"
         );
 

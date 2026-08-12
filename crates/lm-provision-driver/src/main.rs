@@ -31,7 +31,7 @@ use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USE
 #[derive(Parser)]
 #[command(
     name = "lm-provision-driver",
-    about = "Push-driver session (08): ensure-binary → place-profile → hash-verify → invoke → collect → ledger"
+    about = "Obtain a machine a profile requires (acquire / release / check), and converge one over SSH (apply: ensure-binary → place-profile → hash-verify → invoke → collect → ledger)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -312,7 +312,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     // On stderr, because it is a trace and not the artifact: 08 §Outputs
     // gives stdout "exactly one JSON apply report", and this line used to
     // make acquire the one subcommand that emitted two documents there
-    // [実測: 2026-08-12, a successful acquire printed `{"id":...}` and
+    // [measured: 2026-08-12, a successful acquire printed `{"id":...}` and
     // then the verdict object]. The id is in the artifact too, so nothing
     // is lost for a caller that gets that far; what this covers is the
     // caller that does not.
@@ -389,7 +389,7 @@ fn run_release(args: ReleaseArgs) -> ExitCode {
     // process's stdout put its output in the artifact stream: a release
     // printed the service's `""` and then this command's own JSON, two
     // documents where 07-cli.md §Stream split allows "exactly one
-    // machine-readable artifact per run" [実測: 2026-08-12, a release
+    // machine-readable artifact per run" [measured: 2026-08-12, a release
     // against a real pod].
     match std::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -427,7 +427,7 @@ fn relay(bytes: &[u8]) {
 /// said it.
 ///
 /// `program: message` is the GNU convention for a non-interactive
-/// program's messages [理論値:
+/// program's messages [documented:
 /// <https://www.gnu.org/prep/standards/html_node/Errors.html>], and the
 /// program here is the service CLI rather than this one — the operator
 /// is being shown somebody else's words and needs to know it. Both of
@@ -437,11 +437,11 @@ fn relay(bytes: &[u8]) {
 ///
 /// The bracketed and pipe-delimited forms (`[pod/name] line`,
 /// `service-1 | line`) belong to multiplexers, where the prefix picks
-/// one source out of several [理論値: kubectl `--prefix`, Docker
+/// one source out of several [documented: kubectl `--prefix`, Docker
 /// Compose logs]. There is one source here.
 ///
 /// **Silence is not reported.** "When a program has nothing surprising
-/// to say, it should say nothing" [理論値: Raymond, *The Art of Unix
+/// to say, it should say nothing" [documented: Raymond, *The Art of Unix
 /// Programming*, Rule of Silence] — a line on every release announcing
 /// that the service returned nothing would spend the operator's
 /// attention to repeat what the exit status already said.
@@ -584,7 +584,7 @@ mod tests {
     /// machine-readable artifact per run", so a subprocess's output
     /// cannot go there — a release used to print the service's `""`
     /// and then this command's own JSON, two documents in the artifact
-    /// stream [実測: 2026-08-12, a release against a real pod].
+    /// stream [measured: 2026-08-12, a release against a real pod].
     #[test]
     fn only_what_the_service_actually_said_is_relayed() {
         assert!(attributed(b"").is_empty());

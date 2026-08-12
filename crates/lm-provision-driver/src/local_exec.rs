@@ -1,7 +1,9 @@
-//! [`LocalExecTransport`]: the one [`crate::transport::Transport`]
-//! implementation this crate ships (08-push-driver-protocol.md
-//! §Stability: "SSH, provider exec API, `docker exec` all satisfy it"
-//! — those are documented extension points, not shipped here). Runs
+//! [`LocalExecTransport`]: the [`crate::transport::Transport`] that
+//! reaches no further than the driver's own host — the other shipped
+//! implementation is [`crate::ssh`], and a `docker exec` transport is
+//! a documented extension point (08-push-driver-protocol.md
+//! §Stability: "SSH, provider exec API, `docker exec` all satisfy
+//! it"). Runs
 //! the provisioner binary on the same host the driver itself runs on,
 //! staging the uploaded artifacts under a directory of the caller's
 //! choosing (08 §Driver steps step 1: "any byte-transport; paths are
@@ -62,9 +64,9 @@ impl Transport for LocalExecTransport {
         // - **it folded a failed read into "not identical"**. A staged
         //   file that cannot be read is not a mismatch; it is a
         //   question that did not get answered, and answering it "no"
-        //   makes a permission problem look like an ordinary re-copy
-        //   (design §4.1). `NotFound` — nothing staged yet — is a real
-        //   answer and still means copy.
+        //   makes a permission problem look like an ordinary re-copy.
+        //   `NotFound` — nothing staged yet — is a real answer and
+        //   still means copy.
         let already_identical = match lm_provision::digest::of_file(&staged_binary)? {
             Some(staged) => staged == crate::local_digest(local_binary)?,
             None => false,

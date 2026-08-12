@@ -14,6 +14,16 @@ keywords = ["provisioning", "gpu", "runpod", "llm", "infrastructure"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
+# The crates' dependencies on each other. Here rather than in each
+# manifest because the version is a literal a bump has to reach —
+# Cargo has no spelling that tracks `workspace.package.version` — and
+# one place to update beats three to remember.
+#
+# Getting it wrong is not silent: a requirement that no longer matches
+# the version beside it fails to resolve, so a half-done bump does not
+# build [measured: 2026-08-12, both directions].
+lm-provision = { path = "crates/lm-provision", version = "0.5.0" }
+lm-provision-driver = { path = "crates/lm-provision-driver", version = "0.5.0" }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

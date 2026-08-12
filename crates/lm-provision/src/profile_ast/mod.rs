@@ -27,7 +27,7 @@ pub use semantics::{ProfileAst, ProfileSemantics, ProfileValue};
 
 /// Unified AST for provision profile declarations and the Phase catalog kinds (`02-phase-catalog.md`).
 // `Spec` is 368 bytes against 136 for the next largest, so every phase
-// in a `Vec<ProfileNode>` is sized for a variant it is not [実測:
+// in a `Vec<ProfileNode>` is sized for a variant it is not [measured:
 // clippy, 2026-08-12]. The waste is real and it is kilobytes: this AST
 // exists once per run and profiles carry tens of phases, not millions.
 //
@@ -212,8 +212,8 @@ pub enum ProfileNode {
     ///
     /// The **producer** of the `venv` resource ([`crate::resource`]).
     /// Before it existed, three phases reached into a venv nothing
-    /// created — the consumer-with-no-producer shape design §4.3 names,
-    /// invisible because the path was a host constant.
+    /// created — a consumer with no producer, invisible because the
+    /// path was a host constant.
     #[dsl_exec(apply = "toolchain_python")]
     ToolchainPython {
         /// Stable node ID.

@@ -1,5 +1,5 @@
 //! End-to-end regression for the `validate` / `hash` / `plan`
-//! subcommands' file-format routing (plan §CLI 配線): every profile goes
+//! subcommands' file-format routing: every profile goes
 //! through the AST frontend ([`lm_provision::frontend::load_profile`]),
 //! which parses `.json` via the serde bridge and everything else via the
 //! canonical text grammar, and **rejects `.lua`** outright now that the

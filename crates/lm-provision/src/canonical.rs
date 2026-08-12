@@ -1348,7 +1348,7 @@ mod tests {
         // {"content":"a\"b\\c\nd\te<UTF-8 bytes of あ>","path":"/tmp/x","type":"FsWrite"}
         let mut expected = String::new();
         expected.push_str("{\"content\":\"a\\\"b\\\\c\\nd\\te\\u0001");
-        // 3 UTF-8 bytes of U+3042 「あ」 pass through raw.
+        // 3 UTF-8 bytes of U+3042 pass through raw.
         expected.push('\u{3042}');
         expected.push_str("\",\"path\":\"/tmp/x\",\"type\":\"FsWrite\"}");
         assert_eq!(bytes, expected);

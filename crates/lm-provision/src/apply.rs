@@ -34,7 +34,7 @@ use crate::profile_ast::ProfileValue;
 /// single `models` phase — which fans out to this constant, so 4 files
 /// of 16 ranges — and four separate phases, which run one at a time.
 /// **27-34 s the first way, 229-242 s the second**, two rounds each,
-/// with the two shapes never overlapping [実測: 2026-08-11].
+/// with the two shapes never overlapping [measured: 2026-08-11].
 ///
 /// The two axes **compound rather than trade off**, and the per-file
 /// times are why: each file finished *faster* with three others

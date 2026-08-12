@@ -1,5 +1,4 @@
-//! `comfyui_root` as a declared resource, end to end (design §3.6 /
-//! §4.3).
+//! `comfyui_root` as a declared resource, end to end.
 //!
 //! **This file exists because two earlier stages could not finish their
 //! own Done Criteria.** Stage 1's "a `models` entry that is already
@@ -240,8 +239,8 @@ async fn a_skip_survives_the_fan_out() {
 /// A profile that consumes ComfyUI without installing or assuming it is
 /// rejected **by name**, before any effect runs.
 ///
-/// This is the shape design §4.2 describes as failing today without
-/// being named: the run would previously have composed a destination
+/// This is the case that used to fail without being named: the run
+/// would previously have composed a destination
 /// under a root nothing created and failed on the pod with `no such
 /// file`.
 #[tokio::test(flavor = "multi_thread")]

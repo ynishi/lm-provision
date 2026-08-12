@@ -128,7 +128,7 @@ pub struct PortRequirement {
 ///
 /// **Neither field is a platform's word.** A managed pod service selects
 /// from its own catalogue of about fifty model names and has no VRAM
-/// field at all [実測: `PodCreateInput`, which carries `gpuTypeIds`,
+/// field at all [measured: `PodCreateInput`, which carries `gpuTypeIds`,
 /// `gpuCount` and a `minRAMPerGPU` that is system RAM]; a container
 /// runtime's `--gpus` takes a count or device ids and cannot select on
 /// either model or VRAM. What a *workload* knows is how much memory its
@@ -160,7 +160,7 @@ pub struct GpuRequirement {
     /// published 141 GB rather than its 144 GB of physical stacks.
     ///
     /// **It is not what the device will report.** A part sold as 48 GB
-    /// reports 46068 MiB [実測: 2026-08-12, `nvidia-smi` on an A40],
+    /// reports 46068 MiB [measured: 2026-08-12, `nvidia-smi` on an A40],
     /// because ECC reserves about 6.25% of a GDDR6 framebuffer and
     /// because MiB is not GB. So this is a floor on the published figure,
     /// which [`observe`] treats as a *lower bound* on real memory rather
@@ -191,9 +191,9 @@ pub struct GpuRequirement {
 ///
 /// | part | published | this bound | reported | ECC |
 /// |---|---|---|---|---|
-/// | A40 | 48 GB | 45776 MiB | 46068 MiB [実測: 2026-08-12] | on |
-/// | RTX 4090 | 24 GB | 22888 MiB | 24564 MiB [実測: 2026-08-12] | off |
-/// | A100 80GB | 80 GB | 76293 MiB | 81920 MiB [理論値: vendor] | — |
+/// | A40 | 48 GB | 45776 MiB | 46068 MiB [measured: 2026-08-12] | on |
+/// | RTX 4090 | 24 GB | 22888 MiB | 24564 MiB [measured: 2026-08-12] | off |
+/// | A100 80GB | 80 GB | 76293 MiB | 81920 MiB [documented: vendor] | — |
 ///
 /// The two measured parts sit at opposite ends of the reserve: the A40
 /// gives up about 6.25% of its framebuffer to ECC checkbits and still
@@ -210,7 +210,7 @@ pub const fn gb_to_mib(gb: u32) -> u32 {
 /// **Two levels, because the supplier's own words draw the line there.**
 /// A managed pod service describes its container disk as "wiped when the
 /// Pod restarts" and its volume as "persisted across Pod restarts"
-/// [実測: `PodCreateInput`]. A profile that pulls forty gigabytes of
+/// [measured: `PodCreateInput`]. A profile that pulls forty gigabytes of
 /// weights cares which of those it lands on, and nothing in a profile
 /// could say so.
 ///
@@ -1054,7 +1054,7 @@ mod tests {
             ports_observed: true,
             gpu_count: Some(1),
             // What the acquired part actually answered, verbatim
-            // [実測: 2026-08-12, `nvidia-smi` on an A40 sold as 48 GB].
+            // [measured: 2026-08-12, `nvidia-smi` on an A40 sold as 48 GB].
             // Not 48, because 48 is not a number any device says.
             gpu_vram_mib: Some(46068),
             persistent_gb: Some(100),
@@ -1075,7 +1075,7 @@ mod tests {
     /// **The bound has to fall below every part it describes.**
     ///
     /// A published capacity is two numbers wearing one label: the part
-    /// below is sold as "48 GB" and answers 46068 MiB [実測: 2026-08-12,
+    /// below is sold as "48 GB" and answers 46068 MiB [measured: 2026-08-12,
     /// `nvidia-smi`], which is 48.3 decimal GB and 45.0 GiB. Reading the
     /// label as decimal makes the conversion a floor; reading it as
     /// binary would make it a promise, and 48 GiB is 49152 MiB — over
@@ -1086,7 +1086,7 @@ mod tests {
     #[test]
     fn the_published_figure_converts_to_less_than_the_part_reports() {
         // model, published GB, what the part answers in MiB. The first
-        // two are measured [実測: 2026-08-12, `nvidia-smi` on acquired
+        // two are measured [measured: 2026-08-12, `nvidia-smi` on acquired
         // machines]; the A40 runs ECC on and the 4090 runs it off, so
         // the least and the most a part hands out are both here.
         let measured = [

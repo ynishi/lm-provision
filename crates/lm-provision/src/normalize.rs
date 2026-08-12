@@ -264,8 +264,8 @@ fn port_of(phase: &ProfileNode) -> Option<u16> {
 /// frontend hands the root the last id it allocates, so minting above
 /// the phases alone produced an id equal to the root's: the derived AST
 /// keys its program on `NodeId`, and the collision made the engine run
-/// the colliding phase in place of the whole profile [実測: 2026-08-05、
-/// apply が 5 phase 中 1 phase だけを実行して ok=true を返した].
+/// the colliding phase in place of the whole profile [measured:
+/// 2026-08-05, an apply ran one of five phases and returned `ok = true`].
 struct IdMinter(u64);
 
 impl IdMinter {
@@ -499,7 +499,7 @@ mod tests {
     /// at `max(phases) + 1` lands exactly on the root. That collision
     /// made the engine execute the inserted phase in place of the whole
     /// profile — one step, `ok = true`, four phases silently unrun
-    /// [実測: 2026-08-05 apply report].
+    /// [measured: 2026-08-05 apply report].
     #[test]
     fn inserted_phases_get_ids_above_every_id_in_the_tree() {
         let g = ids();

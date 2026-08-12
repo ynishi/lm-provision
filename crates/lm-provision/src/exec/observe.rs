@@ -10,9 +10,9 @@
 //! keeps observations on the far side of a driver precisely because a
 //! read can fail to return — a `stat()` on a hard-mounted NFS path
 //! enters D state, where not even SIGKILL helps and the only move left
-//! is for the caller to stop waiting and answer `CheckFailed(Timeout)`
-//! (design §3.2d). This implementation is the near case; the shape it
-//! implements is what lets a caller wrap it.
+//! is for the caller to stop waiting and answer `CheckFailed(Timeout)`.
+//! This implementation is the near case; the shape it implements is
+//! what lets a caller wrap it.
 //!
 //! ## What these two observations mean
 //!
@@ -29,7 +29,7 @@
 //!   path answers [`DigestReading::Absent`]; a path that exists but is
 //!   not a readable byte stream (a directory, a permission failure) is
 //!   a [`CheckError`], not an absence — that distinction is the whole
-//!   reason the failure is an *answer* (design §4.1: folding the read
+//!   reason the failure is an *answer* (folding the read
 //!   failure into "different" is what the driver's `ensure_binary` used
 //!   to do).
 //! - **`command_status`** spawns `argv` and waits for it, reporting the
@@ -51,8 +51,8 @@
 //!
 //! `command_status` blocks the thread it is polled on, exactly as the
 //! two file reads do: the effect layer's `sh_exec` is synchronous, and
-//! this implementation is the near case (§Why the async evaluator is
-//! not pointless, above). A `command_status` reaching a remote pod is
+//! this implementation is the near case, for the reason given above.
+//! A `command_status` reaching a remote pod is
 //! the one that would need the wrapper the async shape exists for.
 //!
 //! ## The procfs dependency
@@ -120,7 +120,7 @@ impl Observe for LocalObserve {
             Ok(outcome) => Ok(outcome.exit_code),
             // Reached only when the process could not be started at all
             // (a missing binary). That is detected, so it is an answer
-            // rather than an error (design §3.2b).
+            // rather than an error.
             Err(err) => Err(CheckError::new(
                 CheckErrorCategory::Unobservable,
                 err.to_string(),
@@ -392,7 +392,7 @@ mod tests {
 
     /// A binary that is not there is **detected**, so it is an answer
     /// (`CheckFailed`) rather than a host-process error — the same
-    /// boundary the two file reads sit on (design §3.2b).
+    /// boundary the two file reads sit on.
     #[tokio::test]
     async fn a_command_that_cannot_be_started_answers_check_failed() {
         let argv = vec!["lm-provision-no-such-binary-8f3a".to_string()];
