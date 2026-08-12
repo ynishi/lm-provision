@@ -45,6 +45,7 @@
 #![warn(missing_docs)]
 
 pub mod driver;
+pub mod infra;
 pub mod ledger;
 pub mod local_exec;
 pub mod session;

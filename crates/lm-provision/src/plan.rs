@@ -46,14 +46,38 @@ use crate::profile_ast::ProfileNode;
 /// carries the same phases, in the same order, that apply will run.
 pub fn expand(root: &ProfileNode) -> Value {
     let normalized = crate::normalize::normalize(root);
-    let (profile_name, phases) = match &normalized {
-        ProfileNode::Spec { name, phases, .. } => (name.as_str(), phases.as_slice()),
-        _ => ("", [].as_slice()),
+    let (profile_name, phases, requires_ports) = match &normalized {
+        ProfileNode::Spec {
+            name,
+            phases,
+            requires_ports,
+            ..
+        } => (name.as_str(), phases.as_slice(), Some(requires_ports)),
+        _ => ("", [].as_slice(), None),
     };
 
     let steps = build_steps(phases);
     let mut top = Map::new();
     top.insert("profile_name".into(), Value::String(profile_name.into()));
+    // What the machine must be, shown beside what will run on it. A
+    // requirement the plan does not mention is one an author cannot
+    // check before spending a machine on it — and checking before
+    // spending is what a plan is for.
+    //
+    // Omitted when nothing is required, matching the canonical rule and
+    // keeping the artifact of a profile that declares none byte-identical
+    // to what it was before the slot existed.
+    if let Some(required) = requires_ports.filter(|it| !it.is_empty()) {
+        top.insert(
+            "requires_ports".into(),
+            Value::Object(
+                required
+                    .iter()
+                    .map(|(port, exposure)| (port.clone(), Value::String(exposure.clone())))
+                    .collect(),
+            ),
+        );
+    }
     top.insert("steps".into(), Value::Array(steps));
     Value::Object(top)
 }
@@ -600,6 +624,33 @@ mod tests {
 
     fn ids() -> IdGen {
         IdGen::new()
+    }
+
+    /// **A requirement the plan does not mention cannot be checked
+    /// before a machine is spent on it**, and checking before spending
+    /// is what a plan is for.
+    #[test]
+    fn the_plan_shows_what_the_machine_must_be() {
+        let mut root = spec("with-requirements", Vec::new());
+        if let ProfileNode::Spec { requires_ports, .. } = &mut root {
+            requires_ports.insert("8188".into(), "public_http".into());
+            requires_ports.insert("22".into(), "raw_tcp".into());
+        }
+        let plan = expand(&root);
+        assert_eq!(plan["requires_ports"]["8188"], json!("public_http"));
+        assert_eq!(plan["requires_ports"]["22"], json!("raw_tcp"));
+    }
+
+    /// Absent when nothing is required, so the artifact of a profile
+    /// that declares none is what it was before the slot existed — the
+    /// same rule the canonical encoding carries, for the same reason.
+    #[test]
+    fn the_plan_of_a_profile_requiring_nothing_is_unchanged() {
+        let plan = expand(&spec("no-requirements", Vec::new()));
+        assert!(
+            plan.get("requires_ports").is_none(),
+            "an empty requirement set adds nothing to the artifact: {plan}"
+        );
     }
 
     fn step_ids(plan: &Value) -> Vec<String> {
