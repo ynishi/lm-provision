@@ -646,6 +646,5 @@ validate → plan → dispatch → apply --dry-run; real-exec coverage for
 (Linux).
 
 `mount.volume_attach` remains a reserved capability key with no
-catalog kind and no bridge (provider-API-bound; the provisioning
-boundary keeps pod lifecycle with the external pod manager,
-chapter 08).
+catalog kind and no bridge (provider-API territory; no provider SDK
+is linked into the core, chapter 08 §Stability).

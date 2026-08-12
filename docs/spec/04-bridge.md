@@ -396,5 +396,5 @@ Deferred with one-line reasons:
   `max_bytes`, `body_form`, and multipart stay deferred with the
   reasons given there.
 - `mount.volume_attach` has a reserved capability key and no
-  primitive (provider-API territory behind the provisioning boundary,
-  chapter 08).
+  primitive (provider-API territory; no provider SDK is linked,
+  chapter 08 §Stability).

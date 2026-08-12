@@ -326,12 +326,18 @@ absorbs it, so the graph stays acyclic.
 ### On-pod agent model (from 07 and 08)
 
 - **On-pod agent binary.** The profile is applied by an
-  `lm-provision` binary shipped into the pod. The outer driver only
-  uploads the binary, invokes it, and collects the report.
+  `lm-provision` binary shipped into the pod. ~~The outer driver only
+  uploads the binary, invokes it, and collects the report.~~
+  **Superseded (2026-08-12):** the driver also acquires and releases
+  the machine itself (08 §Stability); within an apply it still only
+  uploads, invokes and collects.
   Absorbed by 08.
-- **Provisioning-only boundary.** Pod lifecycle
+- **Provisioning-only boundary.** ~~Pod lifecycle
   (create / start / stop) stays with the external pod manager; only
-  provisioning is owned by lm-provision. The pod-provider API client
+  provisioning is owned by lm-provision.~~ **Superseded
+  (2026-08-12):** machine create / delete is owned by the driver
+  through the provider's own CLI; start / stop stays with the
+  external pod manager (08 §Stability). The pod-provider API client
   is not pulled into the core.
   Absorbed by 08; referenced by 10.
 - **Static provisioner.** The binary is musl-static and carries no
