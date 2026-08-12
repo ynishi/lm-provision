@@ -329,101 +329,18 @@ impl Infra for RunPodAdapter {
         required: &Requirements,
         provider: &BTreeMap<String, String>,
     ) -> Result<Acquisition, AcquisitionError> {
-        let image = required
-            .image
-            .as_deref()
-            .ok_or(AcquisitionError::Incomplete {
-                target: "runpod",
-                missing: "requires_image",
-            })?;
-
-        let mut body = serde_json::Map::new();
-        body.insert("imageName".into(), serde_json::json!(image));
-
-        // Only when the profile asked for something. An empty array is a
-        // claim that nothing should be exposed, and a profile that
-        // declared no ports did not make it — the service's own default
-        // applies instead. Absent is not zero here as it is nowhere else
-        // in this vocabulary.
-        let ports = self.render(required);
-        if !ports.is_empty() {
-            body.insert("ports".into(), serde_json::json!(ports));
-        }
-
-        if let Some(gpu) = &required.gpu {
-            body.insert(
-                "computeType".into(),
-                serde_json::json!(if gpu.count == 0 { "CPU" } else { "GPU" }),
-            );
-            if gpu.count > 0 {
-                body.insert("gpuCount".into(), serde_json::json!(gpu.count));
-                // The models that clear the floor, in the order the
-                // answer put them: cheapest first, the rest as what the
-                // service can fall back to when it is short.
-                //
-                // An answer of anything but `Met` stops here. Carrying on
-                // without the selection would send a request that looks
-                // well-formed and asks for the wrong machine.
-                match self.gpu_answer(gpu) {
-                    Answer::Met { using } => {
-                        if !using.is_empty() {
-                            body.insert("gpuTypeIds".into(), serde_json::json!(using));
-                        }
-                    }
-                    Answer::Unmet { reason } => {
-                        return Err(AcquisitionError::Unmet {
-                            target: "runpod",
-                            reason,
-                        })
-                    }
-                    Answer::NotExamined { reason } => {
-                        return Err(AcquisitionError::Unmet {
-                            target: "runpod",
-                            reason: format!(
-                                "{reason} — this target selects the machine, so a \
-                                 requirement it cannot decide is one it cannot ask for"
-                            ),
-                        })
-                    }
-                }
-            }
-        }
-
-        if let Some(disk) = &required.disk {
-            // Asked, not assumed. This target answers `Met` for every
-            // storage request today, so the arm below is unreachable
-            // from here — but building the request without consulting
-            // the answer is the structure that let a beyond-catalogue
-            // memory floor through, and the structure is what is being
-            // fixed rather than the one case that showed it.
-            match self.disk_answer(disk) {
-                Answer::Met { .. } => {}
-                Answer::Unmet { reason } | Answer::NotExamined { reason } => {
-                    return Err(AcquisitionError::Unmet {
-                        target: "runpod",
-                        reason,
-                    })
-                }
-            }
-            if let Some(gb) = disk.ephemeral_gb {
-                body.insert("containerDiskInGb".into(), serde_json::json!(gb));
-            }
-            if let Some(gb) = disk.persistent_gb {
-                body.insert("volumeInGb".into(), serde_json::json!(gb));
-            }
-            if let Some(path) = &disk.persistent_at {
-                body.insert("volumeMountPath".into(), serde_json::json!(path));
-            }
-        }
-
-        // Whatever the profile addressed to this target, verbatim and
-        // last, so a network volume named there replaces the sizes above
-        // the way the service documents it doing.
-        for (key, value) in provider {
-            if let Some(field) = key.strip_prefix("runpod.") {
-                body.insert(field.to_string(), serde_json::json!(value));
-            }
-        }
+        // Every answer this adapter would give is taken here and handed
+        // to the builder, so the builder cannot reach a requirement
+        // without going through the answer for it. Asking inside the
+        // builder is what let a floor no device clears reach the request
+        // as a silent omission.
+        let body = runpod_body(
+            required,
+            provider,
+            self.render(required),
+            required.gpu.as_ref().map(|it| self.gpu_answer(it)),
+            required.disk.as_ref().map(|it| self.disk_answer(it)),
+        )?;
 
         Ok(Acquisition {
             create: vec![
@@ -432,7 +349,7 @@ impl Infra for RunPodAdapter {
                 "create-pod".into(),
                 "-j".into(),
             ],
-            body: Some(serde_json::Value::Object(body).to_string()),
+            body: Some(body),
             inspect: vec![
                 "runpod-cli".into(),
                 "pods".into(),
@@ -508,6 +425,104 @@ impl Infra for RunPodAdapter {
             image: inspected.get("imageName").and_then(text),
         }
     }
+}
+
+/// The request body for [`RunPodAdapter::acquisition`], built from the
+/// requirements *and the adapter's answers to them*.
+///
+/// The answers arrive as arguments rather than being asked for here. An
+/// adapter that reads a requirement without consulting its own answer
+/// can build a request that looks well-formed and asks for a machine
+/// nobody promised — which is how a memory floor above every catalogued
+/// device once produced a body with no model selection in it and an exit
+/// status of success. Taking them as parameters also makes the refusal
+/// reachable from a test for storage, where this adapter answers `Met`
+/// for everything it is asked today.
+///
+/// `gpu_answer` / `disk_answer` are `None` exactly when the profile
+/// declared no such requirement.
+fn runpod_body(
+    required: &Requirements,
+    provider: &BTreeMap<String, String>,
+    ports: Vec<String>,
+    gpu_answer: Option<Answer>,
+    disk_answer: Option<Answer>,
+) -> Result<String, AcquisitionError> {
+    let image = required
+        .image
+        .as_deref()
+        .ok_or(AcquisitionError::Incomplete {
+            target: "runpod",
+            missing: "requires_image",
+        })?;
+
+    let refuse = |answer: Answer| match answer {
+        Answer::Met { using } => Ok(using),
+        Answer::Unmet { reason } => Err(AcquisitionError::Unmet {
+            target: "runpod",
+            reason,
+        }),
+        Answer::NotExamined { reason } => Err(AcquisitionError::Unmet {
+            target: "runpod",
+            reason: format!(
+                "{reason} — this target selects the machine, so a requirement it \
+                 cannot decide is one it cannot ask for"
+            ),
+        }),
+    };
+
+    let mut body = serde_json::Map::new();
+    body.insert("imageName".into(), serde_json::json!(image));
+
+    // Only when the profile asked for something. An empty array is a
+    // claim that nothing should be exposed, and a profile that declared
+    // no ports did not make it — the service's own default applies
+    // instead. Absent is not zero here as it is nowhere else in this
+    // vocabulary.
+    if !ports.is_empty() {
+        body.insert("ports".into(), serde_json::json!(ports));
+    }
+
+    if let Some(gpu) = &required.gpu {
+        body.insert(
+            "computeType".into(),
+            serde_json::json!(if gpu.count == 0 { "CPU" } else { "GPU" }),
+        );
+        if gpu.count > 0 {
+            body.insert("gpuCount".into(), serde_json::json!(gpu.count));
+            // The models that clear the floor, in the order the answer
+            // put them: cheapest first, the rest as what the service can
+            // fall back to when it is short.
+            let selected = gpu_answer.map(refuse).transpose()?.unwrap_or_default();
+            if !selected.is_empty() {
+                body.insert("gpuTypeIds".into(), serde_json::json!(selected));
+            }
+        }
+    }
+
+    if let Some(disk) = &required.disk {
+        disk_answer.map(refuse).transpose()?;
+        if let Some(gb) = disk.ephemeral_gb {
+            body.insert("containerDiskInGb".into(), serde_json::json!(gb));
+        }
+        if let Some(gb) = disk.persistent_gb {
+            body.insert("volumeInGb".into(), serde_json::json!(gb));
+        }
+        if let Some(path) = &disk.persistent_at {
+            body.insert("volumeMountPath".into(), serde_json::json!(path));
+        }
+    }
+
+    // Whatever the profile addressed to this target, verbatim and last,
+    // so a network volume named there replaces the sizes above the way
+    // the service documents it doing.
+    for (key, value) in provider {
+        if let Some(field) = key.strip_prefix("runpod.") {
+            body.insert(field.to_string(), serde_json::json!(value));
+        }
+    }
+
+    Ok(serde_json::Value::Object(body).to_string())
 }
 
 /// A container runtime: the machine is a container, and whatever is in
@@ -1210,6 +1225,53 @@ mod tests {
             body.get("ports").is_none(),
             "an undeclared requirement carries no field: {body}"
         );
+    }
+
+    /// The same refusal, on the storage axis.
+    ///
+    /// No profile can reach this through [`RunPodAdapter`]: it answers
+    /// `Met` for every storage request it is given today, so the arm is
+    /// unreachable from the outside and a test written against the
+    /// adapter would pass whether or not the answer were consulted. The
+    /// body builder takes the answers as arguments precisely so this can
+    /// be asked directly — the fix that has no failing case yet is the
+    /// one most likely to be quietly undone.
+    #[test]
+    fn an_unmet_storage_answer_stops_the_request_too() {
+        let disk = Requirements::from_slots(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[("persistent_gb", "4096"), ("persistent_at", "/workspace")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            Some("runpod/pytorch:2.4.0"),
+        )
+        .unwrap();
+
+        let err = runpod_body(
+            &disk,
+            &BTreeMap::new(),
+            Vec::new(),
+            None,
+            Some(Answer::Unmet {
+                reason: "no volume that large".into(),
+            }),
+        )
+        .expect_err("an answer of Unmet is not a request");
+        assert!(err.to_string().contains("no volume that large"));
+
+        // And the same answer as `Met` builds the field it always did,
+        // so the guard above is a guard and not a wall.
+        let body = runpod_body(
+            &disk,
+            &BTreeMap::new(),
+            Vec::new(),
+            None,
+            Some(Answer::Met { using: Vec::new() }),
+        )
+        .unwrap();
+        assert!(body.contains("\"volumeInGb\":4096"), "{body}");
     }
 
     /// A machine with no accelerator is a declaration, and it reaches
