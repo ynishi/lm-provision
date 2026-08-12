@@ -139,6 +139,23 @@ pub enum AcquisitionError {
         /// What was not declared.
         missing: &'static str,
     },
+
+    /// The adapter answered that it cannot meet a requirement.
+    ///
+    /// Rendering a request anyway would produce a machine that is not
+    /// what was asked for, and the missing part would be found — if at
+    /// all — by whatever failed later. The first version of this code
+    /// did exactly that: a memory floor beyond the catalogue dropped the
+    /// model selection and returned a request that looked fine
+    /// [実測: 2026-08-12, `min_vram_gb: 512` produced a body with
+    /// `gpuCount` and no `gpuTypeIds`, exit 0].
+    #[error("{target} cannot meet a requirement: {reason}")]
+    Unmet {
+        /// Which target.
+        target: &'static str,
+        /// The adapter's own words.
+        reason: String,
+    },
 }
 
 /// A GPU model and how much memory it carries.
@@ -322,7 +339,16 @@ impl Infra for RunPodAdapter {
 
         let mut body = serde_json::Map::new();
         body.insert("imageName".into(), serde_json::json!(image));
-        body.insert("ports".into(), serde_json::json!(self.render(required)));
+
+        // Only when the profile asked for something. An empty array is a
+        // claim that nothing should be exposed, and a profile that
+        // declared no ports did not make it — the service's own default
+        // applies instead. Absent is not zero here as it is nowhere else
+        // in this vocabulary.
+        let ports = self.render(required);
+        if !ports.is_empty() {
+            body.insert("ports".into(), serde_json::json!(ports));
+        }
 
         if let Some(gpu) = &required.gpu {
             body.insert(
@@ -334,15 +360,51 @@ impl Infra for RunPodAdapter {
                 // The models that clear the floor, in the order the
                 // answer put them: cheapest first, the rest as what the
                 // service can fall back to when it is short.
-                if let Answer::Met { using } = self.gpu_answer(gpu) {
-                    if !using.is_empty() {
-                        body.insert("gpuTypeIds".into(), serde_json::json!(using));
+                //
+                // An answer of anything but `Met` stops here. Carrying on
+                // without the selection would send a request that looks
+                // well-formed and asks for the wrong machine.
+                match self.gpu_answer(gpu) {
+                    Answer::Met { using } => {
+                        if !using.is_empty() {
+                            body.insert("gpuTypeIds".into(), serde_json::json!(using));
+                        }
+                    }
+                    Answer::Unmet { reason } => {
+                        return Err(AcquisitionError::Unmet {
+                            target: "runpod",
+                            reason,
+                        })
+                    }
+                    Answer::NotExamined { reason } => {
+                        return Err(AcquisitionError::Unmet {
+                            target: "runpod",
+                            reason: format!(
+                                "{reason} — this target selects the machine, so a \
+                                 requirement it cannot decide is one it cannot ask for"
+                            ),
+                        })
                     }
                 }
             }
         }
 
         if let Some(disk) = &required.disk {
+            // Asked, not assumed. This target answers `Met` for every
+            // storage request today, so the arm below is unreachable
+            // from here — but building the request without consulting
+            // the answer is the structure that let a beyond-catalogue
+            // memory floor through, and the structure is what is being
+            // fixed rather than the one case that showed it.
+            match self.disk_answer(disk) {
+                Answer::Met { .. } => {}
+                Answer::Unmet { reason } | Answer::NotExamined { reason } => {
+                    return Err(AcquisitionError::Unmet {
+                        target: "runpod",
+                        reason,
+                    })
+                }
+            }
             if let Some(gb) = disk.ephemeral_gb {
                 body.insert("containerDiskInGb".into(), serde_json::json!(gb));
             }
@@ -1090,6 +1152,88 @@ mod tests {
             body.get("container.network").is_none() && body.get("network").is_none(),
             "another target's key is not this target's: {body}"
         );
+    }
+
+    /// **The bug this caught.** A memory floor beyond the catalogue used
+    /// to drop the model selection and return a request that looked
+    /// perfectly well-formed — `gpuCount` present, `gpuTypeIds` absent,
+    /// exit 0 — so a machine would have been created without the thing
+    /// that was asked for [実測: 2026-08-12, before this arm existed].
+    ///
+    /// Silently dropping an unsatisfiable requirement is the exact sin
+    /// the rest of this module argues against. It got in because the
+    /// request was built without consulting the answer.
+    #[test]
+    fn a_requirement_the_adapter_cannot_meet_stops_the_request() {
+        let beyond = Requirements::from_slots(
+            &BTreeMap::new(),
+            &[("count", "1"), ("min_vram_gb", "512")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &BTreeMap::new(),
+            Some("runpod/pytorch:2.4.0"),
+        )
+        .unwrap();
+
+        let err = RunPodAdapter
+            .acquisition(&beyond, &BTreeMap::new())
+            .expect_err("no catalogued device carries 512 GB");
+        let rendered = err.to_string();
+        assert!(rendered.contains("512"), "{rendered}");
+        assert!(
+            rendered.contains("provider.runpod.gpuTypeIds"),
+            "the refusal keeps the way out it had: {rendered}"
+        );
+    }
+
+    /// **The other half of the same bug.** A profile that declares no
+    /// ports was sending an explicit empty array, which is a claim that
+    /// nothing should be exposed — one the profile never made. Absent is
+    /// not zero here as it is nowhere else in this vocabulary; the
+    /// service's own default applies instead.
+    #[test]
+    fn declaring_no_ports_asks_for_nothing_rather_than_for_none() {
+        let no_ports = Requirements::from_slots(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some("runpod/pytorch:2.4.0"),
+        )
+        .unwrap();
+        let acquisition = RunPodAdapter
+            .acquisition(&no_ports, &BTreeMap::new())
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("ports").is_none(),
+            "an undeclared requirement carries no field: {body}"
+        );
+    }
+
+    /// A machine with no accelerator is a declaration, and it reaches
+    /// the request as one.
+    #[test]
+    fn zero_accelerators_asks_for_a_machine_without_one() {
+        let cpu_only = Requirements::from_slots(
+            &BTreeMap::new(),
+            &[("count", "0")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &BTreeMap::new(),
+            Some("runpod/pytorch:2.4.0"),
+        )
+        .unwrap();
+        let acquisition = RunPodAdapter
+            .acquisition(&cpu_only, &BTreeMap::new())
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["computeType"], "CPU");
+        assert!(body.get("gpuCount").is_none(), "{body}");
+        assert!(body.get("gpuTypeIds").is_none(), "{body}");
     }
 
     /// A machine cannot be created without knowing what to run on it,
