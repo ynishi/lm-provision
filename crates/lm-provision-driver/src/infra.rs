@@ -59,6 +59,22 @@ pub trait Infra {
     /// error nor silently fine: see [`unexamined`].
     fn provider_namespace(&self) -> &'static str;
 
+    /// The environment variables this target's tooling reads its
+    /// credential from, **by name**.
+    ///
+    /// Declared by the adapter because the adapter is what knows the
+    /// target. A tool that starts machines owns the means of starting
+    /// them, and on a paid target that means includes a credential; the
+    /// alternative is not "no credential", it is a credential nobody is
+    /// responsible for arranging. See [`crate::credentials`].
+    ///
+    /// Names only. Nothing in this crate ever binds the value — it
+    /// travels from the environment into the child process by
+    /// inheritance, and never through here.
+    ///
+    /// Empty for a target that needs none, which is a real answer.
+    fn credentials(&self) -> &'static [&'static str];
+
     /// Whether this target can give the workload the accelerators it
     /// asked for, and — when a choice was involved — which ones.
     ///
@@ -267,6 +283,15 @@ impl Infra for RunPodAdapter {
 
     fn provider_namespace(&self) -> &'static str {
         "runpod"
+    }
+
+    /// The service CLI takes its key from the environment and from
+    /// nowhere else: it has no `--api-key` and reads no configuration
+    /// file [実測: 2026-08-12, `runpod-cli --help` offers `--base-url`,
+    /// `-o`, `--dry-run`, `-v`]. So a resolution order can only exist
+    /// out here, and naming the variable is how it gets one.
+    fn credentials(&self) -> &'static [&'static str] {
+        &["RUNPOD_API_KEY"]
     }
 
     /// Selecting the models that carry at least the requested memory,
@@ -579,6 +604,13 @@ impl Infra for ContainerAdapter {
 
     fn provider_namespace(&self) -> &'static str {
         "container"
+    }
+
+    /// None. The daemon is reached over a local socket whose
+    /// permissions are the authorisation, so there is no key to arrange
+    /// — an empty list is that answer, not an omission.
+    fn credentials(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// A count it can pass on; a memory floor it cannot decide.

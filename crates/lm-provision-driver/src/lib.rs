@@ -44,6 +44,7 @@
 
 #![warn(missing_docs)]
 
+pub mod credentials;
 pub mod driver;
 pub mod infra;
 pub mod ledger;

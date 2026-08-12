@@ -23,6 +23,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+use lm_provision_driver::credentials;
 use lm_provision_driver::infra::{self, Infra as _, RunPodAdapter};
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
 use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
@@ -153,6 +154,11 @@ struct ApplyArgs {
 }
 
 fn main() -> ExitCode {
+    // Before the command runs, so every subcommand sees the same
+    // environment — a key that works for `acquire` and not for
+    // `release` would strand a machine.
+    credentials::load();
+
     let cli = Cli::parse();
     match cli.command {
         Command::Apply(args) => run_apply(args),
@@ -281,6 +287,16 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Past the dry-run branch, so rendering a request never demands a
+    // key — and before anything runs, so a missing one costs nothing.
+    // Discovering it half way through an acquisition means discovering
+    // it after the machine exists.
+    if let Err(missing) = credentials::require(adapter.provider_namespace(), adapter.credentials())
+    {
+        eprintln!("error: {missing}");
+        return ExitCode::from(4);
+    }
+
     let mut acquired = match infra::acquire(acquisition) {
         Ok(acquired) => acquired,
         Err(err) => {
@@ -342,6 +358,19 @@ fn run_release(args: ReleaseArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The worst place to be short a credential. Acquiring without one
+    // fails and costs nothing; releasing without one leaves a machine
+    // running and billing, so say so plainly rather than through the
+    // service CLI's exit status.
+    if let Err(missing) = credentials::require(
+        RunPodAdapter.provider_namespace(),
+        RunPodAdapter.credentials(),
+    ) {
+        eprintln!("error: {missing}");
+        eprintln!("note: {} is still running", args.id);
+        return ExitCode::from(4);
+    }
+
     let argv: Vec<String> = acquisition
         .release
         .iter()
