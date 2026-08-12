@@ -12,7 +12,7 @@
 //!   additionally consult [`policy`](super::policy) in both modes
 //!   (spec 07 "dry-run does policy"), rejecting targets that fall
 //!   outside the profile's declared `paths` / `http_allowlist`.
-//! - **lifecycle 15 ops** no longer run here. Their steps are composed
+//! - **lifecycle 16 ops** no longer run here. Their steps are composed
 //!   before the engine starts and projected onto engine nodes — one
 //!   `Call` per step ([`super::steps`]) — so the phase is a `Seq` and
 //!   each step suspends on its own, resolved by
@@ -1313,7 +1313,7 @@ pub const HTTP_POST_CALL_LABEL: &str = "net.http_post";
 
 /// The `CallSpec::label` a suspended **lifecycle step** carries.
 ///
-/// One label for all fifteen ops and all four step shapes: what the
+/// One label for all sixteen ops and all four step shapes: what the
 /// resolver needs in order to run the step is the step itself, which it
 /// reaches through [`super::steps::StepPlan`], not through the label. A
 /// label per op would name the phase twice (the payload already does)
@@ -2282,13 +2282,13 @@ mod tests {
     use dsl_kit::{DslNode as _, IdGen};
 
     /// The catalog's size, pinned so that adding a kind cannot quietly
-    /// leave the two places that still state it behind.
+    /// leave the three places that still state it behind.
     ///
     /// The number used to appear in five doc comments as well, and it
     /// went stale the moment `toolchain.python` landed — twice, because
     /// the first correction missed a capitalised spelling. Prose that
     /// has to be hand-synchronised across files is a maintenance
-    /// liability with no reader value, so those are gone; the two that
+    /// liability with no reader value, so those are gone; the three that
     /// remain are the ones a reader is actually served by, and this is
     /// what keeps them honest.
     #[test]

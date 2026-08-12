@@ -38,7 +38,7 @@
 //! This module reads names, reports names, and reports which files were
 //! consulted. A value passes from a file into the process environment
 //! inside `dotenvy` and from there into the child process by ordinary
-//! inheritance. Nothing in this crate binds one to a variable, formats
+//! inheritance. Nothing in this module binds one to a variable, formats
 //! one, or logs one — so there is no place for one to leak from.
 
 use std::path::PathBuf;

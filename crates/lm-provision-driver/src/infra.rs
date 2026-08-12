@@ -68,7 +68,7 @@ pub trait Infra {
     /// alternative is not "no credential", it is a credential nobody is
     /// responsible for arranging. See [`crate::credentials`].
     ///
-    /// Names only. Nothing in this crate ever binds the value — it
+    /// Names only. Nothing in this module ever binds the value — it
     /// travels from the environment into the child process by
     /// inheritance, and never through here.
     ///

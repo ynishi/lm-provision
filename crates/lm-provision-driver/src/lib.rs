@@ -14,15 +14,19 @@
 //! driven through the already-frozen CLI contract (07-cli.md) of the
 //! Phase F `lm-provision` binary, from the outside, over the
 //! transport-agnostic upload / invoke / collect shape 08 defines — so
-//! no effect this crate causes is an effect it performs.
+//! no effect an apply causes is an effect this crate performs. The
+//! effects this crate does perform itself are the machine ones:
+//! [`infra::acquire`] runs the provider's CLI and creates a billable
+//! machine, and [`infra::Acquired`]'s release destroys one.
 //!
 //! What it does read from the library is the part an operator host has
 //! to know before it connects: [`session`] parses, validates and hashes
 //! the profile in process, because the host cannot run the musl
 //! artifact it is about to push and the hash has to be comparable to
 //! the pod's; [`infra`] reads the profile's machine requirements to
-//! decide what to acquire. Both are questions about a profile rather
-//! than execution of one.
+//! decide what to acquire. The first is a question about a profile
+//! rather than execution of one; the second is where rendering ends
+//! and acquiring — the spending call — begins.
 //!
 //! ## Modules
 //!
@@ -52,7 +56,10 @@
 //! - [`infra`] — [`infra::Infra`], the target a machine is placed on,
 //!   with one implementation per target: what it can provide, the
 //!   request that would obtain a machine meeting a profile's
-//!   requirements, and how to read one back and give it up.
+//!   requirements, and how to read one back and give it up — plus
+//!   [`infra::acquire`] and [`infra::Acquired`], which send that
+//!   request and later destroy the machine: the crate's two calls
+//!   that create and stop bills.
 //! - [`credentials`] — where a target's credential is resolved from,
 //!   and what is reported when it is not there.
 

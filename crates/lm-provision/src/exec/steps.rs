@@ -58,7 +58,7 @@ use crate::resource::ResourceEnv;
 /// The registry op name a lifecycle phase dispatches to, or `None` for
 /// any other node.
 ///
-/// This is the crate's one answer to "is this node one of the fifteen",
+/// This is the crate's one answer to "is this node one of the sixteen",
 /// and it is spelled as the *op name* rather than a boolean because the
 /// name is also what a step's failure is labelled with
 /// ([`lifecycle::execute_step`]'s `op` argument). Deriving it from

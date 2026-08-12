@@ -16,8 +16,9 @@ row. Individual session steps can be gated on or off, but the base
 shape is declarative one-shot apply: given a reachable pod, one
 driver invocation converges it (the Terraform / K8s `apply` posture).
 
-Pod lifecycle (create / start / stop / delete) stays outside — see
-§Stability.
+Pod lifecycle: the driver's `acquire` / `release` subcommands create
+and delete a machine through the provider's own CLI; start / stop
+stay outside — see §Stability.
 
 ### Session contract
 
@@ -172,11 +173,18 @@ Per-transport realization:
 - The session-step list and gate names: **provisional** — step
   strategies (`fetch-release`, `cargo-install`, an exec-API
   ConnectionSpec) are additive.
-- Provisioning boundary: pod lifecycle (create / start / stop /
+- ~~Provisioning boundary: pod lifecycle (create / start / stop /
   delete) stays with the external pod manager; only provisioning is
   owned by `lm-provision`. The pod-provider API client is **not**
   pulled into this repo. **Stable** (re-affirmed by the 2026-08-01
-  revision: real-pod usage worked cleanly with lifecycle outside).
+  revision: real-pod usage worked cleanly with lifecycle outside).~~
+  Superseded (2026-08-12): the driver now owns machine create and
+  delete itself — `acquire` renders the provider request from the
+  profile's machine requirements and spawns the provider's CLI,
+  `release` deletes by id the same way. Start / stop stay with the
+  external pod manager. What remains **stable** is the narrower
+  half of the old bullet: no provider SDK is linked into this repo —
+  the provider is reached only through its CLI.
 - Static-binary embeddability constraint (musl, no language runtime,
   no runtime file dependencies): **stable**.
 - Binary target set (musl x86_64 as the baseline): **provisional**
@@ -213,6 +221,6 @@ Phase G adds the driver half without modifying the binary contract.
 
 Deferred with one-line reasons: `fetch-release` / `cargo-install`
 ensure-binary strategies (distribution surface not published yet);
-exec-API ConnectionSpec (no concrete provider client in scope —
-lifecycle boundary keeps provider SDKs out, an exec adapter would
-re-open that question deliberately).
+exec-API ConnectionSpec (no provider SDK in scope — even `acquire` /
+`release` reach the provider through its CLI, an exec adapter would
+pull an API client in deliberately).

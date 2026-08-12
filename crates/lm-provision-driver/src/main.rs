@@ -1,7 +1,10 @@
 //! `lm-provision-driver` — the reference implementation of the
-//! session contract (08-push-driver-protocol.md §Session contract):
-//! one invocation converges a reachable pod (steps 0-5), with
-//! per-step gates as flags.
+//! session contract (08-push-driver-protocol.md §Session contract),
+//! plus the machine side around it. Four subcommands: `apply`
+//! converges a reachable pod (steps 0-5) with per-step gates as
+//! flags, `acquire` obtains a machine that meets a profile's
+//! requirements, `release` gives one back, `check` judges an
+//! existing machine against a profile.
 //!
 //! ```sh
 //! lm-provision-driver apply \
@@ -12,10 +15,17 @@
 //! #        --skip-verify, --no-ledger
 //! ```
 //!
-//! Exit code mirrors the collected apply (0 = report ok, 1 = any
-//! failure, 2 = usage via clap); the collected report JSON goes to
-//! stdout, the pod's stderr transcript is relayed to stderr — the
-//! same stream split the binary itself contracts (chapter 07).
+//! Exit codes, across all subcommands: 0 = the run produced its
+//! artifact (an apply report, an acquisition, a release, a satisfied
+//! verdict); 1 = the run failed, or `check` found the machine
+//! wanting; 2 = the input could not be used (usage via clap, an
+//! unreadable or invalid profile, a description that is not JSON, an
+//! unrenderable acquisition); 3 = `acquire` refused at admission,
+//! before anything was spent; 4 = a credential was missing (`acquire`
+//! before creating; `release` while the machine keeps running and
+//! billing). The artifact JSON goes to stdout, diagnostics and the
+//! pod's stderr transcript to stderr — the same stream split the
+//! binary itself contracts (chapter 07).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
