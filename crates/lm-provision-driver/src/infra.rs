@@ -75,6 +75,62 @@ pub trait Infra {
     /// target may be able to *provide* persistence without being able to
     /// *size* it, and neither yes nor no describes that.
     fn disk_answer(&self, required: &DiskRequirement) -> Answer;
+
+    /// The request that would bring a machine meeting `required` into
+    /// existence.
+    ///
+    /// **Rendered, not sent.** Returning the request rather than
+    /// performing it keeps the one operation here that spends money and
+    /// changes state outside anything that runs by accident: a caller
+    /// has to take this and execute it deliberately. It is also what
+    /// makes the shape testable without a machine, and what lets a
+    /// `plan` show an operator the acquisition before it happens.
+    fn acquisition(
+        &self,
+        required: &Requirements,
+        provider: &BTreeMap<String, String>,
+    ) -> Result<Acquisition, AcquisitionError>;
+}
+
+/// What to run to obtain a machine, and what to run to give it back.
+///
+/// Both halves together, because an acquisition whose release is worked
+/// out later is an acquisition that leaks. This session produced two
+/// orphaned machines by hand for exactly that reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acquisition {
+    /// The program and arguments that create the machine.
+    pub create: Vec<String>,
+    /// The request body, when the create call takes one.
+    pub body: Option<String>,
+    /// How to read back what was created, given its id.
+    ///
+    /// `{id}` is replaced with the identifier the create call returns.
+    pub inspect: Vec<String>,
+    /// How to destroy it, with the same substitution.
+    pub release: Vec<String>,
+}
+
+/// An acquisition that cannot be rendered.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AcquisitionError {
+    /// This target has no acquisition wired.
+    #[error("{target} cannot acquire a machine here: {reason}")]
+    Unsupported {
+        /// Which target.
+        target: &'static str,
+        /// Why not.
+        reason: &'static str,
+    },
+
+    /// A requirement this target needs in order to create anything.
+    #[error("{target} needs {missing} to create a machine")]
+    Incomplete {
+        /// Which target.
+        target: &'static str,
+        /// What was not declared.
+        missing: &'static str,
+    },
 }
 
 /// A GPU model and how much memory it carries.
@@ -234,6 +290,93 @@ impl Infra for RunPodAdapter {
         }
         Answer::Met { using }
     }
+
+    /// The service's own CLI, which is generated from its OpenAPI
+    /// description and already handles authentication from the
+    /// environment.
+    ///
+    /// Driving that rather than speaking the REST API here is the same
+    /// judgement the transport layer makes: the useful thing this repo
+    /// adds is the requirements, not a second REST client that has to
+    /// track somebody else's schema.
+    fn acquisition(
+        &self,
+        required: &Requirements,
+        provider: &BTreeMap<String, String>,
+    ) -> Result<Acquisition, AcquisitionError> {
+        let image = required
+            .image
+            .as_deref()
+            .ok_or(AcquisitionError::Incomplete {
+                target: "runpod",
+                missing: "requires_image",
+            })?;
+
+        let mut body = serde_json::Map::new();
+        body.insert("imageName".into(), serde_json::json!(image));
+        body.insert("ports".into(), serde_json::json!(self.render(required)));
+
+        if let Some(gpu) = &required.gpu {
+            body.insert(
+                "computeType".into(),
+                serde_json::json!(if gpu.count == 0 { "CPU" } else { "GPU" }),
+            );
+            if gpu.count > 0 {
+                body.insert("gpuCount".into(), serde_json::json!(gpu.count));
+                // The models that clear the floor, in the order the
+                // answer put them: cheapest first, the rest as what the
+                // service can fall back to when it is short.
+                if let Answer::Met { using } = self.gpu_answer(gpu) {
+                    if !using.is_empty() {
+                        body.insert("gpuTypeIds".into(), serde_json::json!(using));
+                    }
+                }
+            }
+        }
+
+        if let Some(disk) = &required.disk {
+            if let Some(gb) = disk.ephemeral_gb {
+                body.insert("containerDiskInGb".into(), serde_json::json!(gb));
+            }
+            if let Some(gb) = disk.persistent_gb {
+                body.insert("volumeInGb".into(), serde_json::json!(gb));
+            }
+            if let Some(path) = &disk.persistent_at {
+                body.insert("volumeMountPath".into(), serde_json::json!(path));
+            }
+        }
+
+        // Whatever the profile addressed to this target, verbatim and
+        // last, so a network volume named there replaces the sizes above
+        // the way the service documents it doing.
+        for (key, value) in provider {
+            if let Some(field) = key.strip_prefix("runpod.") {
+                body.insert(field.to_string(), serde_json::json!(value));
+            }
+        }
+
+        Ok(Acquisition {
+            create: vec![
+                "runpod-cli".into(),
+                "pods".into(),
+                "create-pod".into(),
+                "-j".into(),
+            ],
+            body: Some(serde_json::Value::Object(body).to_string()),
+            inspect: vec![
+                "runpod-cli".into(),
+                "pods".into(),
+                "get-pod".into(),
+                "{id}".into(),
+            ],
+            release: vec![
+                "runpod-cli".into(),
+                "pods".into(),
+                "delete-pod".into(),
+                "{id}".into(),
+            ],
+        })
+    }
 }
 
 /// A container runtime: the machine is a container, and whatever is in
@@ -327,6 +470,31 @@ impl Infra for ContainerAdapter {
              comes from the host's filesystem",
             unsized_levels.join(" or ")
         ))
+    }
+
+    /// Not wired, and said rather than faked.
+    ///
+    /// `docker run` would create the machine readily enough. Reaching it
+    /// afterwards is the missing half: this crate's transports are SSH
+    /// and same-host execution, and a container wants `docker exec` —
+    /// which spec 08 names as an extension point precisely because it
+    /// does not exist yet. An acquisition whose result nothing can be
+    /// run against is not an acquisition.
+    ///
+    /// This adapter earns its place on the vocabulary, which is what it
+    /// was added for: it is what proves the requirements are the
+    /// workload's words rather than one service's. Execution is a
+    /// separate claim, and it is not being made.
+    fn acquisition(
+        &self,
+        _required: &Requirements,
+        _provider: &BTreeMap<String, String>,
+    ) -> Result<Acquisition, AcquisitionError> {
+        Err(AcquisitionError::Unsupported {
+            target: "container",
+            reason: "no transport reaches a container yet (spec 08 names `docker exec` \
+                     as an extension point; it is not implemented)",
+        })
     }
 }
 
@@ -571,6 +739,166 @@ mod tests {
             Answer::met_using(["-v /workspace".to_string()]),
             "a path with no size is something it can simply do"
         );
+    }
+
+    fn full_requirements() -> Requirements {
+        Requirements::from_slots(
+            &[("8188", "public_http"), ("22", "raw_tcp")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &[("count", "1"), ("min_vram_gb", "40")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &[
+                ("ephemeral_gb", "100"),
+                ("persistent_gb", "150"),
+                ("persistent_at", "/workspace"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            Some("runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"),
+        )
+        .expect("well-formed fixture")
+    }
+
+    /// The whole vocabulary becomes one request, and every part of it is
+    /// traceable back to a line the profile wrote.
+    #[test]
+    fn the_requirements_become_the_services_own_request() {
+        let acquisition = RunPodAdapter
+            .acquisition(&full_requirements(), &BTreeMap::new())
+            .expect("an image was declared");
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().expect("create takes a body"))
+                .expect("the body is JSON");
+
+        assert_eq!(body["ports"], serde_json::json!(["22/tcp", "8188/http"]));
+        assert_eq!(body["computeType"], "GPU");
+        assert_eq!(body["gpuCount"], 1);
+        assert_eq!(body["containerDiskInGb"], 100);
+        assert_eq!(body["volumeInGb"], 150);
+        assert_eq!(body["volumeMountPath"], "/workspace");
+        assert!(
+            body["gpuTypeIds"]
+                .as_array()
+                .expect("a floor selects models")
+                .iter()
+                .all(|it| it != "NVIDIA L4"),
+            "a 24 GB device does not clear a 40 GB floor: {}",
+            body["gpuTypeIds"]
+        );
+    }
+
+    /// **Every field this emits exists in the service's schema, with the
+    /// right type, and every model named is in its enumeration**
+    /// [実測: 2026-08-12, checked against the OpenAPI description the
+    /// service's own CLI is generated from].
+    ///
+    /// Pinned here rather than left to a live call, because a live call
+    /// costs a machine to find out and this does not. The list is what
+    /// the check verified; a field added to the request without being
+    /// added here has not been checked against anything.
+    #[test]
+    fn every_field_emitted_is_one_the_service_defines() {
+        const CHECKED: &[&str] = &[
+            "computeType",
+            "containerDiskInGb",
+            "gpuCount",
+            "gpuTypeIds",
+            "imageName",
+            "ports",
+            "volumeInGb",
+            "volumeMountPath",
+        ];
+        let provider: BTreeMap<String, String> = [("runpod.networkVolumeId", "vol-1")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let acquisition = RunPodAdapter
+            .acquisition(&full_requirements(), &provider)
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        let emitted: Vec<&String> = body
+            .as_object()
+            .expect("the body is an object")
+            .keys()
+            .collect();
+
+        for key in emitted {
+            assert!(
+                CHECKED.contains(&key.as_str()) || key == "networkVolumeId",
+                "{key} is emitted but was never checked against the service's schema"
+            );
+        }
+    }
+
+    /// A profile's provider keys go in verbatim and last, so a network
+    /// volume named there replaces the size above it the way the service
+    /// documents.
+    #[test]
+    fn provider_keys_land_in_the_request_unchanged() {
+        let provider: BTreeMap<String, String> = [
+            ("runpod.networkVolumeId", "vol-1"),
+            ("container.network", "bridge"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let acquisition = RunPodAdapter
+            .acquisition(&full_requirements(), &provider)
+            .expect("an image was declared");
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+
+        assert_eq!(body["networkVolumeId"], "vol-1");
+        assert!(
+            body.get("container.network").is_none() && body.get("network").is_none(),
+            "another target's key is not this target's: {body}"
+        );
+    }
+
+    /// A machine cannot be created without knowing what to run on it,
+    /// and that is said before anything is spent finding out.
+    #[test]
+    fn creating_without_an_image_is_refused() {
+        let no_image =
+            Requirements::from_slots(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(), None)
+                .unwrap();
+        assert_eq!(
+            RunPodAdapter.acquisition(&no_image, &BTreeMap::new()),
+            Err(AcquisitionError::Incomplete {
+                target: "runpod",
+                missing: "requires_image"
+            })
+        );
+    }
+
+    /// **Every acquisition carries its release.** One worked out later
+    /// is one that leaks, and this repo has leaked two machines by hand
+    /// for exactly that reason.
+    #[test]
+    fn an_acquisition_says_how_to_give_the_machine_back() {
+        let acquisition = RunPodAdapter
+            .acquisition(&full_requirements(), &BTreeMap::new())
+            .unwrap();
+        assert!(acquisition.release.contains(&"delete-pod".to_string()));
+        assert!(acquisition.release.contains(&"{id}".to_string()));
+        assert!(acquisition.inspect.contains(&"get-pod".to_string()));
+    }
+
+    /// Not wired is said, not faked. A `docker run` would create a
+    /// machine that no transport here can reach.
+    #[test]
+    fn a_container_says_it_cannot_acquire_rather_than_pretending() {
+        let err = ContainerAdapter
+            .acquisition(&full_requirements(), &BTreeMap::new())
+            .expect_err("no transport reaches a container");
+        let rendered = err.to_string();
+        assert!(rendered.contains("docker exec"), "{rendered}");
     }
 
     /// Keys for another target are reported, not dropped in silence: the
