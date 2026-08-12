@@ -45,6 +45,8 @@ mod tests {
             assumes: Default::default(),
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
+            requires_disk: Default::default(),
+            requires_image: None,
             provider: Default::default(),
             id: root_id,
             name: "demo".to_string(),

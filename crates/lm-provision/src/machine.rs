@@ -156,6 +156,37 @@ pub struct GpuRequirement {
     pub min_vram_gb: Option<u32>,
 }
 
+/// What a profile requires of the machine's storage.
+///
+/// **Two levels, because the supplier's own words draw the line there.**
+/// A managed pod service describes its container disk as "wiped when the
+/// Pod restarts" and its volume as "persisted across Pod restarts"
+/// [実測: `PodCreateInput`]. A profile that pulls forty gigabytes of
+/// weights cares which of those it lands on, and nothing in a profile
+/// could say so.
+///
+/// A third level exists — storage that outlives the machine itself, so
+/// "future Pods can access it" — and it is **not here**. That is a
+/// reference to something already created, which is what the `provider`
+/// slot is for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiskRequirement {
+    /// Scratch space, in gigabytes, that may vanish when the machine
+    /// restarts.
+    ///
+    /// `None` when the profile does not care how much there is.
+    pub ephemeral_gb: Option<u32>,
+    /// Space, in gigabytes, that survives a restart of the machine.
+    ///
+    /// `None` when the profile needs none. When set,
+    /// [`Self::persistent_at`] must be too: a size with nowhere to
+    /// appear cannot be rendered — a container runtime's mount needs a
+    /// path, and a managed service needs to know where to attach it.
+    pub persistent_gb: Option<u32>,
+    /// Where the persistent space appears in the filesystem.
+    pub persistent_at: Option<String>,
+}
+
 /// What a profile requires of the machine it runs on.
 ///
 /// Ordered and de-duplicated by port: the profile's slot is keyed by
@@ -167,6 +198,17 @@ pub struct Requirements {
     pub ports: Vec<PortRequirement>,
     /// Accelerators, when the profile asks for any.
     pub gpu: Option<GpuRequirement>,
+    /// Storage, when the profile asks for any.
+    pub disk: Option<DiskRequirement>,
+    /// The base image the machine runs.
+    ///
+    /// The one requirement both targets take verbatim — a managed pod
+    /// service's `imageName` and a container runtime's image argument are
+    /// the same string. It is a requirement rather than a setting because
+    /// the provisioner needs what is in it: a profile running
+    /// `comfyui.install` needs git, and one running `toolchain.python`
+    /// needs an interpreter.
+    pub image: Option<String>,
 }
 
 impl Requirements {
@@ -179,11 +221,49 @@ impl Requirements {
     pub fn from_slots(
         ports: &BTreeMap<String, String>,
         gpu: &BTreeMap<String, String>,
+        disk: &BTreeMap<String, String>,
+        image: Option<&str>,
     ) -> Result<Self, RequirementError> {
         Ok(Self {
             gpu: Self::gpu_from_slot(gpu)?,
+            disk: Self::disk_from_slot(disk)?,
+            image: image.map(str::to_string),
             ..Self::from_slot(ports)?
         })
+    }
+
+    /// Read a profile's `requires_disk` slot.
+    fn disk_from_slot(
+        slot: &BTreeMap<String, String>,
+    ) -> Result<Option<DiskRequirement>, RequirementError> {
+        if slot.is_empty() {
+            return Ok(None);
+        }
+        let mut disk = DiskRequirement::default();
+        for (key, value) in slot {
+            let gigabytes = || {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| RequirementError::BadDiskValue {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+            };
+            match key.as_str() {
+                "ephemeral_gb" => disk.ephemeral_gb = Some(gigabytes()?),
+                "persistent_gb" => disk.persistent_gb = Some(gigabytes()?),
+                "persistent_at" => disk.persistent_at = Some(value.clone()),
+                _ => return Err(RequirementError::UnknownDiskKey { key: key.clone() }),
+            }
+        }
+        // A size with nowhere to appear cannot be rendered: a container
+        // runtime's mount takes a path, and a managed service has to be
+        // told where to attach the volume. Catching it here means the
+        // author hears about it before a machine is spent.
+        if disk.persistent_gb.is_some() && disk.persistent_at.is_none() {
+            return Err(RequirementError::PersistentWithoutPath);
+        }
+        Ok(Some(disk))
     }
 
     /// Read a profile's `requires_gpu` slot: `count` and, optionally,
@@ -242,7 +322,12 @@ impl Requirements {
             });
         }
         ports.sort();
-        Ok(Self { ports, gpu: None })
+        Ok(Self {
+            ports,
+            gpu: None,
+            disk: None,
+            image: None,
+        })
     }
 
     /// Whether anything is required at all.
@@ -296,6 +381,35 @@ pub enum RequirementError {
     /// difference is whether the profile can run at all.
     #[error("requires_gpu declares no count (write `count`, using 0 for a machine with none)")]
     GpuWithoutCount,
+
+    /// A `requires_disk` size is not a number.
+    #[error("requires_disk[{key}] = {value:?} is not a number of gigabytes")]
+    BadDiskValue {
+        /// Which entry.
+        key: String,
+        /// The unreadable value.
+        value: String,
+    },
+
+    /// A `requires_disk` key names nothing.
+    #[error(
+        "requires_disk[{key:?}] names nothing (expected one of: ephemeral_gb, \
+         persistent_gb, persistent_at)"
+    )]
+    UnknownDiskKey {
+        /// The unrecognised key.
+        key: String,
+    },
+
+    /// Persistent space was asked for with no path to appear at.
+    ///
+    /// Neither target can render it: a container runtime's mount takes a
+    /// path, and a managed service has to be told where to attach the
+    /// volume.
+    #[error(
+        "requires_disk declares persistent_gb without persistent_at (where should it appear?)"
+    )]
+    PersistentWithoutPath,
 }
 
 /// What an adapter answers when asked whether it can meet a requirement.
@@ -589,6 +703,8 @@ mod tests {
         let read = Requirements::from_slots(
             &slot(&[]),
             &gpu_slot(&[("count", "2"), ("min_vram_gb", "24")]),
+            &slot(&[]),
+            None,
         )
         .expect("well-formed");
         assert_eq!(
@@ -606,7 +722,12 @@ mod tests {
     #[test]
     fn a_gpu_requirement_without_a_count_is_refused() {
         assert_eq!(
-            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("min_vram_gb", "24")])),
+            Requirements::from_slots(
+                &slot(&[]),
+                &gpu_slot(&[("min_vram_gb", "24")]),
+                &slot(&[]),
+                None
+            ),
             Err(RequirementError::GpuWithoutCount)
         );
     }
@@ -616,8 +737,9 @@ mod tests {
     /// nothing at all.
     #[test]
     fn zero_accelerators_is_a_requirement_and_absence_is_not() {
-        let declared = Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "0")]))
-            .expect("well-formed");
+        let declared =
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "0")]), &slot(&[]), None)
+                .expect("well-formed");
         assert_eq!(
             declared.gpu,
             Some(GpuRequirement {
@@ -627,15 +749,17 @@ mod tests {
         );
         assert!(!declared.is_empty());
 
-        let absent = Requirements::from_slots(&slot(&[]), &gpu_slot(&[])).expect("well-formed");
+        let absent = Requirements::from_slots(&slot(&[]), &gpu_slot(&[]), &slot(&[]), None)
+            .expect("well-formed");
         assert_eq!(absent.gpu, None);
         assert!(absent.is_empty());
     }
 
     #[test]
     fn an_unknown_gpu_key_names_the_alternatives() {
-        let err = Requirements::from_slots(&slot(&[]), &gpu_slot(&[("vram", "24")]))
-            .expect_err("vram is not a key here");
+        let err =
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("vram", "24")]), &slot(&[]), None)
+                .expect_err("vram is not a key here");
         assert_eq!(
             err,
             RequirementError::UnknownGpuKey {
@@ -650,7 +774,7 @@ mod tests {
     #[test]
     fn a_gpu_value_that_is_not_a_number_is_refused() {
         assert_eq!(
-            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "one")])),
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "one")]), &slot(&[]), None),
             Err(RequirementError::BadGpuValue {
                 key: "count".to_string(),
                 value: "one".to_string()

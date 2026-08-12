@@ -261,6 +261,8 @@ mod tests {
         ProfileNode::Spec {
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
+            requires_disk: Default::default(),
+            requires_image: None,
             provider: Default::default(),
             assumes: std::collections::BTreeMap::from([(
                 crate::resource::Resource::ComfyUiRoot.as_str().to_string(),

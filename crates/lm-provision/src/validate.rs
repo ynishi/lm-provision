@@ -343,6 +343,8 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         assumes,
         requires_ports,
         requires_gpu,
+        requires_disk,
+        requires_image,
         provider,
         phases,
         ..
@@ -534,8 +536,13 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // Refusing rather than skipping is the point. A requirement quietly
     // dropped leaves exactly the machine this slot exists to stop
     // shipping — one whose profile looks like it declared something.
-    crate::machine::Requirements::from_slots(requires_ports, requires_gpu)
-        .map_err(|source| ValidateError::UnreadableRequirement { source })?;
+    crate::machine::Requirements::from_slots(
+        requires_ports,
+        requires_gpu,
+        requires_disk,
+        requires_image.as_deref(),
+    )
+    .map_err(|source| ValidateError::UnreadableRequirement { source })?;
     for key in provider.keys() {
         let namespace = key.split('.').next().unwrap_or("");
         if namespace.is_empty() || namespace.len() == key.len() {
@@ -1183,6 +1190,8 @@ mod tests {
             assumes: all_resources_assumed(),
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
+            requires_disk: Default::default(),
+            requires_image: None,
             provider: Default::default(),
             id: ids.node(),
             name: name.into(),
@@ -1236,6 +1245,8 @@ mod tests {
             assumes: Default::default(),
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
+            requires_disk: Default::default(),
+            requires_image: None,
             provider: Default::default(),
             id: ids.node(),
             name: name.into(),
@@ -1984,6 +1995,8 @@ mod tests {
             assumes: Default::default(),
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
+            requires_disk: Default::default(),
+            requires_image: None,
             provider: Default::default(),
             id: ids.node(),
             name: "declared".into(),

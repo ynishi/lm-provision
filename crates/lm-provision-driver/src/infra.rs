@@ -30,7 +30,9 @@
 
 use std::collections::BTreeMap;
 
-use lm_provision::machine::{Answer, Capability, Exposure, GpuRequirement, Requirements};
+use lm_provision::machine::{
+    Answer, Capability, DiskRequirement, Exposure, GpuRequirement, Requirements,
+};
 
 /// A target that a machine can be placed on.
 pub trait Infra {
@@ -65,6 +67,14 @@ pub trait Infra {
     /// lands on has enough is settled by looking at the machine rather
     /// than by reading the adapter.
     fn gpu_answer(&self, required: &GpuRequirement) -> Answer;
+
+    /// Whether this target can give the workload the storage it asked
+    /// for.
+    ///
+    /// Same shape as [`Infra::gpu_answer`] and for the same reason: a
+    /// target may be able to *provide* persistence without being able to
+    /// *size* it, and neither yes nor no describes that.
+    fn disk_answer(&self, required: &DiskRequirement) -> Answer;
 }
 
 /// A GPU model and how much memory it carries.
@@ -207,6 +217,23 @@ impl Infra for RunPodAdapter {
         fits.sort_by_key(|it| (it.vram_gb, it.id));
         Answer::met_using(fits.into_iter().map(|it| it.id))
     }
+
+    /// Both levels are settable: the service takes a size for the disk
+    /// that is wiped on restart and a size for the volume that is not,
+    /// plus where the second one is mounted.
+    fn disk_answer(&self, required: &DiskRequirement) -> Answer {
+        let mut using = Vec::new();
+        if let Some(gb) = required.ephemeral_gb {
+            using.push(format!("containerDiskInGb={gb}"));
+        }
+        if let Some(gb) = required.persistent_gb {
+            using.push(format!("volumeInGb={gb}"));
+        }
+        if let Some(path) = &required.persistent_at {
+            using.push(format!("volumeMountPath={path}"));
+        }
+        Answer::Met { using }
+    }
 }
 
 /// A container runtime: the machine is a container, and whatever is in
@@ -267,6 +294,39 @@ impl Infra for ContainerAdapter {
                  {floor} GB per device is a property of the host this runs on"
             )),
         }
+    }
+
+    /// It can mount, but it cannot size.
+    ///
+    /// `-v` puts a volume at a path, so persistence itself is
+    /// providable. How large that volume is comes from the host's
+    /// filesystem, and the container's own writable layer is likewise
+    /// the host's disk — `--storage-opt size=` exists but only on some
+    /// storage drivers, so it is not something to promise.
+    ///
+    /// So a size is not examined and a path is met, which is the same
+    /// answer split two ways rather than an awkward middle: the part
+    /// that can be provided is, and the part that cannot be decided says
+    /// so.
+    fn disk_answer(&self, required: &DiskRequirement) -> Answer {
+        let mut unsized_levels = Vec::new();
+        if required.ephemeral_gb.is_some() {
+            unsized_levels.push("the container's writable layer");
+        }
+        if required.persistent_gb.is_some() {
+            unsized_levels.push("a mounted volume");
+        }
+        if unsized_levels.is_empty() {
+            return match &required.persistent_at {
+                Some(path) => Answer::met_using([format!("-v {path}")]),
+                None => Answer::met(),
+            };
+        }
+        Answer::not_examined(format!(
+            "a container runtime cannot request a size for {}; how much there is \
+             comes from the host's filesystem",
+            unsized_levels.join(" or ")
+        ))
     }
 }
 
@@ -458,6 +518,59 @@ mod tests {
         };
         assert_eq!(RunPodAdapter.gpu_answer(&required), Answer::met());
         assert_eq!(ContainerAdapter.gpu_answer(&required), Answer::met());
+    }
+
+    /// The two storage levels are the supplier's own distinction —
+    /// wiped on restart against persisted across one — and the managed
+    /// service takes a size for each plus where the second is mounted.
+    #[test]
+    fn a_managed_service_sizes_both_storage_levels() {
+        let answer = RunPodAdapter.disk_answer(&DiskRequirement {
+            ephemeral_gb: Some(100),
+            persistent_gb: Some(50),
+            persistent_at: Some("/workspace".into()),
+        });
+        let Answer::Met { using } = answer else {
+            panic!("a managed service sizes both: {answer:?}");
+        };
+        assert!(
+            using.iter().any(|it| it == "containerDiskInGb=100"),
+            "{using:?}"
+        );
+        assert!(using.iter().any(|it| it == "volumeInGb=50"), "{using:?}");
+        assert!(
+            using.iter().any(|it| it == "volumeMountPath=/workspace"),
+            "{using:?}"
+        );
+    }
+
+    /// **The same split as the accelerator floor, one level down.** A
+    /// container runtime can put a volume at a path but cannot say how
+    /// large it is — that comes from the host's filesystem. Refusing
+    /// would turn away a host with plenty of room.
+    #[test]
+    fn a_container_mounts_but_does_not_size() {
+        let sized = ContainerAdapter.disk_answer(&DiskRequirement {
+            ephemeral_gb: None,
+            persistent_gb: Some(50),
+            persistent_at: Some("/workspace".into()),
+        });
+        assert!(
+            matches!(sized, Answer::NotExamined { .. }),
+            "a size is the host's business: {sized:?}"
+        );
+        assert!(!sized.blocks(), "not knowing is not refusing");
+
+        let unsized_request = ContainerAdapter.disk_answer(&DiskRequirement {
+            ephemeral_gb: None,
+            persistent_gb: None,
+            persistent_at: Some("/workspace".into()),
+        });
+        assert_eq!(
+            unsized_request,
+            Answer::met_using(["-v /workspace".to_string()]),
+            "a path with no size is something it can simply do"
+        );
     }
 
     /// Keys for another target are reported, not dropped in silence: the

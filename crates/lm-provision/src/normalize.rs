@@ -70,6 +70,8 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         assumes,
         requires_ports,
         requires_gpu,
+        requires_disk,
+        requires_image,
         provider,
         phases,
     } = root
@@ -90,6 +92,8 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         assumes: assumes.clone(),
         requires_ports: requires_ports.clone(),
         requires_gpu: requires_gpu.clone(),
+        requires_disk: requires_disk.clone(),
+        requires_image: requires_image.clone(),
         provider: provider.clone(),
         phases: normalize_phases(phases, IdMinter::above(root)),
     }
@@ -342,6 +346,8 @@ mod tests {
             assumes: Default::default(),
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
+            requires_disk: Default::default(),
+            requires_image: None,
             provider: Default::default(),
             id: g.node(),
             name: "demo".into(),
@@ -518,6 +524,8 @@ mod tests {
             assumes: Default::default(),
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
+            requires_disk: Default::default(),
+            requires_image: None,
             provider: Default::default(),
             phases: vec![install],
         };

@@ -26,6 +26,17 @@ pub use engine::{create_profile_engine, create_profile_engine_collecting};
 pub use semantics::{ProfileAst, ProfileSemantics, ProfileValue};
 
 /// Unified AST for provision profile declarations and the Phase catalog kinds (`02-phase-catalog.md`).
+// `Spec` is 368 bytes against 136 for the next largest, so every phase
+// in a `Vec<ProfileNode>` is sized for a variant it is not [実測:
+// clippy, 2026-08-12]. The waste is real and it is kilobytes: this AST
+// exists once per run and profiles carry tens of phases, not millions.
+//
+// Boxing would fix the number and cost the shape — `Spec` is the root,
+// the derives here read the variant's fields directly, and the
+// indirection would be threaded through every construction site to save
+// memory nothing is short of. If the AST ever grows a variant that
+// repeats at scale, this is the line to revisit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, DslNode, DslSchema, DslBuild, DslExec)]
 pub enum ProfileNode {
     /// Top-level Profile Spec.
@@ -120,6 +131,28 @@ pub enum ProfileNode {
         /// is what a CPU-only profile says. Empty maps carry no
         /// canonical bytes.
         requires_gpu: BTreeMap<String, String>,
+        /// What the machine's storage must be: `ephemeral_gb`,
+        /// `persistent_gb` and `persistent_at` (spec 03 §Requirements).
+        ///
+        /// Two levels, because that is where the difference bites: a
+        /// managed pod service calls its container disk "wiped when the
+        /// Pod restarts" and its volume "persisted across Pod restarts",
+        /// and a profile that pulls forty gigabytes of weights cares
+        /// which one it lands on.
+        ///
+        /// Storage that outlives the *machine* is a third level and is
+        /// not here — that is a reference to something already created,
+        /// which the `provider` slot carries. Empty maps carry no
+        /// canonical bytes.
+        requires_disk: BTreeMap<String, String>,
+        /// The base image the machine runs (spec 03 §Requirements).
+        ///
+        /// The one requirement both targets take verbatim. It is a
+        /// requirement rather than a setting because the provisioner
+        /// needs what is inside it: `comfyui.install` needs git,
+        /// `toolchain.python` needs an interpreter. Absent when the
+        /// profile does not care, and absent costs no canonical bytes.
+        requires_image: Option<String>,
         /// References to infrastructure that already exists, as
         /// `<provider>.<key> → value` (spec 03 §Provider references).
         ///
