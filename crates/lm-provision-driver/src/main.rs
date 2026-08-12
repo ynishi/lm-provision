@@ -308,7 +308,15 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     // The id goes out before anything else can fail. A machine that
     // exists and whose identifier was never printed is a bill nobody can
     // stop.
-    println!("{}", serde_json::json!({ "id": acquired.id }));
+    //
+    // On stderr, because it is a trace and not the artifact: 08 §Outputs
+    // gives stdout "exactly one JSON apply report", and this line used to
+    // make acquire the one subcommand that emitted two documents there
+    // [実測: 2026-08-12, a successful acquire printed `{"id":...}` and
+    // then the verdict object]. The id is in the artifact too, so nothing
+    // is lost for a caller that gets that far; what this covers is the
+    // caller that does not.
+    eprintln!("acquired {}", acquired.id);
 
     if let Err(err) = acquired.inspect() {
         eprintln!(
@@ -376,23 +384,78 @@ fn run_release(args: ReleaseArgs) -> ExitCode {
         .iter()
         .map(|it| it.replace("{id}", &args.id))
         .collect();
+
+    // Captured, not inherited. Letting the service CLI write to this
+    // process's stdout put its output in the artifact stream: a release
+    // printed the service's `""` and then this command's own JSON, two
+    // documents where 07-cli.md §Stream split allows "exactly one
+    // machine-readable artifact per run" [実測: 2026-08-12, a release
+    // against a real pod].
     match std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .status()
+        .output()
     {
-        Ok(status) if status.success() => {
+        Ok(output) if output.status.success() => {
+            relay(&output.stdout);
+            relay(&output.stderr);
             println!("{}", serde_json::json!({ "released": args.id }));
             ExitCode::SUCCESS
         }
-        Ok(status) => {
-            eprintln!("error: release exited with {status}");
+        Ok(output) => {
+            relay(&output.stdout);
+            relay(&output.stderr);
+            eprintln!("error: release exited with {}", output.status);
+            eprintln!("note: {} may still be running", args.id);
             ExitCode::FAILURE
         }
         Err(err) => {
             eprintln!("error: could not run the release: {err}");
+            eprintln!("note: {} is still running", args.id);
             ExitCode::FAILURE
         }
     }
+}
+
+/// Put what the service said on stderr, if it said anything.
+fn relay(bytes: &[u8]) {
+    for line in attributed(bytes) {
+        eprintln!("{line}");
+    }
+}
+
+/// What the service said, one line each, prefixed with the program that
+/// said it.
+///
+/// `program: message` is the GNU convention for a non-interactive
+/// program's messages [理論値:
+/// <https://www.gnu.org/prep/standards/html_node/Errors.html>], and the
+/// program here is the service CLI rather than this one — the operator
+/// is being shown somebody else's words and needs to know it. Both of
+/// the child's streams get the same prefix: which of its two streams a
+/// line came out of is this program's plumbing, not information about
+/// the release.
+///
+/// The bracketed and pipe-delimited forms (`[pod/name] line`,
+/// `service-1 | line`) belong to multiplexers, where the prefix picks
+/// one source out of several [理論値: kubectl `--prefix`, Docker
+/// Compose logs]. There is one source here.
+///
+/// **Silence is not reported.** "When a program has nothing surprising
+/// to say, it should say nothing" [理論値: Raymond, *The Art of Unix
+/// Programming*, Rule of Silence] — a line on every release announcing
+/// that the service returned nothing would spend the operator's
+/// attention to repeat what the exit status already said.
+fn attributed(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    // `""` is what the service returns from a release: a JSON document
+    // holding an empty string, which is a body with nothing in it.
+    if text.is_empty() || text == "\"\"" {
+        return Vec::new();
+    }
+    text.lines()
+        .map(|line| format!("runpod-cli: {line}"))
+        .collect()
 }
 
 fn run_apply(args: ApplyArgs) -> ExitCode {
@@ -510,9 +573,38 @@ fn default_ledger_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_status, parse_ssh_target, ssh_help, Cli, Command, PathBuf};
+    use super::{attributed, exit_status, parse_ssh_target, ssh_help, Cli, Command, PathBuf};
     use clap::Parser as _;
     use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
+
+    /// **What the service says goes to stderr, in `program: message`
+    /// form, and only when it says something.**
+    ///
+    /// 07-cli.md §Stream split gives stdout "exactly one
+    /// machine-readable artifact per run", so a subprocess's output
+    /// cannot go there — a release used to print the service's `""`
+    /// and then this command's own JSON, two documents in the artifact
+    /// stream [実測: 2026-08-12, a release against a real pod].
+    #[test]
+    fn only_what_the_service_actually_said_is_relayed() {
+        assert!(attributed(b"").is_empty());
+        assert!(attributed(b"   \n").is_empty());
+        assert!(
+            attributed(b"\"\"\n").is_empty(),
+            "an empty JSON string is a body with nothing in it"
+        );
+
+        assert_eq!(
+            attributed(b"warning: pod was already gone\n"),
+            vec!["runpod-cli: warning: pod was already gone"],
+            "the GNU form: the program that said it, a colon, the message"
+        );
+        assert_eq!(
+            attributed(b"first\nsecond\n"),
+            vec!["runpod-cli: first", "runpod-cli: second"],
+            "every line carries the attribution, not just the first"
+        );
+    }
 
     /// The CLI's two "default" spellings — `--remote-dir`'s clap
     /// default and `--ssh`'s user fallback — must be the very
