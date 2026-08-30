@@ -40,8 +40,8 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The subcommand surface (07-cli.md §Invocation table). The four MVP
-/// subcommands: `validate` / `hash` / `plan` / `apply`.
+/// The subcommand surface (07-cli.md §Invocation table):
+/// `validate` / `hash` / `plan` / `apply` / `fetch`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// load → declarations → validate (read-only, no effects).
@@ -68,6 +68,22 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// GET → stage → load → canonical → hash → admit-or-refuse.
+    /// Retrieves a shared profile and keeps it only when its canonical
+    /// hash matches `--expect-hash` (07-cli.md §Invocation `fetch`).
+    Fetch {
+        /// The profile URL (e.g. a raw repository URL of a shared
+        /// profile directory).
+        url: String,
+        /// The canonical profile hash the source's index declares.
+        /// Required: an unverified fetch is what `curl` is for.
+        #[arg(long)]
+        expect_hash: String,
+        /// Where the verified profile lands. The extension selects the
+        /// parser, exactly as it does for every other subcommand.
+        #[arg(long, short = 'o')]
+        out: std::path::PathBuf,
+    },
 }
 
 /// Resolve the effective tracing filter: `RUST_LOG` env var takes
@@ -91,6 +107,11 @@ pub fn run(command: &Command) -> ExitCode {
         Command::Hash { profile } => run_hash(profile),
         Command::Plan { profile } => run_plan(profile),
         Command::Apply { profile, dry_run } => run_apply(profile, *dry_run),
+        Command::Fetch {
+            url,
+            expect_hash,
+            out,
+        } => run_fetch(url, expect_hash, out),
     }
 }
 
@@ -291,6 +312,35 @@ fn run_apply(profile: &Path, dry_run: bool) -> ExitCode {
     ExitCode::from(0)
 }
 
+/// `fetch <url> --expect-hash <hex> -o <path>` (07-cli.md §Invocation
+/// `fetch`). Retrieve a shared profile and admit it only on a hash
+/// match ([`crate::fetch::fetch`]).
+///
+/// Needs a runtime for the same reason `apply` does — the one HTTP
+/// client in this crate is async — and builds it here per the same
+/// judgement: the read-only subcommands never pay for it.
+fn run_fetch(url: &str, expect_hash: &str, out: &Path) -> ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => return print_failure("fetch", err),
+    };
+    match runtime.block_on(crate::fetch::fetch(url, expect_hash, out)) {
+        Ok(fetched) => {
+            print_json(&serde_json::json!({
+                "ok": true,
+                "name": fetched.name,
+                "hash": fetched.hash,
+                // `display()`, not `Path`'s `Serialize`: the latter
+                // panics the `json!` macro on a non-UTF-8 path, after
+                // the file has already landed.
+                "path": fetched.path.display().to_string(),
+            }));
+            ExitCode::from(0)
+        }
+        Err(err) => print_failure("fetch", err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +384,33 @@ mod tests {
             Command::Apply { dry_run, .. } => assert!(!dry_run),
             other => panic!("expected Apply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_fetch_with_expect_hash_and_out() {
+        let cli = Cli::try_parse_from([
+            "lm-provision",
+            "fetch",
+            "https://example.com/p.json",
+            "--expect-hash",
+            "abc",
+            "-o",
+            "p.json",
+        ])
+        .expect("fetch should parse");
+        assert!(matches!(cli.command, Command::Fetch { .. }));
+    }
+
+    #[test]
+    fn fetch_without_expect_hash_is_a_usage_error() {
+        let result = Cli::try_parse_from([
+            "lm-provision",
+            "fetch",
+            "https://example.com/p.json",
+            "-o",
+            "p.json",
+        ]);
+        assert!(result.is_err(), "--expect-hash is required: an unverified fetch is curl");
     }
 
     #[test]

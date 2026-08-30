@@ -69,6 +69,7 @@ pub mod cli;
 pub mod derive;
 pub mod digest;
 pub mod exec;
+pub mod fetch;
 pub mod frontend;
 pub mod machine;
 pub mod normalize;

@@ -392,7 +392,7 @@ where
 /// request"); everything that identifies the failure — connection
 /// refused, a fired read timeout, a TLS rejection — is in the sources.
 /// Dropping them would turn every network failure into the same line.
-fn render(err: &reqwest::Error) -> String {
+pub(crate) fn render(err: &reqwest::Error) -> String {
     let mut out = err.to_string();
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
@@ -404,7 +404,7 @@ fn render(err: &reqwest::Error) -> String {
 
 /// Build a one-request [`reqwest::Client`], applying `configure` on top
 /// of the defaults.
-fn client(
+pub(crate) fn client(
     op: &str,
     configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
 ) -> Result<reqwest::Client, ExecError> {
@@ -812,7 +812,10 @@ pub fn umount(_path: &str) -> Result<(), ExecError> {
 ///
 /// The cap is checked *before* each chunk is appended, so an oversized
 /// body is refused rather than held and then complained about.
-async fn read_capped(mut response: reqwest::Response, max_bytes: u64) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_capped(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     loop {
         let chunk = response

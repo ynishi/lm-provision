@@ -25,6 +25,17 @@ lm-provision <subcommand> <profile-path> [flags]
 | `hash <path>` | load → declarations → canonical → hash | none (read-only) |
 | `plan <path>` | load → declarations → plan | none (read-only) |
 | `apply <path> [--dry-run]` | load → declarations → gate → bridges → plan → dispatch → apply | executes the dispatched op stream (dry-run: decode + policy + secret resolution only, chapter 04) |
+| `fetch <url> --expect-hash <hex> -o <path>` | GET → stage → load → declarations → canonical → hash → admit-or-refuse | one HTTP GET, one file written at `<path>` — and only on a hash match; a refusal writes nothing new (a file already at `<path>` from an earlier run is not touched either way, except by the rename that lands an admitted profile) |
+
+`fetch` is the one subcommand whose positional argument is a URL, not
+a path: it retrieves a shared profile (e.g. from a raw repository URL
+of a published profile directory) and keeps it only when its canonical
+hash matches the pin the caller took from the source's index. The hash
+is computed over the canonical AST encoding, so it is what makes any
+static host a trustworthy source; `--expect-hash` is required because
+an unverified fetch adds nothing over `curl`. The staging file shares
+the destination's extension so it routes to the same parser the
+destination would (§Profile input format).
 
 ### Profile input format
 
@@ -79,6 +90,14 @@ removed together with the embedded VM; profiles are data, not code.
 - `apply`: the apply report (chapter 09) as pretty-printed JSON —
   printed on **both** success and step failure, so the collecting
   side always receives the report even when apply fails.
+- `fetch`: `{"ok": true, "name": "<profile>", "hash": "<hex>",
+  "path": "<out>"}` as pretty-printed JSON on success. On refusal
+  (transport error / timeout / oversized body, non-profile or
+  non-`Spec` body, hash mismatch) nothing is printed to stdout, the
+  staging file is removed, and `<path>` is not written — though a
+  file that was already there before the run survives, so "the path
+  exists" is only evidence of verification for the run that reported
+  `ok`. The error goes to stderr (`fetch failed: <message>`).
 
 ## Error surface
 
@@ -86,7 +105,7 @@ removed together with the embedded VM; profiles are data, not code.
 
 | code | meaning |
 |---|---|
-| 0 | subcommand succeeded (`validate` ok / hash printed / plan printed / apply report `ok = true`) |
+| 0 | subcommand succeeded (`validate` ok / hash printed / plan printed / apply report `ok = true` / `fetch` admitted) |
 | 1 | any failure: profile load error (including a `.lua` path), validate rejection, capability / policy / secret error, apply report `ok = false`, I/O or exec-engine error |
 | 2 | CLI usage error (unknown subcommand / flag) — emitted by the argument parser with usage text on stderr |
 
@@ -106,11 +125,16 @@ detail; the stderr line is a human summary.
   of chapter 02 is idempotent-friendly but not enforced).
 - Transport (binary missing / profile file unreadable): standard OS
   errors, exit 1.
+- Fetch refusal (HTTP transport error / timeout / body over the size
+  cap / non-success status / non-profile or non-`Spec` body / hash
+  mismatch): exit 1, staging removed, destination not written; safe
+  to re-run against a corrected URL or pin.
 
 ## Stability
 
-- Subcommand names and the four-subcommand set: **provisional**
-  through Phase H (additions expected; renames are breaking).
+- Subcommand names and the subcommand set (`validate` / `hash` /
+  `plan` / `apply` / `fetch`): **provisional** through Phase H
+  (additions expected; renames are breaking).
 - Exit code mapping (0 / 1 / 2 as above): **stable once frozen** —
   frozen here.
 - Per-subcommand stdout artifacts (shape ownership: chapter 03 for
@@ -134,7 +158,8 @@ detail; the stderr line is a human summary.
 Ships in Phase G: `validate`, `hash`, `plan`, `apply --dry-run`,
 `apply`. The binary side ships in Phase F, including a
 whole-directory `apply --dry-run` regression over the example
-profiles.
+profiles. `fetch` landed after the MVP set, alongside the shared
+profile directory (`docs/profiles/`) it consumes.
 
 A `canonical` subcommand (dump canonical bytes without hashing) is
 intentionally absent — hash is the operator-facing artifact; the

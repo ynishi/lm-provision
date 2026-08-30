@@ -1,0 +1,18 @@
+{
+  "profiles": [
+    {
+      "name": "machine-verify",
+      "version": "0.1.0",
+      "path": "machine-verify-0.1.0.json",
+      "profile_hash": "c990c80e42821a381c80a64fef3c33634bdbd4e5500dee2a177864a564b35b8f",
+      "summary": "Smoke-test a freshly acquired GPU machine (requirements + one nvidia-smi)."
+    },
+    {
+      "name": "comfyui-base",
+      "version": "0.1.0",
+      "path": "comfyui-base-0.1.0.json",
+      "profile_hash": "426ee76b2e055bd80003697443d5b1a2703396f0158013f5a48a0b0fc1c4daed",
+      "summary": "ComfyUI + ComfyUI-Manager, no model weights baked in."
+    }
+  ]
+}

@@ -10,7 +10,7 @@ binary with zero dependencies on the target pod.
 
 | Crate | What it is |
 |---|---|
-| [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. |
+| [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]` / `fetch`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. |
 | [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push driver. `apply`: one-shot session over SSH — ensure-binary (idempotent SHA-256 push of the musl artifact), place profile, apply, collect report / transcript, append to the apply ledger. `acquire` / `release` / `check`: obtain a machine meeting the profile's declared requirements, give it back, or judge one that already exists. |
 | [`lm-provision-mcp`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-mcp) | MCP server exposing `lm_validate` / `lm_hash` / `lm_plan` and apply-ledger inspection as MCP tools. |
 
@@ -42,6 +42,12 @@ binary with zero dependencies on the target pod.
 lm-provision validate profile.json
 lm-provision hash profile.json
 lm-provision plan profile.json
+
+# Or start from a shared profile (docs/profiles/) — verified fetch,
+# kept only if the canonical hash matches the pin from index.json:
+lm-provision fetch \
+  https://raw.githubusercontent.com/ynishi/lm-provision/main/docs/profiles/comfyui-base-0.1.0.json \
+  --expect-hash <hash-from-index.json> -o profile.json
 
 # Apply on the target host (or via the push driver from your machine):
 lm-provision apply profile.json            # effectful
