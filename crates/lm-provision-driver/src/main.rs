@@ -360,6 +360,30 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // The image's registry is asked before the machine exists to pull
+    // it and fail: a platform that accepts a create naming a manifest
+    // that is not there leaves a host retrying `manifest unknown`
+    // forever, on billing [measured: 2026-08-30, instance 49228600].
+    // Only a definitive "not there" refuses — a registry this check
+    // cannot ask (private auth, no network) is noted and stepped past,
+    // because refusing over an unanswerable question would cost more
+    // than the failure it prevents.
+    if let Some(image) = adapter.image_key().and_then(|key| provider.get(key)) {
+        match lm_provision_driver::image::manifest_check(image) {
+            lm_provision_driver::image::Manifest::Present => {}
+            lm_provision_driver::image::Manifest::Absent { registry } => {
+                eprintln!(
+                    "error: image {image} is not in {registry} (manifest unknown); a machine \
+                     created for it would retry the pull forever while billing"
+                );
+                return ExitCode::from(3);
+            }
+            lm_provision_driver::image::Manifest::Undetermined { reason } => {
+                eprintln!("note: could not preflight image {image}: {reason}; proceeding");
+            }
+        }
+    }
+
     // Past the dry-run branch, so rendering a request never demands a
     // key — and before anything runs, so a missing one costs nothing.
     // Discovering it half way through an acquisition means discovering

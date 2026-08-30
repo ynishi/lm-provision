@@ -62,11 +62,14 @@
 //!   that create and stop bills.
 //! - [`credentials`] — where a target's credential is resolved from,
 //!   and what is reported when it is not there.
+//! - [`image`] — whether the image a profile names exists in its
+//!   registry, asked before a machine exists to pull it and fail.
 
 #![warn(missing_docs)]
 
 pub mod credentials;
 pub mod driver;
+pub mod image;
 pub mod infra;
 pub mod ledger;
 pub mod local_exec;

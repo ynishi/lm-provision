@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `acquire` / `release` / `check` all take `--provider` (default
   `runpod`; where to buy is the operator's call at acquisition time,
   not the profile's).
+- **The image's registry is asked before a machine exists to pull it
+  and fail.** A marketplace host accepts a create naming a manifest
+  that is not there, then retries `manifest unknown` forever — on
+  billing (found live: the create succeeded and the host logged the
+  missing manifest once a minute). `acquire` now asks the registry's
+  own manifest endpoint first, through `curl` with the spec's
+  anonymous-pull token dance; a definitive "not there" refuses at
+  exit 3 while the bill is still zero, and anything unanswerable
+  (private auth, no network) is noted and stepped past rather than
+  refused over.
 
 ### Changed
 

@@ -121,6 +121,15 @@ pub trait Infra {
     /// about the machine that nothing made.
     fn read_state(&self, inspected: &serde_json::Value) -> MachineState;
 
+    /// The provider key this target reads its base image from, when it
+    /// takes one — what `acquire` preflights against the image's own
+    /// registry before anything is created to pull it and fail
+    /// (`crate::image`).
+    ///
+    /// `None` for a target that takes no image, which is a real answer:
+    /// there is nothing to preflight.
+    fn image_key(&self) -> Option<&'static str>;
+
     /// Whether the platform says this machine is still being brought
     /// into existence — pulling its image, starting its container.
     ///
@@ -518,6 +527,11 @@ impl Infra for RunPodAdapter {
         })
     }
 
+    /// The key `runpod_body` requires — one name, two readers.
+    fn image_key(&self) -> Option<&'static str> {
+        Some("runpod.imageName")
+    }
+
     /// Never claimed: this service's boots answered within the base
     /// wait every time they were measured [measured: 2026-08-12 and
     /// 2026-08-30, port 22 within ~2 minutes of create], and its
@@ -877,6 +891,11 @@ impl Infra for ContainerAdapter {
         })
     }
 
+    /// No acquisition, so no image to preflight for one.
+    fn image_key(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Nothing to say: no acquisition means no machine mid-boot.
     fn still_materializing(&self, _inspected: &serde_json::Value) -> bool {
         false
@@ -1017,6 +1036,15 @@ impl Infra for VastAdapter {
             required.gpu.as_ref().map(|it| self.gpu_answer(it)),
             required.disk.as_ref().map(|it| self.disk_answer(it)),
         )
+    }
+
+    /// The key `vast_acquisition` requires — and the preflight that
+    /// matters most on this target: the marketplace accepts a create
+    /// naming an image that does not exist and its host retries the
+    /// pull forever, on billing [measured: 2026-08-30, instance
+    /// 49228600, `manifest unknown` once a minute at `loading`].
+    fn image_key(&self) -> Option<&'static str> {
+        Some("vast.image")
     }
 
     /// `actual_status` is the platform's own word for it: `loading`
