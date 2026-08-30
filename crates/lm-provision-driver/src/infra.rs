@@ -1194,6 +1194,13 @@ fn vast_acquisition(
             "destroy".to_string(),
             "instance".to_string(),
             "{id}".to_string(),
+            // Without this the CLI asks `[y/N]` on a terminal nobody is
+            // at, reads EOF as "no", prints `Aborted.` — **and exits
+            // zero**, so the driver reported a machine released while
+            // it ran on billing [measured: 2026-08-30, instance
+            // 49227715 survived its own successful-looking release and
+            // was destroyed by hand].
+            "--yes".to_string(),
             "--raw".to_string(),
         ],
     })
@@ -2427,6 +2434,13 @@ mod tests {
         assert_eq!(acquisition.created_id_key, "new_contract");
         assert!(acquisition.release.contains(&"destroy".to_string()));
         assert!(acquisition.release.contains(&"{id}".to_string()));
+        assert!(
+            acquisition.release.contains(&"--yes".to_string()),
+            "without --yes the CLI's confirmation prompt reads EOF as \"no\" and exits \
+             zero — a release that reports success while the machine runs on billing: \
+             {:?}",
+            acquisition.release
+        );
     }
 
     /// The same refusal as the pod service's, naming this platform's
