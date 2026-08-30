@@ -998,13 +998,24 @@ impl Infra for VastAdapter {
     /// a real 4090 here]), so it lands as MiB unconverted and no
     /// catalogue has to know the model.
     fn read_state(&self, inspected: &serde_json::Value) -> MachineState {
-        let number = |value: &serde_json::Value| value.as_u64().map(|it| it as u32);
+        // Through `as_f64`, because this response does not commit to
+        // integer-typed numbers — `disk_space` arrives as `60.4`, and a
+        // `24564.0` read with `as_u64` would come back `None`, turning
+        // a satisfied floor into `NotChecked` and a good machine into a
+        // refused one (the failure class the CPU-pod zero fixed).
+        let number = |value: &serde_json::Value| value.as_f64().map(|it| it as u32);
 
         // Two shapes in the wild: the docker-style map
         // `{"8188/tcp": [...]}` and a plain array of numbers. Either
         // way every entry is a TCP port on the shared address.
         let mut exposed = BTreeMap::new();
         let ports = inspected.get("ports");
+        // Observed only when the field holds one of those shapes: a
+        // booting instance writes `"ports": null` before the container
+        // runs, and null is nobody having looked yet, not a machine
+        // exposing nothing (the other adapter draws the same line at
+        // its `as_array`).
+        let mut ports_observed = true;
         match ports {
             Some(serde_json::Value::Object(map)) => {
                 for key in map.keys() {
@@ -1019,12 +1030,12 @@ impl Infra for VastAdapter {
                     exposed.insert(port as u16, Exposure::RawTcp);
                 }
             }
-            _ => {}
+            _ => ports_observed = false,
         }
 
         MachineState {
             exposed,
-            ports_observed: ports.is_some(),
+            ports_observed,
             gpu_count: inspected.get("num_gpus").and_then(number),
             gpu_vram_mib: inspected.get("gpu_ram").and_then(number),
             ephemeral_gb: inspected
@@ -1428,11 +1439,21 @@ fn run_json(argv: &[String], body: Option<&str>) -> Result<serde_json::Value, Ex
     // The CLI prints its own progress before the payload, so the
     // payload is found rather than assumed to start at byte zero — and
     // it may be an array (a discovery's offer list) as well as an
-    // object.
-    let start = stdout.find(['{', '[']).unwrap_or(0);
-    serde_json::from_str(&stdout[start..]).map_err(|err| ExecuteError::Unreadable {
+    // object. Both starts are *tried* rather than the first one taken:
+    // a progress line is free to contain a bracket (`[INFO] …`), and
+    // stopping there would feed the progress text to the parser.
+    // Whichever start yields a document that parses to the end is the
+    // payload.
+    let mut detail = "no JSON payload in the output".to_string();
+    for start in [stdout.find('{'), stdout.find('[')].into_iter().flatten() {
+        match serde_json::from_str(&stdout[start..]) {
+            Ok(value) => return Ok(value),
+            Err(err) => detail = err.to_string(),
+        }
+    }
+    Err(ExecuteError::Unreadable {
         command: argv.join(" "),
-        detail: err.to_string(),
+        detail,
     })
 }
 
@@ -1596,7 +1617,15 @@ mod tests {
             Some("NVIDIA RTX A5000"),
             "the cheapest device that clears the floor leads: {using:?}"
         );
-        let position = |id: &str| using.iter().position(|it| it == id);
+        // `expect`ed, not compared as options: `None < Some(_)` holds,
+        // so a missing model would pass the ordering assertion while
+        // testing nothing.
+        let position = |id: &str| {
+            using
+                .iter()
+                .position(|it| it == id)
+                .unwrap_or_else(|| panic!("{id} missing from the selection: {using:?}"))
+        };
         assert!(
             position("NVIDIA A40") < position("NVIDIA GeForce RTX 4090"),
             "a cheaper 48 GB device sorts ahead of a pricier 24 GB one: {using:?}"
@@ -2462,6 +2491,26 @@ mod tests {
         );
     }
 
+    /// A progress line is free to contain a bracket, and the payload is
+    /// still found — stopping at the first `[` fed `[INFO] …` to the
+    /// parser and broke the path that had always worked.
+    #[test]
+    fn a_progress_line_with_a_bracket_does_not_hide_the_payload() {
+        let acquired = acquire(Acquisition {
+            discover: None,
+            create: vec![
+                "printf".into(),
+                "[INFO] creating pod\\n{\"id\": \"pod-1\"}".into(),
+            ],
+            body: None,
+            created_id_key: "id",
+            inspect: vec!["echo".into(), "{}".into()],
+            release: vec!["true".into()],
+        })
+        .expect("the payload follows the progress line");
+        assert_eq!(acquired.id, "pod-1");
+    }
+
     /// A query that matches nothing is a marketplace out of stock, said
     /// with the query in it, before anything is spent.
     #[test]
@@ -2513,6 +2562,16 @@ mod tests {
         assert_eq!(
             connection.endpoints.get(&8000).map(String::as_str),
             Some("63.135.50.11:44227")
+        );
+
+        // A booting instance writes `"ports": null` before the
+        // container runs — null is nobody having looked yet, not a
+        // machine exposing nothing, and reading it as observed
+        // condemned a machine that was merely still starting.
+        let booting = serde_json::json!({ "ports": null });
+        assert!(
+            !VastAdapter.read_state(&booting).ports_observed,
+            "null is not an observation"
         );
     }
 

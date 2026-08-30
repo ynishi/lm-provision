@@ -391,12 +391,17 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     // caller that does not.
     eprintln!("acquired {}", acquired.id);
 
+    // A failed first inspection is boot-time raggedness until the
+    // deadline says otherwise — a description asked for seconds after
+    // create can be an error or empty on a machine that answers
+    // moments later. Warned and carried into the wait below, which
+    // retries; the machine is not condemned on one unanswered question
+    // while the loop built to tolerate exactly this has not run.
     if let Err(err) = acquired.inspect() {
         eprintln!(
-            "warning: created {} but could not inspect it: {err}",
+            "warning: created {} but could not inspect it yet; retrying while waiting: {err}",
             acquired.id
         );
-        return ExitCode::FAILURE;
     }
 
     // Wait until the platform has answered for every declared port —
@@ -422,8 +427,15 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         }
         std::thread::sleep(ACQUIRE_REACHABILITY_POLL);
         if let Err(err) = acquired.inspect() {
-            eprintln!("warning: {} stopped answering inspection: {err}", acquired.id);
-            break;
+            // Warned per attempt and retried until the deadline, the
+            // same tolerance the port wait extends: a transient error
+            // is indistinguishable from a machine mid-boot, and the
+            // loop is already bounded.
+            eprintln!(
+                "warning: {} answered inspection with an error; retrying: {err}",
+                acquired.id
+            );
+            continue;
         }
         connection = adapter.connection(&acquired.inspected);
     }

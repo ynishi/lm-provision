@@ -4,7 +4,7 @@
       "name": "machine-verify",
       "version": "0.2.0",
       "path": "machine-verify-0.2.0.json",
-      "profile_hash": "6248d88f59c2a668116ce0363c93e2eb12a262e7126de55fb2a3da138eff03bb",
+      "profile_hash": "f66d2e9a280b7265d1fd1c4cba4fe33db08d7c1371c76f397afdd5bc5700ba24",
       "summary": "Smoke-test a freshly acquired GPU machine (requirements + one nvidia-smi)."
     },
     {

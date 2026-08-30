@@ -2,7 +2,7 @@
   "type": "Spec",
   "name": "machine-verify",
   "version": "0.2.0",
-  "description": "Smoke-test a freshly acquired GPU machine. Declares the machine in the requirement slots (image, GPU, disk, ports) so `acquire` can obtain one and `check` can judge one, then runs a single nvidia-smi to prove the GPU is reachable. Use this as the first profile against any new pod or provider account.",
+  "description": "Smoke-test a freshly acquired GPU machine. Declares the machine in the requirement slots (GPU, disk, ports) — the base image rides under `provider`, in the platform's own key — so `acquire` can obtain one and `check` can judge one, then runs a single nvidia-smi to prove the GPU is reachable. Use this as the first profile against any new pod or provider account.",
   "capabilities": [
     "sh.exec"
   ],
