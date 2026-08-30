@@ -222,7 +222,7 @@ pub enum AcquisitionError {
     },
 }
 
-/// A GPU model and how much memory it carries.
+/// A GPU model, how much memory it carries, and what renting one costs.
 ///
 /// **This table is adapter knowledge, and that is the point.** A managed
 /// pod service selects by model name from its own catalogue and has no
@@ -244,6 +244,22 @@ struct Gpu {
     /// [`lm_provision::machine::gb_to_mib`] on the one path where a
     /// device's own unit is wanted.
     vram_gb: u32,
+    /// The published secure-cloud on-demand rate, in US cents per hour
+    /// — the ordering key for [`RunPodAdapter::gpu_answer`]'s selection.
+    ///
+    /// Published rather than live because the REST surface the driver
+    /// speaks has no pricing endpoint [measured: 2026-08-30, the
+    /// service CLI's command list — pods / billing / templates and
+    /// friends, nothing that quotes a GPU type], and a live quote would
+    /// mean a second API with its own credential exposure. What the
+    /// selection needs from this column is the *ordering* of the
+    /// models, which moves far more slowly than the figures themselves;
+    /// a stale absolute here mis-sorts nothing until two models cross.
+    /// Secure-cloud because the create body sets no `cloudType` and
+    /// `SECURE` is the documented default [documented:
+    /// docs.runpod.io/api-reference, POST /pods, `cloudType`]. Figures
+    /// read 2026-08-30 from runpod.io/pricing.
+    usd_cents_hr: u32,
 }
 
 /// A subset of the service's catalogue, largest-selling models first.
@@ -259,34 +275,42 @@ const RUNPOD_CATALOGUE: &[Gpu] = &[
     Gpu {
         id: "NVIDIA A40",
         vram_gb: 48,
+        usd_cents_hr: 44,
     },
     Gpu {
         id: "NVIDIA L40S",
         vram_gb: 48,
+        usd_cents_hr: 99,
     },
     Gpu {
         id: "NVIDIA RTX A6000",
         vram_gb: 48,
+        usd_cents_hr: 53,
     },
     Gpu {
         id: "NVIDIA A100 80GB PCIe",
         vram_gb: 80,
+        usd_cents_hr: 139,
     },
     Gpu {
         id: "NVIDIA H100 PCIe",
         vram_gb: 80,
+        usd_cents_hr: 289,
     },
     Gpu {
         id: "NVIDIA GeForce RTX 4090",
         vram_gb: 24,
+        usd_cents_hr: 74,
     },
     Gpu {
         id: "NVIDIA RTX A5000",
         vram_gb: 24,
+        usd_cents_hr: 27,
     },
     Gpu {
         id: "NVIDIA L4",
         vram_gb: 24,
+        usd_cents_hr: 49,
     },
 ];
 
@@ -374,10 +398,14 @@ impl Infra for RunPodAdapter {
                     .unwrap_or(0),
             ));
         }
-        // Smallest first: the requirement was a floor, so the cheapest
-        // thing that clears it is the one to ask for, and the rest are
-        // fallbacks the service can rent when it is short.
-        fits.sort_by_key(|it| (it.vram_gb, it.id));
+        // Cheapest first — by the rate column, not by memory. Memory
+        // was the old proxy for price and it lies: at a 24 GB floor it
+        // put the RTX 4090 (74¢/hr) ahead of the RTX A5000 (27¢/hr),
+        // 2.7× the price for the same clearance [measured: 2026-08-30,
+        // runpod.io/pricing]. The requirement was a floor, so the
+        // cheapest thing that clears it is the one to ask for, and the
+        // rest are fallbacks the service can rent when it is short.
+        fits.sort_by_key(|it| (it.usd_cents_hr, it.id));
         Answer::met_using(fits.into_iter().map(|it| it.id))
     }
 
@@ -1158,9 +1186,11 @@ mod tests {
 
     /// The floor is a floor: the cheapest thing that clears it comes
     /// first, and the rest are what the service can fall back to when it
-    /// is short of the first.
+    /// is short of the first. Cheapest by the rate column — memory is
+    /// not a price: a 48 GB A40 rents for less than a 24 GB RTX 4090,
+    /// and sorting on memory would have paid the difference.
     #[test]
-    fn the_selection_starts_at_the_smallest_device_that_clears_the_floor() {
+    fn the_selection_starts_at_the_cheapest_device_that_clears_the_floor() {
         let answer = RunPodAdapter.gpu_answer(&GpuRequirement {
             count: 1,
             min_vram_gb: Some(24),
@@ -1170,8 +1200,13 @@ mod tests {
         };
         assert_eq!(
             using.first().map(String::as_str),
-            Some("NVIDIA GeForce RTX 4090"),
-            "24 GB devices sort ahead of 48 GB ones: {using:?}"
+            Some("NVIDIA RTX A5000"),
+            "the cheapest device that clears the floor leads: {using:?}"
+        );
+        let position = |id: &str| using.iter().position(|it| it == id);
+        assert!(
+            position("NVIDIA A40") < position("NVIDIA GeForce RTX 4090"),
+            "a cheaper 48 GB device sorts ahead of a pricier 24 GB one: {using:?}"
         );
     }
 

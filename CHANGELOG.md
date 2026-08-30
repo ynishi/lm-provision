@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **GPU selection sorts by price, not by memory.** The catalogue now
+  carries each model's published secure-cloud on-demand rate, and
+  `acquire` asks for the cheapest device that clears the profile's
+  VRAM floor (the rest remain fallbacks, as before). Memory was the
+  old proxy for price and it lied: at a 24 GB floor it led with the
+  RTX 4090 (74¢/hr) when the RTX A5000 (27¢/hr) also cleared it —
+  2.7× the price for the same clearance.
 - **`requires_image` is gone; the image is a `provider` key.**
   (Breaking, DSL surface.) An image name is one platform's vocabulary
   — the same workload is a docker tag on a pod service and no image at
