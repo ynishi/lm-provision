@@ -45,6 +45,14 @@ pub const TARGETS_PATH_ENV: &str = "LM_PROVISION_TARGETS";
 /// Optional; defaults to a fixed path under the OS temp dir.
 pub const LEDGER_PATH_ENV: &str = "LM_PROVISION_LEDGER_PATH";
 
+/// `LM_PROVISION_ARTIFACTS_DIR` — the directory a profile's declared
+/// artifacts are pulled under after apply (08 §Session steps
+/// pull-artifacts; each lands at `<dir>/<pod_id>/<pod path>`).
+/// Optional; defaults to a fixed subdirectory of the OS temp dir, the
+/// same posture the ledger default takes — a deployment that cares
+/// where its work products land says so here.
+pub const ARTIFACTS_DIR_ENV: &str = "LM_PROVISION_ARTIFACTS_DIR";
+
 /// Errors raised while resolving [`Config`] from the process
 /// environment.
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +100,8 @@ pub struct Config {
     pub staging_dir: PathBuf,
     /// See [`LEDGER_PATH_ENV`].
     pub ledger_path: PathBuf,
+    /// See [`ARTIFACTS_DIR_ENV`].
+    pub artifacts_dir: PathBuf,
     /// The pod target registry [`TARGETS_PATH_ENV`] names, loaded once
     /// at startup and immutable thereafter: adding a pod means editing
     /// the file and restarting the server.
@@ -123,6 +133,7 @@ impl Config {
             std::env::var(BINARY_PATH_ENV).ok(),
             std::env::var(STAGING_DIR_ENV).ok(),
             std::env::var(LEDGER_PATH_ENV).ok(),
+            std::env::var(ARTIFACTS_DIR_ENV).ok(),
             targets_json,
             targets_path,
         )
@@ -144,6 +155,7 @@ impl Config {
         binary_path: Option<String>,
         staging_dir: Option<String>,
         ledger_path: Option<String>,
+        artifacts_dir: Option<String>,
         targets_json: Option<String>,
         targets_path: Option<PathBuf>,
     ) -> Result<Self, ConfigError> {
@@ -156,6 +168,9 @@ impl Config {
         let ledger_path = ledger_path
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("lm-provision-mcp-ledger.jsonl"));
+        let artifacts_dir = artifacts_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("lm-provision-mcp-artifacts"));
         let targets = match (targets_path, targets_json) {
             (Some(path), Some(json)) => {
                 TargetRegistry::load(RegistrySource::FromFile(path), &json, &staging_dir)?
@@ -166,6 +181,7 @@ impl Config {
             binary_path,
             staging_dir,
             ledger_path,
+            artifacts_dir,
             targets,
         })
     }
@@ -177,7 +193,7 @@ mod tests {
 
     #[test]
     fn missing_binary_path_is_a_config_error() {
-        let err = Config::from_vars(None, None, None, None, None)
+        let err = Config::from_vars(None, None, None, None, None, None)
             .expect_err("missing binary path must error");
         assert!(matches!(err, ConfigError::MissingBinaryPath));
     }
@@ -186,6 +202,7 @@ mod tests {
     fn staging_dir_and_ledger_path_default_when_unset() {
         let config = Config::from_vars(
             Some("/usr/local/bin/lm-provision".to_string()),
+            None,
             None,
             None,
             None,
@@ -200,6 +217,7 @@ mod tests {
         assert!(config
             .ledger_path
             .ends_with("lm-provision-mcp-ledger.jsonl"));
+        assert!(config.artifacts_dir.ends_with("lm-provision-mcp-artifacts"));
     }
 
     #[test]
@@ -208,6 +226,7 @@ mod tests {
             Some("/bin/lm-provision".to_string()),
             Some("/tmp/custom-staging".to_string()),
             Some("/tmp/custom-ledger.jsonl".to_string()),
+            Some("/tmp/custom-artifacts".to_string()),
             None,
             None,
         )
@@ -217,6 +236,7 @@ mod tests {
             config.ledger_path,
             PathBuf::from("/tmp/custom-ledger.jsonl")
         );
+        assert_eq!(config.artifacts_dir, PathBuf::from("/tmp/custom-artifacts"));
     }
 
     /// The staging directory a `local-exec` entry inherits is the
@@ -227,6 +247,7 @@ mod tests {
         let config = Config::from_vars(
             Some("/bin/lm-provision".to_string()),
             Some("/tmp/custom-staging".to_string()),
+            None,
             None,
             Some(
                 r#"{ "targets": [ { "pod_id": "dev-local", "kind": "local-exec" } ] }"#.to_string(),

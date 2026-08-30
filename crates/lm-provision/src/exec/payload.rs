@@ -48,6 +48,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             id: root_id,
             name: "demo".to_string(),
             version: None,

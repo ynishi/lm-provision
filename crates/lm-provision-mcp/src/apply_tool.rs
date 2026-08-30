@@ -105,6 +105,13 @@ pub struct ApplyOutput {
     /// append failure as an operational error to retry, not swallow").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ledger_warning: Option<String>,
+    /// The declared artifacts' per-path pull outcomes (08 §Session
+    /// steps pull-artifacts), omitted when the profile declared none.
+    /// A `collected = false` entry is the client's cue that the run's
+    /// work product is still only on the pod — and that `release`
+    /// will refuse the machine until it is pulled.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<lm_provision_driver::ledger::ArtifactRow>,
 }
 
 /// Errors raised before or during the driver protocol — every variant
@@ -208,6 +215,7 @@ pub fn lm_apply(
     transport: &dyn Transport,
     binary_path: &Path,
     ledger_path: &Path,
+    artifacts_dir: &Path,
     args: ApplyArgs<'_>,
 ) -> Result<ApplyOutput, ApplyToolError> {
     let plan = StepPlan {
@@ -222,6 +230,11 @@ pub fn lm_apply(
         } else {
             InvokeMode::Apply
         },
+        // Never gated from here: a server has no standing to skip a
+        // pull the profile declared, and the config default always
+        // gives it somewhere to land (10 §Inputs
+        // `LM_PROVISION_ARTIFACTS_DIR`).
+        artifacts_dir: Some(artifacts_dir.to_path_buf()),
         ledger: Some(ledger_path.to_path_buf()),
     };
 
@@ -242,6 +255,7 @@ pub fn lm_apply(
         // both, and this is where it becomes visible to the client (10
         // §Error surface's `ledger_appended = false` plus a warning).
         ledger_warning: output.ledger_warning,
+        artifacts: output.artifacts,
     })
 }
 
@@ -257,6 +271,13 @@ mod tests {
     use lm_provision_driver::transport::{ExecOutput, PodPaths, TransportError};
 
     use crate::targets::{RegistrySource, TargetRegistry};
+
+    /// Where these tests point step 4b. None of the fixtures declares
+    /// an artifact, so nothing ever lands here — the argument exists
+    /// because the session's plan wants a destination either way.
+    fn test_artifacts_dir() -> PathBuf {
+        std::env::temp_dir().join("lm-provision-mcp-apply-tool-test-artifacts")
+    }
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(format!(
@@ -344,6 +365,11 @@ mod tests {
             Ok(PathBuf::from("/pod/lm-provision"))
         }
 
+        fn download(&self, _remote: &Path, _local: &Path) -> Result<(), TransportError> {
+            self.record("download");
+            Ok(())
+        }
+
         fn dest_profile(&self, _local_profile: &Path) -> Result<PathBuf, TransportError> {
             self.record("dest_profile");
             Ok(PathBuf::from("/pod/profile.json"))
@@ -419,6 +445,7 @@ mod tests {
             transport.as_ref(),
             &binary_path,
             &ledger_path,
+            &test_artifacts_dir(),
             ApplyArgs {
                 profile_path: &fixture("apply-sh-fs.json"),
                 pod_id: "test-pod-1",
@@ -465,6 +492,7 @@ mod tests {
                 &LocalExecTransport::new(&staging_dir),
                 &binary_path,
                 &ledger_path,
+                &test_artifacts_dir(),
                 ApplyArgs {
                     profile_path: &fixture("apply-sh-fs.json"),
                     pod_id: "test-pod-1",
@@ -521,6 +549,7 @@ mod tests {
             &LocalExecTransport::new(&staging_dir),
             &binary_path,
             &ledger_path,
+            &test_artifacts_dir(),
             ApplyArgs {
                 profile_path: &profile_path,
                 pod_id: "test-pod-1",
@@ -559,6 +588,7 @@ mod tests {
             &LocalExecTransport::new(&staging_dir),
             &binary_path,
             &ledger_path,
+            &test_artifacts_dir(),
             ApplyArgs {
                 profile_path: Path::new("/nonexistent/lm-provision-profile.json"),
                 pod_id: "test-pod-1",
@@ -607,6 +637,7 @@ mod tests {
             &transport,
             &binary_path,
             &ledger_path,
+            &test_artifacts_dir(),
             ApplyArgs {
                 profile_path: &profile_path,
                 pod_id: "test-pod-1",
@@ -653,6 +684,7 @@ mod tests {
             &transport,
             Path::new("/nonexistent/lm-provision"),
             &ledger_path,
+            &test_artifacts_dir(),
             ApplyArgs {
                 profile_path: &profile_path,
                 pod_id: "test-pod-1",
@@ -748,6 +780,7 @@ mod tests {
             &transport,
             Path::new("/nonexistent/lm-provision"),
             &ledger_path,
+            &test_artifacts_dir(),
             ApplyArgs {
                 profile_path: &profile_path,
                 pod_id: "test-pod-1",

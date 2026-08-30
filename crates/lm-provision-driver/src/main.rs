@@ -12,7 +12,7 @@
 //!   --profile profile.json \
 //!   --artifact target/x86_64-unknown-linux-musl/release/lm-provision
 //! # gates: --dry-run | --validate-only, --skip-install,
-//! #        --skip-verify, --no-ledger
+//! #        --skip-verify, --no-artifacts, --no-ledger
 //! ```
 //!
 //! Exit codes, across all subcommands: 0 = the run produced its
@@ -20,12 +20,13 @@
 //! verdict); 1 = the run failed, or `check` found the machine
 //! wanting; 2 = the input could not be used (usage via clap, an
 //! unreadable or invalid profile, a description that is not JSON, an
-//! unrenderable acquisition); 3 = `acquire` refused at admission,
-//! before anything was spent; 4 = a credential was missing (`acquire`
-//! before creating; `release` while the machine keeps running and
-//! billing). The artifact JSON goes to stdout, diagnostics and the
-//! pod's stderr transcript to stderr — the same stream split the
-//! binary itself contracts (chapter 07).
+//! unrenderable acquisition); 3 = a refusal before anything was spent
+//! or destroyed (`acquire` at admission; `release` while the ledger
+//! records uncollected artifacts on the machine); 4 = a credential
+//! was missing (`acquire` before creating; `release` while the
+//! machine keeps running and billing). The artifact JSON goes to
+//! stdout, diagnostics and the pod's stderr transcript to stderr —
+//! the same stream split the binary itself contracts (chapter 07).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -41,7 +42,7 @@ use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USE
 #[derive(Parser)]
 #[command(
     name = "lm-provision-driver",
-    about = "Obtain a machine a profile requires (acquire / release / check), and converge one over SSH (apply: ensure-binary → place-profile → hash-verify → invoke → collect → ledger)"
+    about = "Obtain a machine a profile requires (acquire / release / check), and converge one over SSH (apply: ensure-binary → place-profile → hash-verify → invoke → collect → pull-artifacts → ledger)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -104,6 +105,17 @@ struct ReleaseArgs {
     /// release command comes from.
     #[arg(long = "profile")]
     profile: PathBuf,
+
+    /// Ledger the release gate reads (08 §Release gate): the newest
+    /// real apply recorded for this machine must have every declared
+    /// artifact collected, or the release is refused.
+    #[arg(long = "ledger")]
+    ledger: Option<PathBuf>,
+
+    /// Release even though the ledger records uncollected artifacts.
+    /// What is still on the machine is deleted with it.
+    #[arg(long = "force")]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -161,6 +173,17 @@ struct ApplyArgs {
     /// Ledger file path.
     #[arg(long = "ledger")]
     ledger: Option<PathBuf>,
+
+    /// Operator-host directory declared artifacts are pulled under
+    /// (step 4b lands each at `<dir>/<pod-id>/<pod path>`).
+    #[arg(long = "artifacts-dir", default_value = "artifacts")]
+    artifacts_dir: PathBuf,
+
+    /// Gate step 4b (pull-artifacts) off. The profile's declared
+    /// artifacts are still recorded on the ledger row as uncollected —
+    /// the release gate stays armed until something pulls them.
+    #[arg(long = "no-artifacts")]
+    no_artifacts: bool,
 }
 
 fn main() -> ExitCode {
@@ -362,6 +385,52 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
 }
 
 fn run_release(args: ReleaseArgs) -> ExitCode {
+    // The release gate (08 §Release gate), before anything else: a
+    // machine whose newest real apply left declared artifacts
+    // uncollected still carries the run's work product, and deleting
+    // it deletes them. Refused at admission — nothing has been
+    // destroyed yet, hence exit 3, the same "refused before spending"
+    // class `acquire` uses.
+    let ledger_path = args.ledger.clone().unwrap_or_else(default_ledger_path);
+    match uncollected_artifacts(&ledger_path, &args.id) {
+        Ok(uncollected) if !uncollected.is_empty() => {
+            for path in &uncollected {
+                eprintln!("error: artifact not collected: {path}");
+            }
+            if args.force {
+                eprintln!(
+                    "warning: releasing {} anyway (--force); the artifacts above are deleted \
+                     with it",
+                    args.id
+                );
+            } else {
+                eprintln!(
+                    "error: refusing to release {}: the newest apply recorded in {} left the \
+                     artifacts above on the machine (re-run apply to collect them, or pass \
+                     --force to delete them with it)",
+                    args.id,
+                    ledger_path.display()
+                );
+                return ExitCode::from(3);
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            // An unreadable ledger cannot say the machine is clean.
+            // Refusing on it (absent --force) keeps the gate a gate:
+            // fail-open here would make a corrupt ledger the easiest
+            // way through it.
+            eprintln!(
+                "error: release gate could not read {}: {err}",
+                ledger_path.display()
+            );
+            if !args.force {
+                eprintln!("note: pass --force to release without the gate");
+                return ExitCode::from(3);
+            }
+        }
+    }
+
     let (required, provider) = match requirements_of(&args.profile) {
         Ok(parts) => parts,
         Err(message) => {
@@ -493,6 +562,11 @@ fn run_apply(args: ApplyArgs) -> ExitCode {
         skip_install: args.skip_install,
         skip_verify: args.skip_verify,
         mode,
+        artifacts_dir: if args.no_artifacts {
+            None
+        } else {
+            Some(args.artifacts_dir)
+        },
         ledger,
     };
 
@@ -518,8 +592,23 @@ fn run_apply(args: ApplyArgs) -> ExitCode {
             if let Some(warning) = &output.ledger_warning {
                 eprintln!("error: ledger append failed: {warning}");
             }
+            // Same duty for step 4b: an uncollected artifact rides back
+            // in the output rather than failing the session, and this
+            // is where it has to become visible and cost the zero exit.
+            let uncollected = output.artifacts.iter().filter(|it| !it.collected).count();
+            for it in output.artifacts.iter().filter(|it| !it.collected) {
+                eprintln!(
+                    "error: artifact not collected: {}: {}",
+                    it.path,
+                    it.error.as_deref().unwrap_or("unknown")
+                );
+            }
             let ok = output.collected.report["ok"] == serde_json::Value::Bool(true);
-            ExitCode::from(exit_status(ok, output.ledger_warning.as_deref()))
+            ExitCode::from(exit_status(
+                ok,
+                output.ledger_warning.as_deref(),
+                uncollected,
+            ))
         }
         Err(err) => {
             eprintln!("error: {err}");
@@ -529,16 +618,20 @@ fn run_apply(args: ApplyArgs) -> ExitCode {
 }
 
 /// The exit code a completed session maps to: `0` only when the apply
-/// reported `ok` **and** step 5 recorded it.
+/// reported `ok`, step 5 recorded it, **and** step 4b collected every
+/// declared artifact.
 ///
 /// An unrecorded apply is not a success to report as one (09 §Error
 /// surface: "an apply is not 'unrecorded-successful' — drivers must
 /// treat append failure as an operational error to retry"), so a
 /// `ledger_warning` costs the zero exit even when the report itself is
 /// `ok`. The report still goes to stdout: an operator retrying the
-/// append needs to know what it was.
-fn exit_status(report_ok: bool, ledger_warning: Option<&str>) -> u8 {
-    if report_ok && ledger_warning.is_none() {
+/// append needs to know what it was. An uncollected artifact costs it
+/// for the sibling reason: the run's work product is still only on
+/// the pod, and a zero here is what lets a script move on to the
+/// delete that loses it (08 §Release gate).
+fn exit_status(report_ok: bool, ledger_warning: Option<&str>, uncollected_artifacts: usize) -> u8 {
+    if report_ok && ledger_warning.is_none() && uncollected_artifacts == 0 {
         0
     } else {
         1
@@ -570,6 +663,34 @@ fn parse_ssh_target(target: &str) -> Result<(String, String, u16), String> {
         .parse()
         .map_err(|_| format!("--ssh target {target:?} has a non-numeric port"))?;
     Ok((user, host.to_string(), port))
+}
+
+/// The declared-but-uncollected artifact paths on the newest **real**
+/// apply recorded for `pod_id` — the row the release gate judges by.
+///
+/// Dry-run rows are skipped: a dry run produces nothing, records no
+/// artifacts, and must not stand in for the real apply behind it
+/// (session step 4b already records nothing for them; skipping by the
+/// report's own `dry_run` flag keeps the gate honest against rows
+/// other drivers append). No row at all is a pass — the gate can only
+/// weigh what an apply recorded, which is why `apply` wants the
+/// machine id as its `--pod-id` (08 §Release gate).
+fn uncollected_artifacts(
+    ledger_path: &std::path::Path,
+    pod_id: &str,
+) -> Result<Vec<String>, lm_provision_driver::ledger::LedgerError> {
+    let newest_real_apply = lm_provision_driver::ledger::list(ledger_path)?
+        .into_iter()
+        .find(|row| row.pod_id == pod_id && row.report["dry_run"] != serde_json::Value::Bool(true));
+    Ok(newest_real_apply
+        .map(|row| {
+            row.artifacts
+                .into_iter()
+                .filter(|it| !it.collected)
+                .map(|it| it.path)
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 fn default_ledger_path() -> PathBuf {
@@ -675,12 +796,98 @@ mod tests {
     /// unrecorded apply without having to parse stderr.
     #[test]
     fn an_ok_report_with_a_failed_ledger_append_still_exits_nonzero() {
-        assert_eq!(exit_status(true, None), 0);
-        assert_eq!(exit_status(true, Some("ledger i/o error: no such file")), 1);
-        assert_eq!(exit_status(false, None), 1);
+        assert_eq!(exit_status(true, None, 0), 0);
         assert_eq!(
-            exit_status(false, Some("ledger i/o error: no such file")),
+            exit_status(true, Some("ledger i/o error: no such file"), 0),
             1
         );
+        assert_eq!(exit_status(false, None, 0), 1);
+        assert_eq!(
+            exit_status(false, Some("ledger i/o error: no such file"), 0),
+            1
+        );
+    }
+
+    /// The step-4b sibling of the ledger rule above: an `ok` report
+    /// whose declared artifacts were not all pulled exits `1` — a zero
+    /// here is what lets a script move on to the delete that loses
+    /// them (08 §Release gate).
+    #[test]
+    fn an_ok_report_with_an_uncollected_artifact_still_exits_nonzero() {
+        assert_eq!(exit_status(true, None, 1), 1);
+        assert_eq!(exit_status(true, None, 0), 0);
+    }
+
+    /// **The release gate judges by the newest real apply for the
+    /// machine** (08 §Release gate): a later dry-run row does not
+    /// stand in for it, other machines' rows do not reach it, and a
+    /// machine with no recorded apply passes — the gate can only
+    /// weigh what an apply recorded.
+    #[test]
+    fn the_release_gate_reads_the_newest_real_apply_row() {
+        use lm_provision_driver::ledger::{self, ArtifactRow, LedgerRow};
+
+        let path = std::env::temp_dir().join(format!(
+            "lm-provision-driver-release-gate-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let row = |pod_id: &str, dry_run: bool, artifacts: Vec<ArtifactRow>| LedgerRow {
+            pod_id: pod_id.to_string(),
+            profile_hash: "h".repeat(64),
+            report: serde_json::json!({ "ok": true, "dry_run": dry_run }),
+            collected_at: "2026-08-30T00:00:00Z".to_string(),
+            artifacts,
+        };
+        let uncollected_row = ArtifactRow {
+            path: "/workspace/out".to_string(),
+            collected: false,
+            dest: None,
+            error: Some("scp failed".to_string()),
+        };
+
+        // Oldest → newest: a real apply that left a debt, a clean real
+        // apply on another machine, then a dry run on this one.
+        ledger::append(&path, &row("pod-a", false, vec![uncollected_row.clone()]))
+            .expect("append 1");
+        ledger::append(&path, &row("pod-b", false, Vec::new())).expect("append 2");
+        ledger::append(&path, &row("pod-a", true, Vec::new())).expect("append 3");
+
+        assert_eq!(
+            super::uncollected_artifacts(&path, "pod-a").expect("gate reads the ledger"),
+            vec!["/workspace/out".to_string()],
+            "the dry-run row must not mask the real apply's debt"
+        );
+        assert!(super::uncollected_artifacts(&path, "pod-b")
+            .expect("gate reads the ledger")
+            .is_empty());
+        assert!(super::uncollected_artifacts(&path, "pod-never-applied")
+            .expect("gate reads the ledger")
+            .is_empty());
+
+        // A re-apply that collected everything clears the gate: it is
+        // now the newest real row.
+        ledger::append(
+            &path,
+            &row(
+                "pod-a",
+                false,
+                vec![ArtifactRow {
+                    collected: true,
+                    dest: Some("artifacts/pod-a/workspace/out".to_string()),
+                    error: None,
+                    ..uncollected_row
+                }],
+            ),
+        )
+        .expect("append 4");
+        assert!(super::uncollected_artifacts(&path, "pod-a")
+            .expect("gate reads the ledger")
+            .is_empty());
+
+        std::fs::remove_file(&path).ok();
     }
 }

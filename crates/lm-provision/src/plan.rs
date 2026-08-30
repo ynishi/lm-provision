@@ -612,6 +612,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             id: ids.node(),
             name: name.into(),
             version: None,

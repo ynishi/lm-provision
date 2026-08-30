@@ -264,6 +264,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             assumes: std::collections::BTreeMap::from([(
                 crate::resource::Resource::ComfyUiRoot.as_str().to_string(),
                 crate::resource::COMFYUI_ROOT_DEFAULT.to_string(),

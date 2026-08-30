@@ -577,6 +577,66 @@ mod tests {
         assert_eq!(canonical::hash(&ast), canonical::hash(&ast_text));
     }
 
+    /// `Spec.artifacts` rides the built-in `Vec<String>` mapping
+    /// through both front-ends, and an omitted slot parses to the empty
+    /// list — the shape whose canonical encoding is no bytes at all,
+    /// which is what keeps pre-slot profiles on their recorded hash.
+    #[test]
+    fn json_and_text_frontends_both_carry_the_artifacts_slot() {
+        let value = serde_json::json!({
+            "type": "Spec",
+            "name": "artifacts-demo",
+            "capabilities": ["sh.exec"],
+            "artifacts": ["/workspace/ComfyUI/output", "/workspace/run.log"],
+            "phases": [
+                { "type": "ShExec", "argv": ["echo", "ok"] }
+            ]
+        });
+        let json_path = write_temp("artifacts.json", &value.to_string());
+        let ast = load_profile(&json_path).expect("a declared artifacts slot must parse");
+        let ProfileNode::Spec { artifacts, .. } = &ast else {
+            panic!("expected Spec root");
+        };
+        assert_eq!(
+            artifacts,
+            &["/workspace/ComfyUI/output", "/workspace/run.log"]
+        );
+        assert!(crate::validate::validate(&ast).is_ok());
+
+        let text = concat!(
+            "Spec(",
+            "name: \"artifacts-demo\", ",
+            "version: none, ",
+            "description: none, ",
+            "capabilities: [\"sh.exec\"], ",
+            "env: {}, ",
+            "env_secrets: [], ",
+            "artifacts: [\"/workspace/ComfyUI/output\", \"/workspace/run.log\"], ",
+            "phases: [",
+            "ShExec(argv: [\"echo\", \"ok\"])",
+            "])",
+        );
+        let text_path = write_temp("artifacts.txt", text);
+        let ast_text =
+            load_profile(&text_path).expect("a declared artifacts slot must parse as text");
+        assert_eq!(canonical::hash(&ast), canonical::hash(&ast_text));
+
+        let bare = write_temp(
+            "artifacts-bare.json",
+            &serde_json::json!({
+                "type": "Spec",
+                "name": "artifacts-demo",
+                "phases": []
+            })
+            .to_string(),
+        );
+        let ast_bare = load_profile(&bare).expect("an undeclared slot must still parse");
+        assert!(matches!(
+            &ast_bare,
+            ProfileNode::Spec { artifacts, .. } if artifacts.is_empty()
+        ));
+    }
+
     #[test]
     fn malformed_json_surfaces_as_parse_error() {
         let path = write_temp("bad.json", "{not: valid json,");

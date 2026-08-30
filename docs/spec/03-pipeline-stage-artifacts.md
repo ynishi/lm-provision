@@ -58,6 +58,10 @@ Checks, in order:
    here would resolve into the table it sits in).
 5. Every `paths` entry is absolute (`/`-leading), free of `..`
    segments, and shell-safe.
+5b. Every `artifacts` entry passes the same shape rule as a `paths`
+   root (chapter 01 §Collected artifacts). The entry is interpolated
+   into the driver's pull invocation (chapter 08 §Session steps),
+   which is the same exposure a declared root has.
 6. Each phase passes its per-kind walk: shell-safety of the payload
    strings the catalog marks shell-safe, `sync.*` / `staging.*` route
    shape, shell-safety of every `env` keyed-slot key, and — new to the
@@ -144,7 +148,11 @@ and therefore byte-identical canonical output.
   lexicographically before encoding (the AST is not mutated).
   `Spec.env` is order-independent without a sort: it is a keyed table
   and follows the `env` keyed-slot rule below (key order, omitted when
-  empty), one level up.
+  empty), one level up. `Spec.artifacts` is set-shaped and sorts like
+  the four, but follows the keyed slots' omit-when-empty rule rather
+  than emitting `[]`: it postdates hashed profiles, so an undeclaring
+  profile must keep the bytes — and the hash — its ledger rows
+  already carry.
 - **Phase order**: `Spec.phases` is order-preserving — phase order
   is semantic.
 - **`Option<String>`**: `None` omits the key entirely; `Some(x)`
@@ -196,8 +204,8 @@ SHA-256 over the canonical bytes, rendered as a 64-character
 lowercase hex string with no prefix. The profile hash is defined as
 `sha256_hex(canonical::encode(node))`. Because canonical sorts the
 declared lists (`capabilities`, `env_secrets`, `paths`,
-`http_allowlist`), emits the `env` table in key order, and excludes
-`NodeId` during encoding, the hash is:
+`http_allowlist`, and a non-empty `artifacts`), emits the `env` table
+in key order, and excludes `NodeId` during encoding, the hash is:
 
 - byte-identical across declaration-order permutations of the
   declared lists and of the `env` table's entries;

@@ -101,6 +101,7 @@ An AI-native JSON representation ideal for programmatic generation and tool inte
 | `paths` | list\<string\> | no | `{}` | filesystem path root allowlist (chapter 05 §L3 path policy) |
 | `http_allowlist` | list\<string\> | no | `{}` | HTTP URL pattern allowlist (chapter 05 §L3 HTTP policy) |
 | `assumes` | table\<string, string\> | no | `{}` | resources already present on the target, as `resource name → path` (§Assumed resources below); a key naming no resource is rejected (chapter 03 §validate check 8b) |
+| `artifacts` | list\<string\> | no | `{}` | pod-side paths the run's work product lands at, pulled back by the driver after apply (§Collected artifacts below); each absolute, `..`-free, shell-safe (chapter 03 §validate check 5b) |
 | `phases` | list\<ProfileNode\> | no | `{}` | phase nodes per chapter 02 |
 
 Optional fields (`Option<T>` / list-typed) may be omitted on the wire
@@ -117,8 +118,12 @@ the order these entries were written yield the same profile hash.
 as a sorted list: it is stored keyed by name and canonical emits it in
 key order, so no sort step applies — and an empty table is omitted
 from canonical entirely rather than emitted as `[]` (chapter 03
-§canonical). `assumes` is a table under the same rule. Phase order is
-semantic and is preserved by canonical.
+§canonical). `assumes` is a table under the same rule. `artifacts` is
+set-shaped like the four declared lists (canonical sorts it) but
+follows the tables' omit-when-empty rule rather than emitting `[]` —
+it postdates hashed profiles, so an undeclaring profile must keep the
+hash its ledger rows already carry (chapter 03 §canonical). Phase
+order is semantic and is preserved by canonical.
 
 The profile hash (chapter 03 §hash) is **frontend-independent**: the
 canonical text grammar and the JSON serde bridge that both build the
@@ -289,6 +294,41 @@ at apply as well — in both cases naming the resource rather than
 failing later on a missing directory.
 
 An empty `assumes` is omitted from canonical, so a profile that
+declares nothing here keeps the hash it had before the slot existed.
+
+## Collected artifacts (`Spec.artifacts`)
+
+A run's work product is only worth what makes it off the machine. The
+first real uses of this tool produced their images on the pod and
+relied on an operator remembering to copy them out before deleting it
+— the step that gets skipped is exactly the one nothing declared.
+`Spec.artifacts` is where a profile states what the run is *for*:
+
+```text
+Spec(
+    name: "generate",
+    artifacts: ["/workspace/ComfyUI/output", "/workspace/run.log"],
+    phases: [ ... ]
+)
+```
+
+Entries are absolute pod paths, each a file or a directory (a
+directory is pulled recursively — the shape a service whose output
+file names are not known up front needs). The provisioner binary
+never reads the field; like the machine requirements, it is addressed
+to the driver, which pulls each declared path to the operator host
+after a real apply and records the per-path outcome on the ledger row
+(chapter 08 §Session steps pull-artifacts; chapter 09 §Ledger). An
+uncollected artifact is a recorded debt: the driver's `release`
+refuses to delete the machine while its newest real apply carries one
+(chapter 08 §Release gate).
+
+Validate applies the `paths` shape rule to each entry — absolute,
+`..`-free, shell-safe (chapter 03 §validate check 5b): the path is
+interpolated into the driver's pull invocation the way a declared
+root is interpolated into a policy check.
+
+An empty `artifacts` is omitted from canonical, so a profile that
 declares nothing here keeps the hash it had before the slot existed.
 
 ## Escape / Fragment Policy

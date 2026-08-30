@@ -2379,6 +2379,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             id: ids.node(),
             name: "routing".into(),
             version: None,
@@ -2450,6 +2451,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             assumes: std::collections::BTreeMap::from([
                 (
                     crate::resource::Resource::ComfyUiRoot.as_str().to_string(),

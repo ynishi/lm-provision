@@ -220,6 +220,10 @@ mod tests {
             self.dest_profile(local_profile)
         }
 
+        fn download(&self, _remote: &Path, _local: &Path) -> Result<(), TransportError> {
+            unreachable!("the pre-session driver flow never pulls artifacts")
+        }
+
         fn exec(
             &self,
             _paths: &PodPaths,

@@ -130,6 +130,7 @@ fn apply_dry_run_via_local_exec_transport_collects_a_report_with_secret_env_inje
         profile_hash: collected.profile_hash.clone(),
         report: collected.report.clone(),
         collected_at: collected.collected_at.clone(),
+        artifacts: Vec::new(),
     };
     ledger::append(&ledger_path, &first_row).expect("append should succeed");
 

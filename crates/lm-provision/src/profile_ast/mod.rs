@@ -171,6 +171,27 @@ pub enum ProfileNode {
         ///
         /// Empty maps carry no canonical bytes.
         provider: BTreeMap<String, String>,
+        /// Pod-side paths the run's work product lands at, which the
+        /// driver pulls back to the operator host after apply (spec 08
+        /// §Session steps, pull-artifacts).
+        ///
+        /// The declaration is the retrieval contract: work a profile
+        /// produces and never declares here is work an operator has to
+        /// remember to copy out by hand before releasing the machine —
+        /// which is exactly the by-hand step this slot removes (first
+        /// real-pod usage retrieved its generated images manually).
+        /// The binary itself never reads the field; like the
+        /// `requires_*` requirements above, it is addressed to the
+        /// driver.
+        ///
+        /// Entries are absolute pod paths, file or directory (a
+        /// directory is pulled recursively — the common case for a
+        /// service whose output file names are not known up front).
+        /// Set-shaped like `paths`: canonical sorts entries, and an
+        /// empty list carries no canonical bytes, so a profile that
+        /// declares nothing here keeps the hash it had before the slot
+        /// existed.
+        artifacts: Vec<String>,
         /// Sequential list of phases.
         phases: Vec<ProfileNode>,
     },

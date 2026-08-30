@@ -118,4 +118,14 @@ pub trait Transport {
         args: &[String],
         env: &BTreeMap<String, String>,
     ) -> Result<ExecOutput, TransportError>;
+
+    /// The reverse of the upload half: bring `remote` (a pod-side file
+    /// or directory — a directory comes back recursively) to `local`
+    /// on the operator host, creating `local`'s parent directories as
+    /// needed. The session's pull-artifacts step (08 §Session steps)
+    /// is the caller; a missing `remote` is a [`TransportError`] like
+    /// any other failed transfer — whether that is an apply that never
+    /// produced the artifact or a wrong declaration is the operator's
+    /// question, and the error text carries the path either way.
+    fn download(&self, remote: &Path, local: &Path) -> Result<(), TransportError>;
 }

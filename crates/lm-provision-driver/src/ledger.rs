@@ -47,6 +47,34 @@ pub struct LedgerRow {
     pub report: serde_json::Value,
     /// RFC 3339 UTC, driver clock (09 §Ledger).
     pub collected_at: String,
+    /// What became of each artifact the profile declared (09 §Ledger,
+    /// additive 2026-08-30) — the record `release` reads before
+    /// deleting the machine the artifacts are still on. Empty for a
+    /// profile that declared none, and omitted from the encoded row
+    /// then, so every row written before the field existed reads back
+    /// equal to one written today.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactRow>,
+}
+
+/// One declared artifact's collection outcome (09 §Ledger `artifacts`).
+///
+/// `collected = false` is a recorded debt, not a formatting detail:
+/// the work product is still only on the pod, and the release gate
+/// (08 §Release gate) refuses to delete the machine while the newest
+/// real apply for it carries one of these.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactRow {
+    /// The declared pod-side path (chapter 01 `Spec.artifacts`).
+    pub path: String,
+    /// Whether the pull landed the artifact on the operator host.
+    pub collected: bool,
+    /// Where it landed, present iff `collected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<String>,
+    /// Why it did not, present iff `!collected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Errors raised while appending to or reading a ledger file.
@@ -141,6 +169,7 @@ mod tests {
                 "steps": []
             }),
             collected_at: "2026-07-12T00:00:00Z".to_string(),
+            artifacts: Vec::new(),
         }
     }
 
@@ -198,6 +227,37 @@ mod tests {
         assert_eq!(get(&path, 0).expect("get 0"), Some(second));
         assert_eq!(get(&path, 1).expect("get 1"), Some(first));
         assert_eq!(get(&path, 2).expect("get 2"), None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **A row written before the `artifacts` field existed reads back
+    /// equal to one written today with none declared** — the additive
+    /// half of 09 §Stability's "ledger row schema: stable". The other
+    /// half: an empty outcome list writes no `artifacts` key, so
+    /// today's undeclaring rows are byte-compatible with yesterday's
+    /// readers too.
+    #[test]
+    fn a_pre_artifacts_row_reads_back_and_an_empty_list_writes_no_key() {
+        let path = tmp_ledger_path("pre-artifacts");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"pod_id":"pod-1","profile_hash":"h","report":{"ok":true},"#,
+                r#""collected_at":"2026-07-12T00:00:00Z"}"#,
+                "\n"
+            ),
+        )
+        .expect("seed a pre-field row");
+        let rows = list(&path).expect("old rows must still parse");
+        assert_eq!(rows[0].artifacts, Vec::new());
+
+        append(&path, &sample_row("pod-1", "h")).expect("append a new undeclaring row");
+        let bytes = std::fs::read_to_string(&path).expect("ledger readable");
+        assert!(
+            !bytes.contains("artifacts"),
+            "an empty outcome list must not enter the encoded row: {bytes}"
+        );
 
         std::fs::remove_file(&path).ok();
     }

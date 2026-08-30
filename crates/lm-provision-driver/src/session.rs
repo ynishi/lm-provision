@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use lm_provision::profile_ast::ProfileNode;
 
 use crate::driver::CollectedApply;
-use crate::ledger::{self, LedgerRow};
+use crate::ledger::{self, ArtifactRow, LedgerRow};
 use crate::transport::{PodPaths, Transport, TransportError};
 
 /// Which subcommand form step 3 invokes (08 §Session steps step 3's
@@ -57,6 +57,15 @@ pub struct StepPlan {
     pub skip_verify: bool,
     /// Step 3 subcommand form.
     pub mode: InvokeMode,
+    /// Step 4b pull-artifacts: the operator-host directory declared
+    /// artifacts land under, as `<dir>/<pod_id>/<pod path>`; `None`
+    /// gates the pull off (`--no-artifacts`). Gating the pull off does
+    /// **not** erase the declaration: the profile's artifacts are
+    /// still recorded on the ledger row as uncollected, so the
+    /// release gate keeps refusing until something actually pulls
+    /// them — a skipped step is never an implicit promise the work
+    /// happened elsewhere (08 §Session steps).
+    pub artifacts_dir: Option<PathBuf>,
     /// Step 5: append to this ledger file; `None` gates the step off
     /// (`--no-ledger`).
     pub ledger: Option<PathBuf>,
@@ -70,6 +79,15 @@ pub struct SessionOutput {
     pub paths: PodPaths,
     /// The collected invocation (report / transcript / exit code).
     pub collected: CollectedApply,
+    /// Step 4b's per-artifact outcomes (08 §Session steps
+    /// pull-artifacts) — empty when the profile declared none or the
+    /// mode ran no apply. A `collected = false` entry does not fail
+    /// the session, for the ledger's reason: the apply already
+    /// happened, and the report plus the recorded debt is worth more
+    /// than an error in their place. The CLI turns any uncollected
+    /// entry into a non-zero exit (the same duty `ledger_warning`
+    /// puts on it).
+    pub artifacts: Vec<ArtifactRow>,
     /// Whether step 5 appended a ledger row.
     pub ledger_appended: bool,
     /// Why step 5 did not append, when it was supposed to — `Some` iff
@@ -213,6 +231,15 @@ pub fn run(
         collected_at: jiff::Timestamp::now().to_string(),
     };
 
+    // Step 4b pull-artifacts: only a real apply has produced anything
+    // to pull — a dry run or a validate leaves the declaration
+    // unexercised and records nothing, so it cannot arm the release
+    // gate against work that never existed.
+    let artifacts = match plan.mode {
+        InvokeMode::Apply => pull_artifacts(transport, &node, plan, pod_id),
+        InvokeMode::DryRun | InvokeMode::ValidateOnly => Vec::new(),
+    };
+
     // Step 5 ledger (gate: ledger = None). A validate-only session
     // records nothing — no apply happened. A failed append leaves a
     // warning next to the output instead of replacing it (see
@@ -224,6 +251,7 @@ pub fn run(
                 profile_hash: local_hash,
                 report,
                 collected_at: collected.collected_at.clone(),
+                artifacts: artifacts.clone(),
             };
             match ledger::append(path, &row) {
                 Ok(()) => (true, None),
@@ -236,9 +264,61 @@ pub fn run(
     Ok(SessionOutput {
         paths,
         collected,
+        artifacts,
         ledger_appended,
         ledger_warning,
     })
+}
+
+/// Step 4b: pull every declared artifact to
+/// `<artifacts_dir>/<pod_id>/<pod path>` (08 §Session steps
+/// pull-artifacts). Total — a failed pull becomes a
+/// `collected = false` row rather than an error, because the apply
+/// has already run and the record of the debt is the whole point;
+/// the same holds for a gated-off pull (`artifacts_dir = None`),
+/// which records every declared artifact as uncollected.
+fn pull_artifacts(
+    transport: &dyn Transport,
+    node: &ProfileNode,
+    plan: &StepPlan,
+    pod_id: &str,
+) -> Vec<ArtifactRow> {
+    let ProfileNode::Spec { artifacts, .. } = node else {
+        return Vec::new();
+    };
+    artifacts
+        .iter()
+        .map(|path| match &plan.artifacts_dir {
+            None => ArtifactRow {
+                path: path.clone(),
+                collected: false,
+                dest: None,
+                error: Some("pull gated off (--no-artifacts)".to_string()),
+            },
+            Some(dir) => {
+                // Mirror the full pod path under the per-pod directory
+                // (validate pinned it absolute, chapter 03 check 5b),
+                // so two artifacts can never collide on a file name.
+                let dest = dir
+                    .join(pod_id)
+                    .join(path.strip_prefix('/').unwrap_or(path));
+                match transport.download(Path::new(path), &dest) {
+                    Ok(()) => ArtifactRow {
+                        path: path.clone(),
+                        collected: true,
+                        dest: Some(dest.display().to_string()),
+                        error: None,
+                    },
+                    Err(err) => ArtifactRow {
+                        path: path.clone(),
+                        collected: false,
+                        dest: None,
+                        error: Some(err.to_string()),
+                    },
+                }
+            }
+        })
+        .collect()
 }
 
 /// Every consumed secret name (the profile's `env_secrets` list),
@@ -266,5 +346,193 @@ fn invoke_args(mode: InvokeMode, paths: &PodPaths) -> Vec<String> {
         InvokeMode::Apply => vec!["apply".to_string(), profile],
         InvokeMode::DryRun => vec!["apply".to_string(), profile, "--dry-run".to_string()],
         InvokeMode::ValidateOnly => vec!["validate".to_string(), profile],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    use crate::transport::ExecOutput;
+
+    /// A pod that answers the hash probe correctly, applies "ok", and
+    /// scripts step 4b: each declared path either "exists" (download
+    /// succeeds and is recorded) or does not (download errors).
+    struct ArtifactPod {
+        hash: String,
+        missing: Vec<String>,
+        downloads: RefCell<Vec<(PathBuf, PathBuf)>>,
+    }
+
+    impl Transport for ArtifactPod {
+        fn dest_binary(&self, _local: &Path) -> Result<PathBuf, TransportError> {
+            Ok(PathBuf::from("/pod/lm-provision"))
+        }
+
+        fn dest_profile(&self, _local: &Path) -> Result<PathBuf, TransportError> {
+            Ok(PathBuf::from("/pod/profile.json"))
+        }
+
+        fn ensure_binary(&self, local: &Path) -> Result<PathBuf, TransportError> {
+            self.dest_binary(local)
+        }
+
+        fn place_profile(&self, local: &Path) -> Result<PathBuf, TransportError> {
+            self.dest_profile(local)
+        }
+
+        fn exec(
+            &self,
+            _paths: &PodPaths,
+            args: &[String],
+            _env: &BTreeMap<String, String>,
+        ) -> Result<ExecOutput, TransportError> {
+            let stdout = if args.first().map(String::as_str) == Some("hash") {
+                format!("{}\n", self.hash)
+            } else {
+                r#"{"ok":true,"dry_run":false,"profile_name":"demo","steps":[]}"#.to_string()
+            };
+            Ok(ExecOutput {
+                stdout,
+                stderr: String::new(),
+                exit_code: Some(0),
+            })
+        }
+
+        fn download(&self, remote: &Path, local: &Path) -> Result<(), TransportError> {
+            if self.missing.iter().any(|m| Path::new(m) == remote) {
+                return Err(TransportError::Io(std::io::Error::other(format!(
+                    "no such file: {}",
+                    remote.display()
+                ))));
+            }
+            self.downloads
+                .borrow_mut()
+                .push((remote.to_path_buf(), local.to_path_buf()));
+            Ok(())
+        }
+    }
+
+    fn artifact_fixture(dir_label: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-driver-session-test-{dir_label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let profile = dir.join("profile.json");
+        std::fs::write(
+            &profile,
+            serde_json::json!({
+                "type": "Spec",
+                "name": "artifact-session",
+                "artifacts": ["/workspace/out", "/workspace/run.log"],
+                "phases": []
+            })
+            .to_string(),
+        )
+        .expect("write profile");
+        (dir, profile)
+    }
+
+    fn pod_for(profile: &Path, missing: &[&str]) -> ArtifactPod {
+        let node = lm_provision::frontend::load_profile(profile).expect("fixture parses");
+        ArtifactPod {
+            hash: lm_provision::canonical::hash(&node),
+            missing: missing.iter().map(|s| (*s).to_string()).collect(),
+            downloads: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// **Step 4b pulls each declared artifact to
+    /// `<artifacts_dir>/<pod_id>/<pod path>`, records a failed pull as
+    /// an uncollected row instead of failing the session, and step 5
+    /// writes the outcomes onto the ledger row.**
+    #[test]
+    fn declared_artifacts_are_pulled_recorded_and_ledgered() {
+        let (dir, profile) = artifact_fixture("pull");
+        let pod = pod_for(&profile, &["/workspace/run.log"]);
+        let ledger_path = dir.join("ledger.jsonl");
+        let plan = StepPlan {
+            artifacts_dir: Some(dir.join("artifacts")),
+            ledger: Some(ledger_path.clone()),
+            ..StepPlan::default()
+        };
+
+        let output = run(&pod, &plan, Path::new("lm-provision"), &profile, "pod-9")
+            .expect("an uncollected artifact must not fail the session");
+
+        // Declared order is the recorded order; the pull destination
+        // mirrors the pod path under the per-pod directory.
+        assert_eq!(output.artifacts.len(), 2);
+        assert_eq!(output.artifacts[0].path, "/workspace/out");
+        assert!(output.artifacts[0].collected);
+        assert_eq!(
+            output.artifacts[0].dest.as_deref(),
+            Some(dir.join("artifacts/pod-9/workspace/out").to_str().unwrap())
+        );
+        assert!(!output.artifacts[1].collected);
+        assert!(output.artifacts[1]
+            .error
+            .as_deref()
+            .expect("an uncollected row carries its reason")
+            .contains("/workspace/run.log"));
+        assert_eq!(pod.downloads.borrow().len(), 1);
+
+        // The ledger row carries the same outcomes — the record the
+        // release gate reads.
+        let rows = ledger::list(&ledger_path).expect("ledger readable");
+        assert_eq!(rows[0].artifacts, output.artifacts);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Gating the pull off records the debt rather than erasing it**:
+    /// every declared artifact rides the ledger row as uncollected, so
+    /// the release gate stays armed (08 §Session steps: a skipped step
+    /// is never an implicit promise the work happened elsewhere).
+    #[test]
+    fn a_gated_off_pull_still_records_every_declared_artifact_as_uncollected() {
+        let (dir, profile) = artifact_fixture("gated");
+        let pod = pod_for(&profile, &[]);
+        let plan = StepPlan {
+            artifacts_dir: None,
+            ..StepPlan::default()
+        };
+
+        let output = run(&pod, &plan, Path::new("lm-provision"), &profile, "pod-9")
+            .expect("the session itself succeeds");
+        assert_eq!(output.artifacts.len(), 2);
+        assert!(output.artifacts.iter().all(|it| !it.collected));
+        assert!(pod.downloads.borrow().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A dry run records no artifacts**: nothing was produced, so a
+    /// dry-run row must not arm the release gate — nor stand in for
+    /// the real apply behind it (the gate skips dry-run rows for the
+    /// same reason).
+    #[test]
+    fn a_dry_run_records_no_artifacts() {
+        let (dir, profile) = artifact_fixture("dry");
+        let pod = pod_for(&profile, &[]);
+        let plan = StepPlan {
+            mode: InvokeMode::DryRun,
+            artifacts_dir: Some(dir.join("artifacts")),
+            ..StepPlan::default()
+        };
+
+        let output = run(&pod, &plan, Path::new("lm-provision"), &profile, "pod-9")
+            .expect("dry run succeeds");
+        assert!(output.artifacts.is_empty());
+        assert!(pod.downloads.borrow().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

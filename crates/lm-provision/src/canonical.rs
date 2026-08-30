@@ -232,6 +232,7 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             requires_disk,
             requires_image,
             provider,
+            artifacts,
             phases,
         } => {
             let mut fields = variant_object("Spec");
@@ -268,6 +269,11 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             insert_str_map(&mut fields, "requires_disk", requires_disk);
             insert_optional_str(&mut fields, "requires_image", requires_image);
             insert_str_map(&mut fields, "provider", provider);
+            // Spec.artifacts: set-shaped like the declared lists above,
+            // so it sorts — but unlike them it postdates hashed
+            // profiles, so it follows the omit-when-empty rule the
+            // keyed slots carry, and for their reason.
+            insert_sorted_string_array_nonempty(&mut fields, "artifacts", artifacts);
             fields.insert(
                 "phases".into(),
                 CanonValue::Array(phases.iter().map(to_canon).collect()),
@@ -661,6 +667,21 @@ fn sorted_string_array(items: &[String]) -> CanonValue {
     string_array(&sorted)
 }
 
+/// [`sorted_string_array`] under the omit-when-empty rule: a set-shaped
+/// list added after profiles were already being hashed (`artifacts`)
+/// must not move an undeclaring profile's bytes, so an empty list emits
+/// no key at all — the list counterpart of [`insert_str_map`]'s rule.
+fn insert_sorted_string_array_nonempty(
+    fields: &mut BTreeMap<String, CanonValue>,
+    key: &str,
+    items: &[String],
+) {
+    if items.is_empty() {
+        return;
+    }
+    fields.insert(key.into(), sorted_string_array(items));
+}
+
 // ---------------------------------------------------------------------
 // write_canon: CanonValue -> deterministic JSON bytes
 // ---------------------------------------------------------------------
@@ -751,6 +772,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(gen),
             name: name.into(),
             version: None,
@@ -796,6 +818,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -814,6 +837,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -828,6 +852,43 @@ mod tests {
         assert_eq!(encode(&a), encode(&b));
     }
 
+    /// **`artifacts` is set-shaped, and an empty list costs no bytes.**
+    ///
+    /// The sort keeps declaration-order permutations hash-identical
+    /// (the declared-list rule); the omit keeps every profile written
+    /// before the slot existed on the hash it already has in ledgers
+    /// (the keyed-slot rule). `artifacts` is the one declared list that
+    /// needs both, because it is the one added after profiles were
+    /// already being hashed.
+    #[test]
+    fn artifacts_sort_and_an_empty_list_keeps_the_pre_slot_bytes() {
+        let gen = IdGen::new();
+        let empty = empty_spec(&gen, "p");
+        assert!(
+            !encode(&empty).contains("artifacts"),
+            "an undeclared artifacts slot must not enter the bytes"
+        );
+
+        let with = |artifacts: &[&str]| {
+            let mut spec = empty_spec(&gen, "p");
+            let ProfileNode::Spec {
+                artifacts: slot, ..
+            } = &mut spec
+            else {
+                unreachable!("empty_spec builds a Spec");
+            };
+            *slot = artifacts.iter().map(|s| (*s).to_string()).collect();
+            spec
+        };
+        assert_eq!(
+            encode(&with(&["/workspace/out", "/workspace/logs/run.log"])),
+            encode(&with(&["/workspace/logs/run.log", "/workspace/out"])),
+            "declaration order must not move the hash"
+        );
+        assert!(encode(&with(&["/workspace/out"]))
+            .contains("\"artifacts\":[\"/workspace/out\"],\"capabilities\""));
+    }
+
     // -----------------------------------------------------------------
     // The `models` payload, before and after `sha256` was decoded
     // -----------------------------------------------------------------
@@ -840,6 +901,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(gen),
             name: "p".into(),
             version: None,
@@ -1192,6 +1254,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1210,6 +1273,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1242,6 +1306,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(&gen),
             name: "p".into(),
             version: Some("1.0.0".into()),
@@ -1305,6 +1370,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(&gen),
             name: "p".into(),
             version: None,
@@ -1364,6 +1430,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(&gen),
             name: "demo".into(),
             version: None,
@@ -1466,6 +1533,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: vec![],
             id: new_id(&gen),
             name: "p".into(),
             version: None,

@@ -1,7 +1,9 @@
 # 08. Push driver protocol (on-pod agent model)
 
 Status: specified (the session contract below is the Phase G build
-target; revised 2026-08-01 from first real-pod usage feedback).
+target; revised 2026-08-01 from first real-pod usage feedback;
+revised 2026-08-30 to add the artifacts retrieval contract — step 4b
+and the release gate).
 Layer 4. Upstream deps: 07, 04, 06.
 MVP: Phase G.
 
@@ -36,11 +38,13 @@ Input  (everything the caller must know)
        │
        ▼   driver session
   0. ensure-binary → 1. place-profile → 2. hash-verify → 3. invoke
-       → 4. collect → 5. ledger
+       → 4. collect → 4b. pull-artifacts → 5. ledger
        │
        ▼
 Output = collected apply (report JSON, stderr transcript, exit code,
-         profile_hash, collected_at) + a ledger row (chapter 09)
+         profile_hash, collected_at) + the declared artifacts pulled
+         to the operator host with per-path outcomes + a ledger row
+         (chapter 09)
 ```
 
 The 2026-07 revision of this chapter defined only steps 1-4's middle
@@ -105,9 +109,23 @@ any effect runs.
 4. collect        — capture stdout (the apply report JSON), stderr
                     (the audit/progress transcript), and the exit
                     code (follows invoke)
+4b. pull-artifacts — pull each path the profile's `artifacts` slot
+                    declares (chapter 01 §Collected artifacts) to
+                    `<artifacts-dir>/<pod_id>/<pod path>` on the
+                    operator host (a directory recursively), and
+                    record the per-path outcome; runs only after a
+                    real apply — a dry run / validate produced
+                    nothing and records nothing. A failed pull does
+                    not fail the session: the report is already
+                    collected and the recorded debt is the point —
+                    but it does cost the zero exit, and the ledger
+                    row carries it into the release gate below.
+                    gate: no-artifacts (the declared paths are still
+                    recorded, all uncollected — gating the pull off
+                    is not a way to erase the declaration)
 5. ledger         — append (pod_id, profile_hash, report,
-                    collected_at) to the ledger (chapter 09)
-                    gate: no-ledger
+                    collected_at, artifacts) to the ledger
+                    (chapter 09)   gate: no-ledger
 ```
 
 - The driver may run `validate` / `hash` / `plan` remotely or
@@ -135,6 +153,32 @@ Per-transport realization:
   exactly this by hand — the leak surface is why the spelling is now
   pinned.)
 
+### Release gate
+
+The accident this contract exists to remove: work is produced on a
+machine, the machine is deleted, the work goes with it — and every
+step of that was somebody following procedure. The declaration
+(chapter 01 §Collected artifacts) makes retrieval a session step; the
+gate makes the deletion wait for it:
+
+- `release` reads the ledger before touching the provider. The row it
+  judges by is the **newest real apply** recorded for the machine's
+  id — dry-run rows are skipped (they produce nothing and record no
+  artifacts, and must not stand in for the real apply behind them).
+- If that row carries any `collected = false` artifact, the release
+  is refused at admission — exit 3, nothing destroyed, the
+  uncollected paths named. Re-running apply (which re-pulls) is the
+  way through the gate; `--force` is the operator's way around it,
+  stating that what is still on the machine is deleted with it.
+- An unreadable ledger refuses the same way (absent `--force`): a
+  gate that fails open makes a corrupt ledger the easiest way through
+  it.
+- A machine with no recorded apply passes — the gate can only weigh
+  what an apply recorded. The join key is the ledger's `pod_id`, so a
+  session driven for a machine that `acquire` created should carry
+  that machine's id as its pod-id (the apply default of the SSH host
+  records rows the gate will never look up).
+
 ## Outputs
 
 - stdout: exactly one JSON apply report (chapter 09), emitted on
@@ -144,8 +188,8 @@ Per-transport realization:
   failure of any class; 2 = usage).
 - The driver derives `(pod_id, profile_hash, report)` — `pod_id`
   from its own provisioning context, `profile_hash` via the `hash`
-  subcommand — and appends it to the ledger (chapter 09, session
-  step 5).
+  subcommand — and appends it, with step 4b's per-artifact outcomes,
+  to the ledger (chapter 09, session step 5).
 
 ## Error surface
 

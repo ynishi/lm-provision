@@ -164,14 +164,21 @@ fn handle_lm_apply(
     registry: &TargetRegistry,
     binary_path: &Path,
     ledger_path: &Path,
+    artifacts_dir: &Path,
     args: ApplyArgs<'_>,
 ) -> Result<ApplyOutput, McpError> {
     let transport = registry
         .resolve(args.pod_id)
         .map_err(|err| precondition_error(err.to_string()))?
         .to_transport();
-    apply_tool::lm_apply(transport.as_ref(), binary_path, ledger_path, args)
-        .map_err(|err| log_and_map_apply_error(&err, args.pod_id))
+    apply_tool::lm_apply(
+        transport.as_ref(),
+        binary_path,
+        ledger_path,
+        artifacts_dir,
+        args,
+    )
+    .map_err(|err| log_and_map_apply_error(&err, args.pod_id))
 }
 
 /// The MCP server handler (10-mcp.md). Deployment configuration
@@ -259,6 +266,7 @@ impl LmProvisionServer {
                 &config.targets,
                 &config.binary_path,
                 &config.ledger_path,
+                &config.artifacts_dir,
                 ApplyArgs {
                     profile_path: &profile_path,
                     pod_id: &pod_id,
@@ -379,6 +387,7 @@ mod tests {
                 profile_hash: "0".repeat(64),
                 report: serde_json::json!({ "ok": true }),
                 collected_at: "2026-08-06T00:00:00Z".to_string(),
+                artifacts: Vec::new(),
             },
         )
         .expect("seed the ledger with one row");
@@ -397,6 +406,7 @@ mod tests {
             &registry,
             Path::new("/nonexistent/lm-provision"),
             &ledger_path,
+            Path::new("/nonexistent/artifacts"),
             ApplyArgs {
                 profile_path: Path::new("/nonexistent/profile.json"),
                 pod_id: "pod-not-registered",
@@ -484,6 +494,10 @@ mod tests {
             self.upload_to("/pod/profile.json")
         }
 
+        fn download(&self, _remote: &Path, _local: &Path) -> Result<(), TransportError> {
+            unreachable!("these fixtures fail before the pull-artifacts step")
+        }
+
         fn exec(
             &self,
             _paths: &PodPaths,
@@ -510,6 +524,7 @@ mod tests {
             &FailingTransport { failure },
             Path::new("/nonexistent/lm-provision"),
             &temp_path("redacted-ledger").with_extension("jsonl"),
+            Path::new("/nonexistent/artifacts"),
             ApplyArgs {
                 profile_path: &fixture("apply-sh-fs.json"),
                 pod_id: "test-pod-1",
@@ -626,6 +641,7 @@ mod tests {
             &registry,
             Path::new("/nonexistent/lm-provision"),
             &ledger_path,
+            Path::new("/nonexistent/artifacts"),
             ApplyArgs {
                 profile_path: &fixture("apply-sh-fs.json"),
                 pod_id: "dev-local",

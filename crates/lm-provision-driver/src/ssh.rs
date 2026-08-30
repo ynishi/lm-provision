@@ -242,6 +242,40 @@ impl Transport for SshTransport {
         Ok(dest)
     }
 
+    fn download(&self, remote: &Path, local: &Path) -> Result<(), TransportError> {
+        if let Some(parent) = local.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // `-r` unconditionally: a remote directory needs it, and scp
+        // copies a plain file identically with or without it — so the
+        // driver does not have to ask the pod what the path is first.
+        let output = Command::new("scp")
+            .args([
+                "-r",
+                "-P",
+                &self.port.to_string(),
+                "-i",
+                &self.key_path.display().to_string(),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+            ])
+            .arg(format!("{}:{}", self.target(), remote.display()))
+            .arg(local)
+            .output()?;
+        if !output.status.success() {
+            return Err(TransportError::Io(std::io::Error::other(format!(
+                "scp {} -> {} exited with {:?}: {}",
+                remote.display(),
+                local.display(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ))));
+        }
+        Ok(())
+    }
+
     fn exec(
         &self,
         paths: &PodPaths,

@@ -98,6 +98,29 @@ impl Transport for LocalExecTransport {
             exit_code: output.status.code(),
         })
     }
+
+    fn download(&self, remote: &Path, local: &Path) -> Result<(), TransportError> {
+        if let Some(parent) = local.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        copy_recursively(remote, local)?;
+        Ok(())
+    }
+}
+
+/// A file copies as a file; a directory copies entry by entry — the
+/// same-host reading of the SSH transport's `scp -r`.
+fn copy_recursively(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::metadata(from)?.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_recursively(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
 }
 
 fn file_name(path: &Path) -> Result<&OsStr, TransportError> {
@@ -176,6 +199,45 @@ mod tests {
         assert!(matches!(err, TransportError::InvalidPath(_)));
 
         std::fs::remove_dir_all(&staging).ok();
+    }
+
+    /// [`Transport::download`] brings back a file as a file and a
+    /// directory recursively — the same-host reading of `scp -r` the
+    /// SSH transport ships (08 §Session steps pull-artifacts).
+    #[test]
+    fn download_copies_a_file_and_a_directory_recursively() {
+        let pod = tmp_dir("download-pod");
+        std::fs::create_dir_all(pod.join("out/nested")).expect("create pod dirs");
+        std::fs::write(pod.join("run.log"), b"log line").expect("write file");
+        std::fs::write(pod.join("out/a.png"), b"a").expect("write a");
+        std::fs::write(pod.join("out/nested/b.png"), b"b").expect("write b");
+
+        let local = tmp_dir("download-local");
+        let transport = LocalExecTransport::new(tmp_dir("download-staging"));
+
+        transport
+            .download(&pod.join("run.log"), &local.join("pod/run.log"))
+            .expect("a file downloads");
+        assert_eq!(
+            std::fs::read(local.join("pod/run.log")).expect("downloaded file readable"),
+            b"log line"
+        );
+
+        transport
+            .download(&pod.join("out"), &local.join("pod/out"))
+            .expect("a directory downloads");
+        assert_eq!(
+            std::fs::read(local.join("pod/out/nested/b.png")).expect("nested entry survives"),
+            b"b"
+        );
+
+        let err = transport
+            .download(&pod.join("absent"), &local.join("pod/absent"))
+            .expect_err("a missing remote is a transport error");
+        assert!(matches!(err, TransportError::Io(_)));
+
+        std::fs::remove_dir_all(&pod).ok();
+        std::fs::remove_dir_all(&local).ok();
     }
 
     #[cfg(unix)]

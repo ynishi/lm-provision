@@ -164,6 +164,30 @@ pub enum ValidateError {
         path: String,
     },
 
+    /// An `artifacts` entry is not a `..`-free absolute path
+    /// (check 5b). Same shape rule as `paths` — an artifact path is
+    /// interpolated into the driver's pull invocation the way a
+    /// declared root is interpolated into a policy check.
+    #[error("artifacts[{index}] ({path:?}) {reason}")]
+    ArtifactShape {
+        /// 1-based position within `artifacts`.
+        index: usize,
+        /// The offending path.
+        path: String,
+        /// Why the path shape is rejected.
+        reason: &'static str,
+    },
+
+    /// An `artifacts` entry is absolute and `..`-free but not
+    /// shell-safe (check 5b).
+    #[error("artifacts[{index}] ({path:?}) is not shell-safe")]
+    ArtifactNotShellSafe {
+        /// 1-based position within `artifacts`.
+        index: usize,
+        /// The offending path.
+        path: String,
+    },
+
     /// A phase payload failed its shell-safety / route-shape walk
     /// (check 6). The message is preformatted as
     /// `phases[<i>].<field>: <reason>` to match the legacy per-field
@@ -346,6 +370,7 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         requires_disk,
         requires_image,
         provider,
+        artifacts,
         phases,
         ..
     } = root
@@ -442,6 +467,27 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         }
         if !is_shell_safe(p) {
             return Err(ValidateError::PathNotShellSafe {
+                index: idx + 1,
+                path: p.clone(),
+            });
+        }
+    }
+
+    // Check 5b: every `artifacts` entry passes the same shape rule as
+    // a `paths` root — absolute, `..`-free, shell-safe. The entry is
+    // interpolated into the driver's pull invocation (spec 08
+    // §Session steps, pull-artifacts), which is the same exposure a
+    // declared root has.
+    for (idx, p) in artifacts.iter().enumerate() {
+        if let Err(reason) = check_absolute_path_shape(p) {
+            return Err(ValidateError::ArtifactShape {
+                index: idx + 1,
+                path: p.clone(),
+                reason,
+            });
+        }
+        if !is_shell_safe(p) {
+            return Err(ValidateError::ArtifactNotShellSafe {
                 index: idx + 1,
                 path: p.clone(),
             });
@@ -1193,6 +1239,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -1248,6 +1295,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             id: ids.node(),
             name: name.into(),
             version: None,
@@ -1442,6 +1490,59 @@ mod tests {
     fn a_clean_absolute_path_passes_check_5() {
         let node = spec_full("demo", &[], &[], &["/workspace/models"], vec![]);
         assert!(validate(&node).is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // Check 5b: artifacts — same shape rule as paths, own error.
+    // -----------------------------------------------------------------
+
+    /// The `spec` fixture with the `artifacts` slot filled in.
+    fn spec_with_artifacts(artifacts: &[&str]) -> ProfileNode {
+        let mut node = spec("demo", vec![]);
+        let ProfileNode::Spec {
+            artifacts: slot, ..
+        } = &mut node
+        else {
+            unreachable!("spec builds a Spec");
+        };
+        *slot = artifacts.iter().map(|s| (*s).to_string()).collect();
+        node
+    }
+
+    #[test]
+    fn a_relative_or_dotdot_or_unsafe_artifact_is_rejected() {
+        assert_eq!(
+            validate(&spec_with_artifacts(&["out/x.png"])),
+            Err(ValidateError::ArtifactShape {
+                index: 1,
+                path: "out/x.png".into(),
+                reason: "must be absolute (leading '/')",
+            })
+        );
+        assert_eq!(
+            validate(&spec_with_artifacts(&["/workspace/../etc"])),
+            Err(ValidateError::ArtifactShape {
+                index: 1,
+                path: "/workspace/../etc".into(),
+                reason: "must not contain a '..' segment",
+            })
+        );
+        assert_eq!(
+            validate(&spec_with_artifacts(&["/out dir"])),
+            Err(ValidateError::ArtifactNotShellSafe {
+                index: 1,
+                path: "/out dir".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn clean_absolute_artifacts_pass_check_5b() {
+        assert!(validate(&spec_with_artifacts(&[
+            "/workspace/ComfyUI/output",
+            "/workspace/run.log"
+        ]))
+        .is_ok());
     }
 
     // -----------------------------------------------------------------
@@ -1998,6 +2099,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             id: ids.node(),
             name: "declared".into(),
             version: None,

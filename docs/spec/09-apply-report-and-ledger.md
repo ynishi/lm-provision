@@ -242,8 +242,30 @@ One row per apply invocation:
   profile_hash = string,   -- 64-hex, chapter 03 hash of the applied profile
   report       = <apply report>,  -- verbatim, as collected
   collected_at = string,   -- RFC 3339 UTC, driver clock
+  artifacts?   = [ <artifact entry>, ... ],  -- absent when none declared
 }
 ```
+
+Artifact entry — one per path the profile's `artifacts` slot declared
+(chapter 01 §Collected artifacts), recorded by the driver's
+pull-artifacts step (chapter 08 §Session steps):
+
+```
+{
+  path      = string,   -- the declared pod-side path
+  collected = bool,     -- whether the pull landed it on the operator host
+  dest?     = string,   -- where it landed, present iff collected
+  error?    = string,   -- why it did not, present iff not collected
+}
+```
+
+A `collected = false` entry is a recorded debt, not bookkeeping: the
+run's work product exists only on the pod, and chapter 08's release
+gate refuses to delete the machine while its newest real apply
+carries one. The field is additive to the frozen row schema: a row
+written before it existed reads back as one declaring no artifacts,
+and a row declaring none is written without the key — old rows and
+new undeclaring rows are byte-compatible in both directions.
 
 - Append-only: rows are never mutated or deleted; corrections are
   new rows. The ledger is the source of truth for downstream
@@ -282,7 +304,9 @@ One row per apply invocation:
   rendering): **stable**.
 - Ledger row schema + append-only semantics: **stable** — a tier
   separate from the driver protocol (ledger readers outlive driver
-  implementations).
+  implementations). The `artifacts` field (2026-08-30) is the
+  additive form that stability permits: optional, absent-means-none,
+  and never re-encoding a row that does not carry it.
 - Ledger physical encoding: **internal**.
 
 ## Upstream references

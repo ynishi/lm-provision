@@ -73,6 +73,7 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         requires_disk,
         requires_image,
         provider,
+        artifacts,
         phases,
     } = root
     else {
@@ -95,6 +96,7 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         requires_disk: requires_disk.clone(),
         requires_image: requires_image.clone(),
         provider: provider.clone(),
+        artifacts: artifacts.clone(),
         phases: normalize_phases(phases, IdMinter::above(root)),
     }
 }
@@ -349,6 +351,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             id: g.node(),
             name: "demo".into(),
             version: None,
@@ -527,6 +530,7 @@ mod tests {
             requires_disk: Default::default(),
             requires_image: None,
             provider: Default::default(),
+            artifacts: Vec::new(),
             phases: vec![install],
         };
         let root_id = root.node_id();

@@ -61,6 +61,7 @@ mod tests {
             profile_hash: hash.to_string(),
             report: serde_json::json!({ "ok": true, "dry_run": true, "profile_name": "demo", "steps": [] }),
             collected_at: "2026-07-12T00:00:00Z".to_string(),
+            artifacts: Vec::new(),
         }
     }
 
