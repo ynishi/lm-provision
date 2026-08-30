@@ -1,0 +1,49 @@
+{
+  "type": "Spec",
+  "name": "qwen-vllm-serve",
+  "version": "0.1.0",
+  "description": "Serve a Qwen-family chat model on vLLM (OpenAI-compatible, port 8000, tool calling enabled) on a single 48GB-class GPU. The model is yours to declare: replace the SET-ME placeholder in service.start with the Hugging Face repo id you intend to serve — verified with community AWQ-INT4 builds of Qwen3.6-27B and Qwen3.8-27B (Apache 2.0). Tool-call parser: the default 'hermes' fits Qwen3.5/3.6 lineage; switch the extra_args value to 'qwen3_coder' for Qwen3.8 / Qwen3-Coder lineage, which emits the XML function-call format. The install step is CUDA-driver-aware: PyPI's default vllm/torch wheels are CUDA-13 builds, and on hosts whose driver reports CUDA 12.x (e.g. driver 570) they fail at engine start with 'driver too old' — on such hosts the script force-reinstalls the +cu129 torch family and the +cu129 vllm wheel from the vLLM GitHub release, which run on any 12.x driver via CUDA minor-version compatibility. First start downloads the model via vLLM itself (~16 GB for a 27B AWQ build), hence the generous service.ready deadline.",
+  "capabilities": ["sh.exec", "net.http_get"],
+  "paths": ["/workspace"],
+  "http_allowlist": ["http://127.0.0.1:8000"],
+  "requires_ports": {
+    "8000": "public_http",
+    "22": "raw_tcp"
+  },
+  "requires_gpu": {
+    "count": "1",
+    "min_vram_gb": "40"
+  },
+  "requires_disk": {
+    "ephemeral_gb": "80"
+  },
+  "requires_image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+  "phases": [
+    {
+      "type": "PostInstall",
+      "script": "set -e\ncuda_major=$(nvidia-smi | grep -oE 'CUDA Version: [0-9]+' | grep -oE '[0-9]+$' | head -1 || echo 0)\npip install 'vllm==0.28.0'\nif [ \"$cuda_major\" = \"12\" ]; then\n  pip install --force-reinstall --no-deps 'torch==2.13.0+cu129' 'torchvision==0.28.0+cu129' 'torchaudio==2.11.0+cu129' torchcodec --index-url https://download.pytorch.org/whl/cu129\n  pip install --force-reinstall --no-deps 'https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl'\nfi\npython3 -c 'import torch, vllm; torch.zeros(1).cuda(); print(\"stack-ok\", torch.__version__, vllm.__version__)'"
+    },
+    {
+      "type": "ServiceStart",
+      "name": "vllm-qwen",
+      "platform_kind": "vllm",
+      "model": "SET-ME/your-model-repo-id",
+      "port": 8000,
+      "extra_args": [
+        "--max-model-len",
+        "32768",
+        "--gpu-memory-utilization",
+        "0.92",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "hermes"
+      ]
+    },
+    {
+      "type": "ServiceReady",
+      "name": "vllm-qwen",
+      "check_url": "http://127.0.0.1:8000/v1/models",
+      "timeout_sec": 1800
+    }
+  ]
+}

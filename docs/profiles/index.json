@@ -13,6 +13,13 @@
       "path": "comfyui-base-0.1.0.json",
       "profile_hash": "426ee76b2e055bd80003697443d5b1a2703396f0158013f5a48a0b0fc1c4daed",
       "summary": "ComfyUI + ComfyUI-Manager, no model weights baked in."
+    },
+    {
+      "name": "qwen-vllm-serve",
+      "version": "0.1.0",
+      "path": "qwen-vllm-serve-0.1.0.json",
+      "profile_hash": "0dcf4964ee9f684dadafb70078d878b9b1b5d021fe8db8800f55a2f5fd8b1498",
+      "summary": "vLLM OpenAI-compatible serving for a Qwen-family model you declare (48GB GPU, tool calling on, CUDA-driver-aware install)."
     }
   ]
 }
