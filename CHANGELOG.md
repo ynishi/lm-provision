@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A second platform: the vast.ai marketplace (`--provider vast`).**
+  The hardware there is already listed as offers, so selection happens
+  before create: the acquisition now carries an optional *discovery* —
+  a `search offers` query built from the profile's requirements in the
+  marketplace's own filter words (`num_gpus>=`, `gpu_ram>=`,
+  `disk_space>=`), pinned to verified hosts, sorted by ascending
+  price — and the first row is the machine. The query is the whole
+  selection policy, and a dry-run prints it. No catalogue: the
+  marketplace answers memory in the device's own figures, and the
+  filter takes the floor in the profile's own unit. Raw TCP only (no
+  managed HTTPS proxy), one disk (a persistent level is refused, not
+  mapped), and authentication stays with the service's own CLI — it
+  holds its key in the file `vastai set api-key` writes, so the driver
+  requires no variable and a missing key is that CLI's own error.
+  `acquire` / `release` / `check` all take `--provider` (default
+  `runpod`; where to buy is the operator's call at acquisition time,
+  not the profile's).
+
 ### Changed
 
 - **GPU selection sorts by price, not by memory.** The catalogue now

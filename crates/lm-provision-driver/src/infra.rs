@@ -73,6 +73,11 @@ pub trait Infra {
     /// inheritance, and never through here.
     ///
     /// Empty for a target that needs none, which is a real answer.
+    ///
+    /// Also empty for a target whose tooling holds its own key — the
+    /// vast CLI reads the file its `set api-key` wrote and never the
+    /// environment, so there is no name to require here and a missing
+    /// key surfaces as that CLI's own error, before anything is spent.
     fn credentials(&self) -> &'static [&'static str];
 
     /// Whether this target can give the workload the accelerators it
@@ -171,10 +176,31 @@ pub struct SshEndpoint {
 /// machines by hand for exactly that reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acquisition {
+    /// What to run first, when the target sells *offers* rather than
+    /// letting a create call describe a machine: prints a JSON array of
+    /// candidates, and the first row's `id` fills `{offer_id}` in
+    /// `create`.
+    ///
+    /// **The query carries the policy.** Which offers qualify and which
+    /// comes first are written into this argv as the service's own
+    /// filter and sort words — so the selection stays data an operator
+    /// can read in a dry-run, and this module needs no callback to ask
+    /// an adapter "which one?". Taking the first row of a query that
+    /// sorts by price *is* taking the cheapest thing that qualifies.
+    ///
+    /// `None` for a target whose create call selects by itself.
+    pub discover: Option<Vec<String>>,
     /// The program and arguments that create the machine.
     pub create: Vec<String>,
     /// The request body, when the create call takes one.
     pub body: Option<String>,
+    /// The key the create response names the new machine under.
+    ///
+    /// Each service's own word: `id` on one, `new_contract` on another
+    /// — and the whole reason [`acquire`] cannot hardcode either is
+    /// that a machine created under a key nobody read is a bill nobody
+    /// can stop (see [`ExecuteError::Anonymous`]).
+    pub created_id_key: &'static str,
     /// How to read back what was created, given its id.
     ///
     /// `{id}` is replaced with the identifier the create call returns.
@@ -453,6 +479,9 @@ impl Infra for RunPodAdapter {
         )?;
 
         Ok(Acquisition {
+            // The create call describes the machine itself, so there is
+            // nothing to discover first.
+            discover: None,
             create: vec![
                 "runpod-cli".into(),
                 "pods".into(),
@@ -460,6 +489,7 @@ impl Infra for RunPodAdapter {
                 "-j".into(),
             ],
             body: Some(body),
+            created_id_key: "id",
             inspect: vec![
                 "runpod-cli".into(),
                 "pods".into(),
@@ -841,6 +871,323 @@ impl Infra for ContainerAdapter {
     }
 }
 
+/// A GPU marketplace: the hardware is already listed as *offers* from
+/// many hosts, and the create call names an offer rather than
+/// describing a machine.
+///
+/// That inversion is the whole shape of this adapter. The managed pod
+/// service takes a description and finds hardware, so its adapter
+/// carries a catalogue and builds a request body; here selection
+/// happens **before** create, so this adapter carries no catalogue at
+/// all — the requirements translate into the marketplace's own filter
+/// words (`gpu_ram>=`, `num_gpus>=`), the query sorts by price, and
+/// [`Acquisition::discover`]'s first row is the machine. The cheapest
+/// thing that clears the floor leads on both targets; this one just
+/// asks the marketplace instead of a table.
+///
+/// **Verified hosts only.** The listings are other people's machines,
+/// and the unverified tier is the one the marketplace itself fences off
+/// (datacenter verification); the query pins `verified=true` so what a
+/// profile lands on is the fenced side. `provider."vast.query"` is the
+/// way to say otherwise, as `provider.runpod.gpuTypeIds` is on the
+/// other target.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VastAdapter;
+
+impl Infra for VastAdapter {
+    /// Raw TCP only: an internal port maps to a random external port on
+    /// the host's shared public address, read back from the
+    /// description. There is no managed HTTPS proxy in front — a
+    /// profile that requires `public_http` is refused at admission
+    /// rather than handed a port that answers plain TCP
+    /// [documented: docs.vast.ai/documentation/instances/connect/networking].
+    fn capability(&self) -> Capability {
+        Capability {
+            target: "vast",
+            exposures: &[Exposure::RawTcp],
+        }
+    }
+
+    /// Docker's own `-p` form, verbatim — the create call forwards
+    /// these inside its `--env` argument, which is where this service
+    /// takes docker run options.
+    fn render(&self, required: &Requirements) -> Vec<String> {
+        required
+            .ports
+            .iter()
+            .map(|it| format!("-p {}:{}", it.port, it.port))
+            .collect()
+    }
+
+    fn provider_namespace(&self) -> &'static str {
+        "vast"
+    }
+
+    /// None — not because the target is free, but because its CLI holds
+    /// its own key: `vastai set api-key` writes a file the CLI reads
+    /// back, and it reads no environment variable at all [measured:
+    /// 2026-08-30, vast.py resolves `args.api_key` from the key file or
+    /// a flag; the only env read is `VAST_URL`]. Authentication is the
+    /// delegate's own (spec 06's rule for every tool this repo drives),
+    /// so a missing key surfaces as that CLI's error — before anything
+    /// is spent, since the first call is the discovery.
+    fn credentials(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The floor and the count, in the marketplace's own filter words.
+    ///
+    /// The query unit is decimal gigabytes, same terms the requirement
+    /// is written in [documented: docs.vast.ai — `gpu_ram` is GB in CLI
+    /// queries, MB in REST responses], so no catalogue and no
+    /// conversion stand between them.
+    fn gpu_answer(&self, required: &GpuRequirement) -> Answer {
+        if required.count == 0 {
+            return Answer::unmet(
+                "this marketplace rents GPU machines; a profile asking for none \
+                 has nothing to rent here",
+            );
+        }
+        let mut using = vec![format!("num_gpus>={}", required.count)];
+        if let Some(floor) = required.min_vram_gb {
+            using.push(format!("gpu_ram>={floor}"));
+        }
+        Answer::Met { using }
+    }
+
+    /// One disk, sized at create, living and dying with the instance.
+    ///
+    /// A persistent level is refused rather than mapped onto that disk:
+    /// calling storage "persisted across restarts" when the platform
+    /// has no such distinction would promise exactly what the two-level
+    /// vocabulary exists to keep apart.
+    fn disk_answer(&self, required: &DiskRequirement) -> Answer {
+        if required.persistent_gb.is_some() || required.persistent_at.is_some() {
+            return Answer::unmet(
+                "an instance here has one disk that lives and dies with it; \
+                 there is no separately persisted volume to size or mount",
+            );
+        }
+        match required.ephemeral_gb {
+            Some(gb) => Answer::met_using([format!("disk_space>={gb}")]),
+            None => Answer::met(),
+        }
+    }
+
+    /// The service's own CLI, driven the same way as the other target's
+    /// and for the same reason: the useful thing this repo adds is the
+    /// requirements, not a second REST client.
+    fn acquisition(
+        &self,
+        required: &Requirements,
+        provider: &BTreeMap<String, String>,
+    ) -> Result<Acquisition, AcquisitionError> {
+        vast_acquisition(
+            required,
+            provider,
+            self.render(required),
+            required.gpu.as_ref().map(|it| self.gpu_answer(it)),
+            required.disk.as_ref().map(|it| self.disk_answer(it)),
+        )
+    }
+
+    /// The description names the device and its memory directly —
+    /// `gpu_ram` is the figure the device itself reports (a part sold
+    /// as 24 GB answers 24564 [documented: docs.vast.ai api-reference,
+    /// show-instance example — the same number `nvidia-smi` measured on
+    /// a real 4090 here]), so it lands as MiB unconverted and no
+    /// catalogue has to know the model.
+    fn read_state(&self, inspected: &serde_json::Value) -> MachineState {
+        let number = |value: &serde_json::Value| value.as_u64().map(|it| it as u32);
+
+        // Two shapes in the wild: the docker-style map
+        // `{"8188/tcp": [...]}` and a plain array of numbers. Either
+        // way every entry is a TCP port on the shared address.
+        let mut exposed = BTreeMap::new();
+        let ports = inspected.get("ports");
+        match ports {
+            Some(serde_json::Value::Object(map)) => {
+                for key in map.keys() {
+                    let port = key.split('/').next().and_then(|it| it.parse::<u16>().ok());
+                    if let Some(port) = port {
+                        exposed.insert(port, Exposure::RawTcp);
+                    }
+                }
+            }
+            Some(serde_json::Value::Array(entries)) => {
+                for port in entries.iter().filter_map(|it| it.as_u64()) {
+                    exposed.insert(port as u16, Exposure::RawTcp);
+                }
+            }
+            _ => {}
+        }
+
+        MachineState {
+            exposed,
+            ports_observed: ports.is_some(),
+            gpu_count: inspected.get("num_gpus").and_then(number),
+            gpu_vram_mib: inspected.get("gpu_ram").and_then(number),
+            ephemeral_gb: inspected
+                .get("disk_space")
+                .and_then(|it| it.as_f64())
+                .map(|it| it as u32),
+            persistent_gb: None,
+            persistent_at: None,
+        }
+    }
+
+    /// `ssh_host` + `ssh_port` for the session, and the docker-style
+    /// port map against `public_ipaddr` for everything else — each
+    /// field the service's own [documented: docs.vast.ai api-reference,
+    /// show-instance]. SSH goes through the service's own ssh hosts
+    /// rather than a mapped port, which is why it is not derived from
+    /// the port map the way the other target's is.
+    fn connection(&self, inspected: &serde_json::Value) -> Connection {
+        let text = |key: &str| {
+            inspected
+                .get(key)
+                .and_then(|it| it.as_str())
+                .filter(|it| !it.is_empty())
+        };
+        let ssh = text("ssh_host").and_then(|host| {
+            inspected
+                .get("ssh_port")
+                .and_then(|it| it.as_u64())
+                .map(|port| SshEndpoint {
+                    host: host.to_string(),
+                    port: port as u16,
+                    user: crate::ssh::DEFAULT_SSH_USER.to_string(),
+                })
+        });
+
+        let mut endpoints = BTreeMap::new();
+        if let (Some(ip), Some(map)) = (
+            text("public_ipaddr"),
+            inspected.get("ports").and_then(|it| it.as_object()),
+        ) {
+            for (key, bindings) in map {
+                let Some(port) = key.split('/').next().and_then(|it| it.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+                let external = bindings
+                    .as_array()
+                    .and_then(|it| it.first())
+                    .and_then(|it| it.get("HostPort"))
+                    .and_then(|it| it.as_str());
+                if let Some(external) = external {
+                    endpoints.insert(port, format!("{ip}:{external}"));
+                }
+            }
+        }
+        Connection { ssh, endpoints }
+    }
+}
+
+/// The discovery and create for [`VastAdapter::acquisition`], built
+/// from the requirements *and the adapter's answers to them* — the same
+/// gate [`runpod_body`] stands behind, for the same reason: a builder
+/// that reads a requirement without consulting its own answer can emit
+/// a query that quietly dropped one.
+fn vast_acquisition(
+    required: &Requirements,
+    provider: &BTreeMap<String, String>,
+    ports: Vec<String>,
+    gpu_answer: Option<Answer>,
+    disk_answer: Option<Answer>,
+) -> Result<Acquisition, AcquisitionError> {
+    // The image is the platform's own key, as on every target that
+    // takes one (see `runpod_body`).
+    let image = provider
+        .get("vast.image")
+        .ok_or(AcquisitionError::Incomplete {
+            target: "vast",
+            missing: "provider.vast.image",
+        })?;
+
+    let refuse = |answer: Answer| match answer {
+        Answer::Met { using } => Ok(using),
+        Answer::Unmet { reason } => Err(AcquisitionError::Unmet {
+            target: "vast",
+            reason,
+        }),
+        Answer::NotExamined { reason } => Err(AcquisitionError::Unmet {
+            target: "vast",
+            reason: format!(
+                "{reason} — this target selects the machine, so a requirement it \
+                 cannot decide is one it cannot ask for"
+            ),
+        }),
+    };
+
+    // `rentable=true`: listed and not currently taken. `verified=true`:
+    // the fenced tier — see the adapter doc.
+    let mut query = vec!["rentable=true".to_string(), "verified=true".to_string()];
+    if let Some(answer) = gpu_answer {
+        query.extend(refuse(answer)?);
+    }
+    if let Some(answer) = disk_answer {
+        query.extend(refuse(answer)?);
+    }
+    if let Some(extra) = provider.get("vast.query") {
+        query.push(extra.clone());
+    }
+
+    let mut create = vec![
+        "vastai".to_string(),
+        "create".to_string(),
+        "instance".to_string(),
+        "{offer_id}".to_string(),
+        "--image".to_string(),
+        image.clone(),
+        // Key registration is account-level (`vastai create ssh-key`);
+        // `--ssh --direct` is what makes the created instance answer on
+        // an SSH endpoint at all.
+        "--ssh".to_string(),
+        "--direct".to_string(),
+    ];
+    if let Some(gb) = required.disk.as_ref().and_then(|it| it.ephemeral_gb) {
+        create.push("--disk".to_string());
+        create.push(gb.to_string());
+    }
+    if !ports.is_empty() {
+        create.push("--env".to_string());
+        create.push(ports.join(" "));
+    }
+    create.push("--raw".to_string());
+
+    Ok(Acquisition {
+        discover: Some(vec![
+            "vastai".to_string(),
+            "search".to_string(),
+            "offers".to_string(),
+            query.join(" "),
+            // Ascending price: taking the first row of this *is* the
+            // selection policy.
+            "-o".to_string(),
+            "dph".to_string(),
+            "--raw".to_string(),
+        ]),
+        create,
+        body: None,
+        created_id_key: "new_contract",
+        inspect: vec![
+            "vastai".to_string(),
+            "show".to_string(),
+            "instance".to_string(),
+            "{id}".to_string(),
+            "--raw".to_string(),
+        ],
+        release: vec![
+            "vastai".to_string(),
+            "destroy".to_string(),
+            "instance".to_string(),
+            "{id}".to_string(),
+            "--raw".to_string(),
+        ],
+    })
+}
+
 /// A machine that exists because [`acquire`] made it.
 ///
 /// Carries what it takes to give it back, so that a caller holding one
@@ -938,6 +1285,19 @@ pub enum ExecuteError {
         /// What came back instead.
         body: String,
     },
+
+    /// A discovery ran and matched nothing, so there is nothing to
+    /// create from.
+    ///
+    /// Not a failure of the command — the query succeeded and the
+    /// marketplace simply has no machine like that right now. Said
+    /// before anything is spent, with the query in it, because the way
+    /// out is loosening the query.
+    #[error("`{command}` found no offers to create from")]
+    NoCandidates {
+        /// The discovery that came back empty.
+        command: String,
+    },
 }
 
 /// Create a machine from a rendered [`Acquisition`].
@@ -947,22 +1307,53 @@ pub enum ExecuteError {
 /// performing one are separate acts in the source as well as in the
 /// design: a caller that only wants to show an operator what would
 /// happen cannot reach this by accident.
-pub fn acquire(acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
+pub fn acquire(mut acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
+    if let Some(discover) = &acquisition.discover {
+        let found = run_json(discover, None)?;
+        // The first row of a query whose argv already sorted and
+        // filtered — see `Acquisition::discover` for why the policy
+        // lives in the query rather than here.
+        let offer = found
+            .as_array()
+            .and_then(|it| it.first())
+            .ok_or_else(|| ExecuteError::NoCandidates {
+                command: discover.join(" "),
+            })?;
+        let offer_id = json_id(offer, "id").ok_or_else(|| ExecuteError::Unreadable {
+            command: discover.join(" "),
+            detail: format!("the first offer has no readable id: {offer}"),
+        })?;
+        acquisition.create = acquisition
+            .create
+            .iter()
+            .map(|it| it.replace("{offer_id}", &offer_id))
+            .collect();
+    }
     let created = run_json(&acquisition.create, acquisition.body.as_deref())?;
-    let id = created
-        .get("id")
-        .and_then(|it| it.as_str())
-        .ok_or_else(|| ExecuteError::Anonymous {
+    let id = json_id(&created, acquisition.created_id_key).ok_or_else(|| {
+        ExecuteError::Anonymous {
             command: acquisition.create.join(" "),
             body: created.to_string(),
-        })?
-        .to_string();
+        }
+    })?;
     Ok(Acquired {
         id,
         inspected: created.clone(),
         created,
         acquisition,
     })
+}
+
+/// The identifier under `key`, in the form every argv wants it.
+///
+/// A string or a number — one service writes `"id": "abc"` and another
+/// writes `"new_contract": 9841205`, and both name a machine.
+fn json_id(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value.get(key)? {
+        serde_json::Value::String(it) => Some(it.clone()),
+        serde_json::Value::Number(it) => Some(it.to_string()),
+        _ => None,
+    }
 }
 
 /// Copy over what `fresh` does not say, from what `earlier` did.
@@ -1034,9 +1425,11 @@ fn run(argv: &[String], body: Option<&str>) -> Result<String, ExecuteError> {
 /// [`run`], reading the output as JSON.
 fn run_json(argv: &[String], body: Option<&str>) -> Result<serde_json::Value, ExecuteError> {
     let stdout = run(argv, body)?;
-    // The CLI prints its own progress before the payload, so the object
-    // is found rather than assumed to start at byte zero.
-    let start = stdout.find('{').unwrap_or(0);
+    // The CLI prints its own progress before the payload, so the
+    // payload is found rather than assumed to start at byte zero — and
+    // it may be an array (a discovery's offer list) as well as an
+    // object.
+    let start = stdout.find(['{', '[']).unwrap_or(0);
     serde_json::from_str(&stdout[start..]).map_err(|err| ExecuteError::Unreadable {
         command: argv.join(" "),
         detail: err.to_string(),
@@ -1820,8 +2213,10 @@ mod tests {
         }"#;
 
         let mut acquired = acquire(Acquisition {
+            discover: None,
             create: vec!["echo".into(), created.into()],
             body: None,
+            created_id_key: "id",
             inspect: vec!["echo".into(), read_back.into()],
             release: vec!["true".into()],
         })
@@ -1937,5 +2332,203 @@ mod tests {
             unexamined(&RunPodAdapter, &provider),
             vec!["container.network"]
         );
+    }
+
+    /// What a marketplace profile asks for: raw TCP (there is no
+    /// managed HTTPS proxy to require), one 40 GB device, one sized
+    /// disk.
+    fn marketplace_requirements() -> Requirements {
+        Requirements::from_slots(
+            &[("8000", "raw_tcp")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &[("count", "1"), ("min_vram_gb", "40")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &[("ephemeral_gb", "60")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+        .expect("well-formed fixture")
+    }
+
+    fn marketplace_provider() -> BTreeMap<String, String> {
+        [("vast.image", "pytorch/pytorch:2.4.0")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// **The selection is the query.** Every requirement lands in the
+    /// discovery as the marketplace's own filter word, the sort is
+    /// ascending price, and the create call takes the winner by
+    /// placeholder — so a dry-run shows an operator the whole policy.
+    #[test]
+    fn a_marketplace_acquisition_discovers_before_it_creates() {
+        let acquisition = VastAdapter
+            .acquisition(&marketplace_requirements(), &marketplace_provider())
+            .expect("an image was declared");
+
+        let discover = acquisition.discover.as_ref().expect("offers come first");
+        let query = discover
+            .iter()
+            .find(|it| it.contains("rentable=true"))
+            .expect("the query is one argument");
+        for filter in [
+            "verified=true",
+            "num_gpus>=1",
+            "gpu_ram>=40",
+            "disk_space>=60",
+        ] {
+            assert!(query.contains(filter), "{filter} missing from: {query}");
+        }
+        let sort = discover.iter().position(|it| it == "-o");
+        assert!(
+            sort.is_some_and(|at| discover.get(at + 1).is_some_and(|it| it == "dph")),
+            "ascending price is the selection policy: {discover:?}"
+        );
+
+        assert!(acquisition.create.contains(&"{offer_id}".to_string()));
+        assert!(acquisition.create.contains(&"--ssh".to_string()));
+        assert!(acquisition.create.contains(&"pytorch/pytorch:2.4.0".to_string()));
+        assert!(acquisition.create.contains(&"-p 8000:8000".to_string()));
+        assert_eq!(acquisition.created_id_key, "new_contract");
+        assert!(acquisition.release.contains(&"destroy".to_string()));
+        assert!(acquisition.release.contains(&"{id}".to_string()));
+    }
+
+    /// The same refusal as the pod service's, naming this platform's
+    /// own key.
+    #[test]
+    fn the_marketplace_refuses_to_create_without_an_image_too() {
+        assert_eq!(
+            VastAdapter.acquisition(&marketplace_requirements(), &BTreeMap::new()),
+            Err(AcquisitionError::Incomplete {
+                target: "vast",
+                missing: "provider.vast.image"
+            })
+        );
+    }
+
+    /// A persistent level is refused rather than quietly mapped onto
+    /// the one disk an instance has.
+    #[test]
+    fn a_persistent_level_is_refused_not_mapped() {
+        let answer = VastAdapter.disk_answer(&DiskRequirement {
+            ephemeral_gb: None,
+            persistent_gb: Some(50),
+            persistent_at: Some("/workspace".into()),
+        });
+        let Answer::Unmet { reason } = answer else {
+            panic!("one disk cannot be a persisted volume: {answer:?}");
+        };
+        assert!(reason.contains("persisted"), "{reason}");
+    }
+
+    /// A machine with no accelerator is not something a GPU marketplace
+    /// sells, and that is said rather than searched for.
+    #[test]
+    fn zero_accelerators_is_refused_on_a_gpu_marketplace() {
+        let answer = VastAdapter.gpu_answer(&GpuRequirement {
+            count: 0,
+            min_vram_gb: None,
+        });
+        assert!(answer.blocks(), "{answer:?}");
+    }
+
+    /// The discovery's first row fills the create call: `{offer_id}`
+    /// is substituted, and the numeric `new_contract` the service
+    /// answers with becomes the machine's id.
+    #[test]
+    fn the_discovery_feeds_the_create_call_and_the_numeric_id_is_read() {
+        let acquired = acquire(Acquisition {
+            discover: Some(vec![
+                "echo".into(),
+                r#"[{"id": 123, "dph_total": 0.27}, {"id": 456, "dph_total": 0.44}]"#.into(),
+            ]),
+            create: vec!["echo".into(), r#"{"new_contract": {offer_id}}"#.into()],
+            body: None,
+            created_id_key: "new_contract",
+            inspect: vec!["echo".into(), "{}".into()],
+            release: vec!["true".into()],
+        })
+        .expect("the discovery found offers");
+        assert_eq!(
+            acquired.id, "123",
+            "the first row of the price-sorted query is the machine"
+        );
+    }
+
+    /// A query that matches nothing is a marketplace out of stock, said
+    /// with the query in it, before anything is spent.
+    #[test]
+    fn an_empty_discovery_is_out_of_stock_not_a_machine() {
+        let err = acquire(Acquisition {
+            discover: Some(vec!["echo".into(), "[]".into()]),
+            create: vec!["true".into()],
+            body: None,
+            created_id_key: "new_contract",
+            inspect: vec!["true".into()],
+            release: vec!["true".into()],
+        })
+        .expect_err("nothing to create from");
+        assert!(
+            matches!(err, ExecuteError::NoCandidates { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The description names the device's memory directly — the figure
+    /// the device itself reports, so it lands as MiB with no catalogue
+    /// in between — and the connection comes from the service's own ssh
+    /// fields plus the docker-style port map.
+    #[test]
+    fn the_marketplace_description_reads_back_without_a_catalogue() {
+        let inspected = serde_json::json!({
+            "actual_status": "running",
+            "ssh_host": "ssh2281.vast.ai",
+            "ssh_port": 10882,
+            "public_ipaddr": "63.135.50.11",
+            "ports": {"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "44227"}]},
+            "gpu_name": "RTX A5000",
+            "num_gpus": 1,
+            "gpu_ram": 24564,
+            "disk_space": 60.4
+        });
+
+        let state = VastAdapter.read_state(&inspected);
+        assert_eq!(state.gpu_count, Some(1));
+        assert_eq!(state.gpu_vram_mib, Some(24564));
+        assert_eq!(state.ephemeral_gb, Some(60));
+        assert_eq!(state.exposed.get(&8000), Some(&Exposure::RawTcp));
+        assert!(state.ports_observed);
+
+        let connection = VastAdapter.connection(&inspected);
+        let ssh = connection.ssh.expect("--ssh --direct was asked for");
+        assert_eq!(ssh.host, "ssh2281.vast.ai");
+        assert_eq!(ssh.port, 10882);
+        assert_eq!(
+            connection.endpoints.get(&8000).map(String::as_str),
+            Some("63.135.50.11:44227")
+        );
+    }
+
+    /// No managed HTTPS proxy means a `public_http` requirement is
+    /// turned away while the bill is still zero.
+    #[test]
+    fn a_public_http_requirement_is_refused_at_admission() {
+        let required = Requirements::from_slots(
+            &[("8188", "public_http")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(lm_provision::machine::admit(&required, &VastAdapter.capability()).is_err());
     }
 }

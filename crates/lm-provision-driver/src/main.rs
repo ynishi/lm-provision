@@ -35,7 +35,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use lm_provision_driver::credentials;
-use lm_provision_driver::infra::{self, Infra as _, RunPodAdapter};
+use lm_provision_driver::infra::{self, Infra, RunPodAdapter, VastAdapter};
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
 use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
 
@@ -78,6 +78,11 @@ struct CheckArgs {
     /// A file holding what the service said about the machine.
     #[arg(long = "inspected")]
     inspected: PathBuf,
+
+    /// Which platform's adapter reads the description (`runpod`,
+    /// `vast`) — each service writes its own field names.
+    #[arg(long = "provider", default_value = "runpod")]
+    provider: String,
 }
 
 #[derive(Args)]
@@ -93,6 +98,15 @@ struct AcquireArgs {
     /// out by it having happened.
     #[arg(long = "dry-run", default_value_t = true, action = clap::ArgAction::Set)]
     dry_run: bool,
+
+    /// Which platform to buy from (`runpod`, `vast`).
+    ///
+    /// The operator's choice, not the profile's: the profile says what
+    /// the machine must be, and where to buy one meeting it is decided
+    /// at acquisition time — today's prices and today's stock are not
+    /// facts a profile could carry.
+    #[arg(long = "provider", default_value = "runpod")]
+    provider: String,
 }
 
 #[derive(Args)]
@@ -100,6 +114,10 @@ struct ReleaseArgs {
     /// The identifier the service gave the machine.
     #[arg(long = "id")]
     id: String,
+
+    /// The platform the machine was acquired from (`runpod`, `vast`).
+    #[arg(long = "provider", default_value = "runpod")]
+    provider: String,
 
     /// The profile the machine was acquired from, which is where the
     /// release command comes from.
@@ -224,7 +242,14 @@ fn run_check(args: CheckArgs) -> ExitCode {
         }
     };
 
-    let state = RunPodAdapter.read_state(&inspected);
+    let adapter = match adapter_named(&args.provider) {
+        Ok(adapter) => adapter,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let state = adapter.read_state(&inspected);
     let findings = lm_provision::machine::observe(&required, &state);
     let verdict = lm_provision::machine::verdict(&findings);
     println!(
@@ -243,6 +268,19 @@ fn run_check(args: CheckArgs) -> ExitCode {
     match verdict {
         lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
+    }
+}
+
+/// The adapter sold under `name`, or which names would have worked.
+///
+/// A static reference rather than a box because the adapters are unit
+/// structs: there is nothing to construct, only one of two vocabularies
+/// to speak.
+fn adapter_named(name: &str) -> Result<&'static dyn Infra, String> {
+    match name {
+        "runpod" => Ok(&RunPodAdapter),
+        "vast" => Ok(&VastAdapter),
+        other => Err(format!("unknown provider `{other}` (runpod, vast)")),
     }
 }
 
@@ -286,7 +324,13 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         }
     };
 
-    let adapter = RunPodAdapter;
+    let adapter = match adapter_named(&args.provider) {
+        Ok(adapter) => adapter,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
     // Admission before anything is spent: a target that could never
     // satisfy this should say so while the bill is still zero.
     if let Err(refusal) = lm_provision::machine::admit(&required, &adapter.capability()) {
@@ -307,6 +351,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
             "{}",
             serde_json::json!({
                 "dry_run": true,
+                "discover": acquisition.discover,
                 "create": acquisition.create,
                 "body": acquisition.body,
                 "release": acquisition.release,
@@ -486,7 +531,14 @@ fn run_release(args: ReleaseArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let acquisition = match RunPodAdapter.acquisition(&required, &provider) {
+    let adapter = match adapter_named(&args.provider) {
+        Ok(adapter) => adapter,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let acquisition = match adapter.acquisition(&required, &provider) {
         Ok(acquisition) => acquisition,
         Err(err) => {
             eprintln!("error: {err}");
@@ -497,10 +549,9 @@ fn run_release(args: ReleaseArgs) -> ExitCode {
     // fails and costs nothing; releasing without one leaves a machine
     // running and billing, so say so plainly rather than through the
     // service CLI's exit status.
-    if let Err(missing) = credentials::require(
-        RunPodAdapter.provider_namespace(),
-        RunPodAdapter.credentials(),
-    ) {
+    if let Err(missing) =
+        credentials::require(adapter.provider_namespace(), adapter.credentials())
+    {
         eprintln!("error: {missing}");
         eprintln!("note: {} is still running", args.id);
         return ExitCode::from(4);
