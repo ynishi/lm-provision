@@ -37,6 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (private auth, no network) is noted and stepped past rather than
   refused over.
 
+- **cargo-dist release pipeline.** Pushing a version tag now builds
+  all three binaries for six targets — including
+  `x86_64-unknown-linux-musl`, the pod-side artifact `driver apply`
+  pushes (spec 08's static-binary baseline) — and uploads archives,
+  checksums, and shell/powershell installers to the GitHub Release.
+  Configuration lives in `dist-workspace.toml`; the workflow is
+  `dist generate`d, not hand-written. Homebrew / APT / Docker targets
+  are deliberately not configured: each needs operator-side
+  infrastructure (a tap repository, signing keys, registry
+  credentials) that is a separate decision.
+
 ### Changed
 
 - **GPU selection sorts by price, not by memory.** The catalogue now

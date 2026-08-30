@@ -48,3 +48,8 @@ dsl-kit-core = "0.11"
 dsl-kit-schema = "0.11"
 dsl-kit-parse = "0.11"
 dsl-kit-mcp = "0.11"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
