@@ -229,6 +229,20 @@ gate makes the deletion wait for it:
   external pod manager. What remains **stable** is the narrower
   half of the old bullet: no provider SDK is linked into this repo —
   the provider is reached only through its CLI.
+
+  Revised (2026-08-30): `acquire`'s artifact also carries the
+  **created-machine connection data** — the caller's `ConnectionSpec`
+  inputs (§Session contract), projected per platform from the
+  service's own description by the adapter (a managed pod service's
+  `publicIp` + port mappings; each platform names its own fields).
+  `acquire` waits, bounded, until the platform has answered for every
+  declared port before judging the verdict and reporting: a machine
+  inspected mid-boot is not a refused machine, and an artifact
+  without the address sends every caller back to the provider —
+  arranging the provider credential in its own shell — for a fact
+  the driver already paid to learn (first artifacts verification did
+  exactly that by hand). The projection is part of the adapter
+  seam; the wait bound is the driver's own (**internal**).
 - Static-binary embeddability constraint (musl, no language runtime,
   no runtime file dependencies): **stable**.
 - Binary target set (musl x86_64 as the baseline): **provisional**

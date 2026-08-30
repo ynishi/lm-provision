@@ -359,6 +359,35 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Wait until the platform has answered for every declared port —
+    // bounded, so a machine that never comes up still ends in a report.
+    // Two reasons this wait is the driver's and not the caller's:
+    // the address is part of the acquire artifact (a caller re-deriving
+    // it has to arrange the service credential in its own shell for a
+    // fact the driver already paid to learn), and a verdict judged
+    // mid-boot refuses machines that were merely still starting
+    // [measured: 2026-08-30, a CPU pod inspected right after create
+    // exited 1 and reported no address; the same pod answered both a
+    // few minutes later].
+    let deadline = std::time::Instant::now() + ACQUIRE_REACHABILITY_TIMEOUT;
+    let mut connection = adapter.connection(&acquired.inspected);
+    while !connection_covers(&required.ports, &connection) {
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "warning: {} still has unanswered ports after {}s; reporting what is known",
+                acquired.id,
+                ACQUIRE_REACHABILITY_TIMEOUT.as_secs()
+            );
+            break;
+        }
+        std::thread::sleep(ACQUIRE_REACHABILITY_POLL);
+        if let Err(err) = acquired.inspect() {
+            eprintln!("warning: {} stopped answering inspection: {err}", acquired.id);
+            break;
+        }
+        connection = adapter.connection(&acquired.inspected);
+    }
+
     let state = adapter.read_state(&acquired.inspected);
     let findings = lm_provision::machine::observe(&required, &state);
     let verdict = lm_provision::machine::verdict(&findings);
@@ -374,6 +403,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
                     "outcome": format!("{:?}", it.outcome),
                 }))
                 .collect::<Vec<_>>(),
+            "connection": connection,
             "release": acquired.id,
         })
     );
@@ -382,6 +412,29 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     }
+}
+
+/// How long `acquire` waits for the machine to answer for its declared
+/// ports before reporting what is known. Generous against the minute
+/// or two a pod takes to come up [measured: 2026-08-30, two fresh
+/// pods each answered for port 22 within ~2 minutes of create],
+/// bounded so a machine that never answers still ends in a report
+/// rather than a hang.
+const ACQUIRE_REACHABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The interval between inspections while waiting.
+const ACQUIRE_REACHABILITY_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the platform has answered for every port the profile
+/// declared — the condition `acquire` waits on. No declared ports is
+/// covered by definition: there is nothing to wait for.
+fn connection_covers(
+    required: &[lm_provision::machine::PortRequirement],
+    connection: &infra::Connection,
+) -> bool {
+    required
+        .iter()
+        .all(|it| connection.endpoints.contains_key(&it.port))
 }
 
 fn run_release(args: ReleaseArgs) -> ExitCode {
@@ -816,6 +869,44 @@ mod tests {
     fn an_ok_report_with_an_uncollected_artifact_still_exits_nonzero() {
         assert_eq!(exit_status(true, None, 1), 1);
         assert_eq!(exit_status(true, None, 0), 0);
+    }
+
+    /// **The wait condition is the declared ports, all of them, and
+    /// nothing when none were declared.** A machine is "reachable" for
+    /// this command exactly when the platform has answered for every
+    /// port the profile asked to expose — not when SSH alone is up
+    /// (a profile may declare none) and not before the health-check
+    /// port has a mapping.
+    #[test]
+    fn acquire_waits_on_exactly_the_declared_ports() {
+        use lm_provision::machine::{Exposure, PortRequirement};
+        use lm_provision_driver::infra::Connection;
+
+        let declared = [
+            PortRequirement {
+                port: 22,
+                exposure: Exposure::RawTcp,
+            },
+            PortRequirement {
+                port: 8188,
+                exposure: Exposure::PublicHttp,
+            },
+        ];
+        let mut connection = Connection::default();
+        assert!(!super::connection_covers(&declared, &connection));
+        connection
+            .endpoints
+            .insert(22, "203.0.113.10:22016".to_string());
+        assert!(!super::connection_covers(&declared, &connection));
+        connection
+            .endpoints
+            .insert(8188, "203.0.113.10:80".to_string());
+        assert!(super::connection_covers(&declared, &connection));
+
+        assert!(
+            super::connection_covers(&[], &Connection::default()),
+            "no declared ports leaves nothing to wait for"
+        );
     }
 
     /// **The release gate judges by the newest real apply for the

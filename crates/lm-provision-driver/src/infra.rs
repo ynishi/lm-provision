@@ -115,6 +115,53 @@ pub trait Infra {
     /// `None` rather than defaulted, because a zero would be a claim
     /// about the machine that nothing made.
     fn read_state(&self, inspected: &serde_json::Value) -> MachineState;
+
+    /// Read the same description into how the machine is **reached** —
+    /// the caller's half of spec 08's `ConnectionSpec`, projected from
+    /// where this platform writes its addresses.
+    ///
+    /// Per-platform by necessity: the requirement vocabulary is the
+    /// workload's, but where the resulting address lands is each
+    /// service's own (a managed pod service writes `publicIp` +
+    /// `portMappings`; a container runtime would write host port
+    /// bindings). Before this existed, every caller re-derived the
+    /// address by querying the service directly — which meant arranging
+    /// the service credential in the caller's own shell for a fact the
+    /// driver had already paid to learn [measured: 2026-08-30, the
+    /// artifacts verification script polled `get-pod` by hand and
+    /// spun on a missing `RUNPOD_API_KEY`].
+    ///
+    /// Absent means not reachable **yet**, same rule as
+    /// [`Infra::read_state`]: a machine still booting answers with an
+    /// empty projection, not a guess.
+    fn connection(&self, inspected: &serde_json::Value) -> Connection;
+}
+
+/// How to reach a machine, as the platform reports it — the created
+/// side of spec 08's `ConnectionSpec` input (§Session contract).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct Connection {
+    /// The SSH endpoint a driver session can be pointed at, when the
+    /// machine exposes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshEndpoint>,
+    /// Every declared port's public address, as `machine port →
+    /// "host:port"` — what a caller polls a health check against
+    /// without asking the service where things landed.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<u16, String>,
+}
+
+/// One SSH endpoint, in the fields spec 08's `ConnectionSpec` takes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SshEndpoint {
+    /// Host name or address.
+    pub host: String,
+    /// TCP port the machine's sshd is reachable on.
+    pub port: u16,
+    /// Remote user ([`crate::ssh::DEFAULT_SSH_USER`] on a platform
+    /// that runs workloads as root).
+    pub user: String,
 }
 
 /// What to run to obtain a machine, and what to run to give it back.
@@ -453,19 +500,73 @@ impl Infra for RunPodAdapter {
                     .map(|it| gb_to_mib(it.vram_gb))
             });
 
+        // `gpuCount` when the description says it; otherwise a CPU
+        // machine still gets an observed zero, because the service
+        // *does* say so — `cpuFlavorId` is documented for CPU pods
+        // only [documented: docs.runpod.io/api-reference, get pod
+        // response schema]. Reading that presence keeps "absent means
+        // not observed" intact: the zero comes from a field the
+        // service wrote, not from a field it left out. Without it a
+        // profile asking `gpu.count = 0` came back `NotChecked` on
+        // every CPU pod, so `acquire` exited non-zero on machines that
+        // were exactly what was asked for [measured: 2026-08-30, pod
+        // verification run, verdict NotChecked on a running CPU pod].
+        let gpu_count = inspected.get("gpuCount").and_then(number).or_else(|| {
+            inspected
+                .get("cpuFlavorId")
+                .and_then(|it| it.as_str())
+                .filter(|it| !it.is_empty())
+                .map(|_| 0)
+        });
+
         MachineState {
             exposed,
             // The description carries the field whether or not anything
             // is in it, so an empty list is "nothing exposed" rather
             // than "nobody looked".
             ports_observed: ports.is_some(),
-            gpu_count: inspected.get("gpuCount").and_then(number),
+            gpu_count,
             gpu_vram_mib,
             ephemeral_gb: inspected.get("containerDiskInGb").and_then(number),
             persistent_gb: inspected.get("volumeInGb").and_then(number),
             persistent_at: inspected.get("volumeMountPath").and_then(text),
             image: inspected.get("imageName").and_then(text),
         }
+    }
+
+    /// `publicIp` + `portMappings` — the two fields this service uses
+    /// to say where a pod landed, and the two fields the first real
+    /// usages read out by hand.
+    ///
+    /// An empty `publicIp` is what a pod reports while it boots
+    /// [measured: 2026-08-12 create response], so empty is treated as
+    /// absent — a `""` host is not an address anything can dial.
+    fn connection(&self, inspected: &serde_json::Value) -> Connection {
+        let ip = inspected
+            .get("publicIp")
+            .and_then(|it| it.as_str())
+            .filter(|it| !it.is_empty());
+        let mappings = inspected.get("portMappings").and_then(|it| it.as_object());
+        let mut endpoints = BTreeMap::new();
+        if let (Some(ip), Some(mappings)) = (ip, mappings) {
+            for (private, public) in mappings {
+                let (Ok(private), Some(public)) = (private.parse::<u16>(), public.as_u64()) else {
+                    continue;
+                };
+                endpoints.insert(private, format!("{ip}:{public}"));
+            }
+        }
+        let ssh = ip.and_then(|host| {
+            mappings?
+                .get("22")
+                .and_then(|it| it.as_u64())
+                .map(|port| SshEndpoint {
+                    host: host.to_string(),
+                    port: port as u16,
+                    user: crate::ssh::DEFAULT_SSH_USER.to_string(),
+                })
+        });
+        Connection { ssh, endpoints }
     }
 }
 
@@ -699,6 +800,13 @@ impl Infra for ContainerAdapter {
     /// requirement comes back unexamined rather than met.
     fn read_state(&self, _inspected: &serde_json::Value) -> MachineState {
         MachineState::default()
+    }
+
+    /// Empty, for the same reason as [`read_state`](Self::read_state):
+    /// no acquisition means nothing to reach. When the `docker exec`
+    /// transport lands, this is where the host port bindings project.
+    fn connection(&self, _inspected: &serde_json::Value) -> Connection {
+        Connection::default()
     }
 }
 
@@ -1480,6 +1588,61 @@ mod tests {
             "publicIp": "203.0.113.10",
             "machine": {}
         })
+    }
+
+    /// **A CPU machine's zero accelerators is an observation, not a
+    /// gap.** The description of a CPU pod carries no `gpuCount`, but
+    /// it does carry `cpuFlavorId` — a field the service documents
+    /// for CPU pods only — and that is the service saying what kind
+    /// of machine this is. Without this read, `gpu.count = 0` came
+    /// back `NotChecked` on every CPU pod and `acquire` refused
+    /// machines that were exactly what the profile asked for.
+    /// A GPU pod's stated `gpuCount` always wins.
+    #[test]
+    fn a_cpu_flavor_is_an_observed_zero_gpu_count() {
+        let cpu_pod = serde_json::json!({
+            "id": "pod-id",
+            "desiredStatus": "RUNNING",
+            "cpuFlavorId": "cpu3c",
+            "ports": ["22/tcp"]
+        });
+        assert_eq!(RunPodAdapter.read_state(&cpu_pod).gpu_count, Some(0));
+
+        let gpu_pod = serde_json::json!({ "id": "pod-id", "gpuCount": 2 });
+        assert_eq!(RunPodAdapter.read_state(&gpu_pod).gpu_count, Some(2));
+
+        let unobserved = serde_json::json!({ "id": "pod-id", "cpuFlavorId": "" });
+        assert_eq!(
+            RunPodAdapter.read_state(&unobserved).gpu_count,
+            None,
+            "an empty flavor is not a statement; absent stays not observed"
+        );
+    }
+
+    /// **The address projection reads the two fields the service
+    /// writes it in, and a booting pod projects to nothing.** The
+    /// empty-`publicIp` shape is the create response's own
+    /// [measured: 2026-08-12 fixture below]; treating it as an address
+    /// would hand a caller `":16422"` to dial.
+    #[test]
+    fn connection_projects_public_ip_and_port_mappings_and_boot_is_empty() {
+        let described = inspected_pod();
+        let connection = RunPodAdapter.connection(&described);
+        let ssh = connection.ssh.expect("22 is mapped and the ip is set");
+        assert_eq!(ssh.host, "203.0.113.10");
+        assert_eq!(ssh.port, 22016);
+        assert_eq!(ssh.user, crate::ssh::DEFAULT_SSH_USER);
+        assert_eq!(
+            connection.endpoints.get(&22),
+            Some(&"203.0.113.10:22016".to_string())
+        );
+
+        let booting = serde_json::json!({
+            "id": "pod-id",
+            "publicIp": "",
+            "ports": ["22/tcp"]
+        });
+        assert_eq!(RunPodAdapter.connection(&booting), Connection::default());
     }
 
     /// **The loop closes** — over what the service said across both of
