@@ -414,16 +414,40 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     // [measured: 2026-08-30, a CPU pod inspected right after create
     // exited 1 and reported no address; the same pod answered both a
     // few minutes later].
-    let deadline = std::time::Instant::now() + ACQUIRE_REACHABILITY_TIMEOUT;
+    let started = std::time::Instant::now();
+    let deadline = started + ACQUIRE_REACHABILITY_TIMEOUT;
+    let cap = started + ACQUIRE_MATERIALIZING_CAP;
+    let mut extended = false;
     let mut connection = adapter.connection(&acquired.inspected);
     while !connection_covers(&required.ports, &connection) {
-        if std::time::Instant::now() >= deadline {
-            eprintln!(
-                "warning: {} still has unanswered ports after {}s; reporting what is known",
-                acquired.id,
-                ACQUIRE_REACHABILITY_TIMEOUT.as_secs()
-            );
-            break;
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // The deadline is for a machine that went quiet, and a
+            // machine the platform still calls *loading* is not quiet —
+            // it is answering, with "not yet". Judging it at the base
+            // deadline reported NotChecked on hardware that was merely
+            // mid-pull [measured: 2026-08-30, a multi-gigabyte image was
+            // still loading at 300s]. The cap keeps the extension from
+            // becoming an unbounded bill when loading never ends.
+            if now < cap && adapter.still_materializing(&acquired.inspected) {
+                if !extended {
+                    extended = true;
+                    eprintln!(
+                        "note: {} says it is still materializing after {}s; \
+                         waiting up to {}s for it",
+                        acquired.id,
+                        ACQUIRE_REACHABILITY_TIMEOUT.as_secs(),
+                        ACQUIRE_MATERIALIZING_CAP.as_secs()
+                    );
+                }
+            } else {
+                eprintln!(
+                    "warning: {} still has unanswered ports after {}s; reporting what is known",
+                    acquired.id,
+                    now.duration_since(started).as_secs()
+                );
+                break;
+            }
         }
         std::thread::sleep(ACQUIRE_REACHABILITY_POLL);
         if let Err(err) = acquired.inspect() {
@@ -476,6 +500,15 @@ const ACQUIRE_REACHABILITY_TIMEOUT: std::time::Duration = std::time::Duration::f
 
 /// The interval between inspections while waiting.
 const ACQUIRE_REACHABILITY_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the wait may run in total while the platform itself says
+/// the machine is still materializing (`Infra::still_materializing`) —
+/// the bound on trusting that claim, so a machine stuck at "loading"
+/// forever is still a bounded bill. Sized for a multi-gigabyte image
+/// pulled by a marketplace host that has never seen it [measured:
+/// 2026-08-30, a pytorch image was still loading when the base 300s
+/// expired; such pulls run minutes, not tens of minutes].
+const ACQUIRE_MATERIALIZING_CAP: std::time::Duration = std::time::Duration::from_secs(1200);
 
 /// Whether the platform has answered for every port the profile
 /// declared — the condition `acquire` waits on. No declared ports is

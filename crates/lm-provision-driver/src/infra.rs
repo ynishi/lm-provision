@@ -121,6 +121,19 @@ pub trait Infra {
     /// about the machine that nothing made.
     fn read_state(&self, inspected: &serde_json::Value) -> MachineState;
 
+    /// Whether the platform says this machine is still being brought
+    /// into existence — pulling its image, starting its container.
+    ///
+    /// Read by `acquire`'s bounded wait: a deadline reached while the
+    /// service itself reports *still loading* is not a machine that
+    /// failed to answer, it is a question asked too early, and giving
+    /// up on it judged a good machine `NotChecked` [measured:
+    /// 2026-08-30, a marketplace instance was still pulling a
+    /// multi-gigabyte image when the 300s wait expired]. `false` when
+    /// the platform makes no such claim — absence of "loading" is not
+    /// evidence of readiness, and the port wait still decides.
+    fn still_materializing(&self, inspected: &serde_json::Value) -> bool;
+
     /// Read the same description into how the machine is **reached** —
     /// the caller's half of spec 08's `ConnectionSpec`, projected from
     /// where this platform writes its addresses.
@@ -505,6 +518,16 @@ impl Infra for RunPodAdapter {
         })
     }
 
+    /// Never claimed: this service's boots answered within the base
+    /// wait every time they were measured [measured: 2026-08-12 and
+    /// 2026-08-30, port 22 within ~2 minutes of create], and its
+    /// descriptions carry no field that says "still starting" the way
+    /// the marketplace's `actual_status` does — so nothing is read as
+    /// one.
+    fn still_materializing(&self, _inspected: &serde_json::Value) -> bool {
+        false
+    }
+
     /// Read the service's own pod description.
     ///
     /// The `ports` array comes back in the same `[port]/[protocol]` form
@@ -854,6 +877,11 @@ impl Infra for ContainerAdapter {
         })
     }
 
+    /// Nothing to say: no acquisition means no machine mid-boot.
+    fn still_materializing(&self, _inspected: &serde_json::Value) -> bool {
+        false
+    }
+
     /// Nothing observed, because nothing was acquired.
     ///
     /// This adapter renders no acquisition, so it is never handed
@@ -988,6 +1016,19 @@ impl Infra for VastAdapter {
             self.render(required),
             required.gpu.as_ref().map(|it| self.gpu_answer(it)),
             required.disk.as_ref().map(|it| self.disk_answer(it)),
+        )
+    }
+
+    /// `actual_status` is the platform's own word for it: `loading`
+    /// while the host pulls the image and starts the container —
+    /// which for a multi-gigabyte image runs well past the base
+    /// reachability wait [measured: 2026-08-30, instance 49227715
+    /// still `loading` at 300s] — and `created` before that. Anything
+    /// else, including an absent field, makes no claim.
+    fn still_materializing(&self, inspected: &serde_json::Value) -> bool {
+        matches!(
+            inspected.get("actual_status").and_then(|it| it.as_str()),
+            Some("loading") | Some("created")
         )
     }
 
@@ -2586,6 +2627,27 @@ mod tests {
         assert!(
             !VastAdapter.read_state(&booting).ports_observed,
             "null is not an observation"
+        );
+    }
+
+    /// The platform's own word for "not yet" extends the wait; its
+    /// silence and its "running" do not.
+    #[test]
+    fn only_the_platforms_own_loading_claim_extends_the_wait() {
+        let loading = serde_json::json!({ "actual_status": "loading" });
+        let created = serde_json::json!({ "actual_status": "created" });
+        let running = serde_json::json!({ "actual_status": "running" });
+        let silent = serde_json::json!({});
+        assert!(VastAdapter.still_materializing(&loading));
+        assert!(VastAdapter.still_materializing(&created));
+        assert!(!VastAdapter.still_materializing(&running));
+        assert!(
+            !VastAdapter.still_materializing(&silent),
+            "absence of a claim is not a claim"
+        );
+        assert!(
+            !RunPodAdapter.still_materializing(&loading),
+            "another platform's field is not this platform's word"
         );
     }
 
