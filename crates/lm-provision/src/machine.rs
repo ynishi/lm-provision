@@ -249,15 +249,6 @@ pub struct Requirements {
     pub gpu: Option<GpuRequirement>,
     /// Storage, when the profile asks for any.
     pub disk: Option<DiskRequirement>,
-    /// The base image the machine runs.
-    ///
-    /// The one requirement both targets take verbatim — a managed pod
-    /// service's `imageName` and a container runtime's image argument are
-    /// the same string. It is a requirement rather than a setting because
-    /// the provisioner needs what is in it: a profile running
-    /// `comfyui.install` needs git, and one running `toolchain.python`
-    /// needs an interpreter.
-    pub image: Option<String>,
 }
 
 impl Requirements {
@@ -271,12 +262,10 @@ impl Requirements {
         ports: &BTreeMap<String, String>,
         gpu: &BTreeMap<String, String>,
         disk: &BTreeMap<String, String>,
-        image: Option<&str>,
     ) -> Result<Self, RequirementError> {
         Ok(Self {
             gpu: Self::gpu_from_slot(gpu)?,
             disk: Self::disk_from_slot(disk)?,
-            image: image.map(str::to_string),
             ..Self::from_slot(ports)?
         })
     }
@@ -375,7 +364,6 @@ impl Requirements {
             ports,
             gpu: None,
             disk: None,
-            image: None,
         })
     }
 
@@ -704,8 +692,6 @@ pub struct MachineState {
     pub persistent_gb: Option<u32>,
     /// Where that space is mounted.
     pub persistent_at: Option<String>,
-    /// The image the machine is running.
-    pub image: Option<String>,
 }
 
 /// One requirement, and what looking at the machine said about it.
@@ -746,7 +732,7 @@ pub enum Outcome {
 /// be.
 ///
 /// Returns one finding per requirement, in the order a profile reads:
-/// image, accelerators, storage, ports. **Every requirement produces a
+/// accelerators, storage, ports. **Every requirement produces a
 /// finding**, including the ones nothing could see — an omitted line
 /// would read as a requirement that was met.
 pub fn observe(required: &Requirements, state: &MachineState) -> Vec<Finding> {
@@ -769,14 +755,6 @@ pub fn observe(required: &Requirements, state: &MachineState) -> Vec<Finding> {
             Some(_) => Outcome::Unsatisfied,
         },
     };
-
-    if let Some(image) = &required.image {
-        findings.push(compare(
-            format!("image={image}"),
-            image,
-            state.image.as_deref(),
-        ));
-    }
 
     if let Some(gpu) = &required.gpu {
         findings.push(at_least(
@@ -945,7 +923,6 @@ mod tests {
             &slot(&[]),
             &gpu_slot(&[("count", "2"), ("min_vram_gb", "24")]),
             &slot(&[]),
-            None,
         )
         .expect("well-formed");
         assert_eq!(
@@ -963,12 +940,7 @@ mod tests {
     #[test]
     fn a_gpu_requirement_without_a_count_is_refused() {
         assert_eq!(
-            Requirements::from_slots(
-                &slot(&[]),
-                &gpu_slot(&[("min_vram_gb", "24")]),
-                &slot(&[]),
-                None
-            ),
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("min_vram_gb", "24")]), &slot(&[])),
             Err(RequirementError::GpuWithoutCount)
         );
     }
@@ -979,7 +951,7 @@ mod tests {
     #[test]
     fn zero_accelerators_is_a_requirement_and_absence_is_not() {
         let declared =
-            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "0")]), &slot(&[]), None)
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "0")]), &slot(&[]))
                 .expect("well-formed");
         assert_eq!(
             declared.gpu,
@@ -990,7 +962,7 @@ mod tests {
         );
         assert!(!declared.is_empty());
 
-        let absent = Requirements::from_slots(&slot(&[]), &gpu_slot(&[]), &slot(&[]), None)
+        let absent = Requirements::from_slots(&slot(&[]), &gpu_slot(&[]), &slot(&[]))
             .expect("well-formed");
         assert_eq!(absent.gpu, None);
         assert!(absent.is_empty());
@@ -999,7 +971,7 @@ mod tests {
     #[test]
     fn an_unknown_gpu_key_names_the_alternatives() {
         let err =
-            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("vram", "24")]), &slot(&[]), None)
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("vram", "24")]), &slot(&[]))
                 .expect_err("vram is not a key here");
         assert_eq!(
             err,
@@ -1015,7 +987,7 @@ mod tests {
     #[test]
     fn a_gpu_value_that_is_not_a_number_is_refused() {
         assert_eq!(
-            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "one")]), &slot(&[]), None),
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("count", "one")]), &slot(&[])),
             Err(RequirementError::BadGpuValue {
                 key: "count".to_string(),
                 value: "one".to_string()
@@ -1039,7 +1011,6 @@ mod tests {
             &slot(&[("8188", "public_http")]),
             &slot(&[("count", "1"), ("min_vram_gb", "24")]),
             &slot(&[("persistent_gb", "50"), ("persistent_at", "/workspace")]),
-            Some("runpod/pytorch:2.4.0"),
         )
         .expect("well-formed fixture")
     }
@@ -1059,7 +1030,6 @@ mod tests {
             gpu_vram_mib: Some(46068),
             persistent_gb: Some(100),
             persistent_at: Some("/workspace".into()),
-            image: Some("runpod/pytorch:2.4.0".into()),
             ..MachineState::default()
         };
         let findings = observe(&required, &state);
@@ -1124,7 +1094,6 @@ mod tests {
             &slot(&[]),
             &slot(&[("count", "1"), ("min_vram_gb", "24")]),
             &slot(&[]),
-            None,
         )
         .unwrap();
         let findings = observe(&required, &state);
@@ -1151,7 +1120,6 @@ mod tests {
     fn every_requirement_produces_a_finding() {
         let findings = observe(&required_all(), &MachineState::default());
         let names: Vec<&str> = findings.iter().map(|it| it.requirement.as_str()).collect();
-        assert!(names.contains(&"image=runpod/pytorch:2.4.0"), "{names:?}");
         assert!(names.contains(&"gpu.count=1"), "{names:?}");
         assert!(names.contains(&"gpu.min_vram_gb=24"), "{names:?}");
         assert!(names.contains(&"disk.persistent_gb=50"), "{names:?}");
@@ -1168,7 +1136,8 @@ mod tests {
     fn a_failure_outranks_an_unexamined_line() {
         let required = required_all();
         let state = MachineState {
-            image: Some("some/other:tag".into()),
+            // Zero devices against a count of one — observed, and wrong.
+            gpu_count: Some(0),
             ..MachineState::default()
         };
         assert_eq!(verdict(&observe(&required, &state)), Outcome::Unsatisfied);

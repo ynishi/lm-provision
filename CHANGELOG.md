@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`requires_image` is gone; the image is a `provider` key.**
+  (Breaking, DSL surface.) An image name is one platform's vocabulary
+  — the same workload is a docker tag on a pod service and no image at
+  all on a bare-VM service — so a neutral slot for it was really the
+  first platform's slot wearing a neutral name. Profiles write
+  `provider."runpod.imageName"` instead, and `acquire` refuses without
+  it as it always did (the refusal now names the provider key).
+  Profiles that never declared an image keep their hash; the two
+  shipped profiles that did are re-issued as `machine-verify-0.2.0`
+  and `qwen-vllm-serve-0.2.0` with new pins in `index.json`.
+
 ## [0.6.0] - 2026-08-12
 
 ### Added

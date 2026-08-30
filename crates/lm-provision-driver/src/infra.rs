@@ -530,7 +530,6 @@ impl Infra for RunPodAdapter {
             ephemeral_gb: inspected.get("containerDiskInGb").and_then(number),
             persistent_gb: inspected.get("volumeInGb").and_then(number),
             persistent_at: inspected.get("volumeMountPath").and_then(text),
-            image: inspected.get("imageName").and_then(text),
         }
     }
 
@@ -591,12 +590,16 @@ fn runpod_body(
     gpu_answer: Option<Answer>,
     disk_answer: Option<Answer>,
 ) -> Result<String, AcquisitionError> {
-    let image = required
-        .image
-        .as_deref()
+    // The image comes from the provider slot, not from a requirement:
+    // an image name is this platform's vocabulary (a bare-VM service
+    // has no such field), so the profile writes it under the platform's
+    // own key. The key matches the service's field name, as every
+    // `runpod.*` key does.
+    let image = provider
+        .get("runpod.imageName")
         .ok_or(AcquisitionError::Incomplete {
             target: "runpod",
-            missing: "requires_image",
+            missing: "provider.runpod.imageName",
         })?;
 
     let refuse = |answer: Answer| match answer {
@@ -1273,9 +1276,21 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
-            Some("runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"),
         )
         .expect("well-formed fixture")
+    }
+
+    /// The provider slot the fixtures pair with [`full_requirements`]:
+    /// the image travels here now, under the platform's own key (see
+    /// [`runpod_body`]).
+    fn image_provider() -> BTreeMap<String, String> {
+        [(
+            "runpod.imageName",
+            "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+        )]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
     }
 
     /// The whole vocabulary becomes one request, and every part of it is
@@ -1283,7 +1298,7 @@ mod tests {
     #[test]
     fn the_requirements_become_the_services_own_request() {
         let acquisition = RunPodAdapter
-            .acquisition(&full_requirements(), &BTreeMap::new())
+            .acquisition(&full_requirements(), &image_provider())
             .expect("an image was declared");
         let body: serde_json::Value =
             serde_json::from_str(acquisition.body.as_deref().expect("create takes a body"))
@@ -1327,10 +1342,13 @@ mod tests {
             "volumeInGb",
             "volumeMountPath",
         ];
-        let provider: BTreeMap<String, String> = [("runpod.networkVolumeId", "vol-1")]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let provider: BTreeMap<String, String> = [
+            ("runpod.imageName", "runpod/pytorch:2.4.0"),
+            ("runpod.networkVolumeId", "vol-1"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
         let acquisition = RunPodAdapter
             .acquisition(&full_requirements(), &provider)
             .unwrap();
@@ -1356,6 +1374,7 @@ mod tests {
     #[test]
     fn provider_keys_land_in_the_request_unchanged() {
         let provider: BTreeMap<String, String> = [
+            ("runpod.imageName", "runpod/pytorch:2.4.0"),
             ("runpod.networkVolumeId", "vol-1"),
             ("container.network", "bridge"),
         ]
@@ -1393,12 +1412,11 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             &BTreeMap::new(),
-            Some("runpod/pytorch:2.4.0"),
         )
         .unwrap();
 
         let err = RunPodAdapter
-            .acquisition(&beyond, &BTreeMap::new())
+            .acquisition(&beyond, &image_provider())
             .expect_err("no catalogued device carries 512 GB");
         let rendered = err.to_string();
         assert!(rendered.contains("512"), "{rendered}");
@@ -1419,11 +1437,10 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            Some("runpod/pytorch:2.4.0"),
         )
         .unwrap();
         let acquisition = RunPodAdapter
-            .acquisition(&no_ports, &BTreeMap::new())
+            .acquisition(&no_ports, &image_provider())
             .unwrap();
         let body: serde_json::Value =
             serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
@@ -1451,13 +1468,12 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            Some("runpod/pytorch:2.4.0"),
         )
         .unwrap();
 
         let err = runpod_body(
             &disk,
-            &BTreeMap::new(),
+            &image_provider(),
             Vec::new(),
             None,
             Some(Answer::Unmet {
@@ -1471,7 +1487,7 @@ mod tests {
         // so the guard above is a guard and not a wall.
         let body = runpod_body(
             &disk,
-            &BTreeMap::new(),
+            &image_provider(),
             Vec::new(),
             None,
             Some(Answer::Met { using: Vec::new() }),
@@ -1491,11 +1507,10 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             &BTreeMap::new(),
-            Some("runpod/pytorch:2.4.0"),
         )
         .unwrap();
         let acquisition = RunPodAdapter
-            .acquisition(&cpu_only, &BTreeMap::new())
+            .acquisition(&cpu_only, &image_provider())
             .unwrap();
         let body: serde_json::Value =
             serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
@@ -1505,17 +1520,19 @@ mod tests {
     }
 
     /// A machine cannot be created without knowing what to run on it,
-    /// and that is said before anything is spent finding out.
+    /// and that is said before anything is spent finding out. The
+    /// refusal names the provider key, because that is where the image
+    /// is written now.
     #[test]
     fn creating_without_an_image_is_refused() {
         let no_image =
-            Requirements::from_slots(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(), None)
+            Requirements::from_slots(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
                 .unwrap();
         assert_eq!(
             RunPodAdapter.acquisition(&no_image, &BTreeMap::new()),
             Err(AcquisitionError::Incomplete {
                 target: "runpod",
-                missing: "requires_image"
+                missing: "provider.runpod.imageName"
             })
         );
     }
@@ -1526,7 +1543,7 @@ mod tests {
     #[test]
     fn an_acquisition_says_how_to_give_the_machine_back() {
         let acquisition = RunPodAdapter
-            .acquisition(&full_requirements(), &BTreeMap::new())
+            .acquisition(&full_requirements(), &image_provider())
             .unwrap();
         assert!(acquisition.release.contains(&"delete-pod".to_string()));
         assert!(acquisition.release.contains(&"{id}".to_string()));
@@ -1538,7 +1555,7 @@ mod tests {
     #[test]
     fn a_container_says_it_cannot_acquire_rather_than_pretending() {
         let err = ContainerAdapter
-            .acquisition(&full_requirements(), &BTreeMap::new())
+            .acquisition(&full_requirements(), &image_provider())
             .expect_err("no transport reaches a container");
         let rendered = err.to_string();
         assert!(rendered.contains("docker exec"), "{rendered}");
@@ -1794,7 +1811,6 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             &BTreeMap::new(),
-            Some("runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"),
         )
         .unwrap();
         let findings = lm_provision::machine::observe(&required, &state);
@@ -1870,6 +1886,7 @@ mod tests {
     #[test]
     fn keys_for_another_target_are_reported() {
         let provider: BTreeMap<String, String> = [
+            ("runpod.imageName", "runpod/pytorch:2.4.0"),
             ("runpod.networkVolumeId", "vol-1"),
             ("container.network", "bridge"),
         ]
@@ -1879,7 +1896,7 @@ mod tests {
 
         assert_eq!(
             unexamined(&ContainerAdapter, &provider),
-            vec!["runpod.networkVolumeId"]
+            vec!["runpod.imageName", "runpod.networkVolumeId"]
         );
         assert_eq!(
             unexamined(&RunPodAdapter, &provider),

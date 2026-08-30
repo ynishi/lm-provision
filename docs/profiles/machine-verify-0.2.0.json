@@ -1,7 +1,7 @@
 {
   "type": "Spec",
   "name": "machine-verify",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Smoke-test a freshly acquired GPU machine. Declares the machine in the requirement slots (image, GPU, disk, ports) so `acquire` can obtain one and `check` can judge one, then runs a single nvidia-smi to prove the GPU is reachable. Use this as the first profile against any new pod or provider account.",
   "capabilities": [
     "sh.exec"
@@ -23,7 +23,9 @@
     "persistent_gb": "80",
     "persistent_at": "/workspace"
   },
-  "requires_image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+  "provider": {
+    "runpod.imageName": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+  },
   "phases": [
     {
       "type": "ShExec",

@@ -265,20 +265,15 @@ fn requirements_of(
         requires_ports,
         requires_gpu,
         requires_disk,
-        requires_image,
         provider,
         ..
     } = &root
     else {
         return Err("the profile's root is not a Spec".to_string());
     };
-    let required = lm_provision::machine::Requirements::from_slots(
-        requires_ports,
-        requires_gpu,
-        requires_disk,
-        requires_image.as_deref(),
-    )
-    .map_err(|err| err.to_string())?;
+    let required =
+        lm_provision::machine::Requirements::from_slots(requires_ports, requires_gpu, requires_disk)
+            .map_err(|err| err.to_string())?;
     Ok((required, provider.clone()))
 }
 

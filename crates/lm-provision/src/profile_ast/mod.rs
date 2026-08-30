@@ -145,14 +145,6 @@ pub enum ProfileNode {
         /// which the `provider` slot carries. Empty maps carry no
         /// canonical bytes.
         requires_disk: BTreeMap<String, String>,
-        /// The base image the machine runs (spec 03 §Requirements).
-        ///
-        /// The one requirement both targets take verbatim. It is a
-        /// requirement rather than a setting because the provisioner
-        /// needs what is inside it: `comfyui.install` needs git,
-        /// `toolchain.python` needs an interpreter. Absent when the
-        /// profile does not care, and absent costs no canonical bytes.
-        requires_image: Option<String>,
         /// References to infrastructure that already exists, as
         /// `<provider>.<key> → value` (spec 03 §Provider references).
         ///
@@ -163,6 +155,15 @@ pub enum ProfileNode {
         /// infrastructure is where a provisioner becomes a second
         /// Terraform; placing one machine into infrastructure that is
         /// already there is not.
+        ///
+        /// The base image lives here too, under the platform's own key
+        /// (`runpod.imageName`), and not in a `requires_*` slot: an
+        /// image name is one platform's vocabulary — the same workload
+        /// is a docker tag on a pod service and no image at all on a
+        /// bare-VM service — so a neutral slot for it was really the
+        /// first platform's slot wearing a neutral name (it was, until
+        /// 2026-08-30: `requires_image` existed because the pod service
+        /// was implemented first).
         ///
         /// The namespace is everything before the first `.`, and an
         /// adapter reads only its own. A key belonging to a provider

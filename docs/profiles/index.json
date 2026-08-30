@@ -2,9 +2,9 @@
   "profiles": [
     {
       "name": "machine-verify",
-      "version": "0.1.0",
-      "path": "machine-verify-0.1.0.json",
-      "profile_hash": "c990c80e42821a381c80a64fef3c33634bdbd4e5500dee2a177864a564b35b8f",
+      "version": "0.2.0",
+      "path": "machine-verify-0.2.0.json",
+      "profile_hash": "6248d88f59c2a668116ce0363c93e2eb12a262e7126de55fb2a3da138eff03bb",
       "summary": "Smoke-test a freshly acquired GPU machine (requirements + one nvidia-smi)."
     },
     {
@@ -16,9 +16,9 @@
     },
     {
       "name": "qwen-vllm-serve",
-      "version": "0.1.0",
-      "path": "qwen-vllm-serve-0.1.0.json",
-      "profile_hash": "0dcf4964ee9f684dadafb70078d878b9b1b5d021fe8db8800f55a2f5fd8b1498",
+      "version": "0.2.0",
+      "path": "qwen-vllm-serve-0.2.0.json",
+      "profile_hash": "6bf10f6c04d6622f3a70bfe2122f3964cd38e893e4c9f275216f2153d9f927ba",
       "summary": "vLLM OpenAI-compatible serving for a Qwen-family model you declare (48GB GPU, tool calling on, CUDA-driver-aware install)."
     }
   ]

@@ -262,7 +262,6 @@ mod tests {
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
             requires_disk: Default::default(),
-            requires_image: None,
             provider: Default::default(),
             artifacts: Vec::new(),
             assumes: std::collections::BTreeMap::from([(

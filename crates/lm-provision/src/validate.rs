@@ -368,7 +368,6 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         requires_ports,
         requires_gpu,
         requires_disk,
-        requires_image,
         provider,
         artifacts,
         phases,
@@ -582,13 +581,8 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // Refusing rather than skipping is the point. A requirement quietly
     // dropped leaves exactly the machine this slot exists to stop
     // shipping — one whose profile looks like it declared something.
-    crate::machine::Requirements::from_slots(
-        requires_ports,
-        requires_gpu,
-        requires_disk,
-        requires_image.as_deref(),
-    )
-    .map_err(|source| ValidateError::UnreadableRequirement { source })?;
+    crate::machine::Requirements::from_slots(requires_ports, requires_gpu, requires_disk)
+        .map_err(|source| ValidateError::UnreadableRequirement { source })?;
     for key in provider.keys() {
         let namespace = key.split('.').next().unwrap_or("");
         if namespace.is_empty() || namespace.len() == key.len() {
@@ -1237,7 +1231,6 @@ mod tests {
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
             requires_disk: Default::default(),
-            requires_image: None,
             provider: Default::default(),
             artifacts: Vec::new(),
             id: ids.node(),
@@ -1293,7 +1286,6 @@ mod tests {
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
             requires_disk: Default::default(),
-            requires_image: None,
             provider: Default::default(),
             artifacts: Vec::new(),
             id: ids.node(),
@@ -2097,7 +2089,6 @@ mod tests {
             requires_ports: Default::default(),
             requires_gpu: Default::default(),
             requires_disk: Default::default(),
-            requires_image: None,
             provider: Default::default(),
             artifacts: Vec::new(),
             id: ids.node(),
