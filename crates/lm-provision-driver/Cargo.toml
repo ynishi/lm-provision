@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 lm-provision = { workspace = true }
+lm-provision-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

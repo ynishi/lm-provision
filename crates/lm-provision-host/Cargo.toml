@@ -1,0 +1,23 @@
+[package]
+name = "lm-provision-host"
+description = "Control plane for lm-provision: the continuously-running host daemon that enforces pod TTLs and holds custody of the apply ledger"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# No `documentation` key: the crate is unpublished (see `publish`
+# below), so there is no docs.rs page to point at yet.
+# Declared, not inherited. The control-plane side of the boundary is
+# AGPL by prior decision, and `license.workspace = true` would silently
+# hand it the workspace's permissive dual license — the one mistake
+# this crate exists to make impossible.
+license = "AGPL-3.0-or-later"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Nothing to publish yet: the crate is an empty scaffold holding the
+# license boundary open. This flips when the host implementation lands
+# (local issue 735a029e).
+publish = false

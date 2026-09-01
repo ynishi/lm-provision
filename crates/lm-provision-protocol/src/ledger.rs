@@ -149,7 +149,7 @@ mod tests {
 
     fn tmp_ledger_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "lm-provision-driver-ledger-test-{name}-{}-{}",
+            "lm-provision-protocol-ledger-test-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)

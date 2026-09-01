@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The license boundary, cut before the code that needs it.** The
+  coming control plane (a daemon that outlives a driver run: TTL
+  enforcement, ledger custody) is AGPL-3.0-or-later, and the engine is
+  MIT / Apache-2.0 and stays that way. Relicensing is a decision one
+  can only make alone before outside contributions arrive, so the split
+  is in place while both new crates are still empty or unchanged:
+  `lm-provision-host` (AGPL-3.0-or-later, `publish = false`, an empty
+  scaffold whose one test asserts no permissive manifest names it), and
+  `lm-provision-protocol` (MIT / Apache-2.0), the neutral crate holding
+  what both sides read and write. The `ledger` module moved there
+  verbatim; `lm-provision-driver` re-exports it, so every
+  `lm_provision_driver::ledger::*` path still resolves and no caller
+  changes.
+
+  **Release order: `lm-provision-protocol` publishes to crates.io
+  before `lm-provision-driver`.** The driver now depends on it by
+  version, and a version that is not on the registry yet does not
+  resolve.
+
 ## [0.7.0] - 2026-08-30
 
 ### Added
