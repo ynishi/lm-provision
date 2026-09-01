@@ -50,6 +50,7 @@ fn an_undeclared_capability_fails_the_op_even_in_dry_run() {
         // capability gate rejects the op first.
         paths: Vec::new(),
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::ShExec {
             id: ids.node(),
             argv: vec!["echo".to_string(), "hi".to_string()],
@@ -113,6 +114,7 @@ fn dry_run_traces_every_direct_op() {
         // reaches its full 7-line shape.
         paths: vec!["/tmp".to_string(), "/src".to_string(), "/dst".to_string()],
         http_allowlist: vec!["https://example.com".to_string()],
+        sh_egress: Vec::new(),
         phases: vec![
             ProfileNode::ShExec {
                 id: ids.node(),
@@ -211,6 +213,7 @@ fn real_mode_runs_sh_exec_and_summarises_the_result() {
         // are inert here.
         paths: Vec::new(),
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::ShExec {
             id: ids.node(),
             argv: vec!["echo".to_string(), "hello".to_string()],
@@ -309,6 +312,7 @@ async fn dry_run_traces_every_traceable_lifecycle_op() {
             "https://ex".to_string(),
             format!("http://127.0.0.1:{}", addr.port()),
         ],
+        sh_egress: Vec::new(),
         phases: vec![
             ProfileNode::SystemApt {
                 id: ids.node(),
@@ -480,6 +484,7 @@ async fn staging_push_hf_dst_composes_a_cli_upload_in_dry_run() {
         env_secrets: Vec::new(),
         paths: Vec::new(),
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::StagingPush {
             id: ids.node(),
             src: "/workspace/out.bin".to_string(),
@@ -533,6 +538,7 @@ fn staging_push_is_denied_when_only_net_transfer_is_granted() {
         env_secrets: Vec::new(),
         paths: Vec::new(),
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::StagingPush {
             id: ids.node(),
             src: "/workspace/out.bin".to_string(),
@@ -604,6 +610,7 @@ async fn sync_pull_demands_the_capability_of_the_route_its_payload_resolves_to()
             env_secrets: Vec::new(),
             paths: vec!["/workspace".to_string()],
             http_allowlist: vec!["https://example.com".to_string()],
+            sh_egress: Vec::new(),
             phases: vec![ProfileNode::SyncPull {
                 id: ids.node(),
                 src: src.to_string(),
@@ -665,6 +672,7 @@ fn a_net_transfer_upload_gates_its_destination_on_the_http_allowlist() {
             env_secrets: Vec::new(),
             paths,
             http_allowlist: allowlist,
+            sh_egress: Vec::new(),
             phases: vec![ProfileNode::NetTransfer {
                 id: ids.node(),
                 src: "/workspace/out.bin".to_string(),
@@ -725,6 +733,7 @@ fn a_public_hf_download_gates_on_the_resolved_host() {
             env_secrets: Vec::new(),
             paths: vec!["/workspace".to_string()],
             http_allowlist: allowlist,
+            sh_egress: Vec::new(),
             phases: vec![ProfileNode::NetTransfer {
                 id: ids.node(),
                 src: "hf://owner/repo/model.bin".to_string(),
@@ -778,6 +787,7 @@ async fn lifecycle_steps_answer_to_the_path_and_http_allowlists() {
             env_secrets: Vec::new(),
             paths,
             http_allowlist: allowlist,
+            sh_egress: Vec::new(),
             phases: vec![phase],
         };
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -871,6 +881,7 @@ fn sh_exec_undeclared_secret_fails_in_dry_run() {
         env_secrets: Vec::new(),
         paths: Vec::new(),
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::ShExec {
             id: ids.node(),
             argv: vec!["true".to_string()],
@@ -926,6 +937,7 @@ fn sh_exec_injects_a_declared_secret_into_the_child_in_real_mode() {
         env_secrets: vec![var.clone()],
         paths: Vec::new(),
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::ShExec {
             id: ids.node(),
             argv: vec![
@@ -1008,6 +1020,7 @@ async fn comfyui_health_polls_a_local_server_when_executing_effects() {
         // declared.
         paths: Vec::new(),
         http_allowlist: vec![format!("http://127.0.0.1:{port}")],
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::ComfyUiHealth {
             id: ids.node(),
             port,
@@ -1070,6 +1083,7 @@ async fn http_poll_lifecycle_ops_are_gated_on_net_http_get_not_sh_exec() {
                 "http://127.0.0.1:8188".to_string(),
                 "http://127.0.0.1:9000".to_string(),
             ],
+            sh_egress: Vec::new(),
             phases: vec![
                 ProfileNode::ComfyUiHealth {
                     id: ids.node(),
@@ -1138,6 +1152,7 @@ fn fs_write_to_an_undeclared_path_root_fails_in_dry_run() {
         // policy denies even before the dry-run trace is recorded.
         paths: Vec::new(),
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::FsWrite {
             id: ids.node(),
             path: "/tmp/blocked".to_string(),
@@ -1189,6 +1204,7 @@ fn fs_write_under_a_declared_path_root_traces_in_dry_run() {
         env_secrets: Vec::new(),
         paths: vec!["/tmp".to_string()],
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::FsWrite {
             id: ids.node(),
             path: "/tmp/allowed".to_string(),
@@ -1231,6 +1247,7 @@ fn http_get_to_an_undeclared_url_fails_in_dry_run() {
         env_secrets: Vec::new(),
         paths: Vec::new(),
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::NetHttpGet {
             id: ids.node(),
             url: "https://denied.example/".to_string(),
@@ -1278,6 +1295,7 @@ fn net_transfer_denies_when_the_http_source_is_not_allowlisted() {
         // Path is declared but HTTP source is not.
         paths: vec!["/tmp".to_string()],
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::NetTransfer {
             id: ids.node(),
             src: "https://denied.example/a".to_string(),
@@ -1321,6 +1339,7 @@ fn mount_bind_denies_when_only_the_source_is_declared() {
         env_secrets: Vec::new(),
         paths: vec!["/src".to_string()],
         http_allowlist: Vec::new(),
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::MountBind {
             id: ids.node(),
             src: "/src".to_string(),
@@ -1446,6 +1465,7 @@ fn http_post_dry_run_resolves_the_secret_header_and_body_without_tracing_them() 
         env_secrets: vec![header_var.clone(), body_var.clone()],
         paths: Vec::new(),
         http_allowlist: vec!["https://example.com".to_string()],
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::NetHttpPost {
             id: ids.node(),
             url: "https://example.com/post".to_string(),
@@ -1520,6 +1540,7 @@ fn http_get_with_a_host_absent_header_secret_fails_in_dry_run() {
         env_secrets: vec![var.clone()],
         paths: Vec::new(),
         http_allowlist: vec!["https://example.com".to_string()],
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::NetHttpGet {
             id: ids.node(),
             url: "https://example.com/get".to_string(),
@@ -1571,6 +1592,7 @@ fn declaring_both_body_forms_fails_the_step_even_without_validate() {
         env_secrets: Vec::new(),
         paths: Vec::new(),
         http_allowlist: vec!["https://example.com".to_string()],
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::NetHttpPost {
             id: ids.node(),
             url: "https://example.com/post".to_string(),
@@ -1624,6 +1646,7 @@ async fn http_post_real_mode_sends_the_declared_headers_and_json_body() {
         env_secrets: Vec::new(),
         paths: Vec::new(),
         http_allowlist: vec![allow],
+        sh_egress: Vec::new(),
         phases: vec![ProfileNode::NetHttpPost {
             id: ids.node(),
             url: url.clone(),

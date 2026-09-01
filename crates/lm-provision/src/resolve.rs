@@ -221,6 +221,7 @@ fn expand_document(
             env_secrets,
             paths,
             http_allowlist,
+            sh_egress,
             assumes,
             requires_ports,
             requires_gpu,
@@ -235,6 +236,7 @@ fn expand_document(
                 env_secrets,
                 paths,
                 http_allowlist,
+                sh_egress,
                 assumes,
             };
             let phases = expand_phases(phases, doc_path, ids, &mut slots, stack, chain)?;
@@ -248,6 +250,7 @@ fn expand_document(
                 env_secrets: slots.env_secrets,
                 paths: slots.paths,
                 http_allowlist: slots.http_allowlist,
+                sh_egress: slots.sh_egress,
                 assumes: slots.assumes,
                 requires_ports,
                 requires_gpu,
@@ -267,6 +270,7 @@ fn expand_document(
             env_secrets,
             paths,
             http_allowlist,
+            sh_egress,
             assumes,
             phases,
         } => {
@@ -276,6 +280,7 @@ fn expand_document(
                 env_secrets,
                 paths,
                 http_allowlist,
+                sh_egress,
                 assumes,
             };
             let phases = expand_phases(phases, doc_path, ids, &mut slots, stack, chain)?;
@@ -289,6 +294,7 @@ fn expand_document(
                 env_secrets: slots.env_secrets,
                 paths: slots.paths,
                 http_allowlist: slots.http_allowlist,
+                sh_egress: slots.sh_egress,
                 assumes: slots.assumes,
                 phases,
             })
@@ -308,6 +314,7 @@ struct Slots {
     env_secrets: Vec<String>,
     paths: Vec<String>,
     http_allowlist: Vec<String>,
+    sh_egress: Vec<String>,
     assumes: BTreeMap<String, String>,
 }
 
@@ -335,6 +342,7 @@ fn expand_phases(
                     env_secrets,
                     paths,
                     http_allowlist,
+                    sh_egress,
                     assumes,
                     phases: fragment_phases,
                     ..
@@ -353,6 +361,7 @@ fn expand_phases(
                 merge_union(&mut slots.env_secrets, env_secrets);
                 merge_union(&mut slots.paths, paths);
                 merge_union(&mut slots.http_allowlist, http_allowlist);
+                merge_union(&mut slots.sh_egress, sh_egress);
                 merge_env(&mut slots.env, env, &src, &fragment_chain)?;
                 merge_assumes(&mut slots.assumes, assumes, &src, &fragment_chain)?;
                 out.extend(fragment_phases);

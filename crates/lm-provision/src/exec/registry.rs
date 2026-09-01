@@ -316,13 +316,23 @@ impl ProfileOp {
     ) -> Result<ProfileValue, ExecError> {
         let (phase_index, _) = self.ctx.phase_meta_of(node);
         let (base_id, kind) = self.base(node);
-        let env = match resolve_phase_env(&self.ctx, payload) {
+        let mut env = match resolve_phase_env(&self.ctx, payload) {
             Ok(env) => env,
             Err(err) => {
                 self.record_phase_failure(node, &err);
                 return Err(err);
             }
         };
+        // Egress pin: route this lifecycle phase's sh-composing sub-steps
+        // (a `comfyui.install`'s `git clone` / `pip install`) through the
+        // allowlist proxy, same as a direct `sh.exec` (spec 05 §L3
+        // sh_egress). The phase's HTTP-poll sub-steps are bridge GETs that
+        // ignore the proxy env; `NO_PROXY` keeps their loopback direct.
+        if let Some(url) = &self.ctx.egress_proxy_url {
+            for (key, value) in crate::egress::proxy_env(url) {
+                env.entry(key).or_insert(value);
+            }
+        }
         // Re-expanded against the environment the build walk recorded
         // for this phase, not a freshly folded one: the phase must
         // compose the same steps here that `StepPlan` projected.
@@ -354,6 +364,7 @@ impl ProfileOp {
                     },
                     &env,
                     self.ctx.mode,
+                    self.ctx.egress_hard_pin,
                 ),
             );
             renders.push(record_lifecycle_step(
@@ -376,7 +387,7 @@ impl ProfileOp {
         // Resolve the env-injection map in both modes (spec 06
         // §Resolution "dry-run resolves too"): an undeclared or missing
         // secret fails a dry run identically to a real run.
-        let resolved_env = match self.ctx.env_policy.resolve(env) {
+        let mut resolved_env = match self.ctx.env_policy.resolve(env) {
             Ok(resolved_env) => resolved_env,
             Err(err) => {
                 let mut entry = StepReport::new(id, kind, "sh.exec");
@@ -386,6 +397,18 @@ impl ProfileOp {
                 return Err(err);
             }
         };
+        // Egress pin (spec 05 §L3 sh_egress): when the profile declares one,
+        // route this subprocess through the allowlist proxy by injecting the
+        // proxy env. `or_insert` so a profile that sets its own `HTTPS_PROXY`
+        // still wins. Only present in real mode — a dry run starts no proxy
+        // (`egress_proxy_url` is `None`) because binding a listener would be
+        // a side effect a dry run must not have, and it spawns no subprocess
+        // to route.
+        if let Some(url) = &self.ctx.egress_proxy_url {
+            for (key, value) in crate::egress::proxy_env(url) {
+                resolved_env.entry(key).or_insert(value);
+            }
+        }
         // Audit before the effect (spec 09 §Audit log). Env keys go
         // through the redaction helper; the resolved values never enter
         // the event.
@@ -408,7 +431,10 @@ impl ProfileOp {
                 Ok(value)
             }
             ExecMode::Real => {
-                let outcome = match effects::sh_exec(argv, &effects::ShOpts::new(resolved_env)) {
+                let outcome = match effects::sh_exec(
+                    argv,
+                    &effects::ShOpts::new(resolved_env).with_hard_pin(self.ctx.egress_hard_pin),
+                ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         let mut entry = StepReport::new(id, kind, "sh.exec");
@@ -1941,8 +1967,16 @@ async fn resolve_lifecycle_step(
     // *whole* phase — see [`lifecycle_preflight`] for why every step
     // pays for every other step's denial. They report their own failure
     // at the phase node, so there is nothing to push here.
-    let env = lifecycle_preflight(ctx, phase, payload, &phase_steps.steps)
+    let mut env = lifecycle_preflight(ctx, phase, payload, &phase_steps.steps)
         .map_err(|err| CallError::from(&err))?;
+    // Egress pin: route this lifecycle phase's sh-composing sub-steps through
+    // the allowlist proxy, mirroring the reducer path in `run_lifecycle`
+    // (spec 05 §L3 sh_egress). `or_insert` so a profile's own proxy var wins.
+    if let Some(url) = &ctx.egress_proxy_url {
+        for (key, value) in crate::egress::proxy_env(url) {
+            env.entry(key).or_insert(value);
+        }
+    }
 
     let (phase_index, _) = ctx.phase_meta_of(phase);
     let (base_id, kind) = report_base(ctx, phase);
@@ -1964,6 +1998,7 @@ async fn resolve_lifecycle_step(
         },
         &env,
         ctx.mode,
+        ctx.egress_hard_pin,
     )
     .await;
     let summary = record_lifecycle_step(
@@ -2392,6 +2427,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: vec!["/workspace".into()],
             http_allowlist: vec!["https://example.com".into()],
+            sh_egress: Vec::new(),
             phases: vec![
                 ProfileNode::NetTransfer {
                     id: phase_ids[0],
@@ -2469,6 +2505,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: Vec::new(),
             http_allowlist: Vec::new(),
+            sh_egress: Vec::new(),
             phases,
         }
     }

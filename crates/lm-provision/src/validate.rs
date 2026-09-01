@@ -235,6 +235,17 @@ pub enum ValidateError {
         capability: &'static str,
     },
 
+    /// `sh_egress` pins subprocess egress, but the profile declares no
+    /// `sh.exec` capability — so there is no subprocess for the pin to
+    /// route (spec 05 §L3 sh_egress). The declaration cannot take effect
+    /// and is almost certainly a mistake, so it is rejected rather than
+    /// silently ignored.
+    #[error(
+        "sh_egress is declared but the profile has no sh.exec capability, \
+         so there is no subprocess to route — add sh.exec or remove sh_egress"
+    )]
+    ShEgressWithoutShExec,
+
     /// A path the run will write to is covered by no declared `paths`
     /// root (check 9).
     #[error("{path:?} is written by this profile's phases but is covered by no paths root")]
@@ -384,6 +395,7 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         env_secrets,
         paths,
         http_allowlist,
+        sh_egress,
         assumes,
         requires_ports,
         requires_gpu,
@@ -401,6 +413,14 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // frontend invariant here — see the module doc.)
     if name.is_empty() {
         return Err(ValidateError::EmptyName);
+    }
+
+    // Check 1b: an egress pin needs a subprocess to pin. `sh_egress` only
+    // routes `sh.exec` subprocesses (spec 05 §L3), so declaring it without
+    // the `sh.exec` capability is inert and almost certainly a mistake —
+    // reject rather than silently ignore.
+    if !sh_egress.is_empty() && !capabilities.iter().any(|c| c == "sh.exec") {
+        return Err(ValidateError::ShEgressWithoutShExec);
     }
 
     // Check 0b: no unresolved `Import` / `Fragment` in the phase list.
@@ -1282,6 +1302,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: vec!["/".to_string()],
             http_allowlist: vec!["http://*".to_string(), "https://*".to_string()],
+            sh_egress: Vec::new(),
             phases,
         }
     }
@@ -1337,6 +1358,7 @@ mod tests {
             env_secrets: env_secrets.iter().map(|s| (*s).to_string()).collect(),
             paths: declared_paths,
             http_allowlist: vec!["http://*".to_string(), "https://*".to_string()],
+            sh_egress: Vec::new(),
             phases,
         }
     }
@@ -2137,6 +2159,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: paths.iter().map(|p| (*p).to_string()).collect(),
             http_allowlist: http_allowlist.iter().map(|u| (*u).to_string()).collect(),
+            sh_egress: Vec::new(),
             phases,
         }
     }
@@ -3104,5 +3127,48 @@ mod tests {
             ],
         );
         assert!(validate(&node).is_ok(), "{:?}", validate(&node));
+    }
+
+    /// A `Spec` with the given capabilities and `sh_egress`, one `sh.exec`
+    /// phase, everything else inert — for the egress-pin capability check.
+    fn spec_with_egress(capabilities: &[&str], sh_egress: &[&str]) -> ProfileNode {
+        let ids = IdGen::new();
+        ProfileNode::Spec {
+            assumes: all_resources_assumed(),
+            requires_ports: Default::default(),
+            requires_gpu: Default::default(),
+            requires_disk: Default::default(),
+            provider: Default::default(),
+            artifacts: Vec::new(),
+            id: ids.node(),
+            name: "egress".into(),
+            version: None,
+            description: None,
+            capabilities: capabilities.iter().map(|c| (*c).to_string()).collect(),
+            env: BTreeMap::new(),
+            env_secrets: Vec::new(),
+            paths: vec!["/".into()],
+            http_allowlist: vec!["https://*".into()],
+            sh_egress: sh_egress.iter().map(|h| (*h).to_string()).collect(),
+            phases: vec![ProfileNode::ShExec {
+                id: ids.node(),
+                argv: vec!["curl".into(), "https://huggingface.co/".into()],
+                env: BTreeMap::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn sh_egress_with_sh_exec_capability_validates() {
+        let node = spec_with_egress(&["sh.exec"], &["huggingface.co", "*.hf.co"]);
+        assert!(validate(&node).is_ok(), "{:?}", validate(&node));
+    }
+
+    #[test]
+    fn sh_egress_without_sh_exec_capability_is_rejected() {
+        // `net.http_get` is declared but not `sh.exec`, so the pin has no
+        // subprocess to route — reject rather than silently ignore.
+        let node = spec_with_egress(&["net.http_get"], &["huggingface.co"]);
+        assert_eq!(validate(&node), Err(ValidateError::ShEgressWithoutShExec));
     }
 }

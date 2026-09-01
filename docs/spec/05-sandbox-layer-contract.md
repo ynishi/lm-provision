@@ -127,6 +127,54 @@ the op, not the kernel. A containment boundary would have to be imposed
 outside the profile (container / mount namespace / seccomp), which is a
 deployment concern rather than a spec-05 one.
 
+#### `sh_egress` — the subprocess egress pin
+
+`sh_egress` is the one place spec-05 does reach a subprocess's effect,
+and only its **network egress**, not its filesystem. It is an opt-in
+host allowlist: a profile that declares `sh_egress` has every `sh.exec`
+subprocess routed through an egress proxy, and a destination host absent
+from the list is refused. The declaration is **host-independent** (it
+names hosts, e.g. `huggingface.co` or `*.hf.co`, with the same single
+`*.` authority wildcard the `http_allowlist` patterns carry); how the
+route is supplied and enforced is not.
+
+- **Absent or empty means no pin.** Unlike `paths` / `http_allowlist`,
+  whose empty state denies all, an empty `sh_egress` leaves subprocesses
+  unrouted — the pin is opt-in, so a profile written before it existed is
+  unchanged in behaviour and in hash. An empty declared list is therefore
+  indistinguishable from an absent one, and both mean "do not pin". A
+  profile that wants "allow nothing" declares a host it will never reach,
+  or declares no `sh.exec` capability at all (validate rejects a
+  `sh_egress` declared without `sh.exec`, since the pin would then route
+  nothing).
+- **Supply is a deployment concern**, the same side of the line the
+  containment boundary above sits on. The host either self-hosts an
+  in-process proxy on loopback (the default) or points at an external
+  egress gateway; the profile does not choose, and does not carry the
+  proxy's address.
+- **Enforcement is two layers, both best-effort, neither a containment
+  claim.** A *soft* layer routes every subprocess that honours the proxy
+  environment (`HTTPS_PROXY` / `HTTP_PROXY`) and checks each CONNECT host
+  — and the TLS ClientHello's SNI, to refuse a fronted name — against the
+  allowlist, tunnelling opaquely without decoding TLS. A *hard* layer
+  (Linux, self-hosted proxy only) additionally pins each subprocess's
+  `connect(2)` at the syscall via a seccomp supervisor, so a subprocess
+  that ignores the proxy environment still cannot reach off-host: the
+  allowed destinations are loopback (the proxy) and DNS, and everything
+  else is refused. Which layer takes effect is decided by the host at run
+  time; the profile states intent, never mechanism.
+
+What it does **not** do, stated as plainly as the `paths` limits above:
+it does not gate the filesystem (that is `paths`, and under `sh.exec`
+still only a lint over bridge ops); it does not close a supply-chain
+hijack from a *permitted* host (a poisoned package from an allowed
+registry arrives over an allowed connection — that is a hash-pin problem,
+not an egress one); and the hard layer leaves DNS (port 53) open so a
+subprocess that resolves before proxying keeps working, which leaves DNS
+tunnelling as a narrower residual channel than open egress. The pin
+closes the **exfiltration** half of the `sh.exec` gap — a credential or a
+work product leaving for an undeclared host — and says nothing more.
+
 The `env` declared table (the non-secret declarations) carries two
 separable roles, and only one of them is a policy role.
 
@@ -227,9 +275,19 @@ effects already performed by **earlier** steps of the same apply
   `http_allowlist`, is denied exactly as the `net.transfer` /
   `net.http_get` spelling of the same effect would be — the targets
   are read off the expanded steps, so the check does not depend on how
-  the phase was written. That subprocess writes under `sh.exec` are
+  the phase was written. That subprocess *writes* under `sh.exec` are
   outside the policy is structural rather than provisional: closing it
   is a deployment-side concern, not a layer change.
+- The `sh_egress` subprocess egress pin (§`sh_egress`): its **contract**
+  — opt-in host allowlist, absent/empty means no pin, supply is a
+  deployment concern, enforcement is best-effort and not a containment
+  claim, exfiltration-only — is **stable**. Its **enforcement
+  mechanisms** are **provisional**: the soft (proxy env + host/SNI
+  allowlist) and hard (Linux seccomp `connect` pin) layers are what the
+  current host implements, and a host may add or drop a mechanism (an OS
+  netns route where one is available, a tighter loopback-only DNS policy)
+  without changing what a profile declares. The allowset of the hard
+  layer (loopback + DNS) is provisional for the same reason.
 - L4 entry-check enforcement and the frozen `KNOWN_CAPABILITIES` set:
   **stable**. `mount.volume_attach` reserved key: **provisional**.
 

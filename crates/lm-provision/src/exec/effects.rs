@@ -136,12 +136,27 @@ const TRANSFER_READ_TIMEOUT_SEC: u64 = 60;
 pub struct ShOpts {
     /// Resolved `name → value` env injected into the child process.
     env: BTreeMap<String, String>,
+    /// Whether to spawn the subprocess under the egress hard pin (a seccomp
+    /// `connect` supervisor, [`crate::egress::hardpin`]). Set when the profile
+    /// pins egress to a **self-hosted** loopback proxy: the pin refuses any
+    /// connect that is not loopback or DNS, so a subprocess that ignores the
+    /// proxy env cannot reach off-host. Linux-only; ignored elsewhere.
+    hard_pin: bool,
 }
 
 impl ShOpts {
     /// Build options carrying the resolved env-injection map.
     pub fn new(env: BTreeMap<String, String>) -> Self {
-        Self { env }
+        Self {
+            env,
+            hard_pin: false,
+        }
+    }
+
+    /// Enable (or not) the egress hard pin for this subprocess.
+    pub fn with_hard_pin(mut self, hard_pin: bool) -> Self {
+        self.hard_pin = hard_pin;
+        self
     }
 }
 
@@ -306,15 +321,27 @@ pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError>
         });
     }
 
-    let output = Command::new(&argv[0])
-        .args(&argv[1..])
-        .envs(&opts.env)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|err| ExecError::EffectFailed {
-            op: "sh_exec".to_string(),
-            message: format!("failed to start '{}': {err}", argv[0]),
-        })?;
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]).envs(&opts.env).stdin(Stdio::null());
+
+    // Egress hard pin (spec 05 §L3 sh_egress, Linux only): route the
+    // subprocess's `connect` syscalls through a seccomp supervisor that
+    // refuses anything but loopback / DNS, so a subprocess ignoring the proxy
+    // env cannot reach off-host. `run_pinned` sets up the stdio pipes itself.
+    #[cfg(target_os = "linux")]
+    let output = if opts.hard_pin {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        crate::egress::hardpin::run_pinned(command)
+    } else {
+        command.output()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let output = command.output();
+
+    let output = output.map_err(|err| ExecError::EffectFailed {
+        op: "sh_exec".to_string(),
+        message: format!("failed to start '{}': {err}", argv[0]),
+    })?;
 
     Ok(ExecOutcome {
         exit_code: output.status.code().unwrap_or(-1),
