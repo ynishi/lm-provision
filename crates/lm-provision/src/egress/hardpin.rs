@@ -204,6 +204,45 @@
 //! gating of a real CLI (an IPv4-only filter is bypassed over IPv6, so both
 //! families are gated here).
 //!
+//! # `pidfd_getfd` gates the mode: full pin, or connect-only fallback
+//!
+//! Two things want `pidfd_getfd(2)`: the listener hand-off lifts the
+//! child's seccomp listener into the supervisor with it
+//! ([`supported::lift_listener`]), and the emulated syscalls
+//! ([`supported::emulate`]) operate on a `pidfd_getfd` duplicate of the
+//! tracee's socket. The hand-off cannot instead use `SCM_RIGHTS` *while
+//! sends are trapped* — `SCM_RIGHTS` is a `sendmsg`, which the full filter
+//! traps the instant it is armed, before the supervisor has a listener to
+//! answer with (a deadlock; see [`supported::install_and_signal`]) — so
+//! the full pin is bound to `pidfd_getfd`.
+//!
+//! A container seccomp policy can refuse `pidfd_getfd`: Docker's default
+//! profile does on some platforms — **measured: a RunPod pod under
+//! `Seccomp:2`, 2026-09-01, `pidfd_getfd` → `EPERM`**. Rather than refuse
+//! to run there, the pin falls back to a **connect-only** mode
+//! ([`supported::Mode`]): its filter traps `connect` alone, so `sendmsg`
+//! is no longer trapped and the listener hands off by `SCM_RIGHTS`
+//! ([`supported::send_fd`] / [`supported::recv_listener`]) with no
+//! `pidfd_getfd`; the supervisor answers `connect` with `CONTINUE` (allow)
+//! / `EPERM` (deny), so a non-cooperative subprocess's off-host TCP
+//! `connect` is still refused at the syscall. The cost, stated plainly:
+//! the send families (`sendto` / `sendmsg` / `sendmmsg`, and the
+//! `AF_UNSPEC` UDP exfil vector) are **not** pinned in this mode, and the
+//! `CONTINUE` re-read race is not closed — both are the accepted
+//! best-effort limitation of a host that cannot run the full pin. For full
+//! off-host enforcement on such a host, reach off-host through
+//! [`super::EgressSupply::External`] (`LM_EGRESS_PROXY`), which does not
+//! use this layer.
+//!
+//! [`supported::run_pinned`] chooses the mode once, before the fork, from
+//! [`supported::pidfd_getfd_available`]. A second guard backs it up:
+//! [`supported::install_and_signal`] closes the child's inherited copy of
+//! the parent socketpair end, so a hand-off failure becomes a clean EOF on
+//! the child's ack read rather than the hang it was before — the forked
+//! child otherwise kept that end open and never saw EOF (**measured: the
+//! same RunPod pod, any pinned `sh.exec` hung until killed**, before the
+//! fallback and this close existed).
+//!
 //! Applies only to a **self-hosted** (loopback) proxy. An external gateway
 //! ([`super::EgressSupply::External`]) is off-host, so a loopback-only pin
 //! would break it; there the gateway owns enforcement and this layer is off.
@@ -1346,22 +1385,27 @@ mod supported {
     /// Install the user-notify filter and hand its listener fd to the parent —
     /// **without a trapped syscall**.
     ///
-    /// The obvious way to pass the listener is `SCM_RIGHTS` over the
-    /// socketpair, but that is a `sendmsg`, which this very filter now traps
-    /// (§Which syscalls are trapped) — and it is trapped the instant `seccomp`
-    /// returns, before the parent has the listener to answer the trap with.
-    /// That deadlocks: the child blocks in the fd-passing `sendmsg`, the parent
-    /// blocks waiting to receive it, and the supervisor that would allow it has
-    /// no listener yet.
+    /// The mechanism depends on the [`Mode`]. In `Emulated` the obvious way
+    /// to pass the listener — `SCM_RIGHTS` over the socketpair — is a
+    /// `sendmsg`, which the full filter traps the instant `seccomp` returns,
+    /// before the parent has the listener to answer the trap with. That
+    /// deadlocks: the child blocks in the fd-passing `sendmsg`, the parent
+    /// blocks waiting to receive it, and the supervisor that would allow it
+    /// has no listener yet. So in `Emulated` the fd travels differently: the
+    /// child `write`s its own pid and listener fd *number* to `sync_sock` (a
+    /// plain `write`, not trapped), then blocks in a `read` for a one-byte
+    /// ack. While it is blocked — alive, fd table stable — a parent **helper
+    /// thread** lifts the listener out of the child with `pidfd_getfd(2)`
+    /// ([`run_pinned`]), acks, and the child then closes its own copy (so an
+    /// adversarial child cannot answer its own notifications, and the fd does
+    /// not leak across the exec) and proceeds.
     ///
-    /// So the fd travels a different way. The child `write`s its own pid and
-    /// listener fd *number* to `sync_sock` (a plain `write`, not trapped), then
-    /// blocks in a `read` for a one-byte ack. While it is blocked — alive, fd
-    /// table stable — a parent **helper thread** lifts the listener out of the
-    /// child with `pidfd_getfd(2)` ([`run_pinned`]), acks, and the child then
-    /// closes its own copy (so an adversarial child cannot answer its own
-    /// notifications, and the fd does not leak across the exec) and proceeds.
-    /// `write` / `read` / `close` are all `RET_ALLOW`, so nothing here traps.
+    /// In `ConnectOnly` (the host refused `pidfd_getfd`) the filter traps
+    /// `connect` alone, so `sendmsg` is *not* trapped and `SCM_RIGHTS` works:
+    /// the child sends the listener fd directly ([`send_fd`]) over
+    /// `sync_sock`, waits the same ack, and closes its copy. `write` / `read`
+    /// / `sendmsg`(ConnectOnly) / `close` are all `RET_ALLOW` in their mode,
+    /// so nothing here traps.
     ///
     /// The helper thread is load-bearing: `Command::spawn` does not return
     /// until the child `exec`s, and the child cannot `exec` until it is
@@ -1371,33 +1415,62 @@ mod supported {
     /// syscalls (no allocation): a fork child sharing the parent's address
     /// space cannot safely run arbitrary code.
     ///
+    /// Which enforcement the pin runs, chosen once by [`run_pinned`] from
+    /// whether `pidfd_getfd(2)` is permitted on this host.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        /// `pidfd_getfd` available: trap the full address-carrying set
+        /// (connect + sendto + sendmsg + sendmmsg), hand the listener off by
+        /// `pidfd_getfd`, and perform authorized syscalls in the supervisor
+        /// (the re-read TOCTOU closure).
+        Emulated,
+        /// `pidfd_getfd` refused by the host's seccomp (e.g. RunPod under
+        /// Docker `Seccomp:2`): trap `connect` alone. `sendmsg` is then not
+        /// trapped, so the listener hands off by `SCM_RIGHTS`, and the
+        /// supervisor answers `connect` with `CONTINUE` (allow) / `EPERM`
+        /// (deny) — no emulation. A best-effort connect pin: a
+        /// non-cooperative subprocess's off-host TCP `connect` is still
+        /// refused at the syscall, but the send families (UDP / `sendto`)
+        /// are unpinned and the CONTINUE re-read race is not closed.
+        ConnectOnly,
+    }
+
     /// # Safety
     /// Called only from `pre_exec` on a freshly forked child.
-    unsafe fn install_and_signal(sync_sock: RawFd) -> io::Result<()> {
+    unsafe fn install_and_signal(sync_sock: RawFd, parent_end: RawFd, mode: Mode) -> io::Result<()> {
+        // Close the fork-inherited copy of the *parent's* socketpair end
+        // before blocking on the ack. Both ends were created `SOCK_CLOEXEC`,
+        // but close-on-exec has not fired yet — this child has not exec'd,
+        // it is about to block in `read_exact` for the ack — so without this
+        // the child still holds `parent_end` open, and the peer of
+        // `sync_sock` never reaches zero writers. If the parent's handshake
+        // then fails (e.g. `pidfd_getfd` is refused by the host's seccomp)
+        // and closes *its* `parent_end`, the child's ack read would not see
+        // EOF and would block forever — deadlocking `Command::spawn` and
+        // hanging the whole step. Closing it here makes that failure a clean
+        // EOF → the child errors out → `spawn` returns and the pin fails
+        // closed instead of hanging. [measured: 2026-09-01, RunPod pod under
+        // Docker Seccomp:2 refusing `pidfd_getfd`, sh.exec hung until killed.]
+        libc::close(parent_end);
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(io::Error::last_os_error());
         }
-        // x86_64 BPF program — 13 instructions. The arch + x32 guards
-        // come first (§Arch check); then io_uring_setup is denied
-        // (§io_uring is denied outright); then the four address-carrying
-        // network syscalls (§Which syscalls are trapped) go to the
-        // supervisor; everything else native is allowed. Jump offsets
-        // are counted from the instruction *after* the jump.
-        //   0: A = seccomp_data.arch (offset 4)
-        //   1: if A == NATIVE_AUDIT_ARCH: fall to 2; else jf 10 → KILL (12)
-        //   2: A = seccomp_data.nr (offset 0)
-        //   3: if A >= X32_SYSCALL_BIT: jt 8 → KILL (12); else fall
-        //   4: if A == io_uring_setup: jt 6 → DENY_EPERM (11); else fall
-        //   5: if A == connect:  jt 4 → NOTIFY (10); else fall
-        //   6: if A == sendto:   jt 3 → NOTIFY (10); else fall
-        //   7: if A == sendmsg:  jt 2 → NOTIFY (10); else fall
-        //   8: if A == sendmmsg: jt 1 → NOTIFY (10); else fall to 9
-        //   9: RET_ALLOW        — every other native-ABI syscall is fine
-        //  10: RET_USER_NOTIF   — supervisor answers the destination
-        //  11: RET_ERRNO_EPERM  — io_uring_setup refused (no ring)
-        //  12: RET_KILL_PROCESS — foreign ABI or x32 → no filter coverage
+        // Two BPF programs, chosen by `mode`. Both open with the arch
+        // (+ x32 on x86_64) guards (§Arch check) and the io_uring_setup
+        // denial (§io_uring is denied outright); they differ only in which
+        // network syscalls reach the supervisor:
+        //
+        // - `Emulated` traps the full address-carrying set (connect +
+        //   sendto + sendmsg + sendmmsg). `sendmsg` being trapped is why the
+        //   listener hand-off cannot use `SCM_RIGHTS` and uses `pidfd_getfd`.
+        // - `ConnectOnly` traps `connect` alone (§`pidfd_getfd` fallback).
+        //   `sendmsg` is left `ALLOW`, so the hand-off *can* use `SCM_RIGHTS`
+        //   here — the whole reason this mode exists on a host that refuses
+        //   `pidfd_getfd`. Jump offsets are counted from the instruction
+        //   after the jump, so the two programs have different targets and
+        //   are written out in full rather than edited from one another.
         #[cfg(target_arch = "x86_64")]
-        let filter = [
+        let full = [
             SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 4 },
             SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 10, k: NATIVE_AUDIT_ARCH },
             SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 },
@@ -1412,23 +1485,26 @@ mod supported {
             SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO_EPERM },
             SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
         ];
-        // aarch64 BPF program — 12 instructions, no x32 guard (the ABI
-        // has no x32 equivalent), so every offset below the nr load
-        // shifts down by one.
-        //   0: A = seccomp_data.arch (offset 4)
-        //   1: if A == NATIVE_AUDIT_ARCH: fall to 2; else jf 9 → KILL (11)
-        //   2: A = seccomp_data.nr (offset 0)
-        //   3: if A == io_uring_setup: jt 6 → DENY_EPERM (10); else fall
-        //   4: if A == connect:  jt 4 → NOTIFY (9); else fall
-        //   5: if A == sendto:   jt 3 → NOTIFY (9); else fall
-        //   6: if A == sendmsg:  jt 2 → NOTIFY (9); else fall
-        //   7: if A == sendmmsg: jt 1 → NOTIFY (9); else fall to 8
-        //   8: RET_ALLOW        — every other native-ABI syscall is fine
-        //   9: RET_USER_NOTIF   — supervisor answers the destination
-        //  10: RET_ERRNO_EPERM  — io_uring_setup refused (no ring)
-        //  11: RET_KILL_PROCESS — foreign ABI → the pin has no coverage
+        // x86_64 connect-only — 10 instructions.
+        //   0: A=arch; 1: JEQ NATIVE jf 7→KILL(9); 2: A=nr;
+        //   3: JGE X32 jt 5→KILL(9); 4: JEQ io_uring jt 3→EPERM(8);
+        //   5: JEQ connect jt 1→NOTIFY(7); 6: ALLOW; 7: NOTIFY; 8: EPERM; 9: KILL
+        #[cfg(target_arch = "x86_64")]
+        let connect_only = [
+            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 4 },
+            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 7, k: NATIVE_AUDIT_ARCH },
+            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 },
+            SockFilter { code: BPF_JMP | BPF_JGE | BPF_K, jt: 5, jf: 0, k: X32_SYSCALL_BIT },
+            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 3, jf: 0, k: libc::SYS_io_uring_setup as u32 },
+            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: libc::SYS_connect as u32 },
+            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_USER_NOTIF },
+            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO_EPERM },
+            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
+        ];
+        // aarch64 full — 12 instructions, no x32 guard.
         #[cfg(target_arch = "aarch64")]
-        let filter = [
+        let full = [
             SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 4 },
             SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 9, k: NATIVE_AUDIT_ARCH },
             SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 },
@@ -1442,6 +1518,26 @@ mod supported {
             SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO_EPERM },
             SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
         ];
+        // aarch64 connect-only — 9 instructions.
+        //   0: A=arch; 1: JEQ NATIVE jf 6→KILL(8); 2: A=nr;
+        //   3: JEQ io_uring jt 3→EPERM(7); 4: JEQ connect jt 1→NOTIFY(6);
+        //   5: ALLOW; 6: NOTIFY; 7: EPERM; 8: KILL
+        #[cfg(target_arch = "aarch64")]
+        let connect_only = [
+            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 4 },
+            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 6, k: NATIVE_AUDIT_ARCH },
+            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 },
+            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 3, jf: 0, k: libc::SYS_io_uring_setup as u32 },
+            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: libc::SYS_connect as u32 },
+            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_USER_NOTIF },
+            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO_EPERM },
+            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
+        ];
+        let filter: &[SockFilter] = match mode {
+            Mode::Emulated => &full,
+            Mode::ConnectOnly => &connect_only,
+        };
         let prog = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         let listener = libc::syscall(
             libc::SYS_seccomp,
@@ -1453,13 +1549,25 @@ mod supported {
             return Err(io::Error::last_os_error());
         }
         let listener = listener as RawFd;
-        // Hand our pid + the fd *number* to the parent helper and wait for the
-        // ack that says it has been lifted out. Both are plain `write` /
-        // `read` — not trapped — so no deadlock (see this function's doc).
-        let mut msg = [0u8; 8];
-        msg[0..4].copy_from_slice(&(libc::getpid() as i32).to_ne_bytes());
-        msg[4..8].copy_from_slice(&(listener as i32).to_ne_bytes());
-        write_all(sync_sock, &msg)?;
+        // Hand the listener to the parent, then wait for the ack that says it
+        // has it. The mechanism depends on the mode (see this function's doc
+        // and [`Mode`]).
+        match mode {
+            Mode::Emulated => {
+                // `sendmsg` is trapped, so SCM_RIGHTS would deadlock — write
+                // our pid + the listener fd *number* (plain `write`, not
+                // trapped) for the parent to lift with `pidfd_getfd`.
+                let mut msg = [0u8; 8];
+                msg[0..4].copy_from_slice(&(libc::getpid() as i32).to_ne_bytes());
+                msg[4..8].copy_from_slice(&(listener as i32).to_ne_bytes());
+                write_all(sync_sock, &msg)?;
+            }
+            Mode::ConnectOnly => {
+                // `sendmsg` is NOT trapped in this filter, so pass the
+                // listener itself by SCM_RIGHTS directly — no `pidfd_getfd`.
+                send_fd(sync_sock, listener)?;
+            }
+        }
         let mut ack = [0u8; 1];
         read_exact(sync_sock, &mut ack)?;
         // The parent holds a dup now; drop our copy so it neither survives the
@@ -1467,6 +1575,44 @@ mod supported {
         // its own notifications.
         libc::close(listener);
         Ok(())
+    }
+
+    /// Send `fd` to the peer of `sock` in a one-byte `SCM_RIGHTS` `sendmsg`
+    /// (the `ConnectOnly` hand-off). Raw so it is safe in the child's
+    /// `pre_exec`; only reached under the connect-only filter, which does
+    /// not trap `sendmsg`, so this call is not itself intercepted.
+    ///
+    /// # Safety
+    /// Called only from `pre_exec` on a freshly forked child.
+    unsafe fn send_fd(sock: RawFd, fd: RawFd) -> io::Result<()> {
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        // Room for one fd's control message (CMSG_SPACE(4) is 24 on LP64).
+        let mut cbuf = [0u8; 64];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
+        std::ptr::copy_nonoverlapping(&fd, libc::CMSG_DATA(cmsg) as *mut RawFd, 1);
+        loop {
+            let n = libc::sendmsg(sock, &msg, 0);
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            return Ok(());
+        }
     }
 
     /// `write(2)` all of `buf`, looping over short writes. Raw so it is
@@ -1562,6 +1708,75 @@ mod supported {
             return Err(err);
         }
         Ok(notify_fd)
+    }
+
+    /// Receive the child's notification listener over `SCM_RIGHTS` (the
+    /// `ConnectOnly` hand-off), acking once it is ours. The sibling of
+    /// [`lift_listener`] for a host that refuses `pidfd_getfd`: the child's
+    /// connect-only filter leaves `sendmsg` untrapped, so it sends the fd
+    /// directly ([`send_fd`]) and this receives it — no `pidfd_getfd`.
+    /// Consumes `sync_sock`.
+    fn recv_listener(sync_sock: RawFd) -> io::Result<RawFd> {
+        let result = recv_listener_inner(sync_sock);
+        // Whatever happened, close our end: on failure the close gives the
+        // child's ack `read` an EOF so it exits rather than hanging.
+        unsafe { libc::close(sync_sock) };
+        result
+    }
+
+    fn recv_listener_inner(sync_sock: RawFd) -> io::Result<RawFd> {
+        let notify_fd = recv_fd(sync_sock)?;
+        // The fd is ours; ack so the child closes its copy and exec's.
+        if let Err(err) = unsafe { write_all(sync_sock, &[1u8]) } {
+            unsafe { libc::close(notify_fd) };
+            return Err(err);
+        }
+        Ok(notify_fd)
+    }
+
+    /// Receive one fd from a `SCM_RIGHTS` `sendmsg` on `sock`. The parent
+    /// half of [`send_fd`]; runs on the helper thread (not `pre_exec`), so
+    /// it may allocate. A message that carries no `SCM_RIGHTS` fd, or an
+    /// EOF before one arrives, is an error → the pin fails closed.
+    fn recv_fd(sock: RawFd) -> io::Result<RawFd> {
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let mut cbuf = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cbuf.len() as _;
+        loop {
+            let n = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            if n == 0 {
+                return Err(io::Error::other(
+                    "EOF on the sync socket before the listener fd arrived",
+                ));
+            }
+            break;
+        }
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        if cmsg.is_null()
+            || unsafe { (*cmsg).cmsg_level } != libc::SOL_SOCKET
+            || unsafe { (*cmsg).cmsg_type } != libc::SCM_RIGHTS
+        {
+            return Err(io::Error::other(
+                "hand-off message carried no SCM_RIGHTS listener fd",
+            ));
+        }
+        let fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const RawFd) };
+        Ok(fd)
     }
 
     /// The largest number of `struct mmsghdr` entries the supervisor
@@ -1861,7 +2076,7 @@ mod supported {
     /// listener is closed on **every** exit, including a panic — which is
     /// what lets the child's trapped syscalls resolve to `ENOSYS` rather
     /// than blocking the parent forever (H4).
-    fn supervise(notify_fd: RawFd, stop: Arc<AtomicBool>, config: super::PinConfig) {
+    fn supervise(notify_fd: RawFd, stop: Arc<AtomicBool>, config: super::PinConfig, mode: Mode) {
         // SAFETY: `run_pinned` handed us the sole copy of this fd.
         let listener = unsafe { NotifyListener::from_raw(notify_fd) };
         let notify_fd = listener.as_raw();
@@ -1898,18 +2113,35 @@ mod supported {
                 break;
             }
             // Decide the answer. `is_notif_allowed` is the destination
-            // judgment; a permitted syscall is then turned into a `Plan`
-            // that says how to answer it *without* a re-readable `CONTINUE`
-            // (§the re-read TOCTOU closure). A denied destination, or a
-            // permitted one whose payload the supervisor cannot read, is
-            // `Deny`.
-            let plan = if is_notif_allowed(&notif, &config) {
-                match open_proc_mem(&format!("/proc/{}/mem", notif.pid)) {
-                    Ok(mem) => plan(&mem, &notif, &config),
-                    Err(_) => Plan::Deny, // cannot read to perform → fail closed
+            // judgment in both modes; how a *permitted* syscall is answered
+            // differs:
+            //
+            // - `Emulated`: turn it into a `Plan` that answers *without* a
+            //   re-readable `CONTINUE` — the supervisor performs the syscall
+            //   itself (§the re-read TOCTOU closure). A permitted syscall
+            //   whose payload cannot be read fails closed (`Plan::Deny`).
+            // - `ConnectOnly`: no emulation is possible (the host refused
+            //   `pidfd_getfd`), so a permitted `connect` is `CONTINUE`
+            //   (the accepted best-effort re-read race) and a denied one is
+            //   `EPERM`. Only `connect` is trapped in this mode.
+            let plan = match mode {
+                Mode::Emulated => {
+                    if is_notif_allowed(&notif, &config) {
+                        match open_proc_mem(&format!("/proc/{}/mem", notif.pid)) {
+                            Ok(mem) => plan(&mem, &notif, &config),
+                            Err(_) => Plan::Deny, // cannot read to perform → fail closed
+                        }
+                    } else {
+                        Plan::Deny
+                    }
                 }
-            } else {
-                Plan::Deny
+                Mode::ConnectOnly => {
+                    if is_notif_allowed(&notif, &config) {
+                        Plan::Continue
+                    } else {
+                        Plan::Deny
+                    }
+                }
             };
             // Read, then validate the id, then respond (§What the
             // supervisor's authorization is worth). A notification that
@@ -1955,18 +2187,65 @@ mod supported {
         // `listener` drops here (or on an unwind), closing the fd.
     }
 
-    /// Run `command` with the egress hard pin: install the filter in the child,
-    /// lift its notification listener out with `pidfd_getfd`, supervise its
-    /// address-carrying syscalls against `config` from a parent thread, and
-    /// collect its output like [`Command::output`]. `command`'s stdio must
-    /// already be configured (stdin/stdout/stderr) by the caller. Reached only
-    /// through the outer [`super::run_pinned`], which dispatches by target arch.
+    /// Whether `pidfd_getfd(2)` is usable on this host.
     ///
-    /// The listener travels by `pidfd_getfd` rather than `SCM_RIGHTS` because
-    /// the filter traps `sendmsg` (see [`install_and_signal`]): the child
-    /// writes its listener fd number over the sync socket, the parent lifts
-    /// that fd out of the child while it waits, and only then acks.
+    /// Opens a pidfd on the current process and tries to duplicate a fd it
+    /// is certain exists — the pidfd itself — through `pidfd_getfd`. Success
+    /// means the host's seccomp policy permits the call (→ [`Mode::Emulated`]);
+    /// an `EPERM` / `ENOSYS` (a container profile that filters it, or a kernel
+    /// without it) means [`run_pinned`] falls back to [`Mode::ConnectOnly`].
+    /// Using the pidfd as its own target keeps the probe from depending on any
+    /// other fd being open, so an `EBADF` cannot be mistaken for a policy
+    /// refusal.
+    fn pidfd_getfd_available() -> bool {
+        let pidfd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id() as libc::c_long, 0) };
+        if pidfd < 0 {
+            return false;
+        }
+        let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, pidfd, 0) };
+        let ok = dup >= 0;
+        if ok {
+            unsafe { libc::close(dup as RawFd) };
+        }
+        unsafe { libc::close(pidfd as RawFd) };
+        ok
+    }
+
+    /// Run `command` with the egress hard pin: install the filter in the
+    /// child, hand its notification listener to the parent, supervise its
+    /// trapped syscalls against `config` from a parent thread, and collect
+    /// its output like [`Command::output`]. `command`'s stdio must already
+    /// be configured by the caller. Reached only through the outer
+    /// [`super::run_pinned`], which dispatches by target arch.
+    ///
+    /// [`pidfd_getfd_available`] chooses the [`Mode`]: `Emulated` (full trap,
+    /// `pidfd_getfd` hand-off, syscall emulation) where the host permits
+    /// `pidfd_getfd`, else `ConnectOnly` (connect-only trap, `SCM_RIGHTS`
+    /// hand-off, `CONTINUE`/`EPERM`) as the fallback for a host that refuses
+    /// it (§`pidfd_getfd` fallback).
     pub(super) fn run_pinned(mut command: Command, config: super::PinConfig) -> io::Result<Output> {
+        // Choose the mode once, before the fork, from whether the host
+        // permits `pidfd_getfd(2)`. The full pin (trap sends + emulate)
+        // needs it both to hand off the listener and to perform authorized
+        // syscalls; a host whose seccomp refuses it (Docker's default
+        // profile on some platforms — measured: RunPod pods under
+        // `Seccomp:2`, 2026-09-01, `pidfd_getfd` → EPERM) cannot run that,
+        // so fall back to the connect-only pin, which hands off by
+        // `SCM_RIGHTS` and answers with `CONTINUE`/`EPERM` (§`pidfd_getfd`
+        // fallback). It still refuses a non-cooperative subprocess's
+        // off-host `connect` at the syscall; it does not pin the send
+        // families or close the re-read race.
+        let mode = if pidfd_getfd_available() {
+            Mode::Emulated
+        } else {
+            tracing::warn!(
+                "egress: pidfd_getfd refused by this host's seccomp; the hard pin \
+                 falls back to connect-only (sendto/UDP unpinned, CONTINUE re-read \
+                 race not closed). Use LM_EGRESS_PROXY for full off-host enforcement."
+            );
+            Mode::ConnectOnly
+        };
         let mut fds = [0 as libc::c_int; 2];
         // `SOCK_CLOEXEC`: both ends close at the child's `execve`, so
         // neither the sync socket leaks into the exec'd (untrusted)
@@ -1987,14 +2266,19 @@ mod supported {
         let (parent_sock, child_sock) = (fds[0], fds[1]);
 
         unsafe {
-            command.pre_exec(move || install_and_signal(child_sock));
+            command.pre_exec(move || install_and_signal(child_sock, parent_sock, mode));
         }
 
         // The handshake runs on its own thread because `spawn` blocks until
         // the child `exec`s and the child cannot `exec` until this acks it —
         // so the ack must not be on the spawning thread (see
         // [`install_and_signal`]). The helper owns `parent_sock` and closes it.
-        let handshake = std::thread::spawn(move || lift_listener(parent_sock));
+        // The hand-off mechanism matches the mode: `pidfd_getfd` for
+        // `Emulated`, `SCM_RIGHTS` receive for `ConnectOnly`.
+        let handshake = std::thread::spawn(move || match mode {
+            Mode::Emulated => lift_listener(parent_sock),
+            Mode::ConnectOnly => recv_listener(parent_sock),
+        });
 
         let child = command.spawn();
         // The parent no longer needs the child's end regardless of outcome; on
@@ -2037,7 +2321,7 @@ mod supported {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let supervisor = std::thread::spawn(move || supervise(notify_fd, stop_thread, config));
+        let supervisor = std::thread::spawn(move || supervise(notify_fd, stop_thread, config, mode));
 
         let output = child.wait_with_output();
         stop.store(true, Ordering::Relaxed);
@@ -2738,6 +3022,24 @@ mod supported {
                 &buf[..n],
                 b"EMULATED_OK",
                 "the supervisor must deliver the copied payload"
+            );
+        }
+
+        /// **`pidfd_getfd` is available on the test host**, so the probe
+        /// [`run_pinned`] gates on returns true here and the pin runs. On a
+        /// host whose seccomp refuses `pidfd_getfd` (a Docker container under
+        /// the default profile — measured on RunPod, 2026-09-01) the probe
+        /// returns false and `run_pinned` fails closed with a message
+        /// pointing at the external gateway, rather than deadlocking the
+        /// listener hand-off. The refusal path itself is not unit-testable
+        /// here (it needs a restricting seccomp policy this test process is
+        /// not under), but the probe is the single point that decides it.
+        #[test]
+        fn pidfd_getfd_probe_is_true_on_an_unrestricted_host() {
+            assert!(
+                pidfd_getfd_available(),
+                "the dev/CI host must permit pidfd_getfd; if this fails the \
+                 host's seccomp is refusing it and the pin would fail closed"
             );
         }
 
