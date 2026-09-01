@@ -61,6 +61,7 @@ impl ProfileHost {
             // both allowlists empty preserves the dry-run trace shape.
             paths: Vec::new(),
             http_allowlist: Vec::new(),
+            sh_egress: Vec::new(),
             phases: vec![
                 ProfileNode::SystemApt {
                     id: id_gen.node(),

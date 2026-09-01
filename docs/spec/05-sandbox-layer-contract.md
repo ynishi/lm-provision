@@ -75,9 +75,17 @@ op is reachable, and consulted in **both** dry-run and real mode
   only path by which the host environment is read (chapter 06).
 - **HTTP policy** (`http_allowlist`): a URL is allowed iff it matches
   one of the declared patterns. A pattern is a literal URL prefix,
-  optionally with a single `*` wildcard whose match is confined to the
-  authority component (e.g. `https://*.b2.backblazeb2.com`); the
-  wildcard never matches into the path.
+  optionally with a single `*` wildcard whose match is confined to
+  the authority component (e.g. `https://*.b2.backblazeb2.com`); the
+  wildcard never matches into the path. The **authority** halves of
+  pattern and URL compare **case-insensitively** and with a trailing
+  `.` ignored on either side (RFC 3986 §3.1 for the scheme, RFC 1035
+  §2.3.3 / §3.1 for DNS names — the two spellings name the same
+  authority). A `*.X` pattern additionally matches the apex `X` — the
+  operator expectation for "X and everything under it"; the same
+  authority rules govern `sh_egress` host patterns, and one shared
+  matcher answers to both so a declared host string means the same
+  thing wherever it lives.
 - **Path policy** (`paths`): a path is accepted iff it is absolute,
   contains no `..` segment, and lies under a declared root with
   component-aligned prefix matching (`/workspace_x` is NOT under

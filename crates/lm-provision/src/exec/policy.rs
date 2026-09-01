@@ -277,22 +277,23 @@ impl HttpPolicy {
         let Some((url_scheme, url_authority, url_path)) = Self::split(url) else {
             return false;
         };
-        if pattern_scheme != url_scheme {
+        // Schemes compare case-insensitively (RFC 3986 §3.1): `HTTPS`
+        // and `https` name the same scheme, so a profile written with
+        // either spelling authorises the other.
+        if !pattern_scheme.eq_ignore_ascii_case(url_scheme) {
             return false;
         }
 
-        let authority_ok = match pattern_authority.find('*') {
-            None => url_authority == pattern_authority,
-            Some(star_idx) => {
-                let host_prefix = &pattern_authority[..star_idx];
-                let host_suffix = &pattern_authority[star_idx + 1..];
-                url_authority.len() >= host_prefix.len() + host_suffix.len()
-                    && url_authority.starts_with(host_prefix)
-                    && url_authority.ends_with(host_suffix)
-            }
-        };
-
-        authority_ok && url_path.starts_with(pattern_path)
+        // Authority uses the shared host matcher — one rule across
+        // `sh_egress` and `http_allowlist` (spec 05 §L3), which
+        // additionally makes the host halves compare
+        // case-insensitively and ignore a trailing dot, both DNS
+        // conventions (RFC 1035 §2.3.3, §3.1). The path continues to
+        // use raw prefix matching so a URL's path segment remains
+        // exactly-as-written territory — case there is content, not
+        // identity.
+        crate::egress::host_match::matches(pattern_authority, url_authority)
+            && url_path.starts_with(pattern_path)
     }
 }
 
@@ -510,6 +511,53 @@ mod tests {
         let policy = HttpPolicy::new(&["https://*.b2.backblazeb2.com".to_string()]);
         assert!(!policy.is_allowed("https://attacker.com/https://f001.b2.backblazeb2.com/smuggled"));
         assert!(!policy.is_allowed("https://evil.b2.backblazeb2.com.attacker.com/x"));
+    }
+
+    /// A `*.X` pattern in `http_allowlist` matches the apex `X` too, not
+    /// only its subdomains — the unified contract this module now
+    /// shares with [`crate::egress::policy::EgressPolicy`]
+    /// ([`crate::egress::host_match`], spec 05 §L3 HTTP policy).
+    ///
+    /// This is the operator expectation for "everything under X"
+    /// (`*.example.com` covers `example.com`); the egress side pins it
+    /// with its own test (`wildcard_matches_subdomain_and_bare_suffix…`),
+    /// and the two halves must not disagree on the shape of a declared
+    /// host. An earlier implementation of `HttpPolicy::pattern_matches`
+    /// rejected the apex — the divergence was untested (no fixture
+    /// asserted it) and inconsistent with the sh_egress side; the
+    /// unification via [`crate::egress::host_match`] closes the
+    /// divergence in the direction the tested side pins.
+    #[test]
+    fn http_star_prefix_matches_the_apex_authority_too() {
+        let policy = HttpPolicy::new(&["https://*.hf.co".to_string()]);
+        assert!(policy.is_allowed("https://cdn-lfs.hf.co/model.safetensors"));
+        assert!(policy.is_allowed("https://hf.co/api/models"));
+        assert!(!policy.is_allowed("https://evilhf.co/x"));
+    }
+
+    /// Case sensitivity: the scheme and authority halves compare
+    /// case-insensitively (RFC 3986 §3.1 for scheme, RFC 1035 §2.3.3
+    /// for DNS names). The path continues to be exact — case there is
+    /// content, not identity. Documented here so the unified contract
+    /// stays legible from the http tests.
+    #[test]
+    fn http_scheme_and_authority_compare_case_insensitively() {
+        let policy = HttpPolicy::new(&["https://example.com/api/".to_string()]);
+        assert!(policy.is_allowed("HTTPS://Example.COM/api/models"));
+        assert!(policy.is_allowed("https://EXAMPLE.com/api/models"));
+        // Path stays exact: `/API/` is not `/api/`.
+        assert!(!policy.is_allowed("https://example.com/API/models"));
+    }
+
+    /// Trailing-dot equivalence: a DNS name with a trailing dot is the
+    /// same name as one without (RFC 1035 §3.1). Documents the second
+    /// side of the shared-matcher contract from the http tests.
+    #[test]
+    fn http_trailing_dot_on_the_authority_is_ignored() {
+        let policy = HttpPolicy::new(&["https://example.com/".to_string()]);
+        assert!(policy.is_allowed("https://example.com./"));
+        let with_dot = HttpPolicy::new(&["https://example.com./".to_string()]);
+        assert!(with_dot.is_allowed("https://example.com/"));
     }
 
     #[test]

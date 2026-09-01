@@ -4182,18 +4182,30 @@ mod tests {
     }
 
     /// The settle check is what turns "the spawn was accepted" into
-    /// "the process survived a second": a command that cannot run at
-    /// all fails the launch step, with its log tail on stderr.
+    /// "the process survived a second": a command that dies at once
+    /// fails the launch step, with its log tail on stderr.
+    ///
+    /// The dying command writes its own last words to stderr, so the
+    /// tail-relay assertion pins *this module's* contract (the log
+    /// reaches the step's stderr) and not any launcher's diagnostic
+    /// wording — uutils `nohup` (0.8.0, the `/usr/bin/nohup` on some
+    /// hosts) exits 127 on a missing binary without printing anything,
+    /// so a missing-binary fixture asserts text that never existed
+    /// there [measured: 2026-09-01].
     #[cfg(unix)]
     #[test]
     fn the_launch_script_fails_when_the_process_dies_immediately() {
         let dir = scratch_dir("launch-died");
         let log = dir.join("stub.log");
         let pid_file = dir.join("stub.pid");
-        let missing = dir.join("no-such-binary").to_string_lossy().into_owned();
+        let dying = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "'echo boom: fatal startup error >&2; exit 3'".to_string(),
+        ];
 
         let command = spawn_detached_command(
-            &[missing],
+            &dying,
             &log.to_string_lossy(),
             &pid_file.to_string_lossy(),
             "svc",
@@ -4207,7 +4219,7 @@ mod tests {
         assert_eq!(
             outcome.status.code(),
             Some(1),
-            "a launch that cannot start must fail the step"
+            "a launch that dies at once must fail the step"
         );
         let stderr = String::from_utf8_lossy(&outcome.stderr);
         assert!(
@@ -4215,8 +4227,8 @@ mod tests {
             "stderr should name the dead launch: {stderr}"
         );
         assert!(
-            stderr.contains("not found") || stderr.contains("No such file"),
-            "the log tail should carry the shell's own diagnosis: {stderr}"
+            stderr.contains("boom: fatal startup error"),
+            "the log tail should carry the process's own last words: {stderr}"
         );
 
         fs::remove_dir_all(&dir).ok();

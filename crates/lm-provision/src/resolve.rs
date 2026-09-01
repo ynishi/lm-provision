@@ -447,7 +447,7 @@ fn expand_document(
             artifacts,
             phases,
         } => {
-            let mut slots = Slots {
+            let (slots, phases) = expand_into_slots(
                 capabilities,
                 env,
                 env_secrets,
@@ -455,8 +455,13 @@ fn expand_document(
                 http_allowlist,
                 sh_egress,
                 assumes,
-            };
-            let phases = expand_phases(phases, doc_loc, ctx, ids, &mut slots, stack, chain)?;
+                phases,
+                doc_loc,
+                ctx,
+                ids,
+                stack,
+                chain,
+            )?;
             Ok(ProfileNode::Spec {
                 id,
                 name,
@@ -491,7 +496,7 @@ fn expand_document(
             assumes,
             phases,
         } => {
-            let mut slots = Slots {
+            let (slots, phases) = expand_into_slots(
                 capabilities,
                 env,
                 env_secrets,
@@ -499,8 +504,13 @@ fn expand_document(
                 http_allowlist,
                 sh_egress,
                 assumes,
-            };
-            let phases = expand_phases(phases, doc_loc, ctx, ids, &mut slots, stack, chain)?;
+                phases,
+                doc_loc,
+                ctx,
+                ids,
+                stack,
+                chain,
+            )?;
             Ok(ProfileNode::Fragment {
                 id,
                 name,
@@ -518,6 +528,45 @@ fn expand_document(
         }
         other => Ok(other),
     }
+}
+
+/// Build a [`Slots`] from a `Spec` or `Fragment`'s seven merge-shaped
+/// declaration fields and expand its phase list through it —
+/// [`expand_phases`] mutates the slots as each nested import merges in.
+///
+/// The two callers destructure their variant **exhaustively (no `..`)**
+/// so a new declaration field is a compile error at the destructure
+/// site; this helper takes the seven fields as named arguments, so the
+/// same field addition is also a compile error here, in exactly one
+/// place. Extracted so the 9-line Slots-build + expand-phases +
+/// unpack block does not live twice.
+#[allow(clippy::too_many_arguments)]
+fn expand_into_slots(
+    capabilities: Vec<String>,
+    env: BTreeMap<String, ProfileNode>,
+    env_secrets: Vec<String>,
+    paths: Vec<String>,
+    http_allowlist: Vec<String>,
+    sh_egress: Vec<String>,
+    assumes: BTreeMap<String, String>,
+    phases: Vec<ProfileNode>,
+    doc_loc: &Location,
+    ctx: &ResolveCtx,
+    ids: &IdGen,
+    stack: &mut Vec<StableKey>,
+    chain: &mut Vec<String>,
+) -> Result<(Slots, Vec<ProfileNode>), ResolveError> {
+    let mut slots = Slots {
+        capabilities,
+        env,
+        env_secrets,
+        paths,
+        http_allowlist,
+        sh_egress,
+        assumes,
+    };
+    let phases = expand_phases(phases, doc_loc, ctx, ids, &mut slots, stack, chain)?;
+    Ok((slots, phases))
 }
 
 /// The declaration slots a fragment merges into — shared between the
@@ -661,15 +710,21 @@ fn expand_import(
             });
         }
         (_, Some(pin)) => {
-            let pin_lower = pin.to_ascii_lowercase();
-            if pin_lower.len() != 64 || !pin_lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+            // Shape check goes through the shared
+            // [`canonical::is_sha256_hex`] so this and
+            // [`crate::validate`]'s `models.sha256` check answer to
+            // one rule (case not policed). Lowercase after the shape
+            // pass because [`canonical::hash`] renders in lowercase
+            // (spec 11 §Hash spelling), and the comparison later is
+            // byte-for-byte.
+            if !canonical::is_sha256_hex(pin) {
                 return Err(ResolveError::ImportPinShape {
                     src: src.to_string(),
                     hash: pin.to_string(),
                     chain: fragment_chain(chain),
                 });
             }
-            Some(pin_lower)
+            Some(pin.to_ascii_lowercase())
         }
         (false, None) => None,
     };

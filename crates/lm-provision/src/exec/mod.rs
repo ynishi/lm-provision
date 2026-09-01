@@ -344,4 +344,32 @@ impl ExecContext {
             .cloned()
             .unwrap_or((0, String::new()))
     }
+
+    /// Merge the egress-proxy env vars ([`crate::egress::proxy_env`]) onto
+    /// `env` when the profile pinned egress and the driver started a
+    /// proxy — a no-op when [`Self::egress_proxy_url`] is `None` (no pin,
+    /// or dry run: a dry run starts no proxy because binding a listener
+    /// would be a side effect a dry run must not have).
+    ///
+    /// Every subprocess-spawning op path funnels through this method
+    /// (`sh.exec`, the sync/async lifecycle drivers). Centralising the
+    /// merge is what stops a new spawn site from silently omitting the
+    /// routing — the earlier per-site copy-paste made that a review
+    /// hazard, since the review had to hand-check every spawn code path
+    /// carried the same `for (key, value) in proxy_env(url)` loop.
+    ///
+    /// `or_insert` semantics so a profile that spelled its own
+    /// `HTTPS_PROXY` in the phase's `env` still wins: the resolved env
+    /// arrives with the profile's value already present, and the
+    /// injection does not overwrite it. That mirrors the sh_egress
+    /// contract's opt-in "supply is a deployment concern" stance
+    /// (spec 05 §L3 sh_egress).
+    pub fn merge_egress_env(&self, env: &mut std::collections::BTreeMap<String, String>) {
+        let Some(url) = &self.egress_proxy_url else {
+            return;
+        };
+        for (key, value) in crate::egress::proxy_env(url) {
+            env.entry(key).or_insert(value);
+        }
+    }
 }

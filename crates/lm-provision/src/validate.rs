@@ -101,9 +101,12 @@ struct ModelItemShape {
     sha256: Option<String>,
 }
 
-/// The length of a SHA-256 rendered as hex
-/// (`crate::digest::hex_sha256`).
-const SHA256_HEX_LEN: usize = 64;
+/// The length of a SHA-256 rendered as hex — re-exported here so the
+/// error message can name the expected length without importing the
+/// full path each time. Source of truth is
+/// [`crate::canonical::HASH_HEX_LEN`], which the shape predicate
+/// [`crate::canonical::is_sha256_hex`] also reads from.
+const SHA256_HEX_LEN: usize = crate::canonical::HASH_HEX_LEN;
 
 /// A validate-stage rejection (first violation only,
 /// 03-pipeline-stage-artifacts.md §validate). Each `Display` string
@@ -1002,10 +1005,12 @@ fn check_phase(
                 if let Some(sha256) = &item.sha256 {
                     // Case is not policed: the comparison lowercases
                     // the declared digest, so an uppercase spelling is
-                    // a legible profile, not a broken one.
-                    if sha256.len() != SHA256_HEX_LEN
-                        || !sha256.chars().all(|c| c.is_ascii_hexdigit())
-                    {
+                    // a legible profile, not a broken one. Shape
+                    // check goes through the shared predicate
+                    // ([`crate::canonical::is_sha256_hex`]) so
+                    // `models.sha256` and the resolve stage's pin
+                    // shape answer to one rule.
+                    if !crate::canonical::is_sha256_hex(sha256) {
                         return Err(ValidateError::PhaseShape(format!(
                             "phases[{index}].models[{}].sha256: expected {SHA256_HEX_LEN} hex \
                              characters, got {:?}",

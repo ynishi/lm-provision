@@ -29,6 +29,7 @@ use crate::profile_ast::ProfileNode;
 
 #[cfg(target_os = "linux")]
 pub mod hardpin;
+pub mod host_match;
 pub mod policy;
 pub mod proxy;
 pub mod sni;

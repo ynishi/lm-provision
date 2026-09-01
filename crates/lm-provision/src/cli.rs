@@ -203,7 +203,7 @@ fn print_json(value: &serde_json::Value) {
 /// `pub` so `lm-provision-mcp`'s `lm_validate` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_validate(profile: &Path) -> PipelineResult<String> {
-    let node = crate::resolve::resolve(crate::frontend::load_profile(profile)?, profile)?;
+    let node = load_and_resolve(profile)?;
     crate::validate::validate(&node)?;
     let name = match &node {
         crate::profile_ast::ProfileNode::Spec { name, .. } => name.clone(),
@@ -212,6 +212,24 @@ pub fn ast_validate(profile: &Path) -> PipelineResult<String> {
         _ => String::new(),
     };
     Ok(name)
+}
+
+/// Load `profile` and expand its fragment imports — the shared front
+/// half of the three read-only pipelines below (`validate` / `hash` /
+/// `plan`, spec 07 §Invocation + spec 11 §Resolution).
+///
+/// **`hash` and `plan` do not run validate**: 07 §Invocation's
+/// pipeline-stages column names only `load → declarations → canonical
+/// → hash` and `load → declarations → plan` respectively, and the
+/// two `pub fn ast_*` entry points below hold that contract. So the
+/// resolve call MUST live in the shared load helper, not in
+/// [`ast_validate`] alone — if it did, `hash` on an importing
+/// document would compute the pre-expansion canonical hash and
+/// silently differ from the spec-11 "resolve first" contract
+/// ([`crate::resolve`] module doc, §Identity).
+fn load_and_resolve(profile: &Path) -> PipelineResult<crate::profile_ast::ProfileNode> {
+    let node = crate::frontend::load_profile(profile)?;
+    Ok(crate::resolve::resolve(node, profile)?)
 }
 
 fn run_validate(profile: &Path) -> ExitCode {
@@ -236,7 +254,7 @@ fn run_validate(profile: &Path) -> ExitCode {
 /// `pub` so `lm-provision-mcp`'s `lm_hash` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_hash(profile: &Path) -> PipelineResult<String> {
-    let node = crate::resolve::resolve(crate::frontend::load_profile(profile)?, profile)?;
+    let node = load_and_resolve(profile)?;
     Ok(crate::canonical::hash(&node))
 }
 
@@ -260,7 +278,7 @@ fn run_hash(profile: &Path) -> ExitCode {
 /// `pub` so `lm-provision-mcp`'s `lm_plan` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_plan(profile: &Path) -> PipelineResult<serde_json::Value> {
-    let node = crate::resolve::resolve(crate::frontend::load_profile(profile)?, profile)?;
+    let node = load_and_resolve(profile)?;
     Ok(crate::plan::expand(&node))
 }
 
