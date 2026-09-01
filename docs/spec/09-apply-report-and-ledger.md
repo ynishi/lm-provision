@@ -335,6 +335,28 @@ what have I not given back":
 - **The lease is recorded, not enforced by the writer.** The `acquire`
   that stamped `expires_at` exits long before that moment passes; what
   acts on it is chapter 08's `sweep`.
+- **This file is the audit trail, not the enforcement inventory.** What
+  it answers is who bought what, when, under which profile, and how it
+  was given back. What enforces the lease is the same `expires_at`
+  written onto the machine itself at create time (chapter 08
+  §Acquisitions and sweep: the `lmp-exp-` stamp), and the inventory a
+  sweep works from is the platform's own list. The distinction is the
+  whole point: a file can be lost, or written on a host that is not the
+  one sweeping, and correctness must not turn on that. A failed append
+  therefore costs the audit trail a row rather than costing a machine
+  its expiry.
+- **The record still has work of its own.** It is what a sweep run
+  without `--provider` reads, which is what reaches machines created
+  before the stamp existed; it is where a release argv is kept verbatim
+  for a machine whose profile has moved on; and it is the only place
+  that says which profile a machine was bought for.
+- **Absent from the platform's list means gone.** When a sweep did list
+  the platform an outstanding row names, and the row's `id` is not in
+  the answer, the machine is not running whatever the row says —
+  somebody released it by hand, or a correction was lost. A correction
+  is appended so the file says the bill has ended, and no release call
+  is spent on it. Only when that platform was actually listed: a
+  platform nobody asked supports no such conclusion.
 - Append failures are the ledger's error class with a sharper cost —
   see §Error surface.
 
@@ -382,6 +404,13 @@ what have I not given back":
   is the ledger's additive form: optional, absent-means-unknown, and
   never re-encoding a row that does not carry the new field. Physical
   encoding: **internal**.
+
+  The file's **role** was narrowed (2026-09-01) without its schema
+  changing: it is the audit trail, and the inventory a sweep enforces
+  from is the platform's own list (chapter 08 §Acquisitions and sweep).
+  Readers gain from that rather than lose — the rows still say
+  everything they said, and a lost row no longer means a machine that
+  nothing comes back for.
 
 ## Upstream references
 

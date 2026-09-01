@@ -53,6 +53,21 @@ struct Cli {
     #[arg(long = "driver", default_value = "lm-provision-driver")]
     driver: PathBuf,
 
+    /// A platform each sweep asks what it is running, judging those
+    /// machines by the lease stamped on each one. Repeatable.
+    ///
+    /// **This is what makes the platform the inventory.** Without it a
+    /// sweep can only act on the acquisitions record, and a record is a
+    /// file — it can be lost, or written on a host that is not this
+    /// one, while the machine keeps billing. The expiry rides on the
+    /// machine's own name, so a daemon holding the account's key needs
+    /// nothing kept in step with anything.
+    ///
+    /// Listing needs that credential even in `--dry-run true`.
+    /// Machines carrying no stamp are reported and never released.
+    #[arg(long = "provider")]
+    provider: Vec<String>,
+
     /// The acquisitions record to sweep; passed to the driver
     /// verbatim. Left out, the driver uses its own default — the file
     /// this host's `acquire` runs already wrote to.
@@ -108,6 +123,7 @@ async fn main() -> ExitCode {
     let config = Arc::new(Config {
         interval_secs: cli.interval_secs,
         driver: cli.driver,
+        providers: cli.provider,
         acquisitions: cli.acquisitions,
         ledger: cli.ledger,
         dry_run: cli.dry_run,
@@ -121,6 +137,7 @@ async fn main() -> ExitCode {
         driver = %config.driver.display(),
         interval_secs = config.interval_secs,
         dry_run = config.dry_run,
+        providers = config.providers.join(","),
         acquisitions = config.acquisitions.as_ref().map(|it| it.display().to_string()),
         ledger = config.ledger.as_ref().map(|it| it.display().to_string()),
         bind = %bind,

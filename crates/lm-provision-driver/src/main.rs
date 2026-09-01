@@ -4,8 +4,10 @@
 //! converges a reachable pod (steps 0-5) with per-step gates as
 //! flags, `acquire` obtains a machine that meets a profile's
 //! requirements, `release` gives one back, `sweep` gives back every
-//! machine whose lease has run out, `check` judges an existing
-//! machine against a profile.
+//! machine whose lease has run out — from the platform's own list of
+//! what it is running with `--provider`, and from the acquisitions
+//! record either way — `check` judges an existing machine against a
+//! profile.
 //!
 //! ```sh
 //! lm-provision-driver apply \
@@ -32,7 +34,7 @@
 //! stdout, diagnostics and the pod's stderr transcript to stderr —
 //! the same stream split the binary itself contracts (chapter 07).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -68,9 +70,11 @@ enum Command {
     Release(ReleaseArgs),
     /// Give back every machine whose lease has run out.
     ///
-    /// Reads the acquisitions record rather than the provider: what it
-    /// releases is what this host bought and never gave back, which is
-    /// the fleet a forgotten `release` leaves billing.
+    /// With `--provider`, the platform's own list is the inventory and
+    /// the lease is read off each machine's name — so a machine this
+    /// host has no record of is still found. Without it, the
+    /// acquisitions record is the list, which is what still reaches
+    /// machines created before leases were stamped onto them.
     Sweep(SweepArgs),
     /// Judge a machine that already exists against a profile.
     ///
@@ -140,8 +144,30 @@ struct AcquireArgs {
 
 #[derive(Args)]
 struct SweepArgs {
+    /// Ask this platform what it is running, and judge those machines
+    /// by the lease stamped on each one (`runpod`, `vast`). Repeatable.
+    ///
+    /// **This is the inventory when it is given.** A machine whose
+    /// acquisitions row was never written, was written on another host,
+    /// or was lost is still on the platform's list, and the expiry is
+    /// on the machine's own name — so anything holding the account's
+    /// key can enforce the lease with no file to keep in step.
+    ///
+    /// A machine carrying no `lmp-exp-` stamp is **reported and never
+    /// released**: this tool did not create it, and a sweeper deleting
+    /// what it does not recognise is the accident, not the enforcement.
+    ///
+    /// Listing needs the platform's credential even under
+    /// `--dry-run true` — the key buys the question here, not the kill.
+    #[arg(long = "provider")]
+    providers: Vec<String>,
+
     /// The acquisitions record to sweep (09 §Acquisitions record);
     /// defaults to `~/.lm-provision/acquisitions.jsonl`.
+    ///
+    /// Read whether or not `--provider` is given: it is the audit trail
+    /// of what this host bought, and it is what still reaches machines
+    /// created before the lease was stamped onto the machine itself.
     #[arg(long = "acquisitions")]
     acquisitions: Option<PathBuf>,
 
@@ -438,7 +464,30 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         return ExitCode::from(3);
     }
 
-    let acquisition = match adapter.acquisition(&required, &provider) {
+    // The lease is read off the clock **here**, before the request is
+    // rendered, because the machine and the record have to carry the
+    // same one: the create call writes `expires_at` onto the machine as
+    // its name (08 §Acquisitions and sweep), and the row below writes
+    // the same instant down. Two clock readings would be two leases
+    // disagreeing by however long the create took, and the sweeper
+    // believes the one on the machine.
+    let acquired_at = jiff::Timestamp::now();
+    let expires_at = match acquired_at.checked_add(ttl) {
+        Ok(expires_at) => expires_at,
+        Err(err) => {
+            // Validated at the input, so reaching this means the clock
+            // is somewhere no lease can be added to. An expiry equal to
+            // the acquisition is a machine a sweep will offer to
+            // release, which is the safe way to be wrong here.
+            eprintln!(
+                "warning: could not stamp an expiry {} hours out: {err}",
+                args.ttl_hours
+            );
+            acquired_at
+        }
+    };
+
+    let acquisition = match adapter.acquisition(&required, &provider, Some(expires_at)) {
         Ok(acquisition) => acquisition,
         Err(err) => {
             eprintln!("error: {err}");
@@ -447,16 +496,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     };
 
     if args.dry_run {
-        println!(
-            "{}",
-            serde_json::json!({
-                "dry_run": true,
-                "discover": acquisition.discover,
-                "create": acquisition.create,
-                "body": acquisition.body,
-                "release": acquisition.release,
-            })
-        );
+        println!("{}", dry_run_artifact(&acquisition));
         // Nothing was created, so nothing is recorded: an acquisitions
         // row for a machine that does not exist would put a sweep on a
         // hunt for it.
@@ -526,25 +566,11 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     eprintln!("acquired {}", acquired.id);
 
     // Recorded here, before the wait below — which can run twenty
-    // minutes and can be interrupted at any point in them. The record
-    // is what makes the machine findable after this process is gone,
-    // so it is written as early as there is an id to write.
-    let acquired_at = jiff::Timestamp::now();
-    let expires_at = match acquired_at.checked_add(ttl) {
-        Ok(expires_at) => expires_at.to_string(),
-        Err(err) => {
-            // Validated at the input, so reaching this means the clock
-            // is somewhere no lease can be added to. The row is still
-            // worth writing: an expiry equal to the acquisition is a
-            // machine a sweep will offer to release, which is the safe
-            // way to be wrong here.
-            eprintln!(
-                "warning: could not stamp an expiry {} hours out: {err}",
-                args.ttl_hours
-            );
-            acquired_at.to_string()
-        }
-    };
+    // minutes and can be interrupted at any point in them. The row is
+    // the audit trail: who bought this, when, under what profile, and
+    // how it was given back. What *enforces* the lease is the stamp the
+    // create call above put on the machine, so a row that fails to land
+    // no longer means a machine nothing will come back for.
     let acquisitions_path = args
         .acquisitions
         .clone()
@@ -553,7 +579,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         id: acquired.id.clone(),
         provider: args.provider.clone(),
         acquired_at: acquired_at.to_string(),
-        expires_at,
+        expires_at: expires_at.to_string(),
         profile_hash,
         release: release_template,
         released_at: None,
@@ -703,6 +729,24 @@ const ACQUIRE_REACHABILITY_POLL: std::time::Duration = std::time::Duration::from
 /// expired; such pulls run minutes, not tens of minutes].
 const ACQUIRE_MATERIALIZING_CAP: std::time::Duration = std::time::Duration::from_secs(1200);
 
+/// What `acquire --dry-run` puts on stdout: the request, exactly as it
+/// would be sent.
+///
+/// **Including the lease stamped onto the machine** — the `name` in the
+/// body or the `--label` in the argv (08 §Acquisitions and sweep). An
+/// operator asking what this would do is asking about the request, and
+/// the part of the request that decides whether the machine can ever be
+/// found again by a sweeper is the part that most needs showing.
+fn dry_run_artifact(acquisition: &infra::Acquisition) -> serde_json::Value {
+    serde_json::json!({
+        "dry_run": true,
+        "discover": acquisition.discover,
+        "create": acquisition.create,
+        "body": acquisition.body,
+        "release": acquisition.release,
+    })
+}
+
 /// Whether the platform has answered for every port the profile
 /// declared — the condition `acquire` waits on. No declared ports is
 /// covered by definition: there is nothing to wait for.
@@ -780,7 +824,9 @@ fn run_release(args: ReleaseArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let acquisition = match adapter.acquisition(&required, &provider) {
+    // No lease to stamp: this rendering is wanted for its release
+    // template, and nothing is being bought.
+    let acquisition = match adapter.acquisition(&required, &provider, None) {
         Ok(acquisition) => acquisition,
         Err(err) => {
             eprintln!("error: {err}");
@@ -791,19 +837,14 @@ fn run_release(args: ReleaseArgs) -> ExitCode {
     // fails and costs nothing; releasing without one leaves a machine
     // running and billing, so say so plainly rather than through the
     // service CLI's exit status.
-    if let Err(missing) =
-        credentials::require(adapter.provider_namespace(), adapter.credentials())
+    if let Err(missing) = credentials::require(adapter.provider_namespace(), adapter.credentials())
     {
         eprintln!("error: {missing}");
         eprintln!("note: {} is still running", args.id);
         return ExitCode::from(4);
     }
 
-    let argv: Vec<String> = acquisition
-        .release
-        .iter()
-        .map(|it| it.replace("{id}", &args.id))
-        .collect();
+    let argv = substitute(&acquisition.release, &args.id);
 
     // Captured, not inherited. Letting the service CLI write to this
     // process's stdout put its output in the artifact stream: a release
@@ -898,21 +939,107 @@ fn due(row: &AcquisitionRow, now: jiff::Timestamp, ledger_path: &std::path::Path
     if expires_at > now {
         return Due::Live;
     }
-    // The same gate `release` applies, read the same way (08 §Release
-    // gate). There is no `--force` here: forcing is a statement that
-    // the work still on the machine may be deleted with it, and a
-    // sweep is the least informed thing in the system about whether
-    // that is true. The operator escalates by hand.
-    match uncollected_artifacts(ledger_path, &row.id) {
-        Ok(uncollected) if !uncollected.is_empty() => Due::Refused(format!(
+    match gate(ledger_path, &row.id) {
+        Ok(()) => Due::Expired,
+        Err(reason) => Due::Refused(reason),
+    }
+}
+
+/// The release gate for one machine (08 §Release gate), whichever half
+/// of the sweep found it.
+///
+/// The same gate `release` applies, read the same way. There is no
+/// `--force` here: forcing is a statement that the work still on the
+/// machine may be deleted with it, and a sweep is the least informed
+/// thing in the system about whether that is true. The operator
+/// escalates by hand.
+///
+/// An unreadable ledger refuses rather than passes, for the reason
+/// `release`'s does: a gate that fails open makes a corrupt ledger the
+/// easiest way through it.
+fn gate(ledger_path: &std::path::Path, id: &str) -> Result<(), String> {
+    match uncollected_artifacts(ledger_path, id) {
+        Ok(uncollected) if !uncollected.is_empty() => Err(format!(
             "the newest apply left {} on the machine (collect them, or release --force)",
             uncollected.join(", ")
         )),
-        Ok(_) => Due::Expired,
-        Err(err) => Due::Refused(format!(
+        Ok(_) => Ok(()),
+        Err(err) => Err(format!(
             "the release gate could not read {}: {err}",
             ledger_path.display()
         )),
+    }
+}
+
+/// What a platform's own list says about one machine it is running.
+///
+/// The lease is read off the machine, so this needs no record, no
+/// profile and no memory of having created it — which is the whole
+/// point: a machine whose row was lost is judged exactly like one whose
+/// row is intact.
+#[derive(Debug, PartialEq, Eq)]
+enum Standing {
+    /// Stamped, and the lease has not run out.
+    Live,
+    /// Stamped, and it has.
+    Expired,
+    /// Carrying no `lmp-exp-` stamp at all.
+    ///
+    /// **Reported, never released.** This tool did not name it, so it
+    /// has no idea what it is — somebody else's work, another tool's
+    /// machine, one created before leases were stamped onto machines.
+    /// Janitor Monkey's answer to this is to mark the resource and warn
+    /// its owner before deleting it; that needs an owner to warn and a
+    /// mark to keep, and neither is in this MVP, so the answer here
+    /// stops at telling the operator it is there.
+    Unknown,
+}
+
+/// Read one listed machine's own account of its lease.
+fn standing(machine: &infra::Machine, now: jiff::Timestamp) -> Standing {
+    match machine.name.as_deref().and_then(infra::expiry_of) {
+        None => Standing::Unknown,
+        Some(expires_at) if expires_at > now => Standing::Live,
+        // Reached, not merely passed — the same comparison `due` makes
+        // of the recorded lease: the hours it was bought for are gone.
+        Some(_) => Standing::Expired,
+    }
+}
+
+/// What the record half of a sweep does with one outstanding row, once
+/// the platforms themselves have spoken.
+#[derive(Debug, PartialEq, Eq)]
+enum Bookkeeping {
+    /// A platform already dealt with this machine this run. Acting
+    /// again would be a second release call against something that is
+    /// already gone.
+    Handled,
+    /// The row's platform was asked, and this machine was not in the
+    /// answer. It is not running, whatever the row says — the bill has
+    /// ended, and the audit trail should say so.
+    Gone,
+    /// Nothing else knows about it: judge it by the recorded lease.
+    /// This is the whole of a sweep run without `--provider`, and it is
+    /// what still reaches machines created before the stamp existed.
+    Judge,
+}
+
+/// Place one outstanding row against what the listings said.
+fn bookkeeping(
+    row: &AcquisitionRow,
+    handled: &BTreeSet<String>,
+    listed: &BTreeMap<String, BTreeSet<String>>,
+) -> Bookkeeping {
+    if handled.contains(&row.id) {
+        return Bookkeeping::Handled;
+    }
+    match listed.get(&row.provider) {
+        // Absent from a list that was actually taken. A platform that
+        // could not be asked leaves no such conclusion to draw, which
+        // is why this turns on the listing existing rather than on the
+        // id being missing from an empty map.
+        Some(present) if !present.contains(&row.id) => Bookkeeping::Gone,
+        _ => Bookkeeping::Judge,
     }
 }
 
@@ -921,10 +1048,12 @@ fn due(row: &AcquisitionRow, now: jiff::Timestamp, ledger_path: &std::path::Path
 struct SweepOutcome {
     /// Whether anything was actually released.
     dry_run: bool,
-    /// How many outstanding machines this run found due — the ones
-    /// whose lease it could read and found run out. A row whose lease
-    /// it could not read is in `failed` and counted nowhere else: the
-    /// sweep does not know that it was due.
+    /// How many machines this run found due — the ones whose lease it
+    /// could read, from either the machine's own stamp or the record,
+    /// and found run out. Counted once per machine however many halves
+    /// of the sweep saw it. A lease it could not read is in `failed`
+    /// and counted nowhere else: the sweep does not know that it was
+    /// due.
     expired: usize,
     /// The machines released — or, under `--dry-run`, the ones that
     /// would be. The field names what the operator is deciding about,
@@ -933,8 +1062,14 @@ struct SweepOutcome {
     /// The machines the gate refused, with why.
     refused: Vec<(String, String)>,
     /// The machines still running that this sweep could not release,
-    /// with why.
+    /// with why — and the platforms it could not ask, under their own
+    /// name, since a plane nobody could list may be billing for
+    /// anything.
     failed: Vec<(String, String)>,
+    /// The listed machines carrying no lease stamp, with whatever they
+    /// are named — reported so an operator knows what is on the
+    /// account, and never released (see [`Standing::Unknown`]).
+    unknown: Vec<(String, String)>,
 }
 
 /// The one JSON document a sweep puts on stdout (07-cli.md §Stream
@@ -953,6 +1088,11 @@ fn sweep_artifact(outcome: &SweepOutcome) -> serde_json::Value {
         "released": outcome.released,
         "refused": pairs(&outcome.refused),
         "failed": pairs(&outcome.failed),
+        "unknown": outcome
+            .unknown
+            .iter()
+            .map(|(id, name)| serde_json::json!({ "id": id, "name_or_label": name }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -978,8 +1118,8 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
     let ledger_path = args.ledger.unwrap_or_else(default_ledger_path);
 
     // An unreadable record is the whole command's failure, not one
-    // machine's: a sweep that cannot read the fleet has not found it
-    // empty.
+    // machine's: a sweep that cannot read what this host bought has not
+    // found that it bought nothing.
     let outstanding = match record::outstanding(&acquisitions_path) {
         Ok(rows) => rows,
         Err(err) => {
@@ -998,33 +1138,153 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
         dry_run: args.dry_run,
         ..SweepOutcome::default()
     };
-    for row in outstanding {
-        match due(&row, now, &ledger_path) {
-            Due::Live => {}
-            Due::Failed(reason) => outcome.failed.push((row.id, reason)),
-            Due::Refused(reason) => {
-                outcome.expired += 1;
-                outcome.refused.push((row.id, reason));
+
+    // The provider-as-truth half, first: what each named platform says
+    // it is running, judged by the lease each machine carries. What it
+    // settles here is then what the record half must not do again.
+    let mut handled = BTreeSet::new();
+    let mut listed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for name in args.providers.iter().collect::<BTreeSet<_>>() {
+        let (fleet, machines) = match listing(name) {
+            Ok(listing) => listing,
+            Err(reason) => {
+                // Under the platform's own name in the `id` slot: what
+                // could not be read is the whole plane, not one
+                // machine, and a plane nobody could list is a tick that
+                // failed — it may be billing for anything.
+                outcome.failed.push((name.clone(), reason));
+                continue;
             }
-            Due::Expired => {
-                outcome.expired += 1;
-                if args.dry_run {
-                    // Nothing is spawned and no credential is asked
-                    // for: showing an operator what would happen must
-                    // not demand the key that would let it happen.
-                    outcome.released.push(row.id);
-                    continue;
+        };
+        let mut present = BTreeSet::new();
+        for machine in machines {
+            present.insert(machine.id.clone());
+            match standing(&machine, now) {
+                // The machine's own stamp outranks any row about it,
+                // here and in `Expired` below: the machine is the thing
+                // being billed and the row is a note about it.
+                Standing::Live => {
+                    handled.insert(machine.id);
                 }
-                match release_recorded(&row, &acquisitions_path) {
-                    Ok(()) => outcome.released.push(row.id),
-                    Err(reason) => outcome.failed.push((row.id, reason)),
+                Standing::Unknown => {
+                    outcome
+                        .unknown
+                        .push((machine.id, machine.name.unwrap_or_default()));
+                }
+                Standing::Expired => {
+                    outcome.expired += 1;
+                    handled.insert(machine.id.clone());
+                    if let Err(reason) = gate(&ledger_path, &machine.id) {
+                        outcome.refused.push((machine.id, reason));
+                        continue;
+                    }
+                    if args.dry_run {
+                        outcome.released.push(machine.id);
+                        continue;
+                    }
+                    match run_release_argv(&substitute(&fleet.release, &machine.id)) {
+                        Ok(()) => {
+                            // The audit trail catches up if it has
+                            // something to catch up on. A machine this
+                            // host has no row for is still released —
+                            // that is the point of reading the platform
+                            // — and inventing a row for it would put a
+                            // purchase in the record that this host
+                            // cannot describe.
+                            if let Some(row) = outstanding.iter().find(|it| it.id == machine.id) {
+                                retire(row, &acquisitions_path);
+                            }
+                            outcome.released.push(machine.id);
+                        }
+                        Err(reason) => outcome.failed.push((machine.id, reason)),
+                    }
                 }
             }
+        }
+        listed.insert(name.clone(), present);
+    }
+
+    // The record half. It runs whether or not a platform was asked:
+    // without `--provider` it is the whole sweep, and with one it is
+    // what reaches the machines the listing could not judge — the ones
+    // created before leases were stamped onto them.
+    for row in &outstanding {
+        match bookkeeping(row, &handled, &listed) {
+            Bookkeeping::Handled => {}
+            Bookkeeping::Gone => {
+                // Under `--dry-run` this run writes nothing anywhere,
+                // including here: an operator asking what a sweep would
+                // do is not asking for their record to be edited. The
+                // note is still worth saying — the row is wrong now and
+                // will be wrong at the next sweep too.
+                eprintln!(
+                    "note: {} is not in {}'s list of running machines; it is gone{}",
+                    row.id,
+                    row.provider,
+                    if args.dry_run {
+                        ", and the record would be corrected to say so"
+                    } else {
+                        ", and the record is being corrected to say so"
+                    }
+                );
+                if !args.dry_run {
+                    retire(row, &acquisitions_path);
+                }
+            }
+            Bookkeeping::Judge => match due(row, now, &ledger_path) {
+                Due::Live => {}
+                Due::Failed(reason) => outcome.failed.push((row.id.clone(), reason)),
+                Due::Refused(reason) => {
+                    outcome.expired += 1;
+                    outcome.refused.push((row.id.clone(), reason));
+                }
+                Due::Expired => {
+                    outcome.expired += 1;
+                    if args.dry_run {
+                        // Nothing is spawned and no credential is asked
+                        // for: showing an operator what would happen
+                        // must not demand the key that would let it
+                        // happen. (Asking a platform for its list does
+                        // need one — there the key buys the question.)
+                        outcome.released.push(row.id.clone());
+                        continue;
+                    }
+                    match release_recorded(row, &acquisitions_path) {
+                        Ok(()) => outcome.released.push(row.id.clone()),
+                        Err(reason) => outcome.failed.push((row.id.clone(), reason)),
+                    }
+                }
+            },
         }
     }
 
     println!("{}", sweep_artifact(&outcome));
     ExitCode::from(sweep_exit(&outcome))
+}
+
+/// Ask one platform what it is running.
+///
+/// The credential is required first, as everywhere else: a listing
+/// without one is the platform CLI's own error in the middle of a
+/// sweep, and this way the refusal names the variable and where it was
+/// looked for.
+///
+/// Comes back with the [`infra::Fleet`] it was read through, so a
+/// machine that has to be released is released from the same
+/// description the listing came from rather than from a second lookup.
+fn listing(name: &str) -> Result<(infra::Fleet, Vec<infra::Machine>), String> {
+    let adapter = adapter_named(name)?;
+    credentials::require(adapter.provider_namespace(), adapter.credentials())
+        .map_err(|missing| missing.to_string())?;
+    let fleet = adapter
+        .fleet()
+        .ok_or_else(|| format!("{name} cannot be asked what it is running"))?;
+    let listing = infra::list(&fleet).map_err(|err| err.to_string())?;
+    relay(
+        fleet.list.first().map(String::as_str).unwrap_or(name),
+        &listing.said,
+    );
+    Ok((fleet, listing.machines))
 }
 
 /// Release one recorded machine and write the correction that retires
@@ -1048,20 +1308,32 @@ fn release_recorded(
     let adapter = adapter_named(&row.provider)?;
     credentials::require(adapter.provider_namespace(), adapter.credentials())
         .map_err(|missing| missing.to_string())?;
+    run_release_argv(&substitute(&row.release, &row.id))?;
+    retire(row, acquisitions_path);
+    Ok(())
+}
 
-    let argv: Vec<String> = row
-        .release
-        .iter()
-        .map(|it| it.replace("{id}", &row.id))
-        .collect();
+/// Run one release and relay what the platform said about it.
+///
+/// **Nothing here reads the platform's words to decide anything.** A
+/// machine that is already gone is not detected by matching "not
+/// found" against somebody's error text — text that differs per
+/// platform, per version, and per locale, and whose exact spelling this
+/// code would then depend on. It converges instead: the next tick lists
+/// the machine, does not find it, and the sweep is done with it. A
+/// concurrent double release can therefore cost one plane one failed
+/// entry for one tick, which is the shape every enumerate-and-kill
+/// reaper settles for (`aws-nuke` re-runs until the account comes back
+/// empty).
+///
+/// Captured, not inherited, for the reason `release` captures
+/// (07-cli.md §Stream split): this run's one artifact is the sweep
+/// report, and a service CLI writing to the same stream would make it
+/// two documents.
+fn run_release_argv(argv: &[String]) -> Result<(), String> {
     let Some(program) = argv.first() else {
-        return Err("the recorded release names no command to run".to_string());
+        return Err("the release names no command to run".to_string());
     };
-
-    // Captured, not inherited, for the reason `release` captures
-    // (07-cli.md §Stream split): this run's one artifact is the sweep
-    // report, and a service CLI writing to the same stream would make
-    // it two documents.
     let output = std::process::Command::new(program)
         .args(&argv[1..])
         .output()
@@ -1071,19 +1343,34 @@ fn release_recorded(
     if !output.status.success() {
         return Err(format!("`{program}` exited with {}", output.status));
     }
+    Ok(())
+}
 
+/// `{id}` replaced throughout — the placeholder a recorded release and
+/// a fleet's release template both carry.
+fn substitute(argv: &[String], id: &str) -> Vec<String> {
+    argv.iter().map(|it| it.replace("{id}", id)).collect()
+}
+
+/// Append the row that retires an id: the acquisition's own account of
+/// the machine, now carrying the moment it stopped running.
+///
+/// **A correction that fails to write is reported and not raised.** The
+/// machine is gone either way, and the audit trail being one row short
+/// costs the next sweep at most one wasted release call — which is
+/// cheap, and only cheap because it is said here.
+fn retire(row: &AcquisitionRow, acquisitions_path: &std::path::Path) {
     let correction = AcquisitionRow {
         released_at: Some(jiff::Timestamp::now().to_string()),
         ..row.clone()
     };
     if let Err(err) = record_acquisition(acquisitions_path, &correction) {
         eprintln!(
-            "error: released {} but could not record it in {}: {err}",
+            "error: {} is no longer running but could not be recorded in {}: {err}",
             row.id,
             acquisitions_path.display()
         );
     }
-    Ok(())
 }
 
 /// Put what the service said on stderr, if it said anything.
@@ -1738,6 +2025,7 @@ mod tests {
             released: Vec::new(),
             refused: vec![("pod-owing".to_string(), "artifacts uncollected".to_string())],
             failed: Vec::new(),
+            unknown: Vec::new(),
         };
         assert_eq!(super::sweep_exit(&refused), 0);
         assert_eq!(
@@ -1762,6 +2050,7 @@ mod tests {
                 "released": [],
                 "refused": [],
                 "failed": [],
+                "unknown": [],
             }),
             "an empty sweep still emits the one artifact, with every field present"
         );
@@ -1862,6 +2151,213 @@ mod tests {
         };
         assert!(args.dry_run);
         assert_eq!(args.ttl_hours, 24, "a day, the fleet's ephemeral default");
+    }
+
+    /// **What a sweep does with a machine it found by asking the
+    /// platform** — no record, no profile, nothing but the name the
+    /// machine carries. The two row shapes are the two platforms': a
+    /// wrapped object of pods with a `name`, a bare array of instances
+    /// with a numeric id and a `label`.
+    #[test]
+    fn a_listed_machine_is_judged_by_the_stamp_it_carries() {
+        use lm_provision_driver::infra::{self, Infra as _, RunPodAdapter, VastAdapter};
+
+        let now: jiff::Timestamp = "2026-09-02T00:00:00Z".parse().expect("a fixed clock");
+
+        let pods = RunPodAdapter.fleet().expect("this target can be asked");
+        let listed = serde_json::json!({
+            "pods": [
+                { "id": "pod-over", "name": "lmp-exp-20260901T235959Z" },
+                { "id": "pod-due", "name": "lmp-exp-20260902T000000Z" },
+                { "id": "pod-live", "name": "lmp-exp-20260903T000000Z" },
+                { "id": "pod-someone-elses", "name": "jupyter-scratch" },
+                { "id": "pod-nameless" },
+            ]
+        });
+        let judged: Vec<(String, super::Standing)> = infra::machines(&listed, &pods)
+            .into_iter()
+            .map(|it| (it.id.clone(), super::standing(&it, now)))
+            .collect();
+        assert_eq!(
+            judged,
+            vec![
+                ("pod-over".to_string(), super::Standing::Expired),
+                // Reached is over, as the recorded lease is judged.
+                ("pod-due".to_string(), super::Standing::Expired),
+                ("pod-live".to_string(), super::Standing::Live),
+                // Not this tool's machines as far as anything here can
+                // tell. Reported; never released.
+                ("pod-someone-elses".to_string(), super::Standing::Unknown),
+                ("pod-nameless".to_string(), super::Standing::Unknown),
+            ]
+        );
+
+        let instances = VastAdapter.fleet().expect("this target can be asked");
+        let listed = serde_json::json!([
+            { "id": 49227715, "label": "lmp-exp-20260901T120000Z" },
+            { "id": 49228600, "label": "lmp-exp-20260930T120000Z" },
+            { "id": 49229000, "label": null },
+        ]);
+        let judged: Vec<(String, super::Standing)> = infra::machines(&listed, &instances)
+            .into_iter()
+            .map(|it| (it.id.clone(), super::standing(&it, now)))
+            .collect();
+        assert_eq!(
+            judged,
+            vec![
+                ("49227715".to_string(), super::Standing::Expired),
+                ("49228600".to_string(), super::Standing::Live),
+                ("49229000".to_string(), super::Standing::Unknown),
+            ]
+        );
+    }
+
+    /// **One machine, one release call.** A machine both halves of a
+    /// sweep see — the platform lists it and the record still names it
+    /// — is dealt with by the platform half, and the record half must
+    /// leave it alone: the second call would be against something
+    /// already gone.
+    #[test]
+    fn a_machine_both_halves_see_is_released_once() {
+        let handled: std::collections::BTreeSet<String> =
+            ["pod-1".to_string()].into_iter().collect();
+        let listed: super::BTreeMap<String, std::collections::BTreeSet<String>> = [(
+            "runpod".to_string(),
+            ["pod-1".to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            super::bookkeeping(
+                &recorded("pod-1", "2026-09-02T00:00:00Z"),
+                &handled,
+                &listed
+            ),
+            super::Bookkeeping::Handled
+        );
+
+        // Listed, but the platform half could not read a lease off it
+        // (no stamp) — so it was never handled, and the record is the
+        // only thing that knows when it expires. This is how a machine
+        // created before leases were stamped still gets released.
+        let unstamped_but_listed: super::BTreeMap<String, std::collections::BTreeSet<String>> = [(
+            "runpod".to_string(),
+            ["pod-old".to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            super::bookkeeping(
+                &recorded("pod-old", "2026-09-02T00:00:00Z"),
+                &std::collections::BTreeSet::new(),
+                &unstamped_but_listed,
+            ),
+            super::Bookkeeping::Judge
+        );
+
+        // A platform nobody asked draws no conclusion at all: without
+        // `--provider` every row is judged by its recorded lease.
+        assert_eq!(
+            super::bookkeeping(
+                &recorded("pod-2", "2026-09-02T00:00:00Z"),
+                &std::collections::BTreeSet::new(),
+                &super::BTreeMap::new(),
+            ),
+            super::Bookkeeping::Judge
+        );
+    }
+
+    /// **A machine that is not on its platform's list is not running**,
+    /// whatever the record says — somebody released it by hand, or a
+    /// correction was lost. The bill has ended and the audit trail is
+    /// made to say so, without a release call being spent on it.
+    #[test]
+    fn an_outstanding_row_absent_from_its_platforms_list_is_retired() {
+        let listed: super::BTreeMap<String, std::collections::BTreeSet<String>> = [(
+            "runpod".to_string(),
+            ["pod-other".to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+        let row = recorded("pod-gone", "2036-09-02T00:00:00Z");
+        assert_eq!(
+            super::bookkeeping(&row, &std::collections::BTreeSet::new(), &listed),
+            super::Bookkeeping::Gone,
+            "a lease with ten years left does not keep a machine that is not there"
+        );
+
+        let path = scratch("gone");
+        super::record_acquisition(&path, &row).expect("seed an acquisition");
+        super::retire(&row, &path);
+        assert!(
+            record::outstanding(&path)
+                .expect("the record reads back")
+                .is_empty(),
+            "nothing is believed to be running once the correction lands"
+        );
+        assert_eq!(
+            record::list(&path).expect("the record reads back").len(),
+            2,
+            "corrections are new rows here as everywhere else"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **A dry run shows the lease the machine would carry.** The
+    /// stamped name is what decides whether a sweeper can ever find the
+    /// machine again, so it is the last part of the request that should
+    /// be invisible in the preview of it.
+    #[test]
+    fn a_dry_run_shows_the_lease_the_machine_would_carry() {
+        use lm_provision_driver::infra::{self, Infra as _, RunPodAdapter, VastAdapter};
+
+        let expires_at: jiff::Timestamp = "2026-09-02T06:30:00Z".parse().expect("a fixed lease");
+        let stamp = infra::expiry_stamp(expires_at);
+
+        let ports = [("22".to_string(), "raw_tcp".to_string())]
+            .into_iter()
+            .collect();
+        let gpu = [("count".to_string(), "1".to_string())]
+            .into_iter()
+            .collect();
+        let required =
+            lm_provision::machine::Requirements::from_slots(&ports, &gpu, &super::BTreeMap::new())
+                .expect("well-formed fixture");
+
+        let pod_provider: super::BTreeMap<String, String> =
+            [("runpod.imageName".to_string(), "some/image:1".to_string())]
+                .into_iter()
+                .collect();
+        let artifact = super::dry_run_artifact(
+            &RunPodAdapter
+                .acquisition(&required, &pod_provider, Some(expires_at))
+                .expect("an image was declared"),
+        );
+        assert_eq!(artifact["dry_run"], serde_json::json!(true));
+        assert!(
+            artifact["body"]
+                .as_str()
+                .is_some_and(|it| it.contains(&stamp)),
+            "the request an operator is shown carries the lease: {artifact}"
+        );
+
+        let instance_provider: super::BTreeMap<String, String> =
+            [("vast.image".to_string(), "some/image:1".to_string())]
+                .into_iter()
+                .collect();
+        let artifact = super::dry_run_artifact(
+            &VastAdapter
+                .acquisition(&required, &instance_provider, Some(expires_at))
+                .expect("an image was declared"),
+        );
+        assert!(
+            artifact["create"]
+                .as_array()
+                .is_some_and(|argv| argv.iter().any(|it| it == &serde_json::json!(stamp))),
+            "and so does the argv on the target that takes one: {artifact}"
+        );
     }
 
     /// The record sits beside the ledger under the same home directory:

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The lease now rides on the machine, and the platform's own list is
+  what a sweep works from.** Enforcement used to depend on a file: if
+  `~/.lm-provision/acquisitions.jsonl` was lost, or the machine was
+  bought on one host and swept from another, the row was gone and the
+  machine billed forever with nothing looking for it. Every reaper that
+  has run at scale inverts that — Netflix's Janitor Monkey, `aws-nuke`,
+  `cloud-nuke`, the AWS Instance Scheduler, the Kubernetes TTL
+  controllers all enumerate from the provider's API and read the policy
+  off the resource's own tag. So does this now. `acquire` writes the
+  expiry into the field each platform gives an operator for naming a
+  resource — a pod's `name`, an instance's `--label` — as
+  `lmp-exp-20260902T063000Z` (colon-free: those fields are constrained
+  differently everywhere, and a colon is the likeliest character to be
+  refused). `sweep --provider runpod --provider vast` then lists the
+  account, reads the stamp off each machine, and releases the expired
+  ones through the same release gate as before. Nothing has to be kept
+  in step with anything: a sweeper holding the account's key is
+  sufficient.
+
+  A machine carrying **no** stamp is reported under a new `unknown`
+  field in the sweep artifact and never released — this tool did not
+  name it, and deleting what it does not recognise is the accident, not
+  the enforcement. A platform that could not be listed lands in
+  `failed` under its own name and costs the sweep its zero exit, since
+  that account may be billing for anything. Idempotency is by
+  convergence rather than by reading the platform CLI's error text: a
+  machine already gone is simply absent from the next listing, so
+  nothing here depends on the spelling of somebody else's "not found".
+
+  **The acquisitions record is demoted to the audit trail** — who
+  bought what, when, for which profile, and how it was given back. It
+  is still written exactly as before, still read by a sweep run with no
+  `--provider` (which is what reaches machines created before the stamp
+  existed), and an outstanding row whose machine is absent from its
+  platform's list now gets a correction appended: the bill has ended
+  and the file should say so. What it no longer is, is the thing
+  correctness depends on. The daemon takes the same `--provider` flag
+  (specs 08 §Acquisitions and sweep, 09 §Acquisitions record).
+
 ### Added
 
 - **A daemon that sweeps without being asked

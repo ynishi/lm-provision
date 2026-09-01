@@ -78,6 +78,7 @@ async fn one_tick_runs_the_driver_and_publishes_what_it_said() {
     let config = Config {
         interval_secs: 1,
         driver,
+        providers: vec!["runpod".to_string()],
         acquisitions: Some(dir.join("acquisitions.jsonl")),
         ledger: Some(dir.join("ledger.jsonl")),
         dry_run: false,
@@ -89,11 +90,12 @@ async fn one_tick_runs_the_driver_and_publishes_what_it_said() {
     assert_eq!(
         argv.trim(),
         format!(
-            "sweep --dry-run false --acquisitions {} --ledger {}",
+            "sweep --dry-run false --provider runpod --acquisitions {} --ledger {}",
             dir.join("acquisitions.jsonl").display(),
             dir.join("ledger.jsonl").display()
         ),
-        "the subcommand, the enforcing default said out loud, and both paths verbatim"
+        "the subcommand, the enforcing default said out loud, the platform to ask, \
+         and both paths verbatim"
     );
 
     let doc = health_of(&config, &state).await;
@@ -130,6 +132,7 @@ async fn a_failing_driver_becomes_a_failed_tick_not_a_dead_daemon() {
     let config = Config {
         interval_secs: 1,
         driver,
+        providers: Vec::new(),
         acquisitions: None,
         ledger: None,
         dry_run: false,
@@ -163,6 +166,7 @@ async fn a_missing_driver_is_reported_rather_than_fatal() {
     let config = Config {
         interval_secs: 1,
         driver: dir.join("not-installed"),
+        providers: Vec::new(),
         acquisitions: None,
         ledger: None,
         dry_run: false,

@@ -85,6 +85,15 @@ pub struct Config {
     pub interval_secs: u64,
     /// The driver binary to run. A bare name is looked up on `PATH`.
     pub driver: PathBuf,
+    /// The platforms each sweep asks what they are running, passed
+    /// through one `--provider` each.
+    ///
+    /// Empty means the sweeps judge only what the acquisitions record
+    /// says — which is a record this daemon may not be the writer of.
+    /// Naming a platform here is what makes the daemon's inventory the
+    /// platform's own list (08 §Acquisitions and sweep), so a machine
+    /// whose row was never written is still found.
+    pub providers: Vec<String>,
     /// The acquisitions record to sweep, passed through verbatim when
     /// set; when unset the driver picks its own default, which is the
     /// one the operator's `acquire` runs already wrote to.
@@ -114,7 +123,8 @@ pub struct Status {
     /// Why the newest sweep did not, when it did not.
     pub last_tick_error: Option<String>,
     /// The newest sweep's artifact, verbatim (08 §Acquisitions and
-    /// sweep: `dry_run`, `expired`, `released`, `refused`, `failed`).
+    /// sweep: `dry_run`, `expired`, `released`, `refused`, `failed`,
+    /// `unknown`).
     ///
     /// Kept as an opaque [`serde_json::Value`] on purpose. The daemon
     /// counts three of its fields for a log line and otherwise passes
@@ -199,6 +209,10 @@ pub fn sweep_argv(config: &Config) -> Vec<OsString> {
         "--dry-run".into(),
         if config.dry_run { "true" } else { "false" }.into(),
     ];
+    for provider in &config.providers {
+        argv.push("--provider".into());
+        argv.push(provider.into());
+    }
     if let Some(path) = &config.acquisitions {
         argv.push("--acquisitions".into());
         argv.push(path.clone().into_os_string());
@@ -502,6 +516,7 @@ mod tests {
         Config {
             interval_secs: 300,
             driver: "lm-provision-driver".into(),
+            providers: Vec::new(),
             acquisitions: None,
             ledger: None,
             dry_run: false,
@@ -572,6 +587,34 @@ mod tests {
             !argv_of(&ledger_only).contains(&"--acquisitions".to_string()),
             "an unset path is absent, not guessed at"
         );
+    }
+
+    /// **Each named platform reaches the child as its own
+    /// `--provider`**, which is what turns the sweeps from
+    /// record-reading into asking the platforms themselves what they
+    /// are running (08 §Acquisitions and sweep). No platform named is
+    /// no flag: a daemon that guessed at one would be enforcing against
+    /// an account nobody pointed it at.
+    #[test]
+    fn each_named_platform_is_passed_through_as_its_own_flag() {
+        let asking = Config {
+            providers: vec!["runpod".to_string(), "vast".to_string()],
+            ..config()
+        };
+        assert_eq!(
+            argv_of(&asking),
+            [
+                "lm-provision-driver",
+                "sweep",
+                "--dry-run",
+                "false",
+                "--provider",
+                "runpod",
+                "--provider",
+                "vast",
+            ]
+        );
+        assert!(!argv_of(&config()).contains(&"--provider".to_string()));
     }
 
     #[cfg(unix)]
