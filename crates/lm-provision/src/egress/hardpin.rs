@@ -93,10 +93,20 @@ const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> libc::c_ulong {
     ((dir << 30) | (size << 16) | (ty << 8) | nr) as libc::c_ulong
 }
 fn notif_recv_ioctl() -> libc::c_ulong {
-    ioc(3, b'!' as u32, 0, std::mem::size_of::<SeccompNotif>() as u32)
+    ioc(
+        3,
+        b'!' as u32,
+        0,
+        std::mem::size_of::<SeccompNotif>() as u32,
+    )
 }
 fn notif_send_ioctl() -> libc::c_ulong {
-    ioc(3, b'!' as u32, 1, std::mem::size_of::<SeccompNotifResp>() as u32)
+    ioc(
+        3,
+        b'!' as u32,
+        1,
+        std::mem::size_of::<SeccompNotifResp>() as u32,
+    )
 }
 
 /// Whether a `connect` to this destination is permitted by the hard pin.
@@ -128,12 +138,35 @@ unsafe fn install_and_send(send_sock: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let filter = [
-        SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 }, // offset of nr
-        SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 1, k: libc::SYS_connect as u32 },
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_USER_NOTIF },
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        }, // offset of nr
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_connect as u32,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_USER_NOTIF,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
     ];
-    let prog = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+    let prog = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
     let listener = libc::syscall(
         libc::SYS_seccomp,
         SECCOMP_SET_MODE_FILTER as libc::c_long,
@@ -159,7 +192,8 @@ unsafe fn send_fd(sock: RawFd, fd: RawFd) -> io::Result<()> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _ };
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _ };
     let cmsg = libc::CMSG_FIRSTHDR(&msg);
     (*cmsg).cmsg_level = libc::SOL_SOCKET;
     (*cmsg).cmsg_type = libc::SCM_RIGHTS;
@@ -254,7 +288,11 @@ fn supervise(notify_fd: RawFd, stop: Arc<AtomicBool>) {
     let recv_ioctl = notif_recv_ioctl();
     let send_ioctl = notif_send_ioctl();
     loop {
-        let mut pfd = libc::pollfd { fd: notify_fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: notify_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let pr = unsafe { libc::poll(&mut pfd, 1, 200) };
         if pr == 0 {
             if stop.load(Ordering::Relaxed) {
@@ -350,9 +388,15 @@ mod tests {
     fn allowset_permits_loopback_and_dns_only() {
         assert!(is_allowed(Some((IpAddr::V4(Ipv4Addr::LOCALHOST), 443))));
         assert!(is_allowed(Some((IpAddr::V6(Ipv6Addr::LOCALHOST), 443))));
-        assert!(is_allowed(Some((IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)))); // DNS
+        assert!(is_allowed(Some((
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53
+        )))); // DNS
         assert!(is_allowed(None)); // non-inet
-        assert!(!is_allowed(Some((IpAddr::V4(Ipv4Addr::new(140, 82, 121, 4)), 443))));
+        assert!(!is_allowed(Some((
+            IpAddr::V4(Ipv4Addr::new(140, 82, 121, 4)),
+            443
+        ))));
         assert!(!is_allowed(Some((
             IpAddr::V6("2600:9000:2751:1200::1".parse().unwrap()),
             443
@@ -386,11 +430,16 @@ mod tests {
         );
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(script);
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
 
         let out = run_pinned(cmd).expect("run pinned");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(stdout.contains("LOOPBACK_OK"), "loopback should connect: {stdout}");
+        assert!(
+            stdout.contains("LOOPBACK_OK"),
+            "loopback should connect: {stdout}"
+        );
         assert!(
             stdout.contains("EXTERNAL_BLOCKED"),
             "external connect must be denied at the syscall: {stdout}"

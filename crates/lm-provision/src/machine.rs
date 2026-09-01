@@ -962,17 +962,16 @@ mod tests {
         );
         assert!(!declared.is_empty());
 
-        let absent = Requirements::from_slots(&slot(&[]), &gpu_slot(&[]), &slot(&[]))
-            .expect("well-formed");
+        let absent =
+            Requirements::from_slots(&slot(&[]), &gpu_slot(&[]), &slot(&[])).expect("well-formed");
         assert_eq!(absent.gpu, None);
         assert!(absent.is_empty());
     }
 
     #[test]
     fn an_unknown_gpu_key_names_the_alternatives() {
-        let err =
-            Requirements::from_slots(&slot(&[]), &gpu_slot(&[("vram", "24")]), &slot(&[]))
-                .expect_err("vram is not a key here");
+        let err = Requirements::from_slots(&slot(&[]), &gpu_slot(&[("vram", "24")]), &slot(&[]))
+            .expect_err("vram is not a key here");
         assert_eq!(
             err,
             RequirementError::UnknownGpuKey {
