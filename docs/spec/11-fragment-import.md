@@ -173,12 +173,45 @@ ledger rows already carry.
 ## Cache
 
 `${XDG_CACHE_HOME:-$HOME/.cache}/lm-provision/fragments/<hash>`,
-storing the fragment's **expanded canonical bytes** keyed by its
-expanded hash. Lookup precedes network; a hit is re-hashed on read
-before use (a corrupted cache entry is discarded and refetched, never
-trusted). Only pinned imports are cached — an unpinned local import
-has no key to cache under and reads the file every time, which is the
-behavior a working tree wants anyway.
+storing the fragment's **expanded form in serde-bridge JSON** keyed by
+its expanded hash. Canonical decode remains deferred (chapters 00/03):
+integrity comes from parse-then-rehash on read, not from the byte
+format. Lookup precedes network; a hit is parsed through the ordinary
+JSON frontend and its expanded canonical hash recomputed against the
+key before use. An entry that fails to parse, or fails to re-hash to
+its key, is discarded and refetched — never trusted, and never an
+error: both failures are cache misses, which keeps a cache directory
+shared across tool versions fail-safe.
+
+Only **remote** pinned imports are cached. A local import — pinned or
+not — reads its file every time: the read is cheaper than the cache
+round-trip, and a working tree wants edits visible immediately. (An
+unpinned import has no key to cache under in any case.)
+
+A cache entry names **content, not a derivation**. The expansion
+function (§Resolution) participates at authoring time, when a pin is
+minted, and at fetch time, when fetched source is verified — never on
+the hit path. If expansion rules ever change, a warm entry that still
+hashes to its pin remains valid (it is the very content the author
+pinned); what breaks — loudly, at fetch — is only the ability to
+re-derive that content from source.
+
+The store is deliberately dumb: content-addressed files in a
+self-describing wire format, nothing else. That keeps two doors open
+with no further mechanism. Mirroring: a URL being a location hint
+(§Adopted conventions), any host serving bytes that expand and hash
+to the pin is a legitimate source — including a host serving the
+pre-expanded form, of which this cache is simply the local instance.
+Vendoring: committing a fragment file into the consuming repository
+and importing it by local path with a pin is already expressible.
+Both are the recovery paths for cold-fetch availability; neither is
+built as a feature.
+
+Writing an entry uses the same expanded-AST → bridge-JSON serializer
+that the driver preflight needs in order to upload an expanded
+payload (chapter 08 steps 1–2: the pod re-parses and re-hashes what
+it receives). Every consumer of that serializer rests on one required
+invariant: `hash(parse(serialize(ast))) == hash(ast)`.
 
 ## The resolver layer (`name@version`)
 
@@ -222,13 +255,26 @@ verification material travels with the consumer, not the registry.
 All resolve errors name the import chain (consumer → … → fragment)
 that produced them.
 
+There is no `--force` and no bypass flag on any resolve or fetch
+path, and none may be added: a run that proceeded past a failed pin
+would be a profile whose identity is not what its document says.
+Accepting changed upstream content is an **authoring act** —
+rewriting the document's `src` + `hash` pair, preferably through the
+resolver (§The resolver layer) — never a runtime switch.
+`ImportHashMismatch` may print the hash it computed, but copying that
+value into the document blesses whatever the wire delivered; the
+report says so alongside the hash.
+
 ## Stability
 
-Draft — nothing in this chapter is frozen. Two guarantees are fixed
-now because they gate everything else: (1) profiles without `Import`
-nodes keep their existing canonical bytes and hash; (2) the pin is
-the expanded canonical hash, so a fragment's internal refactoring
-never invalidates consumers.
+Draft — nothing in this chapter is frozen. Two guarantees and one
+prohibition are fixed now because they gate everything else: (1)
+profiles without `Import` nodes keep their existing canonical bytes
+and hash; (2) the pin is the expanded canonical hash, so a fragment's
+internal refactoring never invalidates consumers; (3) no force/bypass
+flag exists on the resolve or fetch paths (§Error surface) — a flag,
+once shipped, could not be removed without breaking users, and its
+existence would make profile identity advisory.
 
 ## Upstream references
 
