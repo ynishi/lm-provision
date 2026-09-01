@@ -3,8 +3,9 @@
 Status: specified (the session contract below is the Phase G build
 target; revised 2026-08-01 from first real-pod usage feedback;
 revised 2026-08-30 to add the artifacts retrieval contract — step 4b
-and the release gate).
-Layer 4. Upstream deps: 07, 04, 06.
+and the release gate; revised 2026-09-01 to name the operator-side
+preflight, whose resolve stage decides what step 1 uploads).
+Layer 4. Upstream deps: 07, 04, 06, 11.
 MVP: Phase G.
 
 ## Purpose
@@ -96,8 +97,13 @@ any effect runs.
                     the local artifact's; identical → no-op, so
                     re-running a session is re-convergence, not
                     re-transfer   gate: skip-install
-1. place-profile  — put the profile file at the pod path (always
-                    overwritten; it is small and step 2 verifies it)
+1. place-profile  — put the profile at the pod path (always
+                    overwritten; it is small and step 2 verifies it).
+                    What is placed is what the preflight below
+                    resolved: a profile that imports a fragment
+                    (chapter 11) travels as its expanded form, written
+                    in the JSON bridge spelling; a profile with no
+                    import travels as its own file, byte for byte
 2. hash-verify    — run `<bin> hash <profile>` on the pod, compare
                     with the locally computed hash (the
                     profile-integrity check)   gate: skip-verify
@@ -135,6 +141,32 @@ any effect runs.
 - Steps 1-4's middle is the 2026-07 three-step contract verbatim
   (upload / invoke / collect); nothing about the invoke command
   form, the stdio contract, or the exit mapping changed.
+
+### Operator-side preflight
+
+Before step 0 the driver reads the profile on its own host, through
+the library rather than the pod: **load → resolve → validate → hash**
+(chapter 11 §Resolution's pipeline, then chapter 03's hash). Every
+part of it happens before the first transport call, so a profile the
+operator host can already refuse costs no connection and leaves no
+half-provisioned pod (§Error surface).
+
+Resolve is the operator's stage by construction: a fragment may be a
+path in the operator's working tree, and fetching one is governed by
+the operator host's network, not the pod's (chapter 11 §Resolution).
+That is why step 1 uploads the expansion — the pod cannot be asked to
+redo work whose inputs it does not have. It is also why the hash step
+2 compares is the *expanded* canonical hash: chapter 11 §Identity
+makes that hash the profile's identity, and the pod's own
+`lm-provision hash` computes the same number because it, too,
+resolves before hashing.
+
+The pod's half of steps 1-2 is therefore unchanged: it re-parses and
+re-hashes the document it receives, and knows nothing about where
+that document came from. Nor does anything change for the profiles
+that exist today — with no `Import` node a profile expands to itself
+(chapter 11 §Stability guarantee 1), and the file placed on the pod
+is the caller's own bytes.
 
 ### Secret delivery
 
@@ -197,8 +229,9 @@ gate makes the deletion wait for it:
   stdout truncated): driver-side; retryable; the pod may hold a
   partially provisioned state — re-invoking apply re-runs from the
   first step (chapter 07 runtime class).
-- Invoke-time precondition failures (missing secret env, validate
-  reject, a gated-off step's missing postcondition such as
+- Invoke-time precondition failures (missing secret env, an import
+  the operator host could not resolve — chapter 11 §Error surface,
+  validate reject, a gated-off step's missing postcondition such as
   `skip-install` with no binary on the pod): exit 1 / session error
   with a stderr line and (for apply) no effects run on the pod.
 - Pod-side apply failures: exit 1 **with** the structured report on
@@ -265,6 +298,8 @@ gate makes the deletion wait for it:
 - chapter 04 bridge — embeddability constraint on every primitive.
 - chapter 06 secret handling — env-only secret delivery, fail-fast.
 - chapter 07 CLI — invocation surface, stream split, exit codes.
+- chapter 11 fragment import — the resolve stage the preflight runs,
+  and the expanded canonical hash step 2 compares.
 
 ## MVP scope
 

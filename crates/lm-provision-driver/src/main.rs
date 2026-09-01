@@ -288,6 +288,16 @@ fn adapter_named(name: &str) -> Result<&'static dyn Infra, String> {
 ///
 /// Validate runs first, so an unreadable requirement is refused here
 /// rather than after a machine exists to be refused against.
+///
+/// Resolve runs before validate, the pipeline order spec 11
+/// §Resolution fixes. It changes no answer this function gives — a
+/// fragment carries no machine requirements and no provider (spec 11
+/// §Fragment documents: those are "the consumer's declaration"), so the
+/// four slots read below are the consumer's own either way. What it
+/// changes is which profiles get an answer at all: validate rejects a
+/// surviving `Import` node (check 0b), so without the expansion every
+/// importing profile would be refused here — before `acquire` or
+/// `check` ever looked at a requirement.
 fn requirements_of(
     profile: &std::path::Path,
 ) -> Result<
@@ -298,6 +308,7 @@ fn requirements_of(
     String,
 > {
     let root = lm_provision::frontend::load_profile(profile).map_err(|err| err.to_string())?;
+    let root = lm_provision::resolve::resolve(root, profile).map_err(|err| err.to_string())?;
     lm_provision::validate::validate(&root).map_err(|err| err.to_string())?;
     let lm_provision::profile_ast::ProfileNode::Spec {
         requires_ports,
@@ -1095,5 +1106,62 @@ mod tests {
             .is_empty());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// **A profile that imports a fragment can still say what machine
+    /// it needs.** `acquire` and `check` both read their requirements
+    /// through this function, and validate refuses a surviving `Import`
+    /// node (check 0b) — so without the resolve stage spec 11
+    /// §Resolution puts between load and validate, an importing profile
+    /// could not be acquired for or judged at all. The requirements
+    /// themselves are the consumer's own either way: a fragment carries
+    /// no `requires_*` and no `provider` (spec 11 §Fragment documents).
+    #[test]
+    fn requirements_survive_a_fragment_import() {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-driver-requirements-import-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        std::fs::write(
+            dir.join("fragment.json"),
+            serde_json::json!({
+                "type": "Fragment",
+                "name": "requirements-fragment",
+                "capabilities": ["sh.exec"],
+                "phases": [{ "type": "ShExec", "argv": ["echo", "from-fragment"] }]
+            })
+            .to_string(),
+        )
+        .expect("write fragment");
+        let profile = dir.join("profile.json");
+        std::fs::write(
+            &profile,
+            serde_json::json!({
+                "type": "Spec",
+                "name": "importing-requirements",
+                "requires_gpu": { "count": "1", "min_vram_gb": "24" },
+                "provider": { "runpod.imageName": "example/image:tag" },
+                "phases": [{ "type": "Import", "src": "./fragment.json" }]
+            })
+            .to_string(),
+        )
+        .expect("write profile");
+
+        let (required, provider) =
+            super::requirements_of(&profile).expect("an importing profile has requirements too");
+        let gpu = required.gpu.expect("the consumer declared a GPU");
+        assert_eq!(gpu.count, 1);
+        assert_eq!(gpu.min_vram_gb, Some(24));
+        assert_eq!(
+            provider.get("runpod.imageName").map(String::as_str),
+            Some("example/image:tag")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
