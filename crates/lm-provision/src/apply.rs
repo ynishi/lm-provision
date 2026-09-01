@@ -192,15 +192,18 @@ pub async fn run_apply_ast_routed(
         ExecMode::DryRun => None,
     };
     let egress_proxy_url = egress_supply.as_ref().map(|supply| supply.url());
-    let egress_hard_pin = egress_supply
+    // The proxy's own listen address, when a self-hosted proxy started —
+    // the endpoint the seccomp hard pin admits (`None` for an external
+    // gateway, which is off-host and owns its own enforcement).
+    let egress_proxy_addr = egress_supply
         .as_ref()
-        .is_some_and(|supply| supply.hard_pin());
+        .and_then(|supply| supply.hard_pin_addr());
     let ctx = Arc::new(ExecContext::from_root(
         &root,
         mode,
         log,
         egress_proxy_url,
-        egress_hard_pin,
+        egress_proxy_addr,
     )?);
     let reports = ctx.reports_handle();
     // One step plan, two readers: the AST declares the per-step nodes it

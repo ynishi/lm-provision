@@ -422,6 +422,24 @@ fn is_import_object(obj: &Map<String, Value>) -> bool {
 /// step 2). Canonicalizing the index's parent here writes an absolute
 /// src that the resolver interprets the same way no matter which
 /// directory the profile is opened from.
+/// The directory an index file lives in, as `Path::parent` reports it
+/// with one correction: a bare filename (no directory component,
+/// `--index index.json`) makes `parent()` return `Some("")`, an empty
+/// path — `canonicalize` on that errors with "No such file or
+/// directory". Treat it as CWD (`.`), which is what a shell would
+/// resolve that spelling to.
+///
+/// Extracted so the empty-parent case is unit-testable without
+/// spelling a filesystem layout: the property is a pure string
+/// transform on the input path.
+fn index_parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+        None => Path::new("."),
+    }
+}
+
 fn join_entry(index_kind: &IndexKind, entry_path: &str) -> Result<String, PinError> {
     match index_kind {
         IndexKind::Url(url) => {
@@ -434,7 +452,7 @@ fn join_entry(index_kind: &IndexKind, entry_path: &str) -> Result<String, PinErr
             Ok(joined.to_string())
         }
         IndexKind::Path(path) => {
-            let raw_parent = path.parent().unwrap_or(Path::new("."));
+            let raw_parent = index_parent_dir(path);
             // `canonicalize` requires the directory to exist — it does
             // (we just read the index out of it). If it somehow does
             // not by the time we get here, name the failure as an
@@ -801,5 +819,39 @@ mod tests {
             Err(PinError::NotJson { .. }) => {}
             other => panic!("expected NotJson, got {other:?}"),
         }
+    }
+
+    /// A bare filename `--index index.json` is a valid shell invocation
+    /// (CWD-relative). `Path::parent` reports it as `Some("")`, which
+    /// [`std::fs::canonicalize`] then rejects with "No such file or
+    /// directory" — the old fallback (`unwrap_or(Path::new("."))`) never
+    /// fired for this case because the `Some` arm swallowed it. The
+    /// corrected helper treats an empty parent as `.`. Tests cannot
+    /// `chdir` (cwd is process-wide), so this exercises the pure string
+    /// transform directly.
+    #[test]
+    fn index_parent_dir_treats_a_bare_filename_as_cwd() {
+        assert_eq!(
+            super::index_parent_dir(Path::new("index.json")),
+            Path::new(".")
+        );
+        assert_eq!(
+            super::index_parent_dir(Path::new("./index.json")),
+            Path::new(".")
+        );
+        assert_eq!(
+            super::index_parent_dir(Path::new("registry/index.json")),
+            Path::new("registry")
+        );
+        assert_eq!(
+            super::index_parent_dir(Path::new("/tmp/registry/index.json")),
+            Path::new("/tmp/registry")
+        );
+        // `Path::parent` returns `None` for the empty path and for
+        // `/` (whose only component is the root); either way, treat
+        // "no parent" as CWD for the same reason a shell would when
+        // handed a bare name.
+        assert_eq!(super::index_parent_dir(Path::new("")), Path::new("."));
+        assert_eq!(super::index_parent_dir(Path::new("/")), Path::new("."));
     }
 }

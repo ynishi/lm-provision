@@ -11,6 +11,18 @@
 //! run the musl artifact it is about to push), and the ledger append
 //! duty (step 5).
 //!
+//! The preflight also owns the resolve stage (spec
+//! `11-fragment-import.md` §Resolution: `load → resolve → validate →
+//! canonical / hash`). A profile that imports a fragment is not a
+//! profile the pod could judge on its own — the fragment may live in
+//! the operator's working tree, and the identity the session compares
+//! in step 2 is the *expanded* canonical hash (spec 11 §Identity, the
+//! same hash the pod's `lm-provision hash` computes because it too
+//! resolves first). So the session expands here, and step 1 places the
+//! expanded payload rather than the source text whenever the source
+//! carried an `Import` ([`place_profile`]). A profile with no `Import`
+//! uploads its own file unchanged, as every session did before spec 11.
+//!
 //! Step 5 is the one step whose failure does not fail the session: the
 //! apply has already run by then, so the append failure is reported as
 //! [`SessionOutput::ledger_warning`] alongside the collected report
@@ -20,6 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lm_provision::profile_ast::ProfileNode;
 
@@ -112,10 +125,20 @@ pub struct SessionOutput {
 /// failure of its own class.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
-    /// The profile failed to load or validate on the operator host —
-    /// nothing was transferred or run (08 §Error surface
+    /// The profile failed to load, resolve or validate on the operator
+    /// host — nothing was transferred or run (08 §Error surface
     /// "invoke-time precondition", pulled forward to before any
     /// connection).
+    ///
+    /// A resolve rejection (spec 11 §Error surface — an unreachable
+    /// fragment, a pin that did not match, a merge collision) lands
+    /// here rather than in a variant of its own, for the reason load
+    /// and validate already share one: 08 §Error surface names a single
+    /// precondition class, and every member of it says the same two
+    /// things — the profile as supplied cannot be applied, and nothing
+    /// has happened to the pod. The distinction a caller needs is
+    /// carried by the message, which spec 11 requires to name the
+    /// import chain that produced it.
     #[error("profile precondition failed: {0}")]
     Profile(String),
 
@@ -174,13 +197,21 @@ pub fn run(
     local_profile: &Path,
     pod_id: &str,
 ) -> Result<SessionOutput, SessionError> {
-    // Operator-side preflight: load + validate + hash in-process, and
-    // resolve every consumed secret from the driver host env — all
-    // before the first transport call.
-    let node = lm_provision::frontend::load_profile(local_profile)
+    // Operator-side preflight: load + resolve + validate + hash
+    // in-process, and resolve every consumed secret from the driver
+    // host env — all before the first transport call.
+    let source = lm_provision::frontend::load_profile(local_profile)
+        .map_err(|err| SessionError::Profile(err.to_string()))?;
+    // Asked before expansion, because afterwards there is nothing left
+    // to ask: resolve's whole job is removing these nodes.
+    let imported = carries_import(&source);
+    let node = lm_provision::resolve::resolve(source, local_profile)
         .map_err(|err| SessionError::Profile(err.to_string()))?;
     lm_provision::validate::validate(&node)
         .map_err(|err| SessionError::Profile(err.to_string()))?;
+    // The expanded AST is the identity (spec 11 §Identity), so this is
+    // the number step 2 compares the pod's answer against — and the
+    // number the pod will compute, since its own `hash` resolves first.
     let local_hash = lm_provision::canonical::hash(&node);
     let env_secrets = match plan.mode {
         InvokeMode::ValidateOnly => BTreeMap::new(),
@@ -193,7 +224,7 @@ pub fn run(
     } else {
         transport.ensure_binary(local_binary)?
     };
-    let profile_path = transport.place_profile(local_profile)?;
+    let profile_path = place_profile(transport, local_profile, &node, imported)?;
     let paths = PodPaths {
         binary: binary_path,
         profile: profile_path,
@@ -268,6 +299,143 @@ pub fn run(
         ledger_appended,
         ledger_warning,
     })
+}
+
+/// Session step 1 place-profile (08 §Session steps), carrying spec 11's
+/// one consequence for it: what the pod re-parses has to be what the
+/// operator hashed.
+///
+/// A document that carried an `Import` is no longer the profile this
+/// session judged — resolve expanded it, `local_hash` came off the
+/// expansion (spec 11 §Identity), and validate ran on it. Uploading the
+/// source text would ask the pod to redo that expansion: to reach a
+/// fragment that may only exist in the operator's working tree, from a
+/// machine whose network the resolve stage never governed (spec 11
+/// §Resolution: "fetching happens on the operator host at resolve
+/// time"). So `expanded` is serialized back through the JSON bridge
+/// ([`lm_provision::to_bridge_json`], whose one required invariant is
+/// `hash(parse(serialize(ast))) == hash(ast)` — spec 11 §Cache last
+/// paragraph) and that payload is placed. The pod's side of the
+/// contract does not change at all: it re-parses and re-hashes what it
+/// receives, as it always has, and step 2 compares two hashes of the
+/// same document.
+///
+/// **A document with no `Import` places its own file, byte for byte.**
+/// The serializer is hash-faithful, not byte-faithful, so routing every
+/// profile through it would rewrite the uploaded text of profiles that
+/// needed no expansion — for nothing (spec 11 §Stability guarantee 1's
+/// philosophy: a profile without imports is untouched by this chapter).
+fn place_profile(
+    transport: &dyn Transport,
+    local_profile: &Path,
+    expanded: &ProfileNode,
+    imported: bool,
+) -> Result<PathBuf, SessionError> {
+    if !imported {
+        return Ok(transport.place_profile(local_profile)?);
+    }
+    // The staged file lives exactly as long as this call: `staged`
+    // deletes it on the way out, including out of the `?` below.
+    let staged = StagedPayload::write(local_profile, expanded).map_err(TransportError::Io)?;
+    Ok(transport.place_profile(&staged.path)?)
+}
+
+/// Whether `node` carries an [`ProfileNode::Import`] anywhere resolve
+/// would expand one — the question that decides whether step 1 uploads
+/// an expanded payload or the operator's own file.
+///
+/// Written here rather than reused: `validate`'s check 0b walks the
+/// same nodes but is an inline loop that returns an error, and it looks
+/// at the top-level phase list only, which is all *it* needs (it runs
+/// after resolve, where a surviving `Import` anywhere is already the
+/// bug it reports). This walk descends into `Fragment.phases` too, so a
+/// document whose root is a fragment answers honestly instead of
+/// answering "no" and having its imports quietly shipped to the pod.
+fn carries_import(node: &ProfileNode) -> bool {
+    match node {
+        ProfileNode::Import { .. } => true,
+        ProfileNode::Spec { phases, .. } | ProfileNode::Fragment { phases, .. } => {
+            phases.iter().any(carries_import)
+        }
+        _ => false,
+    }
+}
+
+/// Per-process counter in a staging directory's name. `pid` alone is
+/// not enough: an MCP server runs sessions concurrently in one process
+/// (`lm_apply`), and two of them staging into one directory could
+/// delete each other's payload mid-upload — the collision
+/// [`lm_provision::resolve`]'s cache writer names for the same reason.
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The expanded payload [`place_profile`] uploads, and the directory it
+/// was staged in — removed together when this value drops.
+///
+/// The hygiene rules are `lm_provision::fetch`'s (its `admit` documents
+/// them): create exclusively under a per-process name, so no parallel
+/// run, leftover file or planted symlink is ever written through, and
+/// leave nothing behind on any path out. Here the cleanup is a `Drop`
+/// rather than a call on each early return, because the caller's early
+/// returns are the transport's and would each have to remember.
+struct StagedPayload {
+    /// The directory holding the payload; removed with it.
+    dir: PathBuf,
+    /// The payload file itself, the path handed to the transport.
+    path: PathBuf,
+}
+
+impl StagedPayload {
+    /// Serialize `expanded` into a fresh staging directory and return
+    /// the guard owning it.
+    ///
+    /// The file is named `<profile stem>.json` inside a directory
+    /// unique to this call, rather than uniquely named itself: the pod
+    /// path a transport derives is the file's name (see
+    /// [`Transport::dest_profile`]), so an importing profile lands at
+    /// the same pod path its source text would have, and re-running a
+    /// session overwrites that one file instead of accumulating a
+    /// per-run pile on the machine. The `.json` extension is
+    /// load-bearing — the frontend picks its parser by extension alone
+    /// (07-cli.md §Profile input format), and the payload is bridge
+    /// JSON whatever the source document was written in.
+    fn write(local_profile: &Path, expanded: &ProfileNode) -> Result<Self, std::io::Error> {
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-driver-expanded-{}-{seq}",
+            std::process::id()
+        ));
+        // `create_dir` refuses an existing entry, so a leftover from a
+        // killed run surfaces here with its path named rather than
+        // being silently reused.
+        std::fs::create_dir(&dir)?;
+        // From here the directory is owned: every failure below returns
+        // through this guard's `Drop`, which removes it.
+        let stem = local_profile
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("profile");
+        let staged = Self {
+            path: dir.join(format!("{stem}.json")),
+            dir,
+        };
+        let bytes = serde_json::to_vec(&lm_provision::to_bridge_json::to_bridge_json(expanded))
+            .map_err(std::io::Error::other)?;
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create_new(&staged.path)?;
+            file.write_all(&bytes)?;
+        }
+        Ok(staged)
+    }
+}
+
+impl Drop for StagedPayload {
+    fn drop(&mut self) {
+        // Best effort: the payload has already been uploaded (or the
+        // upload has already failed), so a directory that resists
+        // removal is a temp-directory question, not a session one.
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
 }
 
 /// Step 4b: pull every declared artifact to
@@ -532,6 +700,226 @@ mod tests {
             .expect("dry run succeeds");
         assert!(output.artifacts.is_empty());
         assert!(pod.downloads.borrow().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pod that keeps whatever step 1 placed and answers step 2 the
+    /// way a real one does — by hashing the document it actually
+    /// received (`<bin> hash <file>`, which resolves first, spec 11
+    /// §Identity) rather than a number the test handed it in advance.
+    /// That makes the integrity check a real comparison: if the session
+    /// uploaded a document that hashes to something other than
+    /// `local_hash`, the session fails here instead of the test having
+    /// to notice.
+    struct RecordingPod {
+        scratch: PathBuf,
+        placed: RefCell<Option<(PathBuf, Vec<u8>)>>,
+    }
+
+    impl RecordingPod {
+        fn new(scratch: &Path) -> Self {
+            Self {
+                scratch: scratch.to_path_buf(),
+                placed: RefCell::new(None),
+            }
+        }
+
+        /// What step 1 handed over: the operator-host path and the
+        /// bytes read from it at that moment (the staging file is gone
+        /// by the time a test looks).
+        fn received(&self) -> (PathBuf, Vec<u8>) {
+            self.placed
+                .borrow()
+                .clone()
+                .expect("step 1 must have placed a profile")
+        }
+
+        /// The pod's own `hash` answer: parse and hash the bytes it was
+        /// given, through the same pipeline the binary runs.
+        fn remote_hash(&self) -> String {
+            let (_, bytes) = self.received();
+            let path = self.scratch.join("received-by-pod.json");
+            std::fs::write(&path, bytes).expect("write the received payload");
+            lm_provision::cli::ast_hash(&path).expect("the pod must be able to hash what it got")
+        }
+    }
+
+    impl Transport for RecordingPod {
+        fn dest_binary(&self, _local: &Path) -> Result<PathBuf, TransportError> {
+            Ok(PathBuf::from("/pod/lm-provision"))
+        }
+
+        fn dest_profile(&self, local: &Path) -> Result<PathBuf, TransportError> {
+            let name = local
+                .file_name()
+                .ok_or_else(|| TransportError::InvalidPath(local.to_path_buf()))?;
+            Ok(PathBuf::from("/pod").join(name))
+        }
+
+        fn ensure_binary(&self, local: &Path) -> Result<PathBuf, TransportError> {
+            self.dest_binary(local)
+        }
+
+        fn place_profile(&self, local: &Path) -> Result<PathBuf, TransportError> {
+            let bytes = std::fs::read(local)?;
+            *self.placed.borrow_mut() = Some((local.to_path_buf(), bytes));
+            self.dest_profile(local)
+        }
+
+        fn exec(
+            &self,
+            _paths: &PodPaths,
+            args: &[String],
+            _env: &BTreeMap<String, String>,
+        ) -> Result<ExecOutput, TransportError> {
+            let stdout = if args.first().map(String::as_str) == Some("hash") {
+                format!("{}\n", self.remote_hash())
+            } else {
+                r#"{"ok":true,"dry_run":false,"profile_name":"demo","steps":[]}"#.to_string()
+            };
+            Ok(ExecOutput {
+                stdout,
+                stderr: String::new(),
+                exit_code: Some(0),
+            })
+        }
+
+        fn download(&self, _remote: &Path, _local: &Path) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// A profile importing a local fragment, next to the fragment it
+    /// imports — the shape spec 11 §Source forms calls a relative path,
+    /// resolved against the importing document's own location.
+    fn import_fixture(dir_label: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-driver-session-test-{dir_label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        std::fs::write(
+            dir.join("fragment.json"),
+            serde_json::json!({
+                "type": "Fragment",
+                "name": "session-fragment",
+                "capabilities": ["sh.exec"],
+                "phases": [{ "type": "ShExec", "argv": ["echo", "from-fragment"] }]
+            })
+            .to_string(),
+        )
+        .expect("write fragment");
+        let profile = dir.join("profile.json");
+        std::fs::write(
+            &profile,
+            serde_json::json!({
+                "type": "Spec",
+                "name": "importing-session",
+                "phases": [
+                    { "type": "Import", "src": "./fragment.json" },
+                    { "type": "ShExec", "argv": ["echo", "after"] }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write profile");
+        (dir, profile)
+    }
+
+    /// **An importing profile uploads its expansion, and the pod
+    /// arrives at the same hash from it.** The session resolves before
+    /// it hashes (spec 11 §Resolution), so what step 1 places has to be
+    /// the expanded document: the pod re-parses and re-hashes what it
+    /// receives (08 §Session steps 1-2), and a source text still
+    /// carrying an `Import` would either hash to something else or ask
+    /// the pod to fetch a fragment the operator resolved locally.
+    #[test]
+    fn an_importing_profile_uploads_the_expansion_the_pod_can_hash_for_itself() {
+        let (dir, profile) = import_fixture("import");
+        let pod = RecordingPod::new(&dir);
+
+        let output = run(
+            &pod,
+            &StepPlan::default(),
+            Path::new("lm-provision"),
+            &profile,
+            "pod-11",
+        )
+        .expect("an importing profile must survive the operator-side preflight");
+
+        // The session's identity is the expanded canonical hash — the
+        // number `lm-provision hash` prints for the same document.
+        let expanded_hash =
+            lm_provision::cli::ast_hash(&profile).expect("the fixture resolves and hashes");
+        assert_eq!(output.collected.profile_hash, expanded_hash);
+
+        // What the pod got: bridge JSON, with the import spliced out
+        // and the fragment's phase in its place.
+        let (placed_path, payload) = pod.received();
+        assert_ne!(
+            placed_path, profile,
+            "the source text is not what the pod may re-hash"
+        );
+        let payload_path = dir.join("payload.json");
+        std::fs::write(&payload_path, &payload).expect("write the payload back out");
+        let payload_ast = lm_provision::frontend::load_profile(&payload_path)
+            .expect("the payload parses as JSON");
+        assert!(
+            !carries_import(&payload_ast),
+            "an expanded payload carries no Import node"
+        );
+        assert_eq!(lm_provision::canonical::hash(&payload_ast), expanded_hash);
+        let ProfileNode::Spec { phases, .. } = &payload_ast else {
+            panic!("the payload's root is a Spec");
+        };
+        assert_eq!(phases.len(), 2, "the fragment's phase replaced the Import");
+
+        // The staging file is gone: the session leaves nothing on the
+        // operator host but what it was given.
+        assert!(
+            !placed_path.exists(),
+            "the staged payload must be removed: {}",
+            placed_path.display()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A profile with no `Import` places its own file, byte for
+    /// byte.** Resolve expands such a document to itself (spec 11
+    /// §Stability guarantee 1), so there is nothing to serialize and no
+    /// reason to hand the pod bytes it did not have before — every
+    /// profile that exists today keeps the upload it has always had.
+    #[test]
+    fn a_profile_without_imports_places_the_operators_own_file_unchanged() {
+        let (dir, profile) = artifact_fixture("no-import");
+        let pod = RecordingPod::new(&dir);
+
+        let output = run(
+            &pod,
+            &StepPlan::default(),
+            Path::new("lm-provision"),
+            &profile,
+            "pod-11",
+        )
+        .expect("an import-free session still completes");
+
+        let (placed_path, payload) = pod.received();
+        assert_eq!(placed_path, profile, "the transport sees the profile path");
+        assert_eq!(
+            payload,
+            std::fs::read(&profile).expect("read the fixture back"),
+            "the uploaded bytes are the file's own"
+        );
+        assert_eq!(
+            output.collected.profile_hash,
+            lm_provision::cli::ast_hash(&profile).expect("the fixture hashes")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -75,9 +75,17 @@ op is reachable, and consulted in **both** dry-run and real mode
   only path by which the host environment is read (chapter 06).
 - **HTTP policy** (`http_allowlist`): a URL is allowed iff it matches
   one of the declared patterns. A pattern is a literal URL prefix,
-  optionally with a single `*` wildcard whose match is confined to the
-  authority component (e.g. `https://*.b2.backblazeb2.com`); the
-  wildcard never matches into the path.
+  optionally with a single `*` wildcard whose match is confined to
+  the authority component (e.g. `https://*.b2.backblazeb2.com`); the
+  wildcard never matches into the path. The **authority** halves of
+  pattern and URL compare **case-insensitively** and with a trailing
+  `.` ignored on either side (RFC 3986 §3.1 for the scheme, RFC 1035
+  §2.3.3 / §3.1 for DNS names — the two spellings name the same
+  authority). A `*.X` pattern additionally matches the apex `X` — the
+  operator expectation for "X and everything under it"; the same
+  authority rules govern `sh_egress` host patterns, and one shared
+  matcher answers to both so a declared host string means the same
+  thing wherever it lives.
 - **Path policy** (`paths`): a path is accepted iff it is absolute,
   contains no `..` segment, and lies under a declared root with
   component-aligned prefix matching (`/workspace_x` is NOT under
@@ -156,24 +164,45 @@ route is supplied and enforced is not.
   claim.** A *soft* layer routes every subprocess that honours the proxy
   environment (`HTTPS_PROXY` / `HTTP_PROXY`) and checks each CONNECT host
   — and the TLS ClientHello's SNI, to refuse a fronted name — against the
-  allowlist, tunnelling opaquely without decoding TLS. A *hard* layer
-  (Linux, self-hosted proxy only) additionally pins each subprocess's
-  `connect(2)` at the syscall via a seccomp supervisor, so a subprocess
-  that ignores the proxy environment still cannot reach off-host: the
-  allowed destinations are loopback (the proxy) and DNS, and everything
-  else is refused. Which layer takes effect is decided by the host at run
-  time; the profile states intent, never mechanism.
+  allowlist, tunnelling opaquely without decoding TLS. The SNI refusal
+  reads the **plaintext outer `server_name` only**: it does not see a
+  name hidden by Encrypted ClientHello, nor a `Host` / `:authority`
+  header fronted inside the established tunnel (inspect-once, not
+  per-request), and it says so — the endpoint pinning below is the
+  backstop for both. A *hard* layer (Linux, self-hosted proxy only)
+  additionally pins each subprocess's address-carrying network syscalls
+  — `connect(2)`, `sendto(2)`, `sendmsg(2)`, `sendmmsg(2)` — at the
+  syscall via a seccomp supervisor, and denies `io_uring` outright (a
+  ring would submit connects the filter cannot see), so a subprocess
+  that ignores the proxy environment still cannot reach off-host. The
+  allowed destinations are exactly **the proxy's own endpoint and the
+  host's configured DNS resolvers on port 53** (read once from
+  `/etc/resolv.conf`), not any loopback service — everything else is
+  refused. Unix-domain sockets are outside this pin (local IPC is not
+  network egress). Which layer takes effect is decided by the host at
+  run time; the profile states intent, never mechanism.
 
 What it does **not** do, stated as plainly as the `paths` limits above:
 it does not gate the filesystem (that is `paths`, and under `sh.exec`
 still only a lint over bridge ops); it does not close a supply-chain
 hijack from a *permitted* host (a poisoned package from an allowed
 registry arrives over an allowed connection — that is a hash-pin problem,
-not an egress one); and the hard layer leaves DNS (port 53) open so a
-subprocess that resolves before proxying keeps working, which leaves DNS
-tunnelling as a narrower residual channel than open egress. The pin
-closes the **exfiltration** half of the `sh.exec` gap — a credential or a
-work product leaving for an undeclared host — and says nothing more.
+not an egress one); and the hard layer admits the host's configured DNS
+resolvers on port 53 so a subprocess that resolves before proxying keeps
+working, which leaves DNS tunnelling *through those resolvers* as a
+narrower residual channel than open egress. (Port 53 to an address that
+is not a configured resolver is refused: a port number is not evidence
+of a protocol.) The pin closes the **exfiltration** half of the
+`sh.exec` gap — a credential or a work product leaving for an undeclared
+host — and says nothing more.
+
+A note on ports, since the same host string configures both L3 host
+allowlists: the `sh_egress` CONNECT pin matches the **host** and admits
+any port on a declared host, while `http_allowlist` matches the full
+authority **including the port** (`https://example.com` does not cover
+`https://example.com:8443`). The HTTP side is not widened to match —
+that would loosen a security allowlist — so a non-default HTTP port is
+declared explicitly.
 
 The `env` declared table (the non-secret declarations) carries two
 separable roles, and only one of them is a policy role.
@@ -287,7 +316,9 @@ effects already performed by **earlier** steps of the same apply
   current host implements, and a host may add or drop a mechanism (an OS
   netns route where one is available, a tighter loopback-only DNS policy)
   without changing what a profile declares. The allowset of the hard
-  layer (loopback + DNS) is provisional for the same reason.
+  layer (the proxy endpoint + configured DNS resolvers) and the set of
+  syscalls it traps (`connect` / `sendto` / `sendmsg` / `sendmmsg`, plus
+  the `io_uring` denial) are provisional for the same reason.
 - L4 entry-check enforcement and the frozen `KNOWN_CAPABILITIES` set:
   **stable**. `mount.volume_attach` reserved key: **provisional**.
 

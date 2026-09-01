@@ -250,6 +250,7 @@ verification material travels with the consumer, not the registry.
 | `ImportHashRequired` | resolve | remote `src` with no `hash` |
 | `ImportHashMismatch` | resolve | expanded canonical hash ≠ pin; nothing kept |
 | `ImportCycle` | resolve | a fragment reachable from itself |
+| `ImportDepthExceeded` | resolve | the chain is longer than the resolver's depth limit — a chain that never repeats a document is not a cycle, and expansion recurses, so the limit is what turns a runaway chain into an error instead of an exhausted stack |
 | `ImportSchemeDenied` | resolve | non-https remote / `file://` / `~/` / env form |
 | `ImportReferentialSanity` | resolve | remote fragment importing a local path |
 | `ImportMergeCollision` | resolve | `env` / `assumes` key declared by both sides with different values |

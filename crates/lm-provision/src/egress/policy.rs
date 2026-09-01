@@ -1,12 +1,13 @@
 //! Host allowlist for the sh.exec egress pin (spec 05 §L3, sh_egress).
 //!
-//! Mirrors [`crate::exec::policy::HttpPolicy`]'s authority wildcard, but keyed
-//! on a **host** (what a CONNECT line and a TLS SNI carry) rather than a full
-//! URL: a subprocess reaches the network through the egress proxy, which sees
-//! `host:port`, never a path. A pattern is a literal host, or a single leading
-//! `*.` wildcard confined to labels (`*.hf.co` matches `cdn-lfs.hf.co` and the
-//! bare `hf.co`, never `evilhf.co`). An empty allowlist denies every host,
-//! the same empty-list-denies-all rule the other L3 policies carry.
+//! Shares its host-matching rules with [`crate::exec::policy::HttpPolicy`]
+//! — both call into [`super::host_match::matches`] on the authority
+//! half, so a declared host string means the same thing whether the
+//! profile carries it in `sh_egress` or in `http_allowlist`. A pattern
+//! is a literal host, or a single leading `*.` wildcard confined to
+//! labels (`*.hf.co` matches `cdn-lfs.hf.co` and the bare `hf.co`,
+//! never `evilhf.co`). An empty allowlist denies every host, the same
+//! empty-list-denies-all rule the other L3 policies carry.
 
 /// A declaration-derived host allowlist.
 #[derive(Debug, Clone, Default)]
@@ -31,19 +32,21 @@ impl EgressPolicy {
 
     /// A host is allowed iff it matches one declared pattern.
     ///
-    /// Case-insensitive on the host, as DNS names are. A `*.suffix` pattern
-    /// matches the bare `suffix` and any label prefixed onto it; a literal
+    /// Delegates to the shared [`super::host_match::matches`] so this
+    /// answers the same as [`crate::exec::policy::HttpPolicy`] on the
+    /// same authority: case-insensitive, trailing dot ignored, `*.X`
+    /// matches the bare `X` and any label prefixed onto it, a literal
     /// pattern matches only itself.
+    ///
+    /// **Port**: the caller passes the CONNECT **host** here, with the
+    /// port already stripped (the proxy's `connect_host`), so a declared
+    /// host admits any port on it. That is the one place this policy
+    /// differs from `http_allowlist`, which pins the port too; see
+    /// [`super::host_match`] §Port handling and spec 05 §L3.
     pub fn allows(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        self.patterns.iter().any(|p| {
-            let p = p.to_ascii_lowercase();
-            if let Some(suffix) = p.strip_prefix("*.") {
-                host == suffix || host.ends_with(&format!(".{suffix}"))
-            } else {
-                host == p
-            }
-        })
+        self.patterns
+            .iter()
+            .any(|p| super::host_match::matches(p, host))
     }
 }
 

@@ -1592,7 +1592,7 @@ pub async fn execute_step(
     planned: &PlannedStep,
     label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
-    hard_pin: bool,
+    hard_pin: Option<std::net::SocketAddr>,
 ) -> Result<StepResult, StepFailure> {
     let evaluated = match &planned.done {
         // `Real`, not the context's mode: this function is the real
@@ -1640,7 +1640,7 @@ async fn run_effect(
     step: &Step,
     label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
-    hard_pin: bool,
+    hard_pin: Option<std::net::SocketAddr>,
 ) -> Result<StepResult, StepFailure> {
     match step {
         Step::Sh(argv) => execute_sh(argv, label.op, env, hard_pin),
@@ -1799,7 +1799,7 @@ pub async fn run_step(
     label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
     mode: ExecMode,
-    hard_pin: bool,
+    hard_pin: Option<std::net::SocketAddr>,
 ) -> Result<StepRun, StepFailure> {
     match mode {
         ExecMode::DryRun => Ok(StepRun::Dry(dry_run_step(planned, env).await)),
@@ -1835,7 +1835,7 @@ fn execute_sh(
     argv: &[String],
     op: &str,
     env: &BTreeMap<String, String>,
-    hard_pin: bool,
+    hard_pin: Option<std::net::SocketAddr>,
 ) -> Result<StepResult, StepFailure> {
     let outcome = effects::sh_exec(
         argv,
@@ -4182,18 +4182,30 @@ mod tests {
     }
 
     /// The settle check is what turns "the spawn was accepted" into
-    /// "the process survived a second": a command that cannot run at
-    /// all fails the launch step, with its log tail on stderr.
+    /// "the process survived a second": a command that dies at once
+    /// fails the launch step, with its log tail on stderr.
+    ///
+    /// The dying command writes its own last words to stderr, so the
+    /// tail-relay assertion pins *this module's* contract (the log
+    /// reaches the step's stderr) and not any launcher's diagnostic
+    /// wording — uutils `nohup` (0.8.0, the `/usr/bin/nohup` on some
+    /// hosts) exits 127 on a missing binary without printing anything,
+    /// so a missing-binary fixture asserts text that never existed
+    /// there [measured: 2026-09-01].
     #[cfg(unix)]
     #[test]
     fn the_launch_script_fails_when_the_process_dies_immediately() {
         let dir = scratch_dir("launch-died");
         let log = dir.join("stub.log");
         let pid_file = dir.join("stub.pid");
-        let missing = dir.join("no-such-binary").to_string_lossy().into_owned();
+        let dying = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "'echo boom: fatal startup error >&2; exit 3'".to_string(),
+        ];
 
         let command = spawn_detached_command(
-            &[missing],
+            &dying,
             &log.to_string_lossy(),
             &pid_file.to_string_lossy(),
             "svc",
@@ -4207,7 +4219,7 @@ mod tests {
         assert_eq!(
             outcome.status.code(),
             Some(1),
-            "a launch that cannot start must fail the step"
+            "a launch that dies at once must fail the step"
         );
         let stderr = String::from_utf8_lossy(&outcome.stderr);
         assert!(
@@ -4215,8 +4227,8 @@ mod tests {
             "stderr should name the dead launch: {stderr}"
         );
         assert!(
-            stderr.contains("not found") || stderr.contains("No such file"),
-            "the log tail should carry the shell's own diagnosis: {stderr}"
+            stderr.contains("boom: fatal startup error"),
+            "the log tail should carry the process's own last words: {stderr}"
         );
 
         fs::remove_dir_all(&dir).ok();
@@ -4560,14 +4572,9 @@ mod tests {
             "-c".into(),
             "echo out-before-failing; echo err-before-failing 1>&2; exit 7".into(),
         ]));
-        let failure = execute_step(
-            &step,
-            StepLabel::flat("post_install"),
-            &BTreeMap::new(),
-            false,
-        )
-        .await
-        .expect_err("a non-zero exit is a step failure");
+        let failure = execute_step(&step, StepLabel::flat("post_install"), &BTreeMap::new(), None)
+            .await
+            .expect_err("a non-zero exit is a step failure");
 
         // The error still names the op, as before.
         match &failure.error {
@@ -4693,13 +4700,13 @@ mod tests {
         let step = steps.first().expect("one step");
         let env = BTreeMap::new();
 
-        let first = execute_step(step, StepLabel::flat("sync.pull"), &env, false)
+        let first = execute_step(step, StepLabel::flat("sync.pull"), &env, None)
             .await
             .expect("the first pull downloads");
         assert_eq!(first.bytes, Some(BODY.len() as u64));
         assert_eq!(served.load(Ordering::SeqCst), 1);
 
-        let second = execute_step(step, StepLabel::flat("sync.pull"), &env, false)
+        let second = execute_step(step, StepLabel::flat("sync.pull"), &env, None)
             .await
             .expect("the second pull skips");
         assert_eq!(
@@ -4733,14 +4740,14 @@ mod tests {
         let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
         let env = BTreeMap::new();
 
-        let first = execute_step(&step, StepLabel::flat("models"), &env, false)
+        let first = execute_step(&step, StepLabel::flat("models"), &env, None)
             .await
             .expect("the first apply downloads");
         assert_eq!(first.bytes, Some(BODY.len() as u64));
         assert_eq!(served.load(Ordering::SeqCst), 1);
         assert_eq!(fs::read(&dst).expect("destination written"), BODY);
 
-        let second = execute_step(&step, StepLabel::flat("models"), &env, false)
+        let second = execute_step(&step, StepLabel::flat("models"), &env, None)
             .await
             .expect("the second apply skips");
         assert_eq!(
@@ -4778,12 +4785,12 @@ mod tests {
         let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
         let env = BTreeMap::new();
 
-        execute_step(&step, StepLabel::flat("models"), &env, false)
+        execute_step(&step, StepLabel::flat("models"), &env, None)
             .await
             .expect("the first apply downloads");
         fs::write(&dst, b"truncated or tampered").expect("overwrite the destination");
 
-        let second = execute_step(&step, StepLabel::flat("models"), &env, false)
+        let second = execute_step(&step, StepLabel::flat("models"), &env, None)
             .await
             .expect("a mismatching destination must be downloaded again");
         assert_eq!(served.load(Ordering::SeqCst), 2);
@@ -4818,7 +4825,7 @@ mod tests {
         let (url, served) = serving_local_server(BODY);
         let step = transfer_step(&url, &dst, None);
 
-        let result = execute_step(&step, StepLabel::flat("models"), &BTreeMap::new(), false)
+        let result = execute_step(&step, StepLabel::flat("models"), &BTreeMap::new(), None)
             .await
             .expect("the step decides");
 
@@ -4926,7 +4933,7 @@ mod tests {
         let step = clone_step(&src, &dst, "v1");
         let env = BTreeMap::new();
 
-        let first = execute_step(&step, StepLabel::flat("comfyui_install"), &env, false)
+        let first = execute_step(&step, StepLabel::flat("comfyui_install"), &env, None)
             .await
             .expect("the first apply clones");
         assert!(dst.join(".git").is_dir(), "the repository was cloned");
@@ -4934,7 +4941,7 @@ mod tests {
         let note = first.note.expect("an executed step reports its condition");
         assert!(note.starts_with("not done: "), "{note}");
 
-        let second = execute_step(&step, StepLabel::flat("comfyui_install"), &env, false)
+        let second = execute_step(&step, StepLabel::flat("comfyui_install"), &env, None)
             .await
             .expect("the second apply skips rather than failing");
         let note = second.note.expect("a skipped step carries a note");
@@ -4948,7 +4955,7 @@ mod tests {
         // And the same command *without* the condition is exactly the
         // failure this stage removes.
         let unguarded = PlannedStep::always(step.step.clone());
-        let failure = execute_step(&unguarded, StepLabel::flat("comfyui_install"), &env, false)
+        let failure = execute_step(&unguarded, StepLabel::flat("comfyui_install"), &env, None)
             .await
             .expect_err("an unguarded second clone fails");
         assert_eq!(failure.observed.status, 128, "git refused the destination");
@@ -4971,7 +4978,7 @@ mod tests {
             &clone_step(&src, &dst, "v1"),
             StepLabel::flat("comfyui_install"),
             &env,
-            false,
+            None,
         )
         .await
         .expect("the first apply clones at v1");
@@ -5004,7 +5011,7 @@ mod tests {
             ]),
             at_v2.clone(),
         );
-        let ran = execute_step(&checkout, StepLabel::flat("custom_nodes"), &env, false)
+        let ran = execute_step(&checkout, StepLabel::flat("custom_nodes"), &env, None)
             .await
             .expect("the checkout runs");
         assert!(ran
@@ -5053,7 +5060,7 @@ mod tests {
             "answering the condition must not clone anything",
         );
 
-        execute_step(&step, StepLabel::flat("comfyui_install"), &no_env, false)
+        execute_step(&step, StepLabel::flat("comfyui_install"), &no_env, None)
             .await
             .expect("the apply clones");
 

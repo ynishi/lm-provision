@@ -97,6 +97,25 @@ pub fn hash(node: &ProfileNode) -> String {
     crate::digest::hex_sha256(encode(node).as_bytes())
 }
 
+/// Length in characters of a SHA-256 digest rendered by [`hash`] /
+/// [`crate::digest::hex_sha256`]: 32 bytes × 2 hex digits per byte.
+pub const HASH_HEX_LEN: usize = 64;
+
+/// Whether `s` has the shape of a SHA-256 hex digest — exactly
+/// [`HASH_HEX_LEN`] characters, all ASCII hex digits. Case is not
+/// policed: the two hex spellings of the same digest are the same
+/// digest, and callers that need lowercase (spec 11 §Hash spelling)
+/// normalise themselves.
+///
+/// One shape check for the whole workspace: the resolve pin-shape
+/// guard ([`crate::resolve`] `ImportPinShape`) and the `models`
+/// declared-digest guard ([`crate::validate`] `PhaseShape`) both
+/// answer to this predicate, so a divergence between them cannot be
+/// introduced by editing one and forgetting the other.
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == HASH_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Canonically encode an [`Assert`] to deterministic JSON bytes.
 ///
 /// Same rules as [`encode`]: variant tag under `"type"`, object keys in

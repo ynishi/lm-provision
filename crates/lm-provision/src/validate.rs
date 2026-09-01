@@ -101,9 +101,12 @@ struct ModelItemShape {
     sha256: Option<String>,
 }
 
-/// The length of a SHA-256 rendered as hex
-/// (`crate::digest::hex_sha256`).
-const SHA256_HEX_LEN: usize = 64;
+/// The length of a SHA-256 rendered as hex — re-exported here so the
+/// error message can name the expected length without importing the
+/// full path each time. Source of truth is
+/// [`crate::canonical::HASH_HEX_LEN`], which the shape predicate
+/// [`crate::canonical::is_sha256_hex`] also reads from.
+const SHA256_HEX_LEN: usize = crate::canonical::HASH_HEX_LEN;
 
 /// A validate-stage rejection (first violation only,
 /// 03-pipeline-stage-artifacts.md §validate). Each `Display` string
@@ -409,6 +412,32 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
         return Err(ValidateError::NotSpec);
     };
 
+    // Check 0b: no unresolved `Import` / `Fragment` in the phase list.
+    // Resolve replaces every `Import` before validate runs (spec 11
+    // §Resolution), so hitting one means the caller skipped that stage
+    // — fail loudly here rather than let plan / normalize silently drop
+    // the node downstream.
+    //
+    // Runs **first**, ahead of check 1, which is what its number says:
+    // an unexpanded document has not yet had the fragment's own
+    // declarations merged in, so every later check is reading half a
+    // profile. A document that imports a fragment supplying `sh.exec`
+    // while declaring `sh_egress` itself trips check 1b below and gets
+    // told its capability list is wrong — when the real answer is that
+    // nobody resolved it. Diagnose the missing stage, not its
+    // symptoms.
+    for (idx, phase) in phases.iter().enumerate() {
+        let kind = match phase {
+            ProfileNode::Import { .. } => "Import",
+            ProfileNode::Fragment { .. } => "Fragment",
+            _ => continue,
+        };
+        return Err(ValidateError::UnresolvedImport {
+            index: idx + 1,
+            kind,
+        });
+    }
+
     // Check 1: name is non-empty. (The Lua `ir.schema` guard is a
     // frontend invariant here — see the module doc.)
     if name.is_empty() {
@@ -421,23 +450,6 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // reject rather than silently ignore.
     if !sh_egress.is_empty() && !capabilities.iter().any(|c| c == "sh.exec") {
         return Err(ValidateError::ShEgressWithoutShExec);
-    }
-
-    // Check 0b: no unresolved `Import` / `Fragment` in the phase list.
-    // Resolve replaces every `Import` before validate runs (spec 11
-    // §Resolution), so hitting one means the caller skipped that stage
-    // — fail loudly here rather than let plan / normalize silently drop
-    // the node downstream.
-    for (idx, phase) in phases.iter().enumerate() {
-        let kind = match phase {
-            ProfileNode::Import { .. } => "Import",
-            ProfileNode::Fragment { .. } => "Fragment",
-            _ => continue,
-        };
-        return Err(ValidateError::UnresolvedImport {
-            index: idx + 1,
-            kind,
-        });
     }
 
     // Check 2: the five declared lists are string lists — subsumed by
@@ -1002,10 +1014,12 @@ fn check_phase(
                 if let Some(sha256) = &item.sha256 {
                     // Case is not policed: the comparison lowercases
                     // the declared digest, so an uppercase spelling is
-                    // a legible profile, not a broken one.
-                    if sha256.len() != SHA256_HEX_LEN
-                        || !sha256.chars().all(|c| c.is_ascii_hexdigit())
-                    {
+                    // a legible profile, not a broken one. Shape
+                    // check goes through the shared predicate
+                    // ([`crate::canonical::is_sha256_hex`]) so
+                    // `models.sha256` and the resolve stage's pin
+                    // shape answer to one rule.
+                    if !crate::canonical::is_sha256_hex(sha256) {
                         return Err(ValidateError::PhaseShape(format!(
                             "phases[{index}].models[{}].sha256: expected {SHA256_HEX_LEN} hex \
                              characters, got {:?}",
@@ -3170,5 +3184,37 @@ mod tests {
         // subprocess to route — reject rather than silently ignore.
         let node = spec_with_egress(&["net.http_get"], &["huggingface.co"]);
         assert_eq!(validate(&node), Err(ValidateError::ShEgressWithoutShExec));
+    }
+
+    /// **An unresolved document is diagnosed as unresolved**, whatever
+    /// else it also trips. This profile declares `sh_egress` and gets
+    /// its `sh.exec` capability from the fragment it imports, so on a
+    /// raw AST it violates check 1b as well — and check 1b's message
+    /// would send the author to edit a capability list that is already
+    /// correct. Check 0b runs first so the answer names the stage that
+    /// was skipped (spec 11 §Resolution) instead of a symptom of it.
+    #[test]
+    fn an_unresolved_import_is_reported_before_any_check_it_also_trips() {
+        let ids = IdGen::new();
+        let mut node = spec_with_egress(&["net.http_get"], &["huggingface.co"]);
+        let ProfileNode::Spec { phases, .. } = &mut node else {
+            panic!("the fixture is a Spec");
+        };
+        phases.insert(
+            0,
+            ProfileNode::Import {
+                id: ids.node(),
+                src: "./fragment.json".into(),
+                hash: None,
+            },
+        );
+
+        assert_eq!(
+            validate(&node),
+            Err(ValidateError::UnresolvedImport {
+                index: 1,
+                kind: "Import",
+            })
+        );
     }
 }

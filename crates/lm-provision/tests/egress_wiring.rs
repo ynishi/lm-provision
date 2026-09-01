@@ -99,38 +99,32 @@ async fn absent_sh_egress_leaves_the_subprocess_unrouted() {
 }
 
 /// The hard layer reaches a real subprocess through apply: a declared
-/// `sh_egress` pins `connect(2)`, so a subprocess that ignores the proxy and
-/// dials an off-host address directly is refused at the syscall, while a
-/// loopback dial still succeeds. Linux-only (seccomp); proves the wiring from
-/// apply → sh_exec → hardpin::run_pinned, not just the module in isolation.
+/// `sh_egress` pins the address-carrying network syscalls, so a subprocess that
+/// ignores the proxy and dials an off-host address directly is refused at the
+/// syscall, while a dial of the proxy endpoint itself still succeeds. The
+/// subprocess learns the proxy endpoint the way any subprocess does — from its
+/// own `HTTPS_PROXY` env — because the pin now admits exactly that endpoint
+/// (and configured DNS resolvers), not any loopback service. Linux-only
+/// (seccomp); proves the wiring from apply → sh_exec → hardpin::run_pinned,
+/// not just the module in isolation.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn declared_sh_egress_hard_pin_blocks_a_direct_offhost_connect() {
-    use std::io::Read;
-    use std::net::TcpListener;
-
     let dir = scratch_dir("hardpin");
     let marker = dir.join("result.txt");
     let _ = std::fs::remove_file(&marker);
 
-    // A loopback listener the subprocess is allowed to reach.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        if let Ok((mut s, _)) = listener.accept() {
-            let _ = s.read(&mut [0u8; 1]);
-        }
-    });
-
-    // bash /dev/tcp: loopback dial (allowed) then a direct TEST-NET-3 dial
-    // (203.0.113.1, off-host → must be EPERM'd at the syscall). Uses bash so
-    // /dev/tcp is available; the profile pins egress, so apply starts the
-    // proxy and runs this under the connect supervisor.
+    // bash /dev/tcp: parse host:port out of $HTTPS_PROXY and dial the proxy
+    // endpoint (allowed — it is what the pin admits), then a direct TEST-NET-3
+    // dial (203.0.113.1, off-host → must be EPERM'd at the syscall). Uses bash
+    // so /dev/tcp is available; the profile pins egress, so apply binds the
+    // proxy, injects its address as HTTPS_PROXY, and runs this under the
+    // supervisor.
     let script = format!(
-        "exec 3<>/dev/tcp/127.0.0.1/{port} && echo LOOPBACK_OK >> {m}; \
+        "hp=${{HTTPS_PROXY#http://}}; h=${{hp%%:*}}; p=${{hp##*:}}; \
+         exec 3<>/dev/tcp/$h/$p && echo PROXY_OK >> {m}; \
          (exec 4<>/dev/tcp/203.0.113.1/80) 2>/dev/null \
            && echo EXTERNAL_LEAK >> {m} || echo EXTERNAL_BLOCKED >> {m}",
-        port = port,
         m = marker.to_string_lossy(),
     );
     let profile = format!(
@@ -155,8 +149,8 @@ async fn declared_sh_egress_hard_pin_blocks_a_direct_offhost_connect() {
 
     let seen = std::fs::read_to_string(&marker).expect("subprocess wrote the marker");
     assert!(
-        seen.contains("LOOPBACK_OK"),
-        "loopback dial should be allowed through the pin: {seen:?}"
+        seen.contains("PROXY_OK"),
+        "a dial of the proxy endpoint should be allowed through the pin: {seen:?}"
     );
     assert!(
         seen.contains("EXTERNAL_BLOCKED"),

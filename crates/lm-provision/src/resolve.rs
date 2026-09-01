@@ -52,6 +52,27 @@ use crate::canonical;
 use crate::frontend;
 use crate::profile_ast::ProfileNode;
 
+/// How many documents deep an import chain may go before resolve
+/// refuses it (spec 11 §Error surface `ImportDepthExceeded`).
+///
+/// Expansion recurses: each `Import` opens a document and expands that
+/// document's own imports on the stack. A cycle is caught by the
+/// stable-key stack, but a chain that never repeats — `a → b → c → …`
+/// — is not a cycle and used to recurse until the thread's stack ran
+/// out, which is a process abort rather than an error a caller can
+/// report.
+///
+/// **32.** Real fragments nest a handful deep: the published shape is
+/// a profile importing one per-model fragment, which imports nothing
+/// (spec 11 §Non-goals — "a fragment is chosen, not configured"), and
+/// vendoring or mirroring adds a level, not a tier. Two orders of
+/// magnitude of headroom over observed use, and far enough below the
+/// stack a resolve actually has (each level is one `expand_document`
+/// frame plus a parse) that the limit is what a caller hits, never the
+/// stack. A document that wants more is describing a structure nobody
+/// can follow by reading it.
+const MAX_IMPORT_DEPTH: usize = 32;
+
 /// A resolve-stage rejection (spec 11 §Error surface). Every message
 /// names the import chain (`consumer → … → fragment`) that produced
 /// it.
@@ -113,6 +134,27 @@ pub enum ResolveError {
         src: String,
         /// The malformed pin as written.
         hash: String,
+        /// The `consumer → … → fragment` chain.
+        chain: String,
+    },
+
+    /// The import chain is longer than [`MAX_IMPORT_DEPTH`].
+    ///
+    /// Distinct from [`Self::ImportCycle`], which catches a fragment
+    /// reachable from itself: this one catches a chain that never
+    /// repeats a document and simply goes on. Both would otherwise end
+    /// the same way — the recursion exhausting the thread's stack,
+    /// which aborts the process instead of returning something a caller
+    /// can report.
+    #[error(
+        "import of {src:?} exceeds the maximum import depth of {max} \
+         (import chain: {chain})"
+    )]
+    ImportDepthExceeded {
+        /// The `src` whose expansion would have gone past the limit.
+        src: String,
+        /// The limit, so the message carries its own scale.
+        max: usize,
         /// The `consumer → … → fragment` chain.
         chain: String,
     },
@@ -363,12 +405,38 @@ pub struct ResolveCtx<'a> {
 /// [`resolve_with_ctx`] directly so they can inject a fake source and
 /// a scratch cache directory.
 pub fn resolve(root: ProfileNode, doc_path: &Path) -> Result<ProfileNode, ResolveError> {
+    with_production_ctx(|ctx| resolve_with_ctx(root, doc_path, ctx))
+}
+
+/// [`resolve`] for a document that arrived **over https**, anchored at
+/// the URL it was served from rather than at wherever it was written
+/// down locally.
+///
+/// The location is not bookkeeping: it decides what the document's own
+/// relative imports mean (§Resolution step 2 — fragment-relative, and
+/// for a remote fragment same-origin), and it is what the referential
+/// sanity check reads to keep a document reached over https from
+/// resolving on the operator's filesystem. A caller that fetched a
+/// profile and then resolved it as a *file* — because the bytes are
+/// sitting in a temp file at that moment — hands its relative imports
+/// the temp directory, which is neither what the document meant nor a
+/// place the sanity check protects. [`crate::fetch`] is that caller,
+/// and this is the entry it uses.
+pub fn resolve_remote(root: ProfileNode, origin: &Url) -> Result<ProfileNode, ResolveError> {
+    with_production_ctx(|ctx| resolve_remote_with_ctx(root, origin, ctx))
+}
+
+/// Build the production [`ResolveCtx`] — [`ReqwestFragmentSource`] plus
+/// the XDG cache root — and run `f` against it. The borrow of the
+/// stack-local source is why this is a closure rather than a returned
+/// value.
+fn with_production_ctx<T>(f: impl FnOnce(&ResolveCtx) -> T) -> T {
     let source = ReqwestFragmentSource;
     let ctx = ResolveCtx {
         source: &source,
         cache_root: default_cache_root(),
     };
-    resolve_with_ctx(root, doc_path, &ctx)
+    f(&ctx)
 }
 
 /// [`resolve`] with a caller-supplied [`ResolveCtx`]. Kept `pub(crate)`:
@@ -379,6 +447,28 @@ pub fn resolve(root: ProfileNode, doc_path: &Path) -> Result<ProfileNode, Resolv
 pub(crate) fn resolve_with_ctx(
     root: ProfileNode,
     doc_path: &Path,
+    ctx: &ResolveCtx,
+) -> Result<ProfileNode, ResolveError> {
+    resolve_at(root, Location::File(doc_path.to_path_buf()), ctx)
+}
+
+/// [`resolve_remote`] with a caller-supplied [`ResolveCtx`] — the
+/// remote sibling of [`resolve_with_ctx`], and the entry the tests use
+/// to exercise same-origin expansion against a fake source instead of
+/// the network.
+pub(crate) fn resolve_remote_with_ctx(
+    root: ProfileNode,
+    origin: &Url,
+    ctx: &ResolveCtx,
+) -> Result<ProfileNode, ResolveError> {
+    resolve_at(root, Location::Https(origin.clone()), ctx)
+}
+
+/// The shared body of every entry above: seed the id generator, seed
+/// the chain and cycle stack with the root's own location, expand.
+fn resolve_at(
+    root: ProfileNode,
+    root_loc: Location,
     ctx: &ResolveCtx,
 ) -> Result<ProfileNode, ResolveError> {
     // Every fragment parse mints from this one generator, seeded above
@@ -393,7 +483,6 @@ pub(crate) fn resolve_with_ctx(
     for _ in 0..=crate::normalize::max_node_id(&root) {
         ids.node();
     }
-    let root_loc = Location::File(doc_path.to_path_buf());
     let mut chain = vec![root_loc.display()];
     let mut stack = vec![root_loc.stable_key()];
     expand_document(root, &root_loc, ctx, &ids, &mut stack, &mut chain)
@@ -447,7 +536,7 @@ fn expand_document(
             artifacts,
             phases,
         } => {
-            let mut slots = Slots {
+            let (slots, phases) = expand_into_slots(
                 capabilities,
                 env,
                 env_secrets,
@@ -455,8 +544,13 @@ fn expand_document(
                 http_allowlist,
                 sh_egress,
                 assumes,
-            };
-            let phases = expand_phases(phases, doc_loc, ctx, ids, &mut slots, stack, chain)?;
+                phases,
+                doc_loc,
+                ctx,
+                ids,
+                stack,
+                chain,
+            )?;
             Ok(ProfileNode::Spec {
                 id,
                 name,
@@ -491,7 +585,7 @@ fn expand_document(
             assumes,
             phases,
         } => {
-            let mut slots = Slots {
+            let (slots, phases) = expand_into_slots(
                 capabilities,
                 env,
                 env_secrets,
@@ -499,8 +593,13 @@ fn expand_document(
                 http_allowlist,
                 sh_egress,
                 assumes,
-            };
-            let phases = expand_phases(phases, doc_loc, ctx, ids, &mut slots, stack, chain)?;
+                phases,
+                doc_loc,
+                ctx,
+                ids,
+                stack,
+                chain,
+            )?;
             Ok(ProfileNode::Fragment {
                 id,
                 name,
@@ -518,6 +617,45 @@ fn expand_document(
         }
         other => Ok(other),
     }
+}
+
+/// Build a [`Slots`] from a `Spec` or `Fragment`'s seven merge-shaped
+/// declaration fields and expand its phase list through it —
+/// [`expand_phases`] mutates the slots as each nested import merges in.
+///
+/// The two callers destructure their variant **exhaustively (no `..`)**
+/// so a new declaration field is a compile error at the destructure
+/// site; this helper takes the seven fields as named arguments, so the
+/// same field addition is also a compile error here, in exactly one
+/// place. Extracted so the 9-line Slots-build + expand-phases +
+/// unpack block does not live twice.
+#[allow(clippy::too_many_arguments)]
+fn expand_into_slots(
+    capabilities: Vec<String>,
+    env: BTreeMap<String, ProfileNode>,
+    env_secrets: Vec<String>,
+    paths: Vec<String>,
+    http_allowlist: Vec<String>,
+    sh_egress: Vec<String>,
+    assumes: BTreeMap<String, String>,
+    phases: Vec<ProfileNode>,
+    doc_loc: &Location,
+    ctx: &ResolveCtx,
+    ids: &IdGen,
+    stack: &mut Vec<StableKey>,
+    chain: &mut Vec<String>,
+) -> Result<(Slots, Vec<ProfileNode>), ResolveError> {
+    let mut slots = Slots {
+        capabilities,
+        env,
+        env_secrets,
+        paths,
+        http_allowlist,
+        sh_egress,
+        assumes,
+    };
+    let phases = expand_phases(phases, doc_loc, ctx, ids, &mut slots, stack, chain)?;
+    Ok((slots, phases))
 }
 
 /// The declaration slots a fragment merges into — shared between the
@@ -606,6 +744,20 @@ fn expand_import(
     stack: &mut Vec<StableKey>,
     chain: &mut Vec<String>,
 ) -> Result<(ProfileNode, String), ResolveError> {
+    // Depth first, before the source is classified and long before
+    // anything is read or fetched: a runaway chain must not spend a
+    // network round trip per level on its way to the refusal. `stack`
+    // holds one key per document currently open — the root plus every
+    // fragment above this import — so its length *is* the depth this
+    // expansion would reach.
+    if stack.len() > MAX_IMPORT_DEPTH {
+        return Err(ResolveError::ImportDepthExceeded {
+            src: src.to_string(),
+            max: MAX_IMPORT_DEPTH,
+            chain: chain.join(" → "),
+        });
+    }
+
     // §Source forms: classify before touching the filesystem or the
     // network. Scheme matching is case-insensitive (RFC 3986 §3.1) so
     // `HTTPS://…` is a remote import, not an unsupported scheme.
@@ -661,15 +813,21 @@ fn expand_import(
             });
         }
         (_, Some(pin)) => {
-            let pin_lower = pin.to_ascii_lowercase();
-            if pin_lower.len() != 64 || !pin_lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+            // Shape check goes through the shared
+            // [`canonical::is_sha256_hex`] so this and
+            // [`crate::validate`]'s `models.sha256` check answer to
+            // one rule (case not policed). Lowercase after the shape
+            // pass because [`canonical::hash`] renders in lowercase
+            // (spec 11 §Hash spelling), and the comparison later is
+            // byte-for-byte.
+            if !canonical::is_sha256_hex(pin) {
                 return Err(ResolveError::ImportPinShape {
                     src: src.to_string(),
                     hash: pin.to_string(),
                     chain: fragment_chain(chain),
                 });
             }
-            Some(pin_lower)
+            Some(pin.to_ascii_lowercase())
         }
         (false, None) => None,
     };
@@ -2048,6 +2206,123 @@ mod tests {
             !ctx.cache_root.exists() || ctx.cache_root.read_dir().unwrap().next().is_none(),
             "cache root must stay empty for a local import"
         );
+    }
+
+    /// **A document that arrived over https resolves its relative
+    /// imports against the URL it came from.** [`resolve_remote`] is
+    /// how a caller holding fetched bytes says so — the bytes may be
+    /// sitting in a temp file, but `./frag.json` inside them means the
+    /// sibling of the URL, and it stays remote (§Adopted conventions:
+    /// "a fragment's relative imports resolve against the fragment's
+    /// own location"; §Resolution step 2: same-origin, therefore
+    /// remote).
+    #[test]
+    fn a_remote_document_resolves_its_relative_import_against_its_own_url() {
+        let dir = temp_dir("remote-origin");
+        let frag_bytes = serde_json::to_vec(&shexec_fragment()).unwrap();
+        let pin = pin_of(&frag_bytes);
+        // The fragment is served next to the document, and only there:
+        // a resolve anchored anywhere else asks for a URL this source
+        // does not have.
+        let source = FakeSource::new(&[("https://example.com/profiles/frag.json", &frag_bytes)]);
+        let ctx = ctx_for(&source, &dir, "remote-origin");
+        let origin = Url::parse("https://example.com/profiles/consumer.json").unwrap();
+        let document = frontend::load_profile_bytes(
+            serde_json::to_vec(&importing_profile("./frag.json", Some(&pin)))
+                .unwrap()
+                .as_slice(),
+            true,
+            &IdGen::new(),
+        )
+        .expect("fixture must parse");
+
+        let expanded = resolve_remote_with_ctx(document, &origin, &ctx)
+            .expect("a same-origin relative import must resolve");
+
+        assert_eq!(source.calls(), 1, "the sibling URL must have been fetched");
+        let ProfileNode::Spec { phases, .. } = &expanded else {
+            panic!("expanded root must stay a Spec");
+        };
+        // apt, the fragment's sh.exec, the trailing sh.exec.
+        assert_eq!(phases.len(), 3);
+        match &phases[1] {
+            ProfileNode::ShExec { argv, .. } => assert_eq!(argv[1], "from-fragment"),
+            other => panic!("expected the fragment's phase spliced in, got {other:?}"),
+        }
+    }
+
+    /// **A chain deeper than the limit is an error, not a crash.** A
+    /// cycle has the stack to catch it; a chain that never repeats a
+    /// document has nothing to catch it but the limit, and without one
+    /// the recursion ends by exhausting the thread's stack — which
+    /// aborts the process instead of returning something the caller can
+    /// report. The chain below is comfortably past
+    /// [`MAX_IMPORT_DEPTH`]; the resolve must name the depth.
+    #[test]
+    fn an_import_chain_past_the_depth_limit_is_refused_rather_than_overflowing() {
+        let dir = temp_dir("deep-chain");
+        let links = MAX_IMPORT_DEPTH + 8;
+        // frag-0 → frag-1 → … → frag-N, none repeating: not a cycle.
+        for i in 0..links {
+            let body = if i + 1 == links {
+                json!({ "type": "Fragment", "name": format!("frag-{i}"), "phases": [] })
+            } else {
+                json!({
+                    "type": "Fragment",
+                    "name": format!("frag-{i}"),
+                    "phases": [{ "type": "Import", "src": format!("./frag-{}.json", i + 1) }]
+                })
+            };
+            write(&dir, &format!("frag-{i}.json"), &body);
+        }
+        let path = write(
+            &dir,
+            "profile.json",
+            &importing_profile("./frag-0.json", None),
+        );
+
+        let err = resolve_file(&path).expect_err("a runaway chain must be refused");
+        let ResolveError::ImportDepthExceeded { max, chain, .. } = &err else {
+            panic!("expected ImportDepthExceeded, got: {err}");
+        };
+        assert_eq!(*max, MAX_IMPORT_DEPTH);
+        assert!(
+            chain.contains("profile.json") && chain.contains(" → "),
+            "the refusal must name the chain that produced it: {chain}"
+        );
+    }
+
+    /// The limit is a ceiling, not a budget everything pays: a chain
+    /// inside it resolves untouched. Without this the test above would
+    /// pass just as well with the limit set to 1.
+    #[test]
+    fn an_import_chain_inside_the_depth_limit_still_resolves() {
+        let dir = temp_dir("deep-ok");
+        let links = MAX_IMPORT_DEPTH - 2;
+        for i in 0..links {
+            let body = if i + 1 == links {
+                shexec_fragment()
+            } else {
+                json!({
+                    "type": "Fragment",
+                    "name": format!("frag-{i}"),
+                    "phases": [{ "type": "Import", "src": format!("./frag-{}.json", i + 1) }]
+                })
+            };
+            write(&dir, &format!("frag-{i}.json"), &body);
+        }
+        let path = write(
+            &dir,
+            "profile.json",
+            &importing_profile("./frag-0.json", None),
+        );
+
+        let ProfileNode::Spec { phases, .. } =
+            resolve_file(&path).expect("a chain inside the limit must resolve")
+        else {
+            panic!("expanded root must stay a Spec");
+        };
+        assert_eq!(phases.len(), 3, "the deepest fragment's phase spliced in");
     }
 
     // -----------------------------------------------------------------
