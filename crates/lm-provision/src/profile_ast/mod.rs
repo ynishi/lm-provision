@@ -79,6 +79,19 @@ pub enum ProfileNode {
         /// HTTP policy). Pattern = literal prefix with an optional
         /// single `*` confined to the authority component.
         http_allowlist: Vec<String>,
+        /// Allowed egress **hosts** for `sh.exec` subprocesses (spec 05 §L3
+        /// sh_egress, [`crate::egress`]). Opt-in and independent of
+        /// `http_allowlist`, which gates only bridge ops: a subprocess
+        /// (`git`, `pip`, the `hf` / `b2` CLIs) reaches the network without
+        /// passing an op handler, so it is routed through an egress proxy and
+        /// its destination host checked against this list. A pattern is a
+        /// literal host or a single leading `*.` label wildcard (`*.hf.co`).
+        /// **Absent (empty) means no pin** — subprocesses run unrouted, as
+        /// before — which is why this is the one declared list whose empty
+        /// state does not deny: the pin is opt-in. A profile that wants
+        /// "allow nothing" pins by declaring a host it will never reach, or
+        /// declares no `sh.exec` capability at all.
+        sh_egress: Vec<String>,
         /// Resources the profile declares are **already present on the
         /// target**, as `resource name → path` (spec 03 §Resource scope).
         ///
@@ -702,6 +715,9 @@ pub enum ProfileNode {
         paths: Vec<String>,
         /// Allowed HTTP URL patterns — merged by set union.
         http_allowlist: Vec<String>,
+        /// Allowed egress hosts for `sh.exec` — merged by set union, same
+        /// shape as [`ProfileNode::Spec::sh_egress`].
+        sh_egress: Vec<String>,
         /// Resources declared already present, same shape as
         /// [`ProfileNode::Spec::assumes`] — merged disjointly.
         assumes: BTreeMap<String, String>,

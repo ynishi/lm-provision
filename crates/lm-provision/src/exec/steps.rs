@@ -277,6 +277,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: Vec::new(),
             http_allowlist: Vec::new(),
+            sh_egress: Vec::new(),
             phases,
         }
     }

@@ -72,6 +72,7 @@ pub mod canonical;
 pub mod cli;
 pub mod derive;
 pub mod digest;
+pub mod egress;
 pub mod exec;
 pub mod fetch;
 pub mod frontend;

@@ -85,6 +85,13 @@ pub enum AstApplyError {
     /// The assembled apply report failed to serialize to JSON.
     #[error("failed to serialize apply report: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// The declared egress pin's proxy could not be started — the
+    /// listener failed to bind before any subprocess ran (spec 05 §L3
+    /// sh_egress / [`crate::egress`]). A precondition failure: nothing on
+    /// the target was touched.
+    #[error("failed to start egress proxy: {0}")]
+    EgressProxy(#[source] std::io::Error),
 }
 
 /// Runs the AST exec engine over `profile` and returns the apply report
@@ -171,7 +178,21 @@ pub async fn run_apply_ast_routed(
     };
 
     let log = Arc::new(Mutex::new(Vec::new()));
-    let ctx = Arc::new(ExecContext::from_root(&root, mode, log)?);
+    // Egress pin (spec 05 §L3 sh_egress): if the profile declares one, start
+    // the enforcement layer before any subprocess runs and hold it for the
+    // whole apply — `egress_supply` drops at the end of this function, which
+    // aborts a self-hosted proxy's serve task. `None` when unpinned (opt-in),
+    // and then nothing is injected. Real mode only: a dry run spawns no
+    // subprocess, so there is nothing to route (and binding a listener during
+    // a no-effect run would be a side effect a dry run must not have).
+    let egress_supply = match mode {
+        ExecMode::Real => crate::egress::start(crate::egress::policy_from_root(&root))
+            .await
+            .map_err(AstApplyError::EgressProxy)?,
+        ExecMode::DryRun => None,
+    };
+    let egress_proxy_url = egress_supply.as_ref().map(|supply| supply.url());
+    let ctx = Arc::new(ExecContext::from_root(&root, mode, log, egress_proxy_url)?);
     let reports = ctx.reports_handle();
     // One step plan, two readers: the AST declares the per-step nodes it
     // projects and the resolver looks a suspended one back up. Building

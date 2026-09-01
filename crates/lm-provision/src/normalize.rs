@@ -67,6 +67,7 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         env_secrets,
         paths,
         http_allowlist,
+        sh_egress,
         assumes,
         requires_ports,
         requires_gpu,
@@ -89,6 +90,7 @@ pub fn normalize(root: &ProfileNode) -> ProfileNode {
         env_secrets: env_secrets.clone(),
         paths: paths.clone(),
         http_allowlist: http_allowlist.clone(),
+        sh_egress: sh_egress.clone(),
         assumes: assumes.clone(),
         requires_ports: requires_ports.clone(),
         requires_gpu: requires_gpu.clone(),
@@ -368,6 +370,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: Vec::new(),
             http_allowlist: Vec::new(),
+            sh_egress: Vec::new(),
             phases,
         }
     }
@@ -531,6 +534,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: Vec::new(),
             http_allowlist: Vec::new(),
+            sh_egress: Vec::new(),
             assumes: Default::default(),
             requires_ports: Default::default(),
             requires_gpu: Default::default(),

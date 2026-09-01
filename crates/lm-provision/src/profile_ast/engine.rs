@@ -62,10 +62,16 @@ pub fn create_profile_engine_collecting(
     mode: crate::exec::ExecMode,
     executed_log: Arc<Mutex<Vec<String>>>,
 ) -> Result<(Engine<ProfileAst>, crate::exec::report::SharedReports), crate::exec::ExecError> {
+    // This sync engine builder (tests / POC / MCP debugger host) does not
+    // start an egress proxy: it has no async apply driver to own one for the
+    // run's lifetime. A profile driven here runs its subprocesses unrouted;
+    // the enforced path is `crate::apply::run_apply_ast_routed`, which starts
+    // the proxy and passes its URL to `from_root`.
     let ctx = Arc::new(crate::exec::ExecContext::from_root(
         root,
         mode,
         executed_log,
+        None,
     )?);
     let reports = ctx.reports_handle();
     let engine = Engine::new_with_ops(

@@ -1282,6 +1282,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: vec!["/".to_string()],
             http_allowlist: vec!["http://*".to_string(), "https://*".to_string()],
+            sh_egress: Vec::new(),
             phases,
         }
     }
@@ -1337,6 +1338,7 @@ mod tests {
             env_secrets: env_secrets.iter().map(|s| (*s).to_string()).collect(),
             paths: declared_paths,
             http_allowlist: vec!["http://*".to_string(), "https://*".to_string()],
+            sh_egress: Vec::new(),
             phases,
         }
     }
@@ -2137,6 +2139,7 @@ mod tests {
             env_secrets: Vec::new(),
             paths: paths.iter().map(|p| (*p).to_string()).collect(),
             http_allowlist: http_allowlist.iter().map(|u| (*u).to_string()).collect(),
+            sh_egress: Vec::new(),
             phases,
         }
     }

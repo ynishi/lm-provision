@@ -226,6 +226,7 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             env_secrets,
             paths,
             http_allowlist,
+            sh_egress,
             assumes,
             requires_ports,
             requires_gpu,
@@ -272,6 +273,12 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             // profiles, so it follows the omit-when-empty rule the
             // keyed slots carry, and for their reason.
             insert_sorted_string_array_nonempty(&mut fields, "artifacts", artifacts);
+            // Spec.sh_egress: set-shaped and opt-in, added after profiles
+            // were hashed — so it follows the omit-when-empty rule (a
+            // profile that declares no egress pin hashes exactly as it did
+            // before this slot existed, which is what keeps the pin opt-in
+            // without re-hashing every ledger row).
+            insert_sorted_string_array_nonempty(&mut fields, "sh_egress", sh_egress);
             fields.insert(
                 "phases".into(),
                 CanonValue::Array(phases.iter().map(to_canon).collect()),
@@ -298,6 +305,7 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             env_secrets,
             paths,
             http_allowlist,
+            sh_egress,
             assumes,
             phases,
         } => {
@@ -310,6 +318,7 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             fields.insert("env_secrets".into(), sorted_string_array(env_secrets));
             fields.insert("http_allowlist".into(), sorted_string_array(http_allowlist));
             fields.insert("paths".into(), sorted_string_array(paths));
+            insert_sorted_string_array_nonempty(&mut fields, "sh_egress", sh_egress);
             insert_str_map(&mut fields, "assumes", assumes);
             fields.insert(
                 "phases".into(),
@@ -831,6 +840,7 @@ mod tests {
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
+            sh_egress: vec![],
             phases: vec![],
         }
     }
@@ -876,6 +886,7 @@ mod tests {
             env_secrets: vec!["S2".into(), "S1".into()],
             paths: vec!["/workspace".into(), "/tmp".into()],
             http_allowlist: vec!["https://b.example/".into(), "https://a.example/".into()],
+            sh_egress: vec![],
             phases: vec![],
         };
         let b = ProfileNode::Spec {
@@ -894,6 +905,7 @@ mod tests {
             env_secrets: vec!["S1".into(), "S2".into()],
             paths: vec!["/tmp".into(), "/workspace".into()],
             http_allowlist: vec!["https://a.example/".into(), "https://b.example/".into()],
+            sh_egress: vec![],
             phases: vec![],
         };
         assert_eq!(encode(&a), encode(&b));
@@ -957,6 +969,7 @@ mod tests {
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
+            sh_egress: vec![],
             phases: vec![ProfileNode::Models {
                 id: new_id(gen),
                 models_json: models_json.into(),
@@ -1309,6 +1322,7 @@ mod tests {
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
+            sh_egress: vec![],
             phases: vec![apt(), sh()],
         };
         let b = ProfileNode::Spec {
@@ -1327,6 +1341,7 @@ mod tests {
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
+            sh_egress: vec![],
             phases: vec![sh(), apt()],
         };
         assert_ne!(encode(&a), encode(&b));
@@ -1359,6 +1374,7 @@ mod tests {
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
+            sh_egress: vec![],
             phases: vec![],
         };
         let bytes = encode(&some);
@@ -1422,6 +1438,7 @@ mod tests {
             env_secrets: vec!["HF_TOKEN".into()],
             paths: vec![],
             http_allowlist: vec![],
+            sh_egress: vec![],
             phases: vec![],
         };
         let bytes = encode(&node);
@@ -1481,6 +1498,7 @@ mod tests {
             env_secrets: vec![],
             paths: vec![],
             http_allowlist: vec![],
+            sh_egress: vec![],
             phases: vec![
                 ProfileNode::SystemApt {
                     id: new_id(&gen),
@@ -1586,6 +1604,7 @@ mod tests {
                 "https://b.example.com/".into(),
                 "https://a.example.com/".into(),
             ],
+            sh_egress: vec![],
             phases: vec![],
         };
         let bytes = encode(&node);
