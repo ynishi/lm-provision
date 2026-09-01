@@ -199,10 +199,10 @@
 //! (`LM_EGRESS_PROXY` pointing at an external gateway), which does
 //! not consult this layer.
 //!
-//! This mirrors two probes recorded in `workspace/tasks/sh-exec-egress-pin/`:
-//! the user-notify install under Docker's default seccomp, and the v4+v6
-//! gating of a real CLI (an IPv4-only filter is bypassed over IPv6, so both
-//! families are gated here).
+//! Both behaviours were probed on a real host before being relied on
+//! here: the user-notify install under Docker's default seccomp, and
+//! the v4+v6 gating of a real CLI (an IPv4-only filter is bypassed
+//! over IPv6, so both families are gated here).
 //!
 //! # `pidfd_getfd` gates the mode: full pin, or connect-only fallback
 //!

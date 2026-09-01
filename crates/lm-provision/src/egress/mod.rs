@@ -10,8 +10,7 @@
 //! declared host allowlist. The supply-chain-hijack half (a poisoned package
 //! from a *permitted* registry) is not an egress problem and is out of scope.
 //!
-//! Three responsibilities, deliberately separated (see
-//! `workspace/tasks/sh-exec-egress-pin/design.md`):
+//! Three responsibilities, deliberately separated:
 //!
 //! - **declaration** — the profile's `sh_egress` host list (host-independent).
 //! - **supply** — who runs the proxy: this crate self-hosts one in-process by
