@@ -364,6 +364,7 @@ impl ProfileOp {
                     },
                     &env,
                     self.ctx.mode,
+                    self.ctx.egress_hard_pin,
                 ),
             );
             renders.push(record_lifecycle_step(
@@ -430,7 +431,10 @@ impl ProfileOp {
                 Ok(value)
             }
             ExecMode::Real => {
-                let outcome = match effects::sh_exec(argv, &effects::ShOpts::new(resolved_env)) {
+                let outcome = match effects::sh_exec(
+                    argv,
+                    &effects::ShOpts::new(resolved_env).with_hard_pin(self.ctx.egress_hard_pin),
+                ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         let mut entry = StepReport::new(id, kind, "sh.exec");
@@ -1963,8 +1967,16 @@ async fn resolve_lifecycle_step(
     // *whole* phase — see [`lifecycle_preflight`] for why every step
     // pays for every other step's denial. They report their own failure
     // at the phase node, so there is nothing to push here.
-    let env = lifecycle_preflight(ctx, phase, payload, &phase_steps.steps)
+    let mut env = lifecycle_preflight(ctx, phase, payload, &phase_steps.steps)
         .map_err(|err| CallError::from(&err))?;
+    // Egress pin: route this lifecycle phase's sh-composing sub-steps through
+    // the allowlist proxy, mirroring the reducer path in `run_lifecycle`
+    // (spec 05 §L3 sh_egress). `or_insert` so a profile's own proxy var wins.
+    if let Some(url) = &ctx.egress_proxy_url {
+        for (key, value) in crate::egress::proxy_env(url) {
+            env.entry(key).or_insert(value);
+        }
+    }
 
     let (phase_index, _) = ctx.phase_meta_of(phase);
     let (base_id, kind) = report_base(ctx, phase);
@@ -1986,6 +1998,7 @@ async fn resolve_lifecycle_step(
         },
         &env,
         ctx.mode,
+        ctx.egress_hard_pin,
     )
     .await;
     let summary = record_lifecycle_step(

@@ -1592,6 +1592,7 @@ pub async fn execute_step(
     planned: &PlannedStep,
     label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
+    hard_pin: bool,
 ) -> Result<StepResult, StepFailure> {
     let evaluated = match &planned.done {
         // `Real`, not the context's mode: this function is the real
@@ -1618,7 +1619,7 @@ pub async fn execute_step(
         }
     }
 
-    let mut result = run_effect(&planned.step, label, env).await?;
+    let mut result = run_effect(&planned.step, label, env, hard_pin).await?;
     if let Some((done, node)) = &evaluated {
         result.note = Some(format!(
             "not done: {}",
@@ -1639,9 +1640,10 @@ async fn run_effect(
     step: &Step,
     label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
+    hard_pin: bool,
 ) -> Result<StepResult, StepFailure> {
     match step {
-        Step::Sh(argv) => execute_sh(argv, label.op, env),
+        Step::Sh(argv) => execute_sh(argv, label.op, env, hard_pin),
         Step::Transfer { src, dst } => {
             // The transcript is this transfer's own: it carries the step
             // id, which is what separates it from the siblings a
@@ -1797,10 +1799,13 @@ pub async fn run_step(
     label: StepLabel<'_>,
     env: &BTreeMap<String, String>,
     mode: ExecMode,
+    hard_pin: bool,
 ) -> Result<StepRun, StepFailure> {
     match mode {
         ExecMode::DryRun => Ok(StepRun::Dry(dry_run_step(planned, env).await)),
-        ExecMode::Real => execute_step(planned, label, env).await.map(StepRun::Real),
+        ExecMode::Real => execute_step(planned, label, env, hard_pin)
+            .await
+            .map(StepRun::Real),
     }
 }
 
@@ -1830,8 +1835,12 @@ fn execute_sh(
     argv: &[String],
     op: &str,
     env: &BTreeMap<String, String>,
+    hard_pin: bool,
 ) -> Result<StepResult, StepFailure> {
-    let outcome = effects::sh_exec(argv, &effects::ShOpts::new(env.clone()))?;
+    let outcome = effects::sh_exec(
+        argv,
+        &effects::ShOpts::new(env.clone()).with_hard_pin(hard_pin),
+    )?;
     if outcome.exit_code != 0 {
         let error = ExecError::EffectFailed {
             op: op.to_string(),
@@ -4551,7 +4560,7 @@ mod tests {
             "-c".into(),
             "echo out-before-failing; echo err-before-failing 1>&2; exit 7".into(),
         ]));
-        let failure = execute_step(&step, StepLabel::flat("post_install"), &BTreeMap::new())
+        let failure = execute_step(&step, StepLabel::flat("post_install"), &BTreeMap::new(), false)
             .await
             .expect_err("a non-zero exit is a step failure");
 
@@ -4679,13 +4688,13 @@ mod tests {
         let step = steps.first().expect("one step");
         let env = BTreeMap::new();
 
-        let first = execute_step(step, StepLabel::flat("sync.pull"), &env)
+        let first = execute_step(step, StepLabel::flat("sync.pull"), &env, false)
             .await
             .expect("the first pull downloads");
         assert_eq!(first.bytes, Some(BODY.len() as u64));
         assert_eq!(served.load(Ordering::SeqCst), 1);
 
-        let second = execute_step(step, StepLabel::flat("sync.pull"), &env)
+        let second = execute_step(step, StepLabel::flat("sync.pull"), &env, false)
             .await
             .expect("the second pull skips");
         assert_eq!(
@@ -4719,14 +4728,14 @@ mod tests {
         let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
         let env = BTreeMap::new();
 
-        let first = execute_step(&step, StepLabel::flat("models"), &env)
+        let first = execute_step(&step, StepLabel::flat("models"), &env, false)
             .await
             .expect("the first apply downloads");
         assert_eq!(first.bytes, Some(BODY.len() as u64));
         assert_eq!(served.load(Ordering::SeqCst), 1);
         assert_eq!(fs::read(&dst).expect("destination written"), BODY);
 
-        let second = execute_step(&step, StepLabel::flat("models"), &env)
+        let second = execute_step(&step, StepLabel::flat("models"), &env, false)
             .await
             .expect("the second apply skips");
         assert_eq!(
@@ -4764,12 +4773,12 @@ mod tests {
         let step = transfer_step(&url, &dst, Some(crate::digest::hex_sha256(BODY)));
         let env = BTreeMap::new();
 
-        execute_step(&step, StepLabel::flat("models"), &env)
+        execute_step(&step, StepLabel::flat("models"), &env, false)
             .await
             .expect("the first apply downloads");
         fs::write(&dst, b"truncated or tampered").expect("overwrite the destination");
 
-        let second = execute_step(&step, StepLabel::flat("models"), &env)
+        let second = execute_step(&step, StepLabel::flat("models"), &env, false)
             .await
             .expect("a mismatching destination must be downloaded again");
         assert_eq!(served.load(Ordering::SeqCst), 2);
@@ -4804,7 +4813,7 @@ mod tests {
         let (url, served) = serving_local_server(BODY);
         let step = transfer_step(&url, &dst, None);
 
-        let result = execute_step(&step, StepLabel::flat("models"), &BTreeMap::new())
+        let result = execute_step(&step, StepLabel::flat("models"), &BTreeMap::new(), false)
             .await
             .expect("the step decides");
 
@@ -4912,7 +4921,7 @@ mod tests {
         let step = clone_step(&src, &dst, "v1");
         let env = BTreeMap::new();
 
-        let first = execute_step(&step, StepLabel::flat("comfyui_install"), &env)
+        let first = execute_step(&step, StepLabel::flat("comfyui_install"), &env, false)
             .await
             .expect("the first apply clones");
         assert!(dst.join(".git").is_dir(), "the repository was cloned");
@@ -4920,7 +4929,7 @@ mod tests {
         let note = first.note.expect("an executed step reports its condition");
         assert!(note.starts_with("not done: "), "{note}");
 
-        let second = execute_step(&step, StepLabel::flat("comfyui_install"), &env)
+        let second = execute_step(&step, StepLabel::flat("comfyui_install"), &env, false)
             .await
             .expect("the second apply skips rather than failing");
         let note = second.note.expect("a skipped step carries a note");
@@ -4934,7 +4943,7 @@ mod tests {
         // And the same command *without* the condition is exactly the
         // failure this stage removes.
         let unguarded = PlannedStep::always(step.step.clone());
-        let failure = execute_step(&unguarded, StepLabel::flat("comfyui_install"), &env)
+        let failure = execute_step(&unguarded, StepLabel::flat("comfyui_install"), &env, false)
             .await
             .expect_err("an unguarded second clone fails");
         assert_eq!(failure.observed.status, 128, "git refused the destination");
@@ -4957,6 +4966,7 @@ mod tests {
             &clone_step(&src, &dst, "v1"),
             StepLabel::flat("comfyui_install"),
             &env,
+            false,
         )
         .await
         .expect("the first apply clones at v1");
@@ -4989,7 +4999,7 @@ mod tests {
             ]),
             at_v2.clone(),
         );
-        let ran = execute_step(&checkout, StepLabel::flat("custom_nodes"), &env)
+        let ran = execute_step(&checkout, StepLabel::flat("custom_nodes"), &env, false)
             .await
             .expect("the checkout runs");
         assert!(ran
@@ -5038,7 +5048,7 @@ mod tests {
             "answering the condition must not clone anything",
         );
 
-        execute_step(&step, StepLabel::flat("comfyui_install"), &no_env)
+        execute_step(&step, StepLabel::flat("comfyui_install"), &no_env, false)
             .await
             .expect("the apply clones");
 

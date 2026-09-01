@@ -973,6 +973,7 @@ dependencies = [
  "dsl-kit-macros",
  "dsl-kit-parse",
  "dsl-kit-schema",
+ "libc",
  "nix",
  "reqwest",
  "serde",

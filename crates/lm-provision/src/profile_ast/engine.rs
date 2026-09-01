@@ -72,6 +72,7 @@ pub fn create_profile_engine_collecting(
         mode,
         executed_log,
         None,
+        false,
     )?);
     let reports = ctx.reports_handle();
     let engine = Engine::new_with_ops(

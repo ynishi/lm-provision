@@ -196,6 +196,12 @@ pub struct ExecContext {
     /// started and owned by the apply driver, which holds it for the run and
     /// passes its URL in; this is only the injection target.
     pub egress_proxy_url: Option<String>,
+    /// Whether `sh.exec` subprocesses also run under the egress **hard pin**
+    /// (a seccomp `connect` supervisor, [`crate::egress::hardpin`]). True only
+    /// when the proxy is self-hosted on loopback: the pin refuses any connect
+    /// but loopback / DNS, catching a subprocess that ignores the proxy env.
+    /// Linux-only; the spawn path ignores it elsewhere.
+    pub egress_hard_pin: bool,
     /// `NodeId -> ProfileNode` payload lookup (dsl-kit does not pass leaf
     /// payloads into [`dsl_kit::Op::apply`]).
     pub payloads: Arc<HashMap<NodeId, ProfileNode>>,
@@ -238,6 +244,7 @@ impl ExecContext {
         mode: ExecMode,
         log: Arc<Mutex<Vec<String>>>,
         egress_proxy_url: Option<String>,
+        egress_hard_pin: bool,
     ) -> Result<Self, ExecError> {
         // Extract the five `Spec`-scoped declarations the context
         // needs, or empty defaults when `root` is not a `Spec` (the
@@ -311,6 +318,7 @@ impl ExecContext {
             http_policy,
             env_policy,
             egress_proxy_url,
+            egress_hard_pin,
             payloads,
             step_plan,
             log,

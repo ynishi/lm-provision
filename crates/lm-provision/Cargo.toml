@@ -30,6 +30,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 nix = { workspace = true }
+libc = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 dsl-kit = { workspace = true }

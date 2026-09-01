@@ -27,6 +27,8 @@ use std::collections::BTreeMap;
 
 use crate::profile_ast::ProfileNode;
 
+#[cfg(target_os = "linux")]
+pub mod hardpin;
 pub mod policy;
 pub mod proxy;
 pub mod sni;
@@ -70,6 +72,15 @@ impl EgressSupply {
             EgressSupply::SelfHosted(p) => p.url(),
             EgressSupply::External(url) => url.clone(),
         }
+    }
+
+    /// Whether the hard pin (a loopback-only seccomp `connect` supervisor)
+    /// applies. Only for a self-hosted proxy, which is on loopback: pinning
+    /// connects to loopback then forces every subprocess through it. An
+    /// external gateway is off-host, so a loopback pin would sever it — there
+    /// the gateway is the enforcement and the hard pin stays off.
+    pub fn hard_pin(&self) -> bool {
+        matches!(self, EgressSupply::SelfHosted(_))
     }
 }
 

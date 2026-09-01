@@ -93,3 +93,89 @@ async fn absent_sh_egress_leaves_the_subprocess_unrouted() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The hard layer reaches a real subprocess through apply: a declared
+/// `sh_egress` pins `connect(2)`, so a subprocess that ignores the proxy and
+/// dials an off-host address directly is refused at the syscall, while a
+/// loopback dial still succeeds. Linux-only (seccomp); proves the wiring from
+/// apply → sh_exec → hardpin::run_pinned, not just the module in isolation.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_sh_egress_hard_pin_blocks_a_direct_offhost_connect() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let dir = scratch_dir("hardpin");
+    let marker = dir.join("result.txt");
+    let _ = std::fs::remove_file(&marker);
+
+    // A loopback listener the subprocess is allowed to reach.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let _ = s.read(&mut [0u8; 1]);
+        }
+    });
+
+    // bash /dev/tcp: loopback dial (allowed) then a direct TEST-NET-3 dial
+    // (203.0.113.1, off-host → must be EPERM'd at the syscall). Uses bash so
+    // /dev/tcp is available; the profile pins egress, so apply starts the
+    // proxy and runs this under the connect supervisor.
+    let script = format!(
+        "exec 3<>/dev/tcp/127.0.0.1/{port} && echo LOOPBACK_OK >> {m}; \
+         (exec 4<>/dev/tcp/203.0.113.1/80) 2>/dev/null \
+           && echo EXTERNAL_LEAK >> {m} || echo EXTERNAL_BLOCKED >> {m}",
+        port = port,
+        m = marker.to_string_lossy(),
+    );
+    let profile = format!(
+        r#"{{
+  "type": "Spec",
+  "name": "egress-hardpin",
+  "version": "0.0.0",
+  "capabilities": ["sh.exec"],
+  "paths": [],
+  "http_allowlist": [],
+  "sh_egress": ["example.com"],
+  "phases": [
+    {{ "type": "ShExec", "argv": ["bash", "-c", {script}] }}
+  ]
+}}"#,
+        script = serde_json_string(&script),
+    );
+    let path = dir.join("profile.json");
+    std::fs::write(&path, profile).expect("write profile");
+
+    run_apply_ast(&path, false).await.expect("apply succeeds");
+
+    let seen = std::fs::read_to_string(&marker).expect("subprocess wrote the marker");
+    assert!(
+        seen.contains("LOOPBACK_OK"),
+        "loopback dial should be allowed through the pin: {seen:?}"
+    );
+    assert!(
+        seen.contains("EXTERNAL_BLOCKED"),
+        "a direct off-host dial must be denied at the syscall: {seen:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Minimal JSON string escaper for embedding a shell script as a JSON argv
+/// element — enough for the scripts here (quotes, backslashes, newlines).
+#[cfg(target_os = "linux")]
+fn serde_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}

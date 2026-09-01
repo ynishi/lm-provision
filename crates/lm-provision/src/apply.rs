@@ -192,7 +192,14 @@ pub async fn run_apply_ast_routed(
         ExecMode::DryRun => None,
     };
     let egress_proxy_url = egress_supply.as_ref().map(|supply| supply.url());
-    let ctx = Arc::new(ExecContext::from_root(&root, mode, log, egress_proxy_url)?);
+    let egress_hard_pin = egress_supply.as_ref().is_some_and(|supply| supply.hard_pin());
+    let ctx = Arc::new(ExecContext::from_root(
+        &root,
+        mode,
+        log,
+        egress_proxy_url,
+        egress_hard_pin,
+    )?);
     let reports = ctx.reports_handle();
     // One step plan, two readers: the AST declares the per-step nodes it
     // projects and the resolver looks a suspended one back up. Building
