@@ -1,13 +1,17 @@
 # 09. Apply report + audit redact + ledger schema
 
-Status: specified (the ledger is the Phase G build target).
+Status: specified (the ledger is the Phase G build target; revised
+2026-09-01 to add the acquisitions record — the second append-only
+file, one row per machine bought).
 Layer 4. Upstream deps: 08. MVP: Phase G.
 
 ## Purpose
 
-The apply report shape, the audit-log redaction rules, and the
-append-only ledger schema. Consumers: the ledger reader (audit, SLA,
-downstream analysis) and the push driver's collect step.
+The apply report shape, the audit-log redaction rules, and the two
+append-only row schemas: the ledger (what was applied) and the
+acquisitions record (what is running). Consumers: the ledger reader
+(audit, SLA, downstream analysis), the push driver's collect step, and
+the expiry sweep (chapter 08).
 
 ## Inputs
 
@@ -281,6 +285,81 @@ new undeclaring rows are byte-compatible in both directions.
   ledger owner's choice: the row schema and append-only semantics
   are the contract, the storage engine is internal.
 
+### Acquisitions record (append-only)
+
+The ledger says what was applied; it says nothing about what is
+*running*. `acquire` creates a billable machine and the only place its
+identifier landed was the run's stdout — close the terminal and the
+machine keeps billing with nothing on the host that knows it exists.
+The acquisitions record is the host's answer to "what did I buy and
+what have I not given back":
+
+```
+{
+  id           = string,   -- the identifier the service gave the machine
+  provider     = string,   -- which platform, as the operator named it
+                           -- (`runpod`, `vast`) — what a sweep looks the
+                           -- adapter up by
+  acquired_at  = string,   -- RFC 3339 UTC, driver clock
+  expires_at   = string,   -- RFC 3339 UTC: acquired_at + the lease
+  profile_hash = string,   -- 64-hex, chapter 03 hash of the profile the
+                           -- machine was acquired for
+  release      = [ string, ... ],  -- the argv that destroys it, `{id}`
+                           -- unsubstituted, verbatim as the adapter
+                           -- rendered it
+  released_at? = string,   -- RFC 3339 UTC, present on a correction row
+}
+```
+
+- **Append-only, and a release is a new row.** Giving a machine back
+  appends a second row naming the same `id` with `released_at` set; the
+  acquisition row is never touched. Same rule as §Ledger and the same
+  reason, sharper here: a file only ever appended to cannot lose an
+  earlier statement to a half-finished rewrite, and this is the file
+  whose whole job is to outlive the process that wrote it.
+- **`outstanding` = the machines still believed to be running**: the
+  rows whose `id` no row in the file — acquisition or correction — has
+  given a `released_at`, one entry per machine however many rows name
+  it. It is an id-join over the whole file rather than a flag on a row,
+  because a flag would have to be written by going back and mutating
+  the row that carries it. Reading the file to answer is the price of
+  never rewriting it, and the file holds one row per machine bought and
+  one per machine returned — a fleet's worth, not a log's worth.
+- A correction for an `id` the file never acquired retires nothing and
+  is not itself outstanding: that is the shape a release against a
+  machine acquired elsewhere leaves behind, and it is not an error.
+- `release` is **credential-free by construction**: every target here
+  takes its key from the environment or from its own CLI's key file,
+  never from the command line (chapter 06), so the recorded argv holds
+  a program name and its arguments and nothing to redact.
+- **The lease is recorded, not enforced by the writer.** The `acquire`
+  that stamped `expires_at` exits long before that moment passes; what
+  acts on it is chapter 08's `sweep`.
+- **This file is the audit trail, not the enforcement inventory.** What
+  it answers is who bought what, when, under which profile, and how it
+  was given back. What enforces the lease is the same `expires_at`
+  written onto the machine itself at create time (chapter 08
+  §Acquisitions and sweep: the `lmp-exp-` stamp), and the inventory a
+  sweep works from is the platform's own list. The distinction is the
+  whole point: a file can be lost, or written on a host that is not the
+  one sweeping, and correctness must not turn on that. A failed append
+  therefore costs the audit trail a row rather than costing a machine
+  its expiry.
+- **The record still has work of its own.** It is what a sweep run
+  without `--provider` reads, which is what reaches machines created
+  before the stamp existed; it is where a release argv is kept verbatim
+  for a machine whose profile has moved on; and it is the only place
+  that says which profile a machine was bought for.
+- **Absent from the platform's list means gone.** When a sweep did list
+  the platform an outstanding row names, and the row's `id` is not in
+  the answer, the machine is not running whatever the row says —
+  somebody released it by hand, or a correction was lost. A correction
+  is appended so the file says the bill has ended, and no release call
+  is spent on it. Only when that platform was actually listed: a
+  platform nobody asked supports no such conclusion.
+- Append failures are the ledger's error class with a sharper cost —
+  see §Error surface.
+
 ## Error surface
 
 - Ledger append failures (disk / transport): driver-side, retryable;
@@ -288,6 +367,17 @@ new undeclaring rows are byte-compatible in both directions.
   retained. An apply is not "unrecorded-successful" — drivers must
   treat append failure as an operational error to retry, not
   swallow.
+- Acquisitions append failures: the same class, and the same rule
+  against swallowing, with the failure mode the record exists to
+  prevent happening as it fails — a machine that is running with
+  nothing on the host that knows it. A failed append after a
+  successful acquire must put the machine's id and the append error
+  where the operator will see them, and must **not** be reported as a
+  failed acquire: the machine exists, and a caller told "nothing
+  happened" will not go looking for it. A failed correction after a
+  successful release is the mirror and is cheaper — the id stays
+  outstanding, and the next sweep spends one release call on a machine
+  that is already gone.
 - Report parse failure at collect time: chapter 08 error surface
   (transport corruption class).
 
@@ -308,6 +398,19 @@ new undeclaring rows are byte-compatible in both directions.
   additive form that stability permits: optional, absent-means-none,
   and never re-encoding a row that does not carry it.
 - Ledger physical encoding: **internal**.
+- Acquisitions row schema + append-only semantics: **stable**, on the
+  ledger's tier and for the ledger's reason — the control plane that
+  takes custody of the file outlives the driver that writes it. Growth
+  is the ledger's additive form: optional, absent-means-unknown, and
+  never re-encoding a row that does not carry the new field. Physical
+  encoding: **internal**.
+
+  The file's **role** was narrowed (2026-09-01) without its schema
+  changing: it is the audit trail, and the inventory a sweep enforces
+  from is the platform's own list (chapter 08 §Acquisitions and sweep).
+  Readers gain from that rather than lose — the rows still say
+  everything they said, and a lost row no longer means a machine that
+  nothing comes back for.
 
 ## Upstream references
 

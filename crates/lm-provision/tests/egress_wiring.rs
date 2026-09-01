@@ -61,7 +61,9 @@ async fn declared_sh_egress_injects_a_loopback_proxy_into_the_subprocess() {
     let _ = std::fs::remove_file(&marker);
     let profile = write_profile(&dir, r#"["example.com"]"#, &marker);
 
-    let report = run_apply_ast(&profile, false).await.expect("apply succeeds");
+    let report = run_apply_ast(&profile, false)
+        .await
+        .expect("apply succeeds");
     assert!(
         report.contains("\"ok\": true") || report.contains("\"ok\":true"),
         "apply report should be ok: {report}"
@@ -84,7 +86,9 @@ async fn absent_sh_egress_leaves_the_subprocess_unrouted() {
     let _ = std::fs::remove_file(&marker);
     let profile = write_profile(&dir, "[]", &marker);
 
-    run_apply_ast(&profile, false).await.expect("apply succeeds");
+    run_apply_ast(&profile, false)
+        .await
+        .expect("apply succeeds");
 
     let seen = std::fs::read_to_string(&marker).expect("subprocess wrote the marker");
     assert!(

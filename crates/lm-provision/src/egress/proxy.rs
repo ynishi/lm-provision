@@ -263,7 +263,11 @@ async fn handle(mut client: TcpStream, policy: Arc<EgressPolicy>) {
     let host = connect_host(target).to_string();
     if !policy.allows(&host) {
         tracing::warn!(host = %host, "egress: CONNECT denied (not in sh_egress)");
-        refuse(&mut client, "HTTP/1.1 403 Forbidden\r\nX-Egress: denied\r\n\r\n").await;
+        refuse(
+            &mut client,
+            "HTTP/1.1 403 Forbidden\r\nX-Egress: denied\r\n\r\n",
+        )
+        .await;
         return;
     }
     // Dial the host that was just allowlisted, not the raw target string

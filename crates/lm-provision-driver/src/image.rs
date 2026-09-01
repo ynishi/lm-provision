@@ -313,7 +313,10 @@ mod tests {
         )
         .expect("the spec's own example shape");
         assert!(url.starts_with("https://auth.docker.io/token?"), "{url}");
-        assert!(url.contains("scope=repository:library/ubuntu:pull"), "{url}");
+        assert!(
+            url.contains("scope=repository:library/ubuntu:pull"),
+            "{url}"
+        );
         assert!(url.contains("service=registry.docker.io"), "{url}");
 
         assert_eq!(

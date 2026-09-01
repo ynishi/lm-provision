@@ -23,7 +23,9 @@ fn every_index_pin_matches_the_profile_it_names() {
     let dir = profiles_dir();
     let index: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("index.json")).unwrap()).unwrap();
-    let entries = index["profiles"].as_array().expect("index.json: profiles array");
+    let entries = index["profiles"]
+        .as_array()
+        .expect("index.json: profiles array");
     assert!(!entries.is_empty(), "index.json lists no profiles");
 
     for entry in entries {

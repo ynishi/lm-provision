@@ -11,8 +11,10 @@ binary with zero dependencies on the target pod.
 | Crate | What it is |
 |---|---|
 | [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]` / `fetch` / `pin`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. Fragment imports (spec 11): hash-pinned local + https fragment reuse with an XDG-cached expansion pass, plus a `pin` authoring subcommand that rewrites `name@version` imports against an `index.json`. |
-| [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push driver. `apply`: one-shot session over SSH — ensure-binary (idempotent SHA-256 push of the musl artifact), place profile, apply, collect report / transcript, append to the apply ledger. `acquire` / `release` / `check`: obtain a machine meeting the profile's declared requirements, give it back, or judge one that already exists. |
+| [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push driver. `apply`: one-shot session over SSH — ensure-binary (idempotent SHA-256 push of the musl artifact), place profile, apply, collect report / transcript, append to the apply ledger. `acquire` / `release` / `sweep` / `check`: obtain a machine meeting the profile's declared requirements (stamping its lease onto the machine's own name), give it back, give back every machine whose lease has run out — from the provider's own list with `--provider`, or from the acquisitions record — or judge one that already exists. |
 | [`lm-provision-mcp`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-mcp) | MCP server exposing `lm_validate` / `lm_hash` / `lm_plan` and apply-ledger inspection as MCP tools. |
+| [`lm-provision-protocol`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-protocol) | The wire types shared across the license boundary: the append-only apply-ledger row schema (`LedgerRow` / `ArtifactRow`) and the acquisitions record (`AcquisitionRow` — the audit trail of what was bought and what came back), both in JSON Lines encoding — appended by the driver, taken custody of by the host. Neutral and permissive so both sides may depend on it. |
+| [`lm-provision-host`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-host) | The control plane, **AGPL-3.0-or-later**, `publish = false`. The TTL-enforcement daemon: it runs `lm-provision-driver sweep` every interval — as a child process, not as a linked library, so the AGPL side depends on nothing permissive — and answers one health endpoint saying whether the last sweep worked and what it did. Enforcing is its default (`--dry-run false`, the opposite of the CLI's): installing it *is* the consent to release expired machines. Ledger custody is next. |
 
 ## Highlights
 
@@ -128,9 +130,26 @@ specs; the specs are the normative surface.
 
 ## License
 
-Dual-licensed under either of:
+The engine — `lm-provision`, `lm-provision-driver`, `lm-provision-mcp`
+and `lm-provision-protocol` — is dual-licensed under either of:
 
 - MIT License ([`LICENSE-MIT`](https://github.com/ynishi/lm-provision/blob/main/LICENSE-MIT))
 - Apache License, Version 2.0 ([`LICENSE-APACHE`](https://github.com/ynishi/lm-provision/blob/main/LICENSE-APACHE))
 
-at your option.
+at your option, **and will remain so permanently**. Provisioning a pod
+is what these crates do, and nothing about how someone runs a control
+plane changes the terms on which they may do that.
+
+`lm-provision-host`, and any control-plane crate added beside it later,
+is **AGPL-3.0-or-later**: it is a service one can host for others, and
+the AGPL is the license that keeps a hosted modification available to
+the people using it.
+
+The two sides still share a vocabulary — the ledger rows the driver
+writes and the host reads. Those types live in
+`lm-provision-protocol`, which stays permissive precisely so that
+depending on it commits no one to anything. The direction that would
+break the promise, an engine crate depending on the host, is empty and
+machine-checked: `no_permissive_crate_depends_on_the_agpl_host` in the
+host crate reads the four permissive manifests and fails if any of
+them names it.

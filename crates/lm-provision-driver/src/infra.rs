@@ -107,11 +107,44 @@ pub trait Infra {
     /// has to take this and execute it deliberately. It is also what
     /// makes the shape testable without a machine, and what lets a
     /// `plan` show an operator the acquisition before it happens.
+    ///
+    /// `expires_at` is the lease the machine is being bought under, and
+    /// the adapter writes it **onto the machine** as
+    /// [`expiry_stamp`] in whatever field the platform lets an operator
+    /// name a resource. That is what makes [`Fleet`] enforcement
+    /// possible: the sweeper reads the expiry off the thing it is about
+    /// to kill rather than off a file that may have been lost. It is a
+    /// parameter of the request rather than something stamped onto the
+    /// result afterwards because the request is built in one pass — a
+    /// later mutation would have to parse the body back and could
+    /// silently do nothing, which is precisely the failure (a machine
+    /// running without an expiry on it) this exists to prevent.
+    ///
+    /// `None` when there is no lease to write: a caller that only wants
+    /// the release template out of the rendering is not buying anything.
     fn acquisition(
         &self,
         required: &Requirements,
         provider: &BTreeMap<String, String>,
+        expires_at: Option<jiff::Timestamp>,
     ) -> Result<Acquisition, AcquisitionError>;
+
+    /// How to ask this target what it is running, and how to read the
+    /// answer — the enumerate-and-kill surface a sweeper works from.
+    ///
+    /// **This is the inventory, and the acquisitions record is not.**
+    /// A record can be lost, moved, or written on one host while the
+    /// machine is billed to another; the platform's own list cannot be,
+    /// because the list *is* the fleet. Every established reaper works
+    /// this way round (Netflix's Janitor Monkey, `aws-nuke`,
+    /// `cloud-nuke`, the AWS Instance Scheduler, the Kubernetes TTL
+    /// controllers): enumerate from the API, read the policy off the
+    /// resource's own tag or label, act. Anything holding a credential
+    /// can then enforce leases with no state to keep in step.
+    ///
+    /// `None` for a target that cannot be asked — which is a real
+    /// answer, not a gap: nothing is acquired on it either.
+    fn fleet(&self) -> Option<Fleet>;
 
     /// Read what [`Acquisition::inspect`] returned into the state
     /// [`lm_provision::machine::observe`] judges.
@@ -229,6 +262,202 @@ pub struct Acquisition {
     pub inspect: Vec<String>,
     /// How to destroy it, with the same substitution.
     pub release: Vec<String>,
+}
+
+/// How to enumerate the machines a target is running for this account,
+/// and how to destroy one — [`Infra::fleet`]'s answer.
+///
+/// Argv plus the two field names the rows are read by, in the same
+/// shape [`Acquisition`] takes, and for the same reason: the platform's
+/// own CLI already speaks its API, and the useful thing this repo adds
+/// is the requirements, not a second REST client tracking somebody
+/// else's schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fleet {
+    /// What to run to list this account's machines. Prints JSON.
+    pub list: Vec<String>,
+    /// The key each listed row names the machine under.
+    pub id: &'static str,
+    /// The key each row carries its operator-set text under — `name` on
+    /// one platform, `label` on another. Where [`expiry_stamp`] rides.
+    pub stamp: &'static str,
+    /// How to destroy one, `{id}` unsubstituted — the same template
+    /// [`Acquisition::release`] carries, from the same source, so a
+    /// machine released off the record and one released off the list
+    /// are released by the same command.
+    pub release: Vec<String>,
+}
+
+/// One machine a target says it is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Machine {
+    /// The identifier the platform lists it under — what a release
+    /// substitutes into [`Fleet::release`].
+    pub id: String,
+    /// The operator-set text on it, when it carries any. `None` is a
+    /// machine nothing named: it may be somebody else's work, and
+    /// [`expiry_of`] refuses to read a lease into silence.
+    pub name: Option<String>,
+}
+
+/// The prefix that marks a name as this tool's lease stamp.
+///
+/// Fixed, and matched exactly: a machine named anything else was not
+/// stamped by this tool, and a sweeper that guessed would be deleting
+/// somebody's work on the strength of a naming coincidence.
+pub const EXPIRY_PREFIX: &str = "lmp-exp-";
+
+/// The lease, written the way it can ride on a machine's own name.
+///
+/// [`EXPIRY_PREFIX`] then RFC 3339 UTC with the separators taken out:
+/// `lmp-exp-20260902T063000Z`. Colon-free because these land in fields
+/// each platform constrains its own way, and a colon is the character
+/// most likely to be one of the ones they refuse.
+///
+/// **Second granularity**, so this is the recorded `expires_at`
+/// truncated rather than reproduced: the record keeps whatever
+/// precision the clock gave it, and the machine carries the second the
+/// lease ends. A sweep can therefore find a machine due up to a second
+/// before the record says so, which is the harmless direction — the
+/// lease was bought in hours.
+pub fn expiry_stamp(expires_at: jiff::Timestamp) -> String {
+    format!("{EXPIRY_PREFIX}{}", expires_at.strftime("%Y%m%dT%H%M%SZ"))
+}
+
+/// The lease [`expiry_stamp`] wrote, read back — or `None` for anything
+/// else.
+///
+/// Tolerant of nothing: the whole field must be the prefix and a
+/// well-formed compact timestamp. A machine whose name this cannot read
+/// is *unknown*, which is a thing to report and never a thing to
+/// delete.
+///
+/// The fixed-width form is rebuilt into ordinary RFC 3339 and handed to
+/// the same parser the record's timestamps go through, rather than
+/// matched by a format string: the digits run together here, so what
+/// rejects `lmp-exp-20261301T000000Z` is a real date parse and not a
+/// length check.
+pub fn expiry_of(name: &str) -> Option<jiff::Timestamp> {
+    let compact = name.strip_prefix(EXPIRY_PREFIX)?.strip_suffix('Z')?;
+    let (date, time) = compact.split_once('T')?;
+    if date.len() != 8 || time.len() != 6 {
+        return None;
+    }
+    if !date
+        .bytes()
+        .chain(time.bytes())
+        .all(|it| it.is_ascii_digit())
+    {
+        return None;
+    }
+    format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &date[..4],
+        &date[4..6],
+        &date[6..],
+        &time[..2],
+        &time[2..4],
+        &time[4..],
+    )
+    .parse()
+    .ok()
+}
+
+/// The machines in what a [`Fleet::list`] printed — or why the
+/// document cannot be read as a fleet.
+///
+/// **The array is found rather than assumed at the root.** One CLI
+/// prints the rows as the whole document and another wraps them in an
+/// object under a name of its own choosing, and which of those a
+/// sweeper is looking at is not something the enforcement should turn
+/// on. When the wrapper holds several arrays, the rows are the one
+/// whose entries carry the [`Fleet::id`] key — taking the *first*
+/// array would let an empty sibling (`"errors": []` sorts before
+/// `"pods"`) shadow the fleet entirely.
+///
+/// **A listing this cannot read is an error, never an empty fleet.**
+/// The caller treats "listed, and absent from the list" as proof a
+/// recorded machine is gone and retires its row (see the sweep's
+/// bookkeeping) — so a shape change that silently read as zero
+/// machines would retire the whole record while every machine on it
+/// kept billing. Only a document whose rows are genuinely empty is an
+/// empty account. A single unreadable row among readable ones is still
+/// skipped: nothing could be released from it, and inventing an
+/// identifier for it would be worse than leaving it out.
+pub fn machines(listed: &serde_json::Value, fleet: &Fleet) -> Result<Vec<Machine>, String> {
+    let rows = match listed {
+        serde_json::Value::Array(rows) => rows,
+        serde_json::Value::Object(fields) => {
+            let arrays: Vec<&Vec<serde_json::Value>> =
+                fields.values().filter_map(|it| it.as_array()).collect();
+            match arrays
+                .iter()
+                .copied()
+                .find(|rows| rows.iter().any(|row| row.get(fleet.id).is_some()))
+            {
+                Some(rows) => rows,
+                // Every array is empty: an empty account, whichever of
+                // them is the rows.
+                None if !arrays.is_empty() && arrays.iter().all(|it| it.is_empty()) => {
+                    return Ok(Vec::new())
+                }
+                None => {
+                    return Err(format!(
+                        "no field in the listing holds rows carrying {:?}",
+                        fleet.id
+                    ))
+                }
+            }
+        }
+        _ => return Err("the listing is neither an array nor an object".to_string()),
+    };
+    let read: Vec<Machine> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(Machine {
+                id: json_id(row, fleet.id)?,
+                name: row
+                    .get(fleet.stamp)
+                    .and_then(|it| it.as_str())
+                    .filter(|it| !it.is_empty())
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    if read.is_empty() && !rows.is_empty() {
+        return Err(format!(
+            "none of the {} listed rows carries a readable {:?}",
+            rows.len(),
+            fleet.id
+        ));
+    }
+    Ok(read)
+}
+
+/// What a target is running, and what it said while being asked.
+#[derive(Debug, Clone)]
+pub struct Listing {
+    /// The machines, as [`machines`] read them.
+    pub machines: Vec<Machine>,
+    /// The platform CLI's own stderr, for the caller to relay under
+    /// that CLI's name — this module never writes to a stream.
+    pub said: Vec<u8>,
+}
+
+/// Ask a target what it is running.
+///
+/// A read, and the only one here that needs the account's credential
+/// without spending anything: the key buys the question, not an
+/// answer that costs money.
+pub fn list(fleet: &Fleet) -> Result<Listing, ExecuteError> {
+    let output = run_output(&fleet.list, None)?;
+    let command = fleet.list.join(" ");
+    let listed = payload(&String::from_utf8_lossy(&output.stdout), &command)?;
+    Ok(Listing {
+        machines: machines(&listed, fleet)
+            .map_err(|detail| ExecuteError::Unreadable { command, detail })?,
+        said: output.stderr,
+    })
 }
 
 /// An acquisition that cannot be rendered.
@@ -486,6 +715,7 @@ impl Infra for RunPodAdapter {
         &self,
         required: &Requirements,
         provider: &BTreeMap<String, String>,
+        expires_at: Option<jiff::Timestamp>,
     ) -> Result<Acquisition, AcquisitionError> {
         // Every answer this adapter would give is taken here and handed
         // to the builder, so the builder cannot reach a requirement
@@ -498,6 +728,7 @@ impl Infra for RunPodAdapter {
             self.render(required),
             required.gpu.as_ref().map(|it| self.gpu_answer(it)),
             required.disk.as_ref().map(|it| self.disk_answer(it)),
+            expires_at,
         )?;
 
         Ok(Acquisition {
@@ -518,12 +749,29 @@ impl Infra for RunPodAdapter {
                 "get-pod".into(),
                 "{id}".into(),
             ],
-            release: vec![
+            release: runpod_release(),
+        })
+    }
+
+    /// The service lists this account's pods, and every pod carries the
+    /// `name` the create call set — which is where `runpod_body` writes
+    /// the lease.
+    fn fleet(&self) -> Option<Fleet> {
+        Some(Fleet {
+            list: vec![
                 "runpod-cli".into(),
                 "pods".into(),
-                "delete-pod".into(),
-                "{id}".into(),
+                "list-pods".into(),
+                // JSON is this CLI's default output; asked for anyway,
+                // because a sweeper that depends on a default is one
+                // release of somebody else's tool away from parsing a
+                // table.
+                "-o".into(),
+                "json".into(),
             ],
+            id: "id",
+            stamp: "name",
+            release: runpod_release(),
         })
     }
 
@@ -664,6 +912,23 @@ impl Infra for RunPodAdapter {
     }
 }
 
+/// What destroys one pod, `{id}` unsubstituted.
+///
+/// One spelling, read by both halves: the acquisition records it so a
+/// machine can be given back from what was written down, and the fleet
+/// carries it so a machine the platform lists can be given back with
+/// nothing written down at all. Two copies would be two commands that
+/// could drift, and the one that drifted would be found by a machine
+/// that would not die.
+fn runpod_release() -> Vec<String> {
+    vec![
+        "runpod-cli".into(),
+        "pods".into(),
+        "delete-pod".into(),
+        "{id}".into(),
+    ]
+}
+
 /// The request body for [`RunPodAdapter::acquisition`], built from the
 /// requirements *and the adapter's answers to them*.
 ///
@@ -684,6 +949,7 @@ fn runpod_body(
     ports: Vec<String>,
     gpu_answer: Option<Answer>,
     disk_answer: Option<Answer>,
+    expires_at: Option<jiff::Timestamp>,
 ) -> Result<String, AcquisitionError> {
     // The image comes from the provider slot, not from a requirement:
     // an image name is this platform's vocabulary (a bare-VM service
@@ -761,6 +1027,19 @@ fn runpod_body(
         if let Some(field) = key.strip_prefix("runpod.") {
             body.insert(field.to_string(), serde_json::json!(value));
         }
+    }
+
+    // The lease, on the machine itself — and after the passthrough
+    // above rather than before it, which is the one place in this body
+    // where the profile does not get the last word. `name` is a free
+    // string the service does not require to be unique [documented:
+    // docs.runpod.io/api-reference, POST /pods, `name`], so a profile
+    // setting `provider.runpod.name` would otherwise take the machine
+    // out of the sweeper's reach — it would list as *unknown*, which is
+    // reported and never released, and a machine that cannot expire is
+    // the accident this whole mechanism exists to remove.
+    if let Some(expires_at) = expires_at {
+        body.insert("name".into(), serde_json::json!(expiry_stamp(expires_at)));
     }
 
     Ok(serde_json::Value::Object(body).to_string())
@@ -883,12 +1162,21 @@ impl Infra for ContainerAdapter {
         &self,
         _required: &Requirements,
         _provider: &BTreeMap<String, String>,
+        _expires_at: Option<jiff::Timestamp>,
     ) -> Result<Acquisition, AcquisitionError> {
         Err(AcquisitionError::Unsupported {
             target: "container",
             reason: "no transport reaches a container yet (spec 08 names `docker exec` \
                      as an extension point; it is not implemented)",
         })
+    }
+
+    /// Nothing to enumerate. This adapter acquires nothing, so a
+    /// sweeper asking it what is running would be asking about
+    /// containers somebody else started — and answering would put them
+    /// in front of a release path.
+    fn fleet(&self) -> Option<Fleet> {
+        None
     }
 
     /// No acquisition, so no image to preflight for one.
@@ -1028,6 +1316,7 @@ impl Infra for VastAdapter {
         &self,
         required: &Requirements,
         provider: &BTreeMap<String, String>,
+        expires_at: Option<jiff::Timestamp>,
     ) -> Result<Acquisition, AcquisitionError> {
         vast_acquisition(
             required,
@@ -1035,7 +1324,30 @@ impl Infra for VastAdapter {
             self.render(required),
             required.gpu.as_ref().map(|it| self.gpu_answer(it)),
             required.disk.as_ref().map(|it| self.disk_answer(it)),
+            expires_at,
         )
+    }
+
+    /// The marketplace lists this account's instances, and each row
+    /// carries the `label` the create call set — the field this
+    /// platform gives an operator to write on an instance, and so where
+    /// `vast_acquisition` puts the lease.
+    ///
+    /// The rows name the machine `id`, not the `new_contract` a create
+    /// answers with; both are the instance, but only one of them is
+    /// what a listing prints.
+    fn fleet(&self) -> Option<Fleet> {
+        Some(Fleet {
+            list: vec![
+                "vastai".into(),
+                "show".into(),
+                "instances".into(),
+                "--raw".into(),
+            ],
+            id: "id",
+            stamp: "label",
+            release: vast_release(),
+        })
     }
 
     /// The key `vast_acquisition` requires — and the preflight that
@@ -1146,8 +1458,7 @@ impl Infra for VastAdapter {
             inspected.get("ports").and_then(|it| it.as_object()),
         ) {
             for (key, bindings) in map {
-                let Some(port) = key.split('/').next().and_then(|it| it.parse::<u16>().ok())
-                else {
+                let Some(port) = key.split('/').next().and_then(|it| it.parse::<u16>().ok()) else {
                     continue;
                 };
                 let external = bindings
@@ -1175,6 +1486,7 @@ fn vast_acquisition(
     ports: Vec<String>,
     gpu_answer: Option<Answer>,
     disk_answer: Option<Answer>,
+    expires_at: Option<jiff::Timestamp>,
 ) -> Result<Acquisition, AcquisitionError> {
     // The image is the platform's own key, as on every target that
     // takes one (see `runpod_body`).
@@ -1234,6 +1546,15 @@ fn vast_acquisition(
         create.push("--env".to_string());
         create.push(ports.join(" "));
     }
+    // The lease, on the instance itself: `--label` is the field this
+    // platform gives an operator to write on one [documented:
+    // docs.vast.ai, `create instance --label LABEL`], and a listing
+    // prints it back — which is what lets a sweeper holding only this
+    // account's key find the machine and read its expiry off it.
+    if let Some(expires_at) = expires_at {
+        create.push("--label".to_string());
+        create.push(expiry_stamp(expires_at));
+    }
     create.push("--raw".to_string());
 
     Ok(Acquisition {
@@ -1258,21 +1579,27 @@ fn vast_acquisition(
             "{id}".to_string(),
             "--raw".to_string(),
         ],
-        release: vec![
-            "vastai".to_string(),
-            "destroy".to_string(),
-            "instance".to_string(),
-            "{id}".to_string(),
-            // Without this the CLI asks `[y/N]` on a terminal nobody is
-            // at, reads EOF as "no", prints `Aborted.` — **and exits
-            // zero**, so the driver reported a machine released while
-            // it ran on billing [measured: 2026-08-30, instance
-            // 49227715 survived its own successful-looking release and
-            // was destroyed by hand].
-            "--yes".to_string(),
-            "--raw".to_string(),
-        ],
+        release: vast_release(),
     })
+}
+
+/// What destroys one instance, `{id}` unsubstituted — one spelling for
+/// the record and for the listing, as `runpod_release` is.
+fn vast_release() -> Vec<String> {
+    vec![
+        "vastai".to_string(),
+        "destroy".to_string(),
+        "instance".to_string(),
+        "{id}".to_string(),
+        // Without this the CLI asks `[y/N]` on a terminal nobody is
+        // at, reads EOF as "no", prints `Aborted.` — **and exits
+        // zero**, so the driver reported a machine released while
+        // it ran on billing [measured: 2026-08-30, instance
+        // 49227715 survived its own successful-looking release and
+        // was destroyed by hand].
+        "--yes".to_string(),
+        "--raw".to_string(),
+    ]
 }
 
 /// A machine that exists because [`acquire`] made it.
@@ -1400,12 +1727,11 @@ pub fn acquire(mut acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
         // The first row of a query whose argv already sorted and
         // filtered — see `Acquisition::discover` for why the policy
         // lives in the query rather than here.
-        let offer = found
-            .as_array()
-            .and_then(|it| it.first())
-            .ok_or_else(|| ExecuteError::NoCandidates {
+        let offer = found.as_array().and_then(|it| it.first()).ok_or_else(|| {
+            ExecuteError::NoCandidates {
                 command: discover.join(" "),
-            })?;
+            }
+        })?;
         let offer_id = json_id(offer, "id").ok_or_else(|| ExecuteError::Unreadable {
             command: discover.join(" "),
             detail: format!("the first offer has no readable id: {offer}"),
@@ -1417,12 +1743,11 @@ pub fn acquire(mut acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
             .collect();
     }
     let created = run_json(&acquisition.create, acquisition.body.as_deref())?;
-    let id = json_id(&created, acquisition.created_id_key).ok_or_else(|| {
-        ExecuteError::Anonymous {
+    let id =
+        json_id(&created, acquisition.created_id_key).ok_or_else(|| ExecuteError::Anonymous {
             command: acquisition.create.join(" "),
             body: created.to_string(),
-        }
-    })?;
+        })?;
     Ok(Acquired {
         id,
         inspected: created.clone(),
@@ -1477,8 +1802,13 @@ fn substitute(argv: &[String], id: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-/// Run `argv`, optionally appending `body` as its last argument.
-fn run(argv: &[String], body: Option<&str>) -> Result<String, ExecuteError> {
+/// Run `argv`, optionally appending `body` as its last argument, and
+/// hand back everything it produced.
+///
+/// A non-zero exit is the error: what a caller does with the streams
+/// differs (one wants the stdout parsed, another relays the stderr
+/// under the child's name), and what a failure means does not.
+fn run_output(argv: &[String], body: Option<&str>) -> Result<std::process::Output, ExecuteError> {
     let Some((program, rest)) = argv.split_first() else {
         return Err(ExecuteError::Unreadable {
             command: String::new(),
@@ -1506,20 +1836,24 @@ fn run(argv: &[String], body: Option<&str>) -> Result<String, ExecuteError> {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output)
 }
 
-/// [`run`], reading the output as JSON.
-fn run_json(argv: &[String], body: Option<&str>) -> Result<serde_json::Value, ExecuteError> {
-    let stdout = run(argv, body)?;
-    // The CLI prints its own progress before the payload, so the
-    // payload is found rather than assumed to start at byte zero — and
-    // it may be an array (a discovery's offer list) as well as an
-    // object. Both starts are *tried* rather than the first one taken:
-    // a progress line is free to contain a bracket (`[INFO] …`), and
-    // stopping there would feed the progress text to the parser.
-    // Whichever start yields a document that parses to the end is the
-    // payload.
+/// [`run_output`], keeping only what it printed.
+fn run(argv: &[String], body: Option<&str>) -> Result<String, ExecuteError> {
+    Ok(String::from_utf8_lossy(&run_output(argv, body)?.stdout).into_owned())
+}
+
+/// The JSON document in what a CLI printed.
+///
+/// The CLI prints its own progress before the payload, so the payload
+/// is found rather than assumed to start at byte zero — and it may be
+/// an array (a discovery's offer list, a fleet listing) as well as an
+/// object. Both starts are *tried* rather than the first one taken: a
+/// progress line is free to contain a bracket (`[INFO] …`), and
+/// stopping there would feed the progress text to the parser. Whichever
+/// start yields a document that parses to the end is the payload.
+fn payload(stdout: &str, command: &str) -> Result<serde_json::Value, ExecuteError> {
     let mut detail = "no JSON payload in the output".to_string();
     for start in [stdout.find('{'), stdout.find('[')].into_iter().flatten() {
         match serde_json::from_str(&stdout[start..]) {
@@ -1528,9 +1862,14 @@ fn run_json(argv: &[String], body: Option<&str>) -> Result<serde_json::Value, Ex
         }
     }
     Err(ExecuteError::Unreadable {
-        command: argv.join(" "),
+        command: command.to_string(),
         detail,
     })
+}
+
+/// [`run`], reading the output as JSON.
+fn run_json(argv: &[String], body: Option<&str>) -> Result<serde_json::Value, ExecuteError> {
+    payload(&run(argv, body)?, &argv.join(" "))
 }
 
 /// The `provider` keys addressed to somebody else.
@@ -1831,7 +2170,7 @@ mod tests {
     #[test]
     fn the_requirements_become_the_services_own_request() {
         let acquisition = RunPodAdapter
-            .acquisition(&full_requirements(), &image_provider())
+            .acquisition(&full_requirements(), &image_provider(), None)
             .expect("an image was declared");
         let body: serde_json::Value =
             serde_json::from_str(acquisition.body.as_deref().expect("create takes a body"))
@@ -1883,7 +2222,7 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         let acquisition = RunPodAdapter
-            .acquisition(&full_requirements(), &provider)
+            .acquisition(&full_requirements(), &provider, None)
             .unwrap();
         let body: serde_json::Value =
             serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
@@ -1915,7 +2254,7 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         let acquisition = RunPodAdapter
-            .acquisition(&full_requirements(), &provider)
+            .acquisition(&full_requirements(), &provider, None)
             .expect("an image was declared");
         let body: serde_json::Value =
             serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
@@ -1949,7 +2288,7 @@ mod tests {
         .unwrap();
 
         let err = RunPodAdapter
-            .acquisition(&beyond, &image_provider())
+            .acquisition(&beyond, &image_provider(), None)
             .expect_err("no catalogued device carries 512 GB");
         let rendered = err.to_string();
         assert!(rendered.contains("512"), "{rendered}");
@@ -1966,14 +2305,10 @@ mod tests {
     /// service's own default applies instead.
     #[test]
     fn declaring_no_ports_asks_for_nothing_rather_than_for_none() {
-        let no_ports = Requirements::from_slots(
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let no_ports =
+            Requirements::from_slots(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new()).unwrap();
         let acquisition = RunPodAdapter
-            .acquisition(&no_ports, &image_provider())
+            .acquisition(&no_ports, &image_provider(), None)
             .unwrap();
         let body: serde_json::Value =
             serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
@@ -2012,6 +2347,7 @@ mod tests {
             Some(Answer::Unmet {
                 reason: "no volume that large".into(),
             }),
+            None,
         )
         .expect_err("an answer of Unmet is not a request");
         assert!(err.to_string().contains("no volume that large"));
@@ -2024,6 +2360,7 @@ mod tests {
             Vec::new(),
             None,
             Some(Answer::Met { using: Vec::new() }),
+            None,
         )
         .unwrap();
         assert!(body.contains("\"volumeInGb\":4096"), "{body}");
@@ -2043,7 +2380,7 @@ mod tests {
         )
         .unwrap();
         let acquisition = RunPodAdapter
-            .acquisition(&cpu_only, &image_provider())
+            .acquisition(&cpu_only, &image_provider(), None)
             .unwrap();
         let body: serde_json::Value =
             serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
@@ -2059,10 +2396,9 @@ mod tests {
     #[test]
     fn creating_without_an_image_is_refused() {
         let no_image =
-            Requirements::from_slots(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
-                .unwrap();
+            Requirements::from_slots(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert_eq!(
-            RunPodAdapter.acquisition(&no_image, &BTreeMap::new()),
+            RunPodAdapter.acquisition(&no_image, &BTreeMap::new(), None),
             Err(AcquisitionError::Incomplete {
                 target: "runpod",
                 missing: "provider.runpod.imageName"
@@ -2076,7 +2412,7 @@ mod tests {
     #[test]
     fn an_acquisition_says_how_to_give_the_machine_back() {
         let acquisition = RunPodAdapter
-            .acquisition(&full_requirements(), &image_provider())
+            .acquisition(&full_requirements(), &image_provider(), None)
             .unwrap();
         assert!(acquisition.release.contains(&"delete-pod".to_string()));
         assert!(acquisition.release.contains(&"{id}".to_string()));
@@ -2088,7 +2424,7 @@ mod tests {
     #[test]
     fn a_container_says_it_cannot_acquire_rather_than_pretending() {
         let err = ContainerAdapter
-            .acquisition(&full_requirements(), &image_provider())
+            .acquisition(&full_requirements(), &image_provider(), None)
             .expect_err("no transport reaches a container");
         let rendered = err.to_string();
         assert!(rendered.contains("docker exec"), "{rendered}");
@@ -2474,7 +2810,7 @@ mod tests {
     #[test]
     fn a_marketplace_acquisition_discovers_before_it_creates() {
         let acquisition = VastAdapter
-            .acquisition(&marketplace_requirements(), &marketplace_provider())
+            .acquisition(&marketplace_requirements(), &marketplace_provider(), None)
             .expect("an image was declared");
 
         let discover = acquisition.discover.as_ref().expect("offers come first");
@@ -2498,7 +2834,9 @@ mod tests {
 
         assert!(acquisition.create.contains(&"{offer_id}".to_string()));
         assert!(acquisition.create.contains(&"--ssh".to_string()));
-        assert!(acquisition.create.contains(&"pytorch/pytorch:2.4.0".to_string()));
+        assert!(acquisition
+            .create
+            .contains(&"pytorch/pytorch:2.4.0".to_string()));
         assert!(acquisition.create.contains(&"-p 8000:8000".to_string()));
         assert_eq!(acquisition.created_id_key, "new_contract");
         assert!(acquisition.release.contains(&"destroy".to_string()));
@@ -2517,7 +2855,7 @@ mod tests {
     #[test]
     fn the_marketplace_refuses_to_create_without_an_image_too() {
         assert_eq!(
-            VastAdapter.acquisition(&marketplace_requirements(), &BTreeMap::new()),
+            VastAdapter.acquisition(&marketplace_requirements(), &BTreeMap::new(), None),
             Err(AcquisitionError::Incomplete {
                 target: "vast",
                 missing: "provider.vast.image"
@@ -2607,10 +2945,7 @@ mod tests {
             release: vec!["true".into()],
         })
         .expect_err("nothing to create from");
-        assert!(
-            matches!(err, ExecuteError::NoCandidates { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, ExecuteError::NoCandidates { .. }), "{err:?}");
     }
 
     /// The description names the device's memory directly — the figure
@@ -2693,5 +3028,284 @@ mod tests {
         )
         .unwrap();
         assert!(lm_provision::machine::admit(&required, &VastAdapter.capability()).is_err());
+    }
+
+    fn at(rfc3339: &str) -> jiff::Timestamp {
+        rfc3339.parse().expect("a fixed instant")
+    }
+
+    /// **The lease survives the round trip through a platform's name
+    /// field**, which is the whole basis of reading expiry off the
+    /// machine instead of out of a file.
+    #[test]
+    fn a_lease_written_onto_a_machine_reads_back_as_the_same_instant() {
+        let expires_at = at("2026-09-02T06:30:00Z");
+        let stamp = expiry_stamp(expires_at);
+        assert_eq!(stamp, "lmp-exp-20260902T063000Z");
+        assert!(
+            !stamp.contains(':'),
+            "colon-free: these land in fields each platform constrains its own way"
+        );
+        assert_eq!(expiry_of(&stamp), Some(expires_at));
+
+        // Sub-second precision is dropped, and only that: the record
+        // keeps what the clock gave it, the machine carries the second
+        // the lease ends.
+        assert_eq!(
+            expiry_of(&expiry_stamp(at("2026-09-02T06:30:00.123456789Z"))),
+            Some(expires_at)
+        );
+    }
+
+    /// **Anything else is not a lease.** A machine this cannot read is
+    /// reported as unknown and never released, so every string here is
+    /// the difference between "leave it alone" and "delete it".
+    #[test]
+    fn nothing_but_the_stamp_reads_as_a_lease() {
+        for not_a_lease in [
+            "",
+            "comfyui-box",
+            "lmp-exp-",
+            "lmp-exp-20260902T063000",      // no zone marker
+            "lmp-exp-2026-09-02T06:30:00Z", // the separators are the point
+            "lmp-exp-20261301T000000Z",     // month 13
+            "lmp-exp-20260932T000000Z",     // day 32
+            "lmp-exp-2026090aT063000Z",     // not digits
+            "lmp-exp-20260902T063000Z-old", // trailing anything
+            " lmp-exp-20260902T063000Z",    // leading anything
+            "exp-20260902T063000Z",         // another tool's prefix
+            "lmp-exp-20260902T0630000Z",    // one digit too many
+        ] {
+            assert_eq!(
+                expiry_of(not_a_lease),
+                None,
+                "{not_a_lease:?} would be read as a lease"
+            );
+        }
+    }
+
+    /// The lease reaches the machine in each platform's own field: a
+    /// `name` in the pod service's request body, a `--label` in the
+    /// marketplace's argv.
+    #[test]
+    fn each_platform_carries_the_lease_in_its_own_field() {
+        let expires_at = at("2026-09-02T06:30:00Z");
+        let stamp = expiry_stamp(expires_at);
+
+        let pod = RunPodAdapter
+            .acquisition(&full_requirements(), &image_provider(), Some(expires_at))
+            .expect("an image was declared");
+        let body: serde_json::Value =
+            serde_json::from_str(pod.body.as_deref().expect("this target takes a body")).unwrap();
+        assert_eq!(body["name"], serde_json::json!(stamp));
+
+        let instance = VastAdapter
+            .acquisition(
+                &marketplace_requirements(),
+                &marketplace_provider(),
+                Some(expires_at),
+            )
+            .expect("an image was declared");
+        let label = instance
+            .create
+            .iter()
+            .position(|it| it == "--label")
+            .expect("the marketplace takes a label");
+        assert_eq!(instance.create.get(label + 1), Some(&stamp));
+
+        // Nothing bought, nothing stamped: a rendering wanted for its
+        // release template does not claim a lease.
+        let unstamped = RunPodAdapter
+            .acquisition(&full_requirements(), &image_provider(), None)
+            .expect("an image was declared");
+        let body: serde_json::Value =
+            serde_json::from_str(unstamped.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body.get("name"), None);
+    }
+
+    /// **The profile does not get the last word on this one field.**
+    /// A `provider.runpod.name` overwriting the stamp would list the
+    /// machine as unknown — reported, never released — and a machine
+    /// that cannot expire is the accident this mechanism removes.
+    #[test]
+    fn a_profile_cannot_name_a_machine_out_of_the_sweepers_reach() {
+        let mut provider = image_provider();
+        provider.insert("runpod.name".to_string(), "my-box".to_string());
+        let expires_at = at("2026-09-02T06:30:00Z");
+        let acquisition = RunPodAdapter
+            .acquisition(&full_requirements(), &provider, Some(expires_at))
+            .expect("an image was declared");
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["name"], serde_json::json!(expiry_stamp(expires_at)));
+    }
+
+    /// **One release template, whichever half of a sweep found the
+    /// machine.** A machine released from the record and one released
+    /// from the platform's own list are released by the same command;
+    /// two copies would be two commands that could drift, and the
+    /// drifted one would be found by a machine that would not die.
+    #[test]
+    fn the_listing_and_the_acquisition_release_a_machine_the_same_way() {
+        let pod = RunPodAdapter
+            .acquisition(&full_requirements(), &image_provider(), None)
+            .expect("an image was declared");
+        assert_eq!(
+            RunPodAdapter
+                .fleet()
+                .expect("this target can be asked")
+                .release,
+            pod.release
+        );
+
+        let instance = VastAdapter
+            .acquisition(&marketplace_requirements(), &marketplace_provider(), None)
+            .expect("an image was declared");
+        assert_eq!(
+            VastAdapter
+                .fleet()
+                .expect("this target can be asked")
+                .release,
+            instance.release
+        );
+
+        assert!(
+            ContainerAdapter.fleet().is_none(),
+            "a target that acquires nothing has no fleet to enumerate"
+        );
+    }
+
+    /// **The rows each platform prints, read into the same two facts.**
+    /// One answers with a bare array and one wraps its rows in an
+    /// object; one names the machine with a string and one with a
+    /// number; the field the stamp rides in is `name` on one and
+    /// `label` on the other. What comes out is an id and what it is
+    /// called.
+    #[test]
+    fn both_platforms_listings_read_into_an_id_and_a_name() {
+        let pods = RunPodAdapter.fleet().expect("this target can be asked");
+        let listed = serde_json::json!({
+            "pods": [
+                { "id": "pod-a", "name": "lmp-exp-20260902T063000Z" },
+                { "id": "pod-b", "name": "" },
+                { "id": "pod-c" },
+                { "name": "lmp-exp-20260902T063000Z" },
+            ]
+        });
+        assert_eq!(
+            machines(&listed, &pods).expect("rows carrying the id key are the fleet"),
+            vec![
+                Machine {
+                    id: "pod-a".to_string(),
+                    name: Some("lmp-exp-20260902T063000Z".to_string()),
+                },
+                Machine {
+                    id: "pod-b".to_string(),
+                    name: None,
+                },
+                Machine {
+                    id: "pod-c".to_string(),
+                    name: None,
+                },
+            ],
+            "an empty name is no name, and a row with no id is nothing that could be released"
+        );
+
+        let instances = VastAdapter.fleet().expect("this target can be asked");
+        let listed = serde_json::json!([
+            { "id": 49227715, "label": "lmp-exp-20260902T063000Z" },
+            { "id": 49228600, "label": null },
+        ]);
+        assert_eq!(
+            machines(&listed, &instances).expect("a bare array is the rows"),
+            vec![
+                Machine {
+                    id: "49227715".to_string(),
+                    name: Some("lmp-exp-20260902T063000Z".to_string()),
+                },
+                Machine {
+                    id: "49228600".to_string(),
+                    name: None,
+                },
+            ],
+            "a numeric id is the machine's name in every argv this drives"
+        );
+    }
+
+    /// **A listing that cannot be read is an error, never an empty
+    /// fleet.** The sweep treats "listed, and absent" as proof a
+    /// recorded machine is gone and retires its row — so a shape this
+    /// silently read as zero machines would retire the whole record
+    /// while everything on it kept billing. Only genuinely empty rows
+    /// are an empty account.
+    #[test]
+    fn a_listing_that_cannot_be_read_is_an_error_not_an_empty_fleet() {
+        let pods = RunPodAdapter.fleet().expect("this target can be asked");
+
+        assert_eq!(
+            machines(&serde_json::json!({ "pods": [] }), &pods),
+            Ok(Vec::new()),
+            "an emptied account is a real answer"
+        );
+        assert_eq!(
+            machines(&serde_json::json!({ "errors": [], "pods": [] }), &pods),
+            Ok(Vec::new()),
+            "and stays one beside an empty sibling array"
+        );
+        assert_eq!(
+            machines(
+                &serde_json::json!({
+                    "errors": [],
+                    "pods": [{ "id": "pod-a", "name": "x" }],
+                }),
+                &pods
+            )
+            .expect("the rows are the array whose entries carry the id key")
+            .len(),
+            1,
+            "an empty sibling that sorts first does not shadow the fleet"
+        );
+
+        for unreadable in [
+            serde_json::json!({ "error": "unauthorized" }),
+            serde_json::json!("unauthorized"),
+            // Rows exist but none carries the id key: a shape change,
+            // not an empty account.
+            serde_json::json!({ "pods": [{ "podId": "pod-a" }] }),
+            serde_json::json!([{ "podId": "pod-a" }]),
+        ] {
+            assert!(
+                machines(&unreadable, &pods).is_err(),
+                "{unreadable} would have been read as an empty fleet"
+            );
+        }
+    }
+
+    /// The listing goes through a real process: what the platform CLI
+    /// printed is parsed, and what it said on the way back is handed to
+    /// the caller to relay rather than written to a stream from here.
+    #[test]
+    fn a_listing_reads_the_clis_output_and_hands_back_what_it_said() {
+        let listing = list(&Fleet {
+            list: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo 'fetching...' >&2; echo '[{\"id\": 7, \"label\": \
+                 \"lmp-exp-20260902T063000Z\"}]'"
+                    .into(),
+            ],
+            id: "id",
+            stamp: "label",
+            release: vec!["true".into()],
+        })
+        .expect("the stub printed a list");
+        assert_eq!(
+            listing.machines,
+            vec![Machine {
+                id: "7".to_string(),
+                name: Some("lmp-exp-20260902T063000Z".to_string()),
+            }]
+        );
+        assert_eq!(String::from_utf8_lossy(&listing.said).trim(), "fetching...");
     }
 }

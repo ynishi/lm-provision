@@ -325,7 +325,10 @@ pub fn sh_exec(argv: &[String], opts: &ShOpts) -> Result<ExecOutcome, ExecError>
     }
 
     let mut command = Command::new(&argv[0]);
-    command.args(&argv[1..]).envs(&opts.env).stdin(Stdio::null());
+    command
+        .args(&argv[1..])
+        .envs(&opts.env)
+        .stdin(Stdio::null());
 
     // Egress hard pin (spec 05 §L3 sh_egress, Linux only): route the
     // subprocess's address-carrying network syscalls through a seccomp

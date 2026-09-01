@@ -7,6 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The lease now rides on the machine, and the platform's own list is
+  what a sweep works from.** Enforcement used to depend on a file: if
+  `~/.lm-provision/acquisitions.jsonl` was lost, or the machine was
+  bought on one host and swept from another, the row was gone and the
+  machine billed forever with nothing looking for it. Every reaper that
+  has run at scale inverts that — Netflix's Janitor Monkey, `aws-nuke`,
+  `cloud-nuke`, the AWS Instance Scheduler, the Kubernetes TTL
+  controllers all enumerate from the provider's API and read the policy
+  off the resource's own tag. So does this now. `acquire` writes the
+  expiry into the field each platform gives an operator for naming a
+  resource — a pod's `name`, an instance's `--label` — as
+  `lmp-exp-20260902T063000Z` (colon-free: those fields are constrained
+  differently everywhere, and a colon is the likeliest character to be
+  refused). `sweep --provider runpod --provider vast` then lists the
+  account, reads the stamp off each machine, and releases the expired
+  ones through the same release gate as before. Nothing has to be kept
+  in step with anything: a sweeper holding the account's key is
+  sufficient.
+
+  A machine carrying **no** stamp is reported under a new `unknown`
+  field in the sweep artifact and never released on the listing's
+  evidence — this tool did not name it, and deleting what it does not
+  recognise is the accident, not the enforcement. (The record half may
+  still release such a machine when a recorded lease names its id;
+  that is how a pre-stamp machine expires, and it then appears as both
+  `unknown` and `released`.) A platform that could not be listed lands
+  in `failed` under its own name and costs the sweep its zero exit,
+  since that account may be billing for anything — and so does a
+  listing whose shape could not be read as a fleet: absence from a
+  listing retires recorded rows, so a shape change that silently read
+  as an empty account would retire the whole record while everything
+  on it kept billing. Idempotency is by convergence rather than by
+  reading the platform CLI's error text: a machine already gone is
+  simply absent from the next listing, so nothing here depends on the
+  spelling of somebody else's "not found".
+
+  **The acquisitions record is demoted to the audit trail** — who
+  bought what, when, for which profile, and how it was given back. It
+  is still written exactly as before, still read by a sweep run with no
+  `--provider` (which is what reaches machines created before the stamp
+  existed), and an outstanding row whose machine is absent from its
+  platform's list now gets a correction appended: the bill has ended
+  and the file should say so. What it no longer is, is the thing
+  correctness depends on. The daemon takes the same `--provider` flag
+  (specs 08 §Acquisitions and sweep, 09 §Acquisitions record).
+
+### Added
+
+- **A daemon that sweeps without being asked
+  (`lm-provision-host`).** `sweep` gives back every machine whose lease
+  has run out, but only when somebody runs it — which is the
+  forgotten-machine problem one level up, since the host has nothing
+  that keeps running between driver invocations. The AGPL control-plane
+  crate is now that something: every `--interval-secs` (default 300,
+  against hour-grained leases) it runs `lm-provision-driver sweep`,
+  relays what the driver said with the driver's name in front of it,
+  and logs what came back. **It runs the driver as a child process
+  rather than linking it** — the CLI is the contract the specs
+  normalise, and exec leaves the AGPL crate depending on nothing
+  permissive at all, which is the cleanest the license boundary can be.
+  One sweep runs at startup, because an operator restarting the daemon
+  after a week with the laptop closed wants enforcement now. A tick
+  that fails — driver missing, non-zero exit, stdout that is not the
+  artifact — is recorded with its reason and the daemon waits for the
+  next one; a TTL enforcer that dies on the first bad tick protects
+  nothing for the rest of the week.
+
+  **`--dry-run` defaults to `false` here, the opposite of the CLI's
+  default, on purpose.** On the CLI, an operator asking which machines
+  would be released must not find out by them being gone; installing a
+  long-lived TTL-enforcement service is the opposite act — it is the
+  consent to release expired machines, and a daemon that defaulted to
+  observing would be the forgotten-machine problem wearing a uniform.
+  `--dry-run true` is the observation mode, and the release gate inside
+  sweep refuses uncollected work either way.
+
+  One endpoint comes with it, on `--bind` (default `127.0.0.1:7909`):
+  any request gets one JSON document — whether the last sweep worked,
+  when it ran, how many have run, and the sweep's own artifact
+  verbatim, kept even on a failed tick when the sweep still wrote one:
+  an exit-1 sweep's `failed` field names the machines still billing,
+  which is exactly what the reader of `ok: false` needs next. Hand-rolled HTTP/1.1 over a raw socket, since a web
+  framework would buy nothing over thirty lines for one consumer asking
+  one question (spec 08 §Acquisitions and sweep).
+
+- **A machine you acquired is now written down, and `sweep` gives back
+  the ones whose lease ran out.** `acquire` created a billable machine
+  and left its id in one place — the run's stdout. Close the terminal
+  and the machine kept running with nothing on the host that knew it
+  was there. Every real acquire now appends a row to
+  `~/.lm-provision/acquisitions.jsonl` (`--acquisitions` to move it):
+  the id, the platform, the profile hash, the release argv verbatim,
+  and a lease — `--ttl-hours`, default 24, with no opt-out, because an
+  unleased machine is one nothing ever comes back for. A release
+  appends a correction row naming the same id; rows are never
+  rewritten, so "what is still running" is an id-join over the file
+  rather than a flag somebody has to keep current. `sweep` reads it,
+  takes the expired machines, and puts each one through the same
+  release gate `release` applies before deleting it — no `--force`
+  here, since a scheduled sweep is the least informed thing in the
+  system about whether the work still on a machine may go with it.
+  `--dry-run` defaults to true, as `acquire`'s does. A gate refusal is
+  not a sweep failure; a machine that expired and could not be
+  released is, because it is still billing — and a ledger the gate
+  could not read fails the machine rather than refusing it, since a
+  corrupt ledger read as a refusal would hold every expired machine
+  behind a zero exit forever. The row schema lives in
+  `lm-provision-protocol` beside the ledger's — the control plane will
+  read the same file (specs 08 §Acquisitions and sweep, 09
+  §Acquisitions record).
+
+- **The license boundary, cut before the code that needs it.** The
+  coming control plane (a daemon that outlives a driver run: TTL
+  enforcement, ledger custody) is AGPL-3.0-or-later, and the engine is
+  MIT / Apache-2.0 and stays that way. Relicensing is a decision one
+  can only make alone before outside contributions arrive, so the split
+  is in place while both new crates are still empty or unchanged:
+  `lm-provision-host` (AGPL-3.0-or-later, `publish = false`, an empty
+  scaffold whose one test asserts no permissive manifest names it), and
+  `lm-provision-protocol` (MIT / Apache-2.0), the neutral crate holding
+  what both sides read and write. The `ledger` module moved there
+  verbatim; `lm-provision-driver` re-exports it, so every
+  `lm_provision_driver::ledger::*` path still resolves and no caller
+  changes.
+
+  **Release order: `lm-provision-protocol` publishes to crates.io
+  before `lm-provision-driver`.** The driver now depends on it by
+  version, and a version that is not on the registry yet does not
+  resolve.
+
 ## [0.7.0] - 2026-08-30
 
 ### Added

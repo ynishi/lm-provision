@@ -4572,9 +4572,14 @@ mod tests {
             "-c".into(),
             "echo out-before-failing; echo err-before-failing 1>&2; exit 7".into(),
         ]));
-        let failure = execute_step(&step, StepLabel::flat("post_install"), &BTreeMap::new(), None)
-            .await
-            .expect_err("a non-zero exit is a step failure");
+        let failure = execute_step(
+            &step,
+            StepLabel::flat("post_install"),
+            &BTreeMap::new(),
+            None,
+        )
+        .await
+        .expect_err("a non-zero exit is a step failure");
 
         // The error still names the op, as before.
         match &failure.error {

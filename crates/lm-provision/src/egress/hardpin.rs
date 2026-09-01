@@ -601,10 +601,20 @@ mod supported {
         ((dir << 30) | (size << 16) | (ty << 8) | nr) as libc::c_ulong
     }
     fn notif_recv_ioctl() -> libc::c_ulong {
-        ioc(3, b'!' as u32, 0, std::mem::size_of::<SeccompNotif>() as u32)
+        ioc(
+            3,
+            b'!' as u32,
+            0,
+            std::mem::size_of::<SeccompNotif>() as u32,
+        )
     }
     fn notif_send_ioctl() -> libc::c_ulong {
-        ioc(3, b'!' as u32, 1, std::mem::size_of::<SeccompNotifResp>() as u32)
+        ioc(
+            3,
+            b'!' as u32,
+            1,
+            std::mem::size_of::<SeccompNotifResp>() as u32,
+        )
     }
     /// `SECCOMP_IOCTL_NOTIF_ID_VALID` = `SECCOMP_IOW(2, __u64)`. The
     /// direction is *write* (dir 1: the id travels userspace → kernel),
@@ -1317,7 +1327,10 @@ mod supported {
     /// spuriously or hanging forever. `EINTR` retries.
     fn do_send(fd: RawFd, addr: Option<&[u8]>, payload: &[u8], flags: i32) -> (i64, i32) {
         let (aptr, alen) = match addr {
-            Some(a) => (a.as_ptr() as *const libc::sockaddr, a.len() as libc::socklen_t),
+            Some(a) => (
+                a.as_ptr() as *const libc::sockaddr,
+                a.len() as libc::socklen_t,
+            ),
             None => (std::ptr::null(), 0),
         };
         let send_once = || unsafe {
@@ -1350,7 +1363,11 @@ mod supported {
                     return (0, libc::ETIMEDOUT);
                 }
                 let n2 = send_once();
-                return if n2 >= 0 { (n2 as i64, 0) } else { (0, errno()) };
+                return if n2 >= 0 {
+                    (n2 as i64, 0)
+                } else {
+                    (0, errno())
+                };
             }
             return (0, e);
         }
@@ -1377,7 +1394,9 @@ mod supported {
 
     /// The current thread's `errno`.
     fn errno() -> i32 {
-        io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+        io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
     }
 
     // --- child side: install the filter, hand the listener to the parent ----
@@ -1437,7 +1456,11 @@ mod supported {
 
     /// # Safety
     /// Called only from `pre_exec` on a freshly forked child.
-    unsafe fn install_and_signal(sync_sock: RawFd, parent_end: RawFd, mode: Mode) -> io::Result<()> {
+    unsafe fn install_and_signal(
+        sync_sock: RawFd,
+        parent_end: RawFd,
+        mode: Mode,
+    ) -> io::Result<()> {
         // Close the fork-inherited copy of the *parent's* socketpair end
         // before blocking on the ack. Both ends were created `SOCK_CLOEXEC`,
         // but close-on-exec has not fired yet — this child has not exec'd,
@@ -1471,19 +1494,84 @@ mod supported {
         //   are written out in full rather than edited from one another.
         #[cfg(target_arch = "x86_64")]
         let full = [
-            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 4 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 10, k: NATIVE_AUDIT_ARCH },
-            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 },
-            SockFilter { code: BPF_JMP | BPF_JGE | BPF_K, jt: 8, jf: 0, k: X32_SYSCALL_BIT },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 6, jf: 0, k: libc::SYS_io_uring_setup as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 4, jf: 0, k: libc::SYS_connect as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 3, jf: 0, k: libc::SYS_sendto as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 2, jf: 0, k: libc::SYS_sendmsg as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: libc::SYS_sendmmsg as u32 },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_USER_NOTIF },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO_EPERM },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
+            SockFilter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 10,
+                k: NATIVE_AUDIT_ARCH,
+            },
+            SockFilter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JGE | BPF_K,
+                jt: 8,
+                jf: 0,
+                k: X32_SYSCALL_BIT,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 6,
+                jf: 0,
+                k: libc::SYS_io_uring_setup as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 4,
+                jf: 0,
+                k: libc::SYS_connect as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 3,
+                jf: 0,
+                k: libc::SYS_sendto as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 2,
+                jf: 0,
+                k: libc::SYS_sendmsg as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 1,
+                jf: 0,
+                k: libc::SYS_sendmmsg as u32,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_USER_NOTIF,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ERRNO_EPERM,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL_PROCESS,
+            },
         ];
         // x86_64 connect-only — 10 instructions.
         //   0: A=arch; 1: JEQ NATIVE jf 7→KILL(9); 2: A=nr;
@@ -1491,32 +1579,142 @@ mod supported {
         //   5: JEQ connect jt 1→NOTIFY(7); 6: ALLOW; 7: NOTIFY; 8: EPERM; 9: KILL
         #[cfg(target_arch = "x86_64")]
         let connect_only = [
-            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 4 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 7, k: NATIVE_AUDIT_ARCH },
-            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 },
-            SockFilter { code: BPF_JMP | BPF_JGE | BPF_K, jt: 5, jf: 0, k: X32_SYSCALL_BIT },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 3, jf: 0, k: libc::SYS_io_uring_setup as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: libc::SYS_connect as u32 },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_USER_NOTIF },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO_EPERM },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
+            SockFilter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 7,
+                k: NATIVE_AUDIT_ARCH,
+            },
+            SockFilter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JGE | BPF_K,
+                jt: 5,
+                jf: 0,
+                k: X32_SYSCALL_BIT,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 3,
+                jf: 0,
+                k: libc::SYS_io_uring_setup as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 1,
+                jf: 0,
+                k: libc::SYS_connect as u32,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_USER_NOTIF,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ERRNO_EPERM,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL_PROCESS,
+            },
         ];
         // aarch64 full — 12 instructions, no x32 guard.
         #[cfg(target_arch = "aarch64")]
         let full = [
-            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 4 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 9, k: NATIVE_AUDIT_ARCH },
-            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 6, jf: 0, k: libc::SYS_io_uring_setup as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 4, jf: 0, k: libc::SYS_connect as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 3, jf: 0, k: libc::SYS_sendto as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 2, jf: 0, k: libc::SYS_sendmsg as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: libc::SYS_sendmmsg as u32 },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_USER_NOTIF },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO_EPERM },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
+            SockFilter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 9,
+                k: NATIVE_AUDIT_ARCH,
+            },
+            SockFilter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 6,
+                jf: 0,
+                k: libc::SYS_io_uring_setup as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 4,
+                jf: 0,
+                k: libc::SYS_connect as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 3,
+                jf: 0,
+                k: libc::SYS_sendto as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 2,
+                jf: 0,
+                k: libc::SYS_sendmsg as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 1,
+                jf: 0,
+                k: libc::SYS_sendmmsg as u32,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_USER_NOTIF,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ERRNO_EPERM,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL_PROCESS,
+            },
         ];
         // aarch64 connect-only — 9 instructions.
         //   0: A=arch; 1: JEQ NATIVE jf 6→KILL(8); 2: A=nr;
@@ -1524,21 +1722,69 @@ mod supported {
         //   5: ALLOW; 6: NOTIFY; 7: EPERM; 8: KILL
         #[cfg(target_arch = "aarch64")]
         let connect_only = [
-            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 4 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 6, k: NATIVE_AUDIT_ARCH },
-            SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: 0 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 3, jf: 0, k: libc::SYS_io_uring_setup as u32 },
-            SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: libc::SYS_connect as u32 },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_USER_NOTIF },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO_EPERM },
-            SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
+            SockFilter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 6,
+                k: NATIVE_AUDIT_ARCH,
+            },
+            SockFilter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 3,
+                jf: 0,
+                k: libc::SYS_io_uring_setup as u32,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 1,
+                jf: 0,
+                k: libc::SYS_connect as u32,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_USER_NOTIF,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ERRNO_EPERM,
+            },
+            SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL_PROCESS,
+            },
         ];
         let filter: &[SockFilter] = match mode {
             Mode::Emulated => &full,
             Mode::ConnectOnly => &connect_only,
         };
-        let prog = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+        let prog = SockFprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr(),
+        };
         let listener = libc::syscall(
             libc::SYS_seccomp,
             SECCOMP_SET_MODE_FILTER as libc::c_long,
@@ -2084,7 +2330,11 @@ mod supported {
         let send_ioctl = notif_send_ioctl();
         let id_valid_ioctl = notif_id_valid_ioctl();
         loop {
-            let mut pfd = libc::pollfd { fd: notify_fd, events: libc::POLLIN, revents: 0 };
+            let mut pfd = libc::pollfd {
+                fd: notify_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             let pr = unsafe { libc::poll(&mut pfd, 1, 200) };
             if pr == 0 {
                 if stop.load(Ordering::Relaxed) {
@@ -2321,7 +2571,8 @@ mod supported {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let supervisor = std::thread::spawn(move || supervise(notify_fd, stop_thread, config, mode));
+        let supervisor =
+            std::thread::spawn(move || supervise(notify_fd, stop_thread, config, mode));
 
         let output = child.wait_with_output();
         stop.store(true, Ordering::Relaxed);
@@ -2521,7 +2772,10 @@ mod supported {
             ));
             // connect with AF_UNSPEC: allowed (dissolve association).
             assert!(is_notif_allowed(
-                &notif(libc::SYS_connect, [3, unspec_off.as_ptr() as u64, 16, 0, 0, 0]),
+                &notif(
+                    libc::SYS_connect,
+                    [3, unspec_off.as_ptr() as u64, 16, 0, 0, 0]
+                ),
                 &cfg
             ));
         }
@@ -2541,11 +2795,17 @@ mod supported {
 
             // connect: sockaddr at args[1], len at args[2].
             assert!(!is_notif_allowed(
-                &notif(libc::SYS_connect, [3, off_host.as_ptr() as u64, 16, 0, 0, 0]),
+                &notif(
+                    libc::SYS_connect,
+                    [3, off_host.as_ptr() as u64, 16, 0, 0, 0]
+                ),
                 &cfg
             ));
             assert!(is_notif_allowed(
-                &notif(libc::SYS_connect, [3, to_proxy.as_ptr() as u64, 16, 0, 0, 0]),
+                &notif(
+                    libc::SYS_connect,
+                    [3, to_proxy.as_ptr() as u64, 16, 0, 0, 0]
+                ),
                 &cfg
             ));
 
@@ -2555,15 +2815,19 @@ mod supported {
             assert!(!is_notif_allowed(
                 &notif(
                     libc::SYS_sendto,
-                    [3, off_host.as_ptr() as u64, 1, 0, off_host.as_ptr() as u64, 16]
+                    [
+                        3,
+                        off_host.as_ptr() as u64,
+                        1,
+                        0,
+                        off_host.as_ptr() as u64,
+                        16
+                    ]
                 ),
                 &cfg
             ));
             assert!(is_notif_allowed(
-                &notif(
-                    libc::SYS_sendto,
-                    [3, 0, 1, 0, to_proxy.as_ptr() as u64, 16]
-                ),
+                &notif(libc::SYS_sendto, [3, 0, 1, 0, to_proxy.as_ptr() as u64, 16]),
                 &cfg
             ));
 
@@ -2628,7 +2892,14 @@ mod supported {
             assert!(!is_notif_allowed(
                 &notif(
                     libc::SYS_sendmmsg,
-                    [3, good.as_ptr() as u64, (MMSG_MAX_ENTRIES + 1) as u64, 0, 0, 0]
+                    [
+                        3,
+                        good.as_ptr() as u64,
+                        (MMSG_MAX_ENTRIES + 1) as u64,
+                        0,
+                        0,
+                        0
+                    ]
                 ),
                 &cfg
             ));
@@ -2651,10 +2922,7 @@ mod supported {
             // After the guard drops the fd is closed: F_GETFD → EBADF.
             let rc = unsafe { libc::fcntl(read_fd, libc::F_GETFD) };
             assert_eq!(rc, -1);
-            assert_eq!(
-                io::Error::last_os_error().raw_os_error(),
-                Some(libc::EBADF)
-            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
             unsafe { libc::close(write_fd) };
         }
 
@@ -2689,11 +2957,16 @@ mod supported {
             );
             let mut cmd = Command::new("bash");
             cmd.arg("-c").arg(script);
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
 
             let out = run_pinned(cmd, cfg_proxy(proxy_addr)).expect("run pinned");
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(stdout.contains("PROXY_OK"), "the proxy endpoint should connect: {stdout}");
+            assert!(
+                stdout.contains("PROXY_OK"),
+                "the proxy endpoint should connect: {stdout}"
+            );
             assert!(
                 stdout.contains("EXTERNAL_BLOCKED"),
                 "external connect must be denied at the syscall: {stdout}"
@@ -2726,7 +2999,9 @@ mod supported {
             );
             let mut cmd = Command::new(python);
             cmd.arg("-c").arg(script);
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let out = run_pinned(cmd, cfg_proxy(proxy)).expect("run pinned");
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2753,7 +3028,10 @@ mod supported {
 
             match plan(
                 &mem,
-                &notif(libc::SYS_connect, [3, to_proxy.as_ptr() as u64, 16, 0, 0, 0]),
+                &notif(
+                    libc::SYS_connect,
+                    [3, to_proxy.as_ptr() as u64, 16, 0, 0, 0],
+                ),
                 &cfg,
             ) {
                 Plan::Emulate {
@@ -3053,10 +3331,7 @@ mod supported {
     }
 }
 
-#[cfg(all(
-    test,
-    not(any(target_arch = "x86_64", target_arch = "aarch64")),
-))]
+#[cfg(all(test, not(any(target_arch = "x86_64", target_arch = "aarch64")),))]
 mod tests_unsupported {
     use super::*;
     use std::process::Command;

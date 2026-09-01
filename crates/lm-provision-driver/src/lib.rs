@@ -47,6 +47,18 @@
 //!   first".
 //! - [`ledger`] — the append-only ledger (09-apply-report-and-ledger.md
 //!   §Ledger): [`ledger::append`] / [`ledger::list`] / [`ledger::get`].
+//!   The module itself now lives in `lm-provision-protocol`, the
+//!   neutral permissive side of the license boundary, because the AGPL
+//!   control plane takes custody of the same file; it is re-exported
+//!   here, so every `lm_provision_driver::ledger::*` path a caller
+//!   already writes keeps resolving.
+//! - [`acquisition`] — the append-only acquisitions record
+//!   (09-apply-report-and-ledger.md §Acquisitions record): one row per
+//!   machine `acquire` created, one per machine given back, and
+//!   [`acquisition::outstanding`], the list a sweep works from. It
+//!   lives in `lm-provision-protocol` for the same reason the ledger
+//!   does — the control plane reads the same file — and is re-exported
+//!   here beside it.
 //! - [`ssh`] — [`ssh::SshTransport`], the SSH realization of the seam
 //!   (08 §Session contract `ConnectionSpec`): scp upload, explicit
 //!   identity file, secrets over stdin (08 §Secret delivery).
@@ -67,11 +79,12 @@
 
 #![warn(missing_docs)]
 
+pub use lm_provision_protocol::acquisition;
 pub mod credentials;
 pub mod driver;
 pub mod image;
 pub mod infra;
-pub mod ledger;
+pub use lm_provision_protocol::ledger;
 pub mod local_exec;
 pub mod session;
 pub mod ssh;

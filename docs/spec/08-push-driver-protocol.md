@@ -4,7 +4,8 @@ Status: specified (the session contract below is the Phase G build
 target; revised 2026-08-01 from first real-pod usage feedback;
 revised 2026-08-30 to add the artifacts retrieval contract — step 4b
 and the release gate; revised 2026-09-01 to name the operator-side
-preflight, whose resolve stage decides what step 1 uploads).
+preflight, whose resolve stage decides what step 1 uploads, and to add
+the acquisition lease and the expiry sweep).
 Layer 4. Upstream deps: 07, 04, 06, 11.
 MVP: Phase G.
 
@@ -19,9 +20,9 @@ row. Individual session steps can be gated on or off, but the base
 shape is declarative one-shot apply: given a reachable pod, one
 driver invocation converges it (the Terraform / K8s `apply` posture).
 
-Pod lifecycle: the driver's `acquire` / `release` subcommands create
-and delete a machine through the provider's own CLI; start / stop
-stay outside — see §Stability.
+Pod lifecycle: the driver's `acquire` / `release` / `sweep`
+subcommands create and delete a machine through the provider's own
+CLI; start / stop stay outside — see §Stability.
 
 ### Session contract
 
@@ -211,6 +212,122 @@ gate makes the deletion wait for it:
   that machine's id as its pod-id (the apply default of the SSH host
   records rows the gate will never look up).
 
+### Acquisitions and sweep
+
+The release gate above keeps a machine alive until its work is
+collected. Nothing kept it from living forever: `acquire` created a
+billable machine and left no record of it on the operator host, so a
+`release` that never came meant an id that sank with the terminal
+scrollback and a machine that billed until someone noticed.
+
+- **Every acquire records the machine** in the acquisitions record
+  (chapter 09 §Acquisitions record) — id, platform, the profile hash,
+  the release argv verbatim, and the lease — before it waits for the
+  machine to come up. A dry-run acquire records nothing: it created
+  nothing.
+- **Every acquire carries a lease**: `--ttl-hours`, default 24. The
+  fleet is ephemeral by design and a machine bought for longer than a
+  day is a decision, not a default; there is no opt-out flag, because
+  an unleased machine is one nothing ever comes back for. The lease is
+  **recorded, not enforced in-band** — the acquiring process exits
+  long before the hours pass, and `expires_at` is a statement for
+  whoever reads the record next.
+- **Every acquire also stamps the lease onto the machine.** The create
+  call writes `expires_at` into the field the platform gives an
+  operator to name a resource — a pod's `name`, an instance's `label` —
+  as `lmp-exp-` followed by RFC 3339 UTC with the separators removed
+  and the seconds truncated: `lmp-exp-20260902T063000Z`. Colon-free,
+  because these fields are constrained differently on every platform
+  and a colon is the likeliest character to be refused. The prefix is
+  fixed and matched whole; a field holding anything else is not a
+  lease. The stamped instant and the recorded `expires_at` come from
+  one clock reading, so the machine and the record cannot disagree, and
+  a profile that also names the machine (`provider.runpod.name`) does
+  **not** win — a name that displaced the stamp would put the machine
+  out of the sweeper's reach.
+- **The platform's list is the inventory; the record is not.** A record
+  is a file: it can be lost, or written on a host that is not the one
+  sweeping, while the machine keeps billing. The list cannot be, because
+  the list *is* the fleet. This is the shape every established reaper
+  has (Netflix's Janitor Monkey, `aws-nuke`, `cloud-nuke`, the AWS
+  Instance Scheduler, the Kubernetes TTL controllers): enumerate from
+  the API, read the policy off the resource's own tag, act. It is what
+  lets anything holding the account's credential enforce leases with no
+  state to keep in step.
+- **`sweep --provider <name>` is that mode** (repeatable). For each
+  named platform it lists the account's machines, reads the stamp off
+  each one, and splits them three ways: *expired* (stamp read, lease
+  reached) go through the same release gate and are released from the
+  adapter's own release argv; *live* are left alone; *unknown* —
+  carrying no `lmp-exp-` stamp — are **reported and never released on
+  the listing's evidence** (the record half below may still release
+  such a machine when a recorded lease names its id — the pre-stamp
+  path — and the machine then appears in the artifact as both
+  `unknown` and `released`).
+  Marking an unrecognised machine and warning its owner before deleting
+  it (Janitor Monkey's answer) needs an owner to warn and a mark to
+  keep; neither is in this MVP, so the answer stops at telling the
+  operator it is there. Listing needs the platform's credential **even
+  under `--dry-run`**: there the key buys the question, not the kill.
+- **`sweep` also reads the record**, with or without `--provider`. It
+  takes the outstanding rows (chapter 09), keeps those whose
+  `expires_at` has been reached (`<= now`, one clock reading for the
+  run), and for each one applies **the same release gate** against the
+  ledger before releasing it from the argv the record carries — not
+  from a re-rendered profile, which may have changed or gone since the
+  machine was bought. A successful release appends the correction row.
+  This is the whole sweep when no platform is named, and it is what
+  still reaches machines created before leases were stamped onto them.
+- **The two halves meet on the machine id.** A machine both halves see
+  is released once, by the platform half: the stamp on the machine
+  outranks the row about it, because the machine is the thing being
+  billed. A machine the platform lists without a stamp is left to the
+  record, which is how a pre-stamp machine still expires. An
+  outstanding row whose id is **absent** from its platform's list — and
+  only when that platform was actually listed this run — is a machine
+  that is gone: no release is spent on it, and a correction is appended
+  so the audit trail says the bill has ended.
+- **Idempotency is by convergence, not by reading error text.** Nothing
+  matches "not found" against a platform CLI's output to decide a
+  machine is already gone: that text differs per platform, per version
+  and per locale, and depending on its spelling is depending on
+  somebody else's prose. A machine already gone is simply absent from
+  the next listing. Two sweeps racing can therefore cost one of them
+  one failed entry for one tick, and the tick after that lists the
+  machine as absent and is done with it — the same retry-until-empty
+  shape `aws-nuke` settles for.
+- **`sweep` has no `--force`.** Forcing is a statement that the work
+  still on a machine may be deleted with it, and a scheduled sweep is
+  the least informed thing in the system about whether that is true. A
+  gated machine is reported and left running; the operator escalates
+  by hand with `release --force`.
+- `--dry-run` **defaults to true**, as `acquire`'s does and for the
+  same reason: the command destroys machines, and an operator asking
+  which ones should not find out by them being gone.
+- Output is one JSON document (chapter 07 §Stream split: one
+  machine-readable artifact per run, everything the provider's CLI
+  said on stderr): `dry_run`, the number of
+  machines found expired (once per machine, however many halves saw
+  it), the ids released (under `--dry-run`, the ids that would be), the
+  refused and failed ones with a reason each, and `unknown` — the
+  listed machines carrying no stamp, as `{id, name_or_label}`. A
+  platform that could not be listed at all is a `failed` entry under
+  the **platform's** name rather than a machine's: what could not be
+  read is the whole plane. Exit 0 when nothing failed — **a gate
+  refusal is not a sweep failure**, it is the gate working, and a
+  non-zero exit from a scheduled sweep would say the opposite. A
+  machine that expired and could **not** be released is exit 1: nobody
+  decided that, and it is still billing. So is a platform nobody could
+  ask, for the same reason — and so is an expired machine whose gate
+  could not read the ledger at all: an unreadable ledger holds the
+  machine (fail closed) but as a `failed` entry, not a refusal, because
+  a corrupt ledger read as a refusal would keep every expired machine
+  billing behind a zero exit forever.
+- A continuously running host daemon that enforces leases without
+  being invoked is the control plane's job (chapter 09's record is
+  the shared vocabulary for exactly that); `sweep` is the operator's
+  hand on the same file.
+
 ## Outputs
 
 - stdout: exactly one JSON apply report (chapter 09), emitted on
@@ -276,6 +393,24 @@ gate makes the deletion wait for it:
   the driver already paid to learn (first artifacts verification did
   exactly that by hand). The projection is part of the adapter
   seam; the wait bound is the driver's own (**internal**).
+- The acquisition lease and the sweep (2026-09-01): the **recording**
+  is chapter 09's stable tier — a row written today is read by the
+  control plane later, which is the whole reason the schema sits on
+  the neutral side of the license boundary. The sweep's own surface
+  (flag names, the artifact's field names, the default lease of 24
+  hours) is **provisional**: it is one operator-invoked realization of
+  the lease, and a host daemon enforcing the same rows without being
+  invoked is the intended successor, not a replacement of the record.
+
+  Revised (2026-09-01): the lease is also **stamped onto the machine**
+  and the platform's list is what a sweep enumerates, so enforcement no
+  longer depends on the record at all. The stamp's spelling — the
+  `lmp-exp-` prefix and the separator-free RFC 3339 form — is
+  **stable** in the same sense the row schema is: a machine created
+  today is read by a sweeper released later, possibly on another host,
+  and a sweeper that stopped recognising the stamp would leave the
+  machine running. Which field on which platform carries it is the
+  adapter seam (**internal**).
 - Static-binary embeddability constraint (musl, no language runtime,
   no runtime file dependencies): **stable**.
 - Binary target set (musl x86_64 as the baseline): **provisional**
@@ -316,4 +451,7 @@ Deferred with one-line reasons: `fetch-release` / `cargo-install`
 ensure-binary strategies (distribution surface not published yet);
 exec-API ConnectionSpec (no provider SDK in scope — even `acquire` /
 `release` reach the provider through its CLI, an exec adapter would
-pull an API client in deliberately).
+pull an API client in deliberately); marking an unstamped machine and
+warning its owner before deleting it, Janitor Monkey style (there is no
+owner to warn and no mark to keep — unstamped machines are reported
+only).

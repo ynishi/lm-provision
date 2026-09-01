@@ -994,9 +994,24 @@ dependencies = [
  "dotenvy",
  "jiff",
  "lm-provision",
+ "lm-provision-protocol",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "lm-provision-host"
+version = "0.7.0"
+dependencies = [
+ "clap",
+ "jiff",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1021,6 +1036,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lm-provision-protocol"
+version = "0.7.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
