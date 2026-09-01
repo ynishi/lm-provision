@@ -5,13 +5,13 @@
 //! The workspace has two sides. The engine — `lm-provision`,
 //! [`lm-provision-driver`](https://docs.rs/lm-provision-driver),
 //! `lm-provision-mcp` — is dual-licensed MIT / Apache-2.0 and stays
-//! that way. The control plane — `lm-provision-host`, an empty
-//! scaffold today — is AGPL-3.0-or-later. Both sides read and write
-//! the same rows, so the vocabulary they share cannot live on either
-//! one: a permissive caller may not link the AGPL crate, and moving
-//! the AGPL crate's types into the permissive ones would relicense
-//! them by the back door. It lives here, permissive, depended on from
-//! both directions.
+//! that way. The control plane — `lm-provision-host`, the
+//! TTL-enforcement daemon — is AGPL-3.0-or-later. Both sides read and
+//! write the same rows, so the vocabulary they share cannot live on
+//! either one: a permissive caller may not link the AGPL crate, and
+//! moving the AGPL crate's types into the permissive ones would
+//! relicense them by the back door. It lives here, permissive,
+//! depended on from both directions.
 //!
 //! **The license boundary is the crate boundary.** That is the only
 //! line a compiler can check, which is why the split was cut before

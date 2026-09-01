@@ -940,9 +940,27 @@ fn due(row: &AcquisitionRow, now: jiff::Timestamp, ledger_path: &std::path::Path
         return Due::Live;
     }
     match gate(ledger_path, &row.id) {
-        Ok(()) => Due::Expired,
-        Err(reason) => Due::Refused(reason),
+        Gate::Clear => Due::Expired,
+        Gate::Holding(reason) => Due::Refused(reason),
+        Gate::Unreadable(reason) => Due::Failed(reason),
     }
+}
+
+/// What the release gate said about one machine.
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    /// Nothing uncollected: the machine may go.
+    Clear,
+    /// The newest apply left work on the machine. A decision, and the
+    /// gate working — reported as refused, exit 0.
+    Holding(String),
+    /// The ledger could not be read, so no decision was made at all.
+    /// Not a refusal: a refusal is this host deciding, and this is this
+    /// host unable to — the same line [`Due`] draws, and it lands in
+    /// `failed` (exit 1), because a corrupt ledger that read as a
+    /// refusal would hold every expired machine forever behind a zero
+    /// exit that cron and the health endpoint both read as fine.
+    Unreadable(String),
 }
 
 /// The release gate for one machine (08 §Release gate), whichever half
@@ -954,17 +972,18 @@ fn due(row: &AcquisitionRow, now: jiff::Timestamp, ledger_path: &std::path::Path
 /// thing in the system about whether that is true. The operator
 /// escalates by hand.
 ///
-/// An unreadable ledger refuses rather than passes, for the reason
-/// `release`'s does: a gate that fails open makes a corrupt ledger the
-/// easiest way through it.
-fn gate(ledger_path: &std::path::Path, id: &str) -> Result<(), String> {
+/// An unreadable ledger holds the machine rather than passing it, for
+/// the reason `release`'s does: a gate that fails open makes a corrupt
+/// ledger the easiest way through it. But it holds as [`Gate::Unreadable`],
+/// not as a refusal — the exit code has to say something is wrong.
+fn gate(ledger_path: &std::path::Path, id: &str) -> Gate {
     match uncollected_artifacts(ledger_path, id) {
-        Ok(uncollected) if !uncollected.is_empty() => Err(format!(
+        Ok(uncollected) if !uncollected.is_empty() => Gate::Holding(format!(
             "the newest apply left {} on the machine (collect them, or release --force)",
             uncollected.join(", ")
         )),
-        Ok(_) => Ok(()),
-        Err(err) => Err(format!(
+        Ok(_) => Gate::Clear,
+        Err(err) => Gate::Unreadable(format!(
             "the release gate could not read {}: {err}",
             ledger_path.display()
         )),
@@ -985,9 +1004,14 @@ enum Standing {
     Expired,
     /// Carrying no `lmp-exp-` stamp at all.
     ///
-    /// **Reported, never released.** This tool did not name it, so it
-    /// has no idea what it is — somebody else's work, another tool's
-    /// machine, one created before leases were stamped onto machines.
+    /// **Reported, and never released on this evidence.** This tool
+    /// did not name it, so the *listing* has no idea what it is —
+    /// somebody else's work, another tool's machine, one created
+    /// before leases were stamped onto machines. The record half may
+    /// still release it when a recorded lease names its id: that is
+    /// the pre-stamp path, and the machine then appears in the
+    /// artifact both as `unknown` (what the listing saw) and as
+    /// `released` (what the record knew).
     /// Janitor Monkey's answer to this is to mark the resource and warn
     /// its owner before deleting it; that needs an owner to warn and a
     /// mark to keep, and neither is in this MVP, so the answer here
@@ -1068,7 +1092,9 @@ struct SweepOutcome {
     failed: Vec<(String, String)>,
     /// The listed machines carrying no lease stamp, with whatever they
     /// are named — reported so an operator knows what is on the
-    /// account, and never released (see [`Standing::Unknown`]).
+    /// account, and never released on the listing's evidence alone. An
+    /// id here can also be in `released` when the record knew its
+    /// lease (see [`Standing::Unknown`] — the pre-stamp path).
     unknown: Vec<(String, String)>,
 }
 
@@ -1174,9 +1200,16 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
                 Standing::Expired => {
                     outcome.expired += 1;
                     handled.insert(machine.id.clone());
-                    if let Err(reason) = gate(&ledger_path, &machine.id) {
-                        outcome.refused.push((machine.id, reason));
-                        continue;
+                    match gate(&ledger_path, &machine.id) {
+                        Gate::Clear => {}
+                        Gate::Holding(reason) => {
+                            outcome.refused.push((machine.id, reason));
+                            continue;
+                        }
+                        Gate::Unreadable(reason) => {
+                            outcome.failed.push((machine.id, reason));
+                            continue;
+                        }
                     }
                     if args.dry_run {
                         outcome.released.push(machine.id);
@@ -2012,6 +2045,33 @@ mod tests {
         std::fs::remove_file(&ledger_path).ok();
     }
 
+    /// **A ledger the gate cannot read is a failed machine, not a
+    /// refused one.** A refusal is this host deciding and exits 0; a
+    /// corrupt ledger is this host unable to decide, and if it read as
+    /// a refusal, every expired machine would sit behind a zero exit —
+    /// billing — while cron and the health endpoint both reported the
+    /// sweep fine.
+    #[test]
+    fn a_corrupt_ledger_fails_the_machine_rather_than_refusing_it() {
+        let ledger_path = scratch("sweep-corrupt-ledger");
+        std::fs::write(&ledger_path, "not a ledger row\n").expect("seed the corruption");
+        let now: jiff::Timestamp = "2026-09-02T00:00:00Z".parse().expect("a fixed clock");
+
+        let super::Due::Failed(reason) = super::due(
+            &recorded("pod-due", "2026-09-01T00:00:00Z"),
+            now,
+            &ledger_path,
+        ) else {
+            panic!("an unreadable ledger is a failure the exit code must carry");
+        };
+        assert!(
+            reason.contains("could not read"),
+            "the reason names the gate's problem, not the machine's: {reason}"
+        );
+
+        std::fs::remove_file(&ledger_path).ok();
+    }
+
     /// **A refused machine is not a failed sweep, and a machine left
     /// billing is.** The gate refusing is the system working; a due
     /// machine that could not be released is the accident this
@@ -2175,6 +2235,7 @@ mod tests {
             ]
         });
         let judged: Vec<(String, super::Standing)> = infra::machines(&listed, &pods)
+            .expect("rows carrying the id key are the fleet")
             .into_iter()
             .map(|it| (it.id.clone(), super::standing(&it, now)))
             .collect();
@@ -2199,6 +2260,7 @@ mod tests {
             { "id": 49229000, "label": null },
         ]);
         let judged: Vec<(String, super::Standing)> = infra::machines(&listed, &instances)
+            .expect("a bare array is the rows")
             .into_iter()
             .map(|it| (it.id.clone(), super::standing(&it, now)))
             .collect();

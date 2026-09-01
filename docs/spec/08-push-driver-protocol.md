@@ -227,7 +227,11 @@ scrollback and a machine that billed until someone noticed.
   each one, and splits them three ways: *expired* (stamp read, lease
   reached) go through the same release gate and are released from the
   adapter's own release argv; *live* are left alone; *unknown* —
-  carrying no `lmp-exp-` stamp — are **reported and never released**.
+  carrying no `lmp-exp-` stamp — are **reported and never released on
+  the listing's evidence** (the record half below may still release
+  such a machine when a recorded lease names its id — the pre-stamp
+  path — and the machine then appears in the artifact as both
+  `unknown` and `released`).
   Marking an unrecognised machine and warning its owner before deleting
   it (Janitor Monkey's answer) needs an owner to warn and a mark to
   keep; neither is in this MVP, so the answer stops at telling the
@@ -282,7 +286,11 @@ scrollback and a machine that billed until someone noticed.
   non-zero exit from a scheduled sweep would say the opposite. A
   machine that expired and could **not** be released is exit 1: nobody
   decided that, and it is still billing. So is a platform nobody could
-  ask, for the same reason.
+  ask, for the same reason — and so is an expired machine whose gate
+  could not read the ledger at all: an unreadable ledger holds the
+  machine (fail closed) but as a `failed` entry, not a refusal, because
+  a corrupt ledger read as a refusal would keep every expired machine
+  billing behind a zero exit forever.
 - A continuously running host daemon that enforces leases without
   being invoked is the control plane's job (chapter 09's record is
   the shared vocabulary for exactly that); `sweep` is the operator's

@@ -117,14 +117,17 @@ pub struct Status {
     pub ticks: u64,
     /// When the newest sweep finished.
     pub last_tick_at: Option<String>,
-    /// Whether the newest sweep produced an artifact this daemon could
-    /// read. `None` until the first one finishes.
+    /// Whether the newest sweep succeeded — spawned, exited zero, and
+    /// wrote its artifact. `None` until the first one finishes.
     pub last_tick_ok: Option<bool>,
-    /// Why the newest sweep did not, when it did not.
+    /// Why the newest sweep failed, when it failed.
     pub last_tick_error: Option<String>,
     /// The newest sweep's artifact, verbatim (08 §Acquisitions and
     /// sweep: `dry_run`, `expired`, `released`, `refused`, `failed`,
-    /// `unknown`).
+    /// `unknown`). Present on a failed tick too, when the failing
+    /// sweep still wrote one — an exit-1 sweep's `failed` field names
+    /// the machines still billing, which is what a reader of
+    /// `ok: false` needs next.
     ///
     /// Kept as an opaque [`serde_json::Value`] on purpose. The daemon
     /// counts three of its fields for a log line and otherwise passes
@@ -176,6 +179,13 @@ pub enum TickFailure {
         program: String,
         /// How it ended, as the platform reports it.
         status: String,
+        /// The artifact the failing sweep still wrote, when its stdout
+        /// held one. A sweep that exits 1 names the machines it could
+        /// not release in its `failed` field — the very ids an
+        /// operator reading `ok: false` needs — and they went to
+        /// stdout, which the health endpoint would otherwise be the
+        /// only thing never to see.
+        artifact: Option<serde_json::Value>,
     },
     /// The child's stdout was not the artifact the contract promises
     /// (07 §Stream split: exactly one machine-readable document there).
@@ -224,13 +234,15 @@ pub fn sweep_argv(config: &Config) -> Vec<OsString> {
     argv
 }
 
-/// Read a finished sweep: its artifact, or why there is none.
+/// Read a finished sweep: its artifact, or why the tick failed.
 ///
-/// A non-zero exit is refused before the stdout is looked at. The
-/// driver does emit its artifact on failure paths, but a sweep that
-/// exited 1 is reporting a machine it could not release, and recording
-/// that document as a healthy tick would be the daemon telling its
-/// operator that enforcement is working while it is not.
+/// A non-zero exit is a failed tick whatever the stdout held —
+/// recording it as healthy would be the daemon telling its operator
+/// that enforcement is working while a machine bills on. But the
+/// artifact a failing sweep wrote is **carried on the failure**, not
+/// discarded: its `failed` field names the machines still running,
+/// which is exactly what the operator reading `ok: false` needs next,
+/// and it went to a stream only this process captured.
 pub fn interpret_sweep(
     program: &str,
     status: std::process::ExitStatus,
@@ -240,6 +252,7 @@ pub fn interpret_sweep(
         return Err(TickFailure::Exit {
             program: program.to_string(),
             status: status.to_string(),
+            artifact: serde_json::from_slice(stdout).ok(),
         });
     }
     serde_json::from_slice(stdout).map_err(|source| TickFailure::Unparseable {
@@ -259,10 +272,13 @@ pub fn interpret_sweep(
 /// more so because the driver's stderr already carries the platform
 /// CLI's own attributed lines nested inside.
 ///
-/// Written out here rather than imported from the driver: importing it
-/// would mean depending on a permissive crate from this AGPL one,
-/// which is the edge the boundary exists to keep empty. Ten lines is
-/// the price.
+/// Written out here rather than imported from the driver — not because
+/// that direction is forbidden (an AGPL crate may depend on permissive
+/// code; the edge the boundary outlaws is the reverse one), but
+/// because this daemon deliberately links none of the workspace's
+/// crates: the CLI is the whole coupling (crate docs, §Exec, not
+/// link), and a dependency taken for ten lines would be the first
+/// crack in that. Ten lines is the price.
 ///
 /// **Silence is not reported.** "When a program has nothing surprising
 /// to say, it should say nothing" [documented: Raymond, *The Art of
@@ -281,13 +297,27 @@ pub fn attributed(program: &str, bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// One failed sweep, as [`record`] takes it: why, and the artifact the
+/// failing sweep still wrote when it wrote one.
+#[derive(Debug)]
+pub struct FailedTick {
+    /// Why the tick failed — what `last_tick_error` reports.
+    pub reason: String,
+    /// The failing sweep's own artifact, when its stdout held one (a
+    /// sweep that exits 1 still reports, and its `failed` field names
+    /// the machines that are the reason). `None` when nothing ran or
+    /// nothing readable was written.
+    pub artifact: Option<serde_json::Value>,
+}
+
 /// Fold one finished sweep into the status the endpoint reports.
 ///
-/// A failure clears the artifact rather than leaving the last good one
-/// in place: `last_artifact` beside `last_tick_at` reads as "this is
-/// what the last sweep did", and a stale document under a fresh
-/// timestamp would say that about a sweep that never ran.
-pub fn record(status: &mut Status, at: String, outcome: Result<serde_json::Value, String>) {
+/// A failure keeps only the artifact the failure itself carried —
+/// never the previous tick's: `last_artifact` beside `last_tick_at`
+/// reads as "this is what the last sweep did", and a stale document
+/// under a fresh timestamp would say that about a sweep that never
+/// ran.
+pub fn record(status: &mut Status, at: String, outcome: Result<serde_json::Value, FailedTick>) {
     status.ticks += 1;
     status.last_tick_at = Some(at);
     match outcome {
@@ -296,10 +326,10 @@ pub fn record(status: &mut Status, at: String, outcome: Result<serde_json::Value
             status.last_tick_error = None;
             status.last_artifact = Some(artifact);
         }
-        Err(reason) => {
+        Err(failure) => {
             status.last_tick_ok = Some(false);
-            status.last_tick_error = Some(reason);
-            status.last_artifact = None;
+            status.last_tick_error = Some(failure.reason);
+            status.last_artifact = failure.artifact;
         }
     }
 }
@@ -311,10 +341,10 @@ pub fn record(status: &mut Status, at: String, outcome: Result<serde_json::Value
 /// that boundary would copy the one field with no size bound.
 #[derive(Debug, serde::Serialize)]
 pub struct Health<'a> {
-    /// Whether the newest sweep produced an artifact — the one
-    /// question this endpoint exists to answer. True before the first
-    /// sweep finishes: the daemon is up and nothing has gone wrong
-    /// yet, and `ticks: 0` beside it says which of the two it is.
+    /// Whether the newest sweep succeeded — the one question this
+    /// endpoint exists to answer. True before the first sweep
+    /// finishes: the daemon is up and nothing has gone wrong yet, and
+    /// `ticks: 0` beside it says which of the two it is.
     pub ok: bool,
     /// Whether the sweeps are enforcing or only observing.
     pub dry_run: bool,
@@ -334,8 +364,9 @@ pub struct Health<'a> {
     /// is something to read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tick_error: Option<&'a str>,
-    /// The newest sweep's artifact, verbatim. Absent for the same
-    /// reason when there is none.
+    /// The newest sweep's artifact, verbatim — on a failed tick too,
+    /// when the failing sweep still wrote one. Absent when there is
+    /// none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_artifact: Option<&'a serde_json::Value>,
 }
@@ -443,7 +474,12 @@ pub async fn tick(config: &Config, state: &SharedStatus) {
         }
         Err(failure) => {
             tracing::error!("sweep failed: {failure}");
-            Err(failure.to_string())
+            let reason = failure.to_string();
+            let artifact = match failure {
+                TickFailure::Exit { artifact, .. } => artifact,
+                TickFailure::Spawn { .. } | TickFailure::Unparseable { .. } => None,
+            };
+            Err(FailedTick { reason, artifact })
         }
     };
 
@@ -509,7 +545,7 @@ pub async fn serve_health(
 mod tests {
     use super::{
         attributed, health, health_body, health_response, interpret_sweep, record, sweep_argv,
-        Config, Status,
+        Config, FailedTick, Status, TickFailure,
     };
 
     fn config() -> Config {
@@ -638,12 +674,13 @@ mod tests {
 
     /// A sweep exits non-zero only when a machine that expired could
     /// not be released (a gate refusal exits 0), so the tick is failed
-    /// before its stdout is even looked at — the alternative is a
-    /// daemon reporting healthy enforcement over a machine that is
-    /// still billing.
+    /// whatever the stdout held — but the artifact it held is carried
+    /// on the failure: its `failed` field names the machines still
+    /// billing, which is what the operator reading `ok: false` needs,
+    /// and it went to a stream only this process captured.
     #[cfg(unix)]
     #[test]
-    fn a_nonzero_sweep_is_a_failed_tick_whatever_it_printed() {
+    fn a_nonzero_sweep_is_a_failed_tick_that_keeps_what_the_sweep_reported() {
         let stdout = br#"{"dry_run":false,"expired":1,"released":[],"refused":[],"failed":[{"id":"pod-a","reason":"no credential"}]}"#;
         let failure = interpret_sweep("lm-provision-driver", exit(1), stdout)
             .expect_err("exit 1 means a machine is still running");
@@ -651,6 +688,18 @@ mod tests {
             failure.to_string().contains("exited with"),
             "the reason names how it ended: {failure}"
         );
+        let TickFailure::Exit { artifact, .. } = failure else {
+            panic!("a run that exited is an Exit failure: {failure}");
+        };
+        assert_eq!(
+            artifact.expect("the failing sweep's artifact rides on the failure")["failed"][0]["id"],
+            "pod-a",
+            "the machine still billing is named, not discarded"
+        );
+
+        let failure = interpret_sweep("lm-provision-driver", exit(1), b"Killed\n")
+            .expect_err("exit 1 fails the tick with or without an artifact");
+        assert!(matches!(failure, TickFailure::Exit { artifact: None, .. }));
     }
 
     #[cfg(unix)]
@@ -730,7 +779,8 @@ mod tests {
 
     /// A failed tick is the whole point of the endpoint: `ok` false,
     /// the reason readable, and no stale artifact left under the fresh
-    /// timestamp claiming a sweep happened.
+    /// timestamp claiming a sweep happened — only the failing sweep's
+    /// own document, when it wrote one.
     #[test]
     fn a_failed_sweep_replaces_the_last_good_one() {
         let mut status = Status::started("2026-09-01T00:00:00Z".to_string());
@@ -742,17 +792,48 @@ mod tests {
         record(
             &mut status,
             "2026-09-01T00:10:00Z".to_string(),
-            Err("could not run `lm-provision-driver`: No such file".to_string()),
+            Err(FailedTick {
+                reason: "could not run `lm-provision-driver`: No such file".to_string(),
+                artifact: None,
+            }),
         );
 
         let rendered = health(&config(), &status);
         assert!(!rendered.ok);
         assert_eq!(rendered.ticks, 2);
         assert_eq!(rendered.last_tick_at, Some("2026-09-01T00:10:00Z"));
-        assert!(rendered.last_artifact.is_none());
+        assert!(
+            rendered.last_artifact.is_none(),
+            "a tick that ran nothing has no document, and the last good one is not it"
+        );
         assert_eq!(
             rendered.last_tick_error,
             Some("could not run `lm-provision-driver`: No such file")
+        );
+
+        // An exit-1 sweep wrote a real document naming what is still
+        // billing; `ok: false` and that document belong side by side.
+        let still_billing = serde_json::json!({
+            "dry_run": false,
+            "expired": 1,
+            "released": [],
+            "refused": [],
+            "failed": [{ "id": "pod-a", "reason": "no credential" }],
+        });
+        record(
+            &mut status,
+            "2026-09-01T00:15:00Z".to_string(),
+            Err(FailedTick {
+                reason: "`lm-provision-driver sweep` exited with exit status: 1".to_string(),
+                artifact: Some(still_billing.clone()),
+            }),
+        );
+        let doc: serde_json::Value = serde_json::from_str(&health_body(&config(), &status))
+            .expect("the health body is JSON");
+        assert_eq!(doc["ok"], false);
+        assert_eq!(
+            doc["last_artifact"], still_billing,
+            "the reader of ok: false sees which machine is still billing"
         );
     }
 

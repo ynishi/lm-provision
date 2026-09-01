@@ -29,14 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sufficient.
 
   A machine carrying **no** stamp is reported under a new `unknown`
-  field in the sweep artifact and never released — this tool did not
-  name it, and deleting what it does not recognise is the accident, not
-  the enforcement. A platform that could not be listed lands in
-  `failed` under its own name and costs the sweep its zero exit, since
-  that account may be billing for anything. Idempotency is by
-  convergence rather than by reading the platform CLI's error text: a
-  machine already gone is simply absent from the next listing, so
-  nothing here depends on the spelling of somebody else's "not found".
+  field in the sweep artifact and never released on the listing's
+  evidence — this tool did not name it, and deleting what it does not
+  recognise is the accident, not the enforcement. (The record half may
+  still release such a machine when a recorded lease names its id;
+  that is how a pre-stamp machine expires, and it then appears as both
+  `unknown` and `released`.) A platform that could not be listed lands
+  in `failed` under its own name and costs the sweep its zero exit,
+  since that account may be billing for anything — and so does a
+  listing whose shape could not be read as a fleet: absence from a
+  listing retires recorded rows, so a shape change that silently read
+  as an empty account would retire the whole record while everything
+  on it kept billing. Idempotency is by convergence rather than by
+  reading the platform CLI's error text: a machine already gone is
+  simply absent from the next listing, so nothing here depends on the
+  spelling of somebody else's "not found".
 
   **The acquisitions record is demoted to the audit trail** — who
   bought what, when, for which profile, and how it was given back. It
@@ -81,7 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   One endpoint comes with it, on `--bind` (default `127.0.0.1:7909`):
   any request gets one JSON document — whether the last sweep worked,
   when it ran, how many have run, and the sweep's own artifact
-  verbatim. Hand-rolled HTTP/1.1 over a raw socket, since a web
+  verbatim, kept even on a failed tick when the sweep still wrote one:
+  an exit-1 sweep's `failed` field names the machines still billing,
+  which is exactly what the reader of `ok: false` needs next. Hand-rolled HTTP/1.1 over a raw socket, since a web
   framework would buy nothing over thirty lines for one consumer asking
   one question (spec 08 §Acquisitions and sweep).
 
@@ -103,7 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   system about whether the work still on a machine may go with it.
   `--dry-run` defaults to true, as `acquire`'s does. A gate refusal is
   not a sweep failure; a machine that expired and could not be
-  released is, because it is still billing. The row schema lives in
+  released is, because it is still billing — and a ledger the gate
+  could not read fails the machine rather than refusing it, since a
+  corrupt ledger read as a refusal would hold every expired machine
+  behind a zero exit forever. The row schema lives in
   `lm-provision-protocol` beside the ledger's — the control plane will
   read the same file (specs 08 §Acquisitions and sweep, 09
   §Acquisitions record).

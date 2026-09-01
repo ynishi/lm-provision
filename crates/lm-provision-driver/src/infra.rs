@@ -363,36 +363,75 @@ pub fn expiry_of(name: &str) -> Option<jiff::Timestamp> {
     .ok()
 }
 
-/// The machines in what a [`Fleet::list`] printed.
+/// The machines in what a [`Fleet::list`] printed — or why the
+/// document cannot be read as a fleet.
 ///
 /// **The array is found rather than assumed at the root.** One CLI
 /// prints the rows as the whole document and another wraps them in an
 /// object under a name of its own choosing, and which of those a
 /// sweeper is looking at is not something the enforcement should turn
-/// on. A row with no readable id is skipped: nothing could be released
-/// from it, and inventing an identifier for it would be worse than
-/// leaving it out.
-pub fn machines(listed: &serde_json::Value, fleet: &Fleet) -> Vec<Machine> {
+/// on. When the wrapper holds several arrays, the rows are the one
+/// whose entries carry the [`Fleet::id`] key — taking the *first*
+/// array would let an empty sibling (`"errors": []` sorts before
+/// `"pods"`) shadow the fleet entirely.
+///
+/// **A listing this cannot read is an error, never an empty fleet.**
+/// The caller treats "listed, and absent from the list" as proof a
+/// recorded machine is gone and retires its row (see the sweep's
+/// bookkeeping) — so a shape change that silently read as zero
+/// machines would retire the whole record while every machine on it
+/// kept billing. Only a document whose rows are genuinely empty is an
+/// empty account. A single unreadable row among readable ones is still
+/// skipped: nothing could be released from it, and inventing an
+/// identifier for it would be worse than leaving it out.
+pub fn machines(listed: &serde_json::Value, fleet: &Fleet) -> Result<Vec<Machine>, String> {
     let rows = match listed {
-        serde_json::Value::Array(rows) => Some(rows),
-        serde_json::Value::Object(fields) => fields.values().find_map(|it| it.as_array()),
-        _ => None,
+        serde_json::Value::Array(rows) => rows,
+        serde_json::Value::Object(fields) => {
+            let arrays: Vec<&Vec<serde_json::Value>> =
+                fields.values().filter_map(|it| it.as_array()).collect();
+            match arrays
+                .iter()
+                .copied()
+                .find(|rows| rows.iter().any(|row| row.get(fleet.id).is_some()))
+            {
+                Some(rows) => rows,
+                // Every array is empty: an empty account, whichever of
+                // them is the rows.
+                None if !arrays.is_empty() && arrays.iter().all(|it| it.is_empty()) => {
+                    return Ok(Vec::new())
+                }
+                None => {
+                    return Err(format!(
+                        "no field in the listing holds rows carrying {:?}",
+                        fleet.id
+                    ))
+                }
+            }
+        }
+        _ => return Err("the listing is neither an array nor an object".to_string()),
     };
-    rows.map(|rows| {
-        rows.iter()
-            .filter_map(|row| {
-                Some(Machine {
-                    id: json_id(row, fleet.id)?,
-                    name: row
-                        .get(fleet.stamp)
-                        .and_then(|it| it.as_str())
-                        .filter(|it| !it.is_empty())
-                        .map(str::to_string),
-                })
+    let read: Vec<Machine> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(Machine {
+                id: json_id(row, fleet.id)?,
+                name: row
+                    .get(fleet.stamp)
+                    .and_then(|it| it.as_str())
+                    .filter(|it| !it.is_empty())
+                    .map(str::to_string),
             })
-            .collect()
-    })
-    .unwrap_or_default()
+        })
+        .collect();
+    if read.is_empty() && !rows.is_empty() {
+        return Err(format!(
+            "none of the {} listed rows carries a readable {:?}",
+            rows.len(),
+            fleet.id
+        ));
+    }
+    Ok(read)
 }
 
 /// What a target is running, and what it said while being asked.
@@ -412,12 +451,11 @@ pub struct Listing {
 /// answer that costs money.
 pub fn list(fleet: &Fleet) -> Result<Listing, ExecuteError> {
     let output = run_output(&fleet.list, None)?;
-    let listed = payload(
-        &String::from_utf8_lossy(&output.stdout),
-        &fleet.list.join(" "),
-    )?;
+    let command = fleet.list.join(" ");
+    let listed = payload(&String::from_utf8_lossy(&output.stdout), &command)?;
     Ok(Listing {
-        machines: machines(&listed, fleet),
+        machines: machines(&listed, fleet)
+            .map_err(|detail| ExecuteError::Unreadable { command, detail })?,
         said: output.stderr,
     })
 }
@@ -3155,7 +3193,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            machines(&listed, &pods),
+            machines(&listed, &pods).expect("rows carrying the id key are the fleet"),
             vec![
                 Machine {
                     id: "pod-a".to_string(),
@@ -3179,7 +3217,7 @@ mod tests {
             { "id": 49228600, "label": null },
         ]);
         assert_eq!(
-            machines(&listed, &instances),
+            machines(&listed, &instances).expect("a bare array is the rows"),
             vec![
                 Machine {
                     id: "49227715".to_string(),
@@ -3192,11 +3230,55 @@ mod tests {
             ],
             "a numeric id is the machine's name in every argv this drives"
         );
+    }
 
-        assert!(
-            machines(&serde_json::json!({ "error": "unauthorized" }), &pods).is_empty(),
-            "a document with no rows in it lists no machines"
+    /// **A listing that cannot be read is an error, never an empty
+    /// fleet.** The sweep treats "listed, and absent" as proof a
+    /// recorded machine is gone and retires its row — so a shape this
+    /// silently read as zero machines would retire the whole record
+    /// while everything on it kept billing. Only genuinely empty rows
+    /// are an empty account.
+    #[test]
+    fn a_listing_that_cannot_be_read_is_an_error_not_an_empty_fleet() {
+        let pods = RunPodAdapter.fleet().expect("this target can be asked");
+
+        assert_eq!(
+            machines(&serde_json::json!({ "pods": [] }), &pods),
+            Ok(Vec::new()),
+            "an emptied account is a real answer"
         );
+        assert_eq!(
+            machines(&serde_json::json!({ "errors": [], "pods": [] }), &pods),
+            Ok(Vec::new()),
+            "and stays one beside an empty sibling array"
+        );
+        assert_eq!(
+            machines(
+                &serde_json::json!({
+                    "errors": [],
+                    "pods": [{ "id": "pod-a", "name": "x" }],
+                }),
+                &pods
+            )
+            .expect("the rows are the array whose entries carry the id key")
+            .len(),
+            1,
+            "an empty sibling that sorts first does not shadow the fleet"
+        );
+
+        for unreadable in [
+            serde_json::json!({ "error": "unauthorized" }),
+            serde_json::json!("unauthorized"),
+            // Rows exist but none carries the id key: a shape change,
+            // not an empty account.
+            serde_json::json!({ "pods": [{ "podId": "pod-a" }] }),
+            serde_json::json!([{ "podId": "pod-a" }]),
+        ] {
+            assert!(
+                machines(&unreadable, &pods).is_err(),
+                "{unreadable} would have been read as an empty fleet"
+            );
+        }
     }
 
     /// The listing goes through a real process: what the platform CLI
