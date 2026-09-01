@@ -182,16 +182,44 @@ pub fn require(target: &'static str, names: &[&'static str]) -> Result<(), Missi
 mod tests {
     use super::*;
 
+    /// Held for as long as a test has [`ENV_FILE`] set to its own
+    /// value.
+    ///
+    /// **The environment is one variable per process, not one per
+    /// test.** Two tests here point `ENV_FILE` at their own file and
+    /// read back what the code under test made of it; run on cargo's
+    /// parallel threads they interleave, and each way of interleaving
+    /// breaks one of them — a set landing between the other's set and
+    /// its read hands it the wrong path, and a `remove_var` landing
+    /// there hands it no path at all [measured: 2026-09-01, both
+    /// failures seen in one afternoon of repeated runs; the comments
+    /// this lock replaces claimed the two used different variables,
+    /// which they never did].
+    ///
+    /// A lock rather than one merged test: they check separate claims
+    /// about the search order, and a failure should name which.
+    static ENV_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The lock, surviving a poisoned one.
+    ///
+    /// A test that panicked while holding it leaves the variable it
+    /// set behind, which is a fair reason for the next test to fail —
+    /// but on its own assertion, with its own message, rather than on
+    /// a `PoisonError` naming neither.
+    fn env_file_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_FILE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The order is the contract: an explicit file beats the defaults,
     /// and the process's own environment beats every file.
     #[test]
     fn the_search_order_puts_the_explicit_file_first() {
-        // Serial with the other env-touching test in this module by
-        // construction: they use different variables and this one reads
-        // only what it sets.
+        let _guard = env_file_lock();
         let named = "/tmp/lm-provision-test-explicit.env";
-        // SAFETY: single-threaded within this test, and the variable is
-        // read back only here.
+        // SAFETY: `ENV_FILE` is written only under `ENV_FILE_LOCK`,
+        // held above, and read back only here.
         unsafe { std::env::set_var(ENV_FILE, named) };
         let candidates = candidates();
         unsafe { std::env::remove_var(ENV_FILE) };
@@ -245,10 +273,12 @@ mod tests {
     /// that clobbers an exported value turns an override into a
     /// coin toss.
     ///
-    /// Uses names nothing else reads, so it does not race the rest of
-    /// the suite over the process environment.
+    /// The two names it delivers are read nowhere else in the
+    /// workspace; `ENV_FILE`, which it also sets, is read by the test
+    /// above, so both take [`ENV_FILE_LOCK`].
     #[test]
     fn a_file_reaches_the_environment_without_displacing_what_is_there() {
+        let _guard = env_file_lock();
         let dir = std::env::temp_dir().join("lm-provision-credentials-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("chain.env");
@@ -258,8 +288,9 @@ mod tests {
         )
         .unwrap();
 
-        // SAFETY: these three names are read nowhere else in the
-        // workspace, so no other test observes them mid-flight.
+        // SAFETY: the two `LM_PROVISION_TEST_*` names are read nowhere
+        // else in the workspace, and `ENV_FILE` is written only under
+        // `ENV_FILE_LOCK`, held above.
         unsafe {
             std::env::set_var("LM_PROVISION_TEST_ALREADY_SET", "from-environment");
             std::env::set_var(ENV_FILE, &file);
