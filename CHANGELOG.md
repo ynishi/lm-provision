@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A daemon that sweeps without being asked
+  (`lm-provision-host`).** `sweep` gives back every machine whose lease
+  has run out, but only when somebody runs it — which is the
+  forgotten-machine problem one level up, since the host has nothing
+  that keeps running between driver invocations. The AGPL control-plane
+  crate is now that something: every `--interval-secs` (default 300,
+  against hour-grained leases) it runs `lm-provision-driver sweep`,
+  relays what the driver said with the driver's name in front of it,
+  and logs what came back. **It runs the driver as a child process
+  rather than linking it** — the CLI is the contract the specs
+  normalise, and exec leaves the AGPL crate depending on nothing
+  permissive at all, which is the cleanest the license boundary can be.
+  One sweep runs at startup, because an operator restarting the daemon
+  after a week with the laptop closed wants enforcement now. A tick
+  that fails — driver missing, non-zero exit, stdout that is not the
+  artifact — is recorded with its reason and the daemon waits for the
+  next one; a TTL enforcer that dies on the first bad tick protects
+  nothing for the rest of the week.
+
+  **`--dry-run` defaults to `false` here, the opposite of the CLI's
+  default, on purpose.** On the CLI, an operator asking which machines
+  would be released must not find out by them being gone; installing a
+  long-lived TTL-enforcement service is the opposite act — it is the
+  consent to release expired machines, and a daemon that defaulted to
+  observing would be the forgotten-machine problem wearing a uniform.
+  `--dry-run true` is the observation mode, and the release gate inside
+  sweep refuses uncollected work either way.
+
+  One endpoint comes with it, on `--bind` (default `127.0.0.1:7909`):
+  any request gets one JSON document — whether the last sweep worked,
+  when it ran, how many have run, and the sweep's own artifact
+  verbatim. Hand-rolled HTTP/1.1 over a raw socket, since a web
+  framework would buy nothing over thirty lines for one consumer asking
+  one question (spec 08 §Acquisitions and sweep).
+
 - **A machine you acquired is now written down, and `sweep` gives back
   the ones whose lease ran out.** `acquire` created a billable machine
   and left its id in one place — the run's stdout. Close the terminal

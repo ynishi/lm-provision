@@ -17,7 +17,34 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# Nothing to publish yet: the crate is an empty scaffold holding the
-# license boundary open. This flips when the host implementation lands
-# (local issue 735a029e).
+# Nothing here is a library anyone builds against: the daemon is run,
+# not depended on, and no permissive crate in this workspace may name
+# it at all (`no_permissive_crate_depends_on_the_agpl_host`). An
+# operator gets it by building or self-hosting this repository, which
+# is what the AGPL side is for; a registry entry would only invite the
+# dependency edge the boundary forbids.
 publish = false
+
+[[bin]]
+name = "lm-provision-host"
+path = "src/main.rs"
+
+[dependencies]
+# No `lm-provision*` dependency, and there will not be one. The daemon
+# reaches the engine by running `lm-provision-driver` as a child
+# process (see the crate docs): the CLI is the contract, and exec keeps
+# the AGPL crate from linking a permissive one — the cleanest the
+# boundary can be.
+#
+# `process` and `sync` on top of the workspace feature set: the whole
+# daemon is spawning one child on a timer and sharing what it said with
+# the health endpoint. Features are additive, so the other members'
+# tokio build is unaffected.
+tokio = { workspace = true, features = ["process", "sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+jiff = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

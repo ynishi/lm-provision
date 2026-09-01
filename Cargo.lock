@@ -1005,6 +1005,16 @@ dependencies = [
 [[package]]
 name = "lm-provision-host"
 version = "0.7.0"
+dependencies = [
+ "clap",
+ "jiff",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "lm-provision-mcp"
