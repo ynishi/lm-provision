@@ -1,7 +1,10 @@
 # 11. Fragment import
 
-Status: draft (design settled at spec level; §MVP scope increment 1 —
-local imports — is implemented in `crates/lm-provision/src/resolve.rs`).
+Status: draft (design settled at spec level; §MVP scope increments 1–3
+— local imports, remote imports + cache, and the `pin` resolver
+subcommand — are implemented in `crates/lm-provision/src/resolve.rs`,
+`crates/lm-provision/src/to_bridge_json.rs`, and
+`crates/lm-provision/src/pin.rs`).
 Layer 2.
 Upstream deps: 01, 02, 03. MVP: post-H increment (§MVP scope).
 
@@ -92,7 +95,7 @@ a reusable unit can honestly own:
 | field | carried | notes |
 |---|---|---|
 | `name`, `version`, `description` | yes | same rules as `Spec` |
-| `capabilities`, `env_secrets`, `paths`, `http_allowlist` | yes | set-shaped, merged by union (§Resolution) |
+| `capabilities`, `env_secrets`, `paths`, `http_allowlist`, `sh_egress` | yes | set-shaped, merged by union (§Resolution) |
 | `env`, `assumes` | yes | keyed tables, merged disjointly (§Resolution) |
 | `phases` | yes | phase nodes per chapter 02, `Import` included |
 | machine requirements (`requires_*`), `provider` | **no** | machine shape is the consumer's declaration; a fragment cannot know what else the profile runs |
@@ -151,9 +154,10 @@ Expansion, per `Import` node, in order:
    `Import` node in place. Phase order is semantic on both sides and
    is preserved.
 5. **Merge declarations**:
-   - `capabilities`, `env_secrets`, `paths`, `http_allowlist` —
-     set union. These are order-independent sets (chapter 03 sorts
-     them before hashing), so union is the whole rule.
+   - `capabilities`, `env_secrets`, `paths`, `http_allowlist`,
+     `sh_egress` — set union. These are order-independent sets
+     (chapter 03 sorts them before hashing), so union is the whole
+     rule.
    - `env`, `assumes` — disjoint-key merge. A key declared by both
      sides with different values is an error, **not an override**:
      late-binding override semantics are how GCL-lineage languages

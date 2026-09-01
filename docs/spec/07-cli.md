@@ -26,6 +26,7 @@ lm-provision <subcommand> <profile-path> [flags]
 | `plan <path>` | load → declarations → plan | none (read-only) |
 | `apply <path> [--dry-run]` | load → declarations → gate → bridges → plan → dispatch → apply | executes the dispatched op stream (dry-run: decode + policy + secret resolution only, chapter 04) |
 | `fetch <url> --expect-hash <hex> -o <path>` | GET → stage → load → declarations → canonical → hash → admit-or-refuse | one HTTP GET, one file written at `<path>` — and only on a hash match; a refusal writes nothing new (a file already at `<path>` from an earlier run is not touched either way, except by the rename that lands an admitted profile) |
+| `pin <path> --index <url-or-path>` | load-as-JSON → rewrite `name@version` → verify (chapter 11 §Resolution) → overwrite | rewrites the profile at `<path>` in place — HTTP GET the fragments the rewritten pins name, verify each, then rename over the original; a verify failure writes nothing (the temp file is removed and the original is left intact) |
 
 `fetch` is the one subcommand whose positional argument is a URL, not
 a path: it retrieves a shared profile (e.g. from a raw repository URL
@@ -36,6 +37,24 @@ static host a trustworthy source; `--expect-hash` is required because
 an unverified fetch adds nothing over `curl`. The staging file shares
 the destination's extension so it routes to the same parser the
 destination would (§Profile input format).
+
+`pin` is the authoring-time counterpart to fragment resolve
+(chapter 11 §The resolver layer): it walks the JSON profile at
+`<path>`, finds every `Import` whose `src` matches the `name@version`
+shorthand (`name` and `version` drawn from `[A-Za-z0-9._-]`, joined by
+exactly one `@`, no scheme and no `/`), looks each pair up in
+`--index`'s `{"profiles":[{name,version,path,profile_hash}]}` list,
+and rewrites the import into the explicit `src` + `hash` pair the
+resolve stage consumes. `--index` is either an https URL — fetched
+under the same 4 MB cap and 30 s deadline `fetch` uses — or a local
+path. Before overwriting the target, the rewritten document is
+materialized to a temp file next to it and run through the full
+resolve stage: every rewritten fragment is fetched, and every pin is
+re-verified against the fragment's own expanded canonical hash. A
+document that does not resolve never overwrites the original.
+
+MVP is JSON-only (the canonical text form is not rewritable without
+losing whitespace and comment shape — deferred).
 
 ### Profile input format
 
@@ -98,6 +117,14 @@ removed together with the embedded VM; profiles are data, not code.
   file that was already there before the run survives, so "the path
   exists" is only evidence of verification for the run that reported
   `ok`. The error goes to stderr (`fetch failed: <message>`).
+- `pin`: `{"ok": true, "pinned": [{"name": "...", "version": "...",
+  "src": "...", "hash": "..."}]}` as pretty-printed JSON. A profile
+  with no `name@version` imports succeeds with `"pinned": []` and
+  does not touch the file (idempotent). On any failure — index
+  unreadable / missing entry / verify failure — nothing is printed
+  to stdout, the temp file next to the target is removed, and the
+  original file is left byte-identical. The error goes to stderr
+  (`pin failed: <message>`).
 
 ## Error surface
 
@@ -129,12 +156,17 @@ detail; the stderr line is a human summary.
   cap / non-success status / non-profile or non-`Spec` body / hash
   mismatch): exit 1, staging removed, destination not written; safe
   to re-run against a corrected URL or pin.
+- Pin refusal (non-JSON target / malformed profile JSON / index
+  unreadable / index shape wrong / no matching `name@version`
+  entry / rewritten document does not resolve): exit 1, temp file
+  removed, original left untouched; safe to re-run against a
+  corrected index or profile.
 
 ## Stability
 
 - Subcommand names and the subcommand set (`validate` / `hash` /
-  `plan` / `apply` / `fetch`): **provisional** through Phase H
-  (additions expected; renames are breaking).
+  `plan` / `apply` / `fetch` / `pin`): **provisional** through Phase
+  H (additions expected; renames are breaking).
 - Exit code mapping (0 / 1 / 2 as above): **stable once frozen** —
   frozen here.
 - Per-subcommand stdout artifacts (shape ownership: chapter 03 for

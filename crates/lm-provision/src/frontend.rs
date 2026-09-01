@@ -134,6 +134,32 @@ pub(crate) fn load_profile_with(path: &Path, ids: &IdGen) -> Result<ProfileNode,
     }
 }
 
+/// Parse an already-obtained profile document from `bytes`, using the
+/// same two parse routes as [`load_profile_with`] but with the
+/// route pre-selected by the caller: `is_json = true` routes through the
+/// JSON serde bridge; anything else, the canonical text grammar.
+///
+/// Introduced for the resolve stage's remote / cache entries
+/// ([`crate::resolve`], spec 11 §Cache), whose bytes never had a
+/// filesystem path — the extension rule lives one level up, applied to
+/// the URL path.
+///
+/// UTF-8 bytes only (both parsers work on `&str`): a non-UTF-8 body is a
+/// [`FrontendError::Parse`] with the underlying decode error, the same
+/// shape a malformed document surfaces.
+pub(crate) fn load_profile_bytes(
+    bytes: &[u8],
+    is_json: bool,
+    ids: &IdGen,
+) -> Result<ProfileNode, FrontendError> {
+    let text = std::str::from_utf8(bytes).map_err(|err| FrontendError::Parse(err.to_string()))?;
+    if is_json {
+        parse_json(text, ids)
+    } else {
+        parse_text(text, ids)
+    }
+}
+
 /// True when `path`'s extension equals `ext` (case-insensitive).
 fn has_extension(path: &Path, ext: &str) -> bool {
     path.extension()

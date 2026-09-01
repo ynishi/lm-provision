@@ -10,7 +10,7 @@ binary with zero dependencies on the target pod.
 
 | Crate | What it is |
 |---|---|
-| [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]` / `fetch`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. |
+| [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]` / `fetch` / `pin`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. Fragment imports (spec 11): hash-pinned local + https fragment reuse with an XDG-cached expansion pass, plus a `pin` authoring subcommand that rewrites `name@version` imports against an `index.json`. |
 | [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push driver. `apply`: one-shot session over SSH — ensure-binary (idempotent SHA-256 push of the musl artifact), place profile, apply, collect report / transcript, append to the apply ledger. `acquire` / `release` / `check`: obtain a machine meeting the profile's declared requirements, give it back, or judge one that already exists. |
 | [`lm-provision-mcp`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-mcp) | MCP server exposing `lm_validate` / `lm_hash` / `lm_plan` and apply-ledger inspection as MCP tools. |
 
@@ -48,6 +48,13 @@ lm-provision plan profile.json
 lm-provision fetch \
   https://raw.githubusercontent.com/ynishi/lm-provision/main/docs/profiles/comfyui-base-0.1.0.json \
   --expect-hash <hash-from-index.json> -o profile.json
+
+# Fragment reuse: write `Import` nodes with the `name@version`
+# shorthand and let `pin` rewrite them into the explicit src+hash
+# pair against an index.json (spec 11 §The resolver layer). The
+# rewrite is verified end-to-end before it lands.
+lm-provision pin profile.json \
+  --index https://raw.githubusercontent.com/ynishi/lm-provision/main/docs/profiles/index.json
 
 # Apply on the target host (or via the push driver from your machine):
 lm-provision apply profile.json            # effectful

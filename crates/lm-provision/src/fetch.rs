@@ -43,12 +43,22 @@ use std::path::{Path, PathBuf};
 
 /// Whole-request deadline. A profile is KB-scale; a source that cannot
 /// deliver one in this window is down, not slow.
-const TIMEOUT_SEC: u64 = 30;
+///
+/// `pub(crate)` because [`crate::resolve`] shares this deadline for its
+/// fragment fetches — the two routes have the same shape (KB-scale
+/// documents over static HTTPS), and spec 07-cli.md §Invocation `pin`
+/// names the shared budget literally ("under the same 4 MB cap and
+/// 30 s deadline `fetch` uses"). One constant, one place to change.
+pub(crate) const TIMEOUT_SEC: u64 = 30;
 
 /// Body cap, checked chunk-by-chunk before buffering
 /// ([`crate::exec::effects::read_capped`]). Refuses an index typo that
 /// points the URL at a model weight before it can fill memory.
-const MAX_PROFILE_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// `pub(crate)` for the same reason [`TIMEOUT_SEC`] is: [`crate::resolve`]
+/// and [`crate::pin`] cap fragment / index bodies at the same 4 MB
+/// (spec 07-cli.md §Invocation `pin`).
+pub(crate) const MAX_PROFILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// What a successful fetch admitted.
 #[derive(Debug)]
@@ -341,7 +351,10 @@ mod tests {
 
         assert!(matches!(err, FetchError::HashMismatch { .. }), "{err}");
         assert!(!out.exists(), "the destination must not appear on mismatch");
-        assert!(!staging_path(&out).exists(), "the staging file must be cleaned up");
+        assert!(
+            !staging_path(&out).exists(),
+            "the staging file must be cleaned up"
+        );
     }
 
     /// A refusal does not eat what was already there: a pre-existing

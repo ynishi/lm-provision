@@ -41,6 +41,12 @@ libc = "0.2"
 # `default-features = false` is load-bearing: reqwest's default TLS backend is
 # native-tls (OpenSSL), which breaks the static musl build. rustls only.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# `url` is spec 11 §Resolution step 2's `Url::join` — a remote fragment's
+# relative import stays same-origin, and same-origin is Url::join. reqwest
+# already pulls it in transitively, so this adds no new tree weight; it
+# only makes the workspace-level dependency explicit for the code that
+# reasons about it directly (`crate::resolve`, the `pin` subcommand).
+url = "2"
 jiff = "0.1"
 dotenvy = "0.15"
 rmcp = { version = "2", features = ["server", "transport-io", "macros"] }

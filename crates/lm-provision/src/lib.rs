@@ -30,8 +30,17 @@
 //!   (03-pipeline-stage-artifacts.md §canonical / §hash). Frontend-
 //!   independent by construction: `NodeId` is excluded, declared lists
 //!   are sorted, phase order preserved.
+//! - [`pin`] — the resolver-layer `pin` subcommand (spec 11 §The
+//!   resolver layer): rewrite `name@version` imports in a JSON profile
+//!   into the explicit pinned `src` + `hash` form against an
+//!   `index.json`, verifying the rewritten document resolves before
+//!   overwriting it.
 //! - [`plan`] — the AST plan stage: expand a profile into the plan
 //!   artifact (03-pipeline-stage-artifacts.md §plan).
+//! - [`to_bridge_json`] — expanded AST → serde-JSON serializer whose
+//!   output the JSON serde bridge accepts (spec 11 §Cache last
+//!   paragraph: the pin-verifiable cache entries the resolve stage
+//!   writes, and — later — the payload the driver preflight uploads).
 //! - [`resource`] — what a phase creates (`produces`) and what it needs
 //!   already there (`requires` / `assumes`), and the forward fold that
 //!   decides whether a profile is well-formed under that. Every
@@ -78,8 +87,10 @@ pub mod fetch;
 pub mod frontend;
 pub mod machine;
 pub mod normalize;
+pub mod pin;
 pub mod plan;
 pub mod profile_ast;
 pub mod resolve;
 pub mod resource;
+pub mod to_bridge_json;
 pub mod validate;

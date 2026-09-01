@@ -84,6 +84,21 @@ pub enum Command {
         #[arg(long, short = 'o')]
         out: std::path::PathBuf,
     },
+    /// Rewrite every `name@version` Import in the profile into the
+    /// explicit pinned `src` + `hash` form, using an `index.json` as
+    /// the resolver (spec 11 §The resolver layer). The rewritten
+    /// document is verified end-to-end (fetch every fragment, re-hash
+    /// every pin) before it overwrites the original; on any failure
+    /// the file is left untouched.
+    Pin {
+        /// Path to the JSON profile to rewrite.
+        profile: std::path::PathBuf,
+        /// The index location — an https URL or a local path to a JSON
+        /// file with the same `{"profiles":[{name,version,path,profile_hash}]}`
+        /// shape as `docs/profiles/index.json`.
+        #[arg(long)]
+        index: String,
+    },
 }
 
 /// Resolve the effective tracing filter: `RUST_LOG` env var takes
@@ -112,6 +127,7 @@ pub fn run(command: &Command) -> ExitCode {
             expect_hash,
             out,
         } => run_fetch(url, expect_hash, out),
+        Command::Pin { profile, index } => run_pin(profile, index),
     }
 }
 
@@ -323,6 +339,27 @@ fn run_apply(profile: &Path, dry_run: bool) -> ExitCode {
     ExitCode::from(0)
 }
 
+/// `pin <profile> --index <url-or-path>` (07-cli.md §Invocation `pin`,
+/// spec 11 §The resolver layer). Rewrite every `name@version` Import
+/// in the profile into the explicit pinned form; verify the rewritten
+/// document resolves before overwriting it.
+///
+/// Success prints `{"ok": true, "pinned": [...]}` on stdout; failure
+/// prints `pin failed: <message>` on stderr and leaves the file
+/// untouched.
+fn run_pin(profile: &Path, index: &str) -> ExitCode {
+    match crate::pin::pin(profile, index) {
+        Ok(outcome) => {
+            print_json(&serde_json::json!({
+                "ok": true,
+                "pinned": outcome.pinned,
+            }));
+            ExitCode::from(0)
+        }
+        Err(err) => print_failure("pin", err),
+    }
+}
+
 /// `fetch <url> --expect-hash <hex> -o <path>` (07-cli.md §Invocation
 /// `fetch`). Retrieve a shared profile and admit it only on a hash
 /// match ([`crate::fetch::fetch`]).
@@ -413,6 +450,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_pin_subcommand() {
+        let cli = Cli::try_parse_from([
+            "lm-provision",
+            "pin",
+            "profile.json",
+            "--index",
+            "docs/profiles/index.json",
+        ])
+        .expect("pin should parse");
+        match cli.command {
+            Command::Pin { profile, index } => {
+                assert_eq!(profile, std::path::PathBuf::from("profile.json"));
+                assert_eq!(index, "docs/profiles/index.json");
+            }
+            other => panic!("expected Pin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pin_without_index_is_a_usage_error() {
+        let result = Cli::try_parse_from(["lm-provision", "pin", "profile.json"]);
+        assert!(result.is_err(), "--index is required");
+    }
+
+    #[test]
     fn fetch_without_expect_hash_is_a_usage_error() {
         let result = Cli::try_parse_from([
             "lm-provision",
@@ -421,7 +483,10 @@ mod tests {
             "-o",
             "p.json",
         ]);
-        assert!(result.is_err(), "--expect-hash is required: an unverified fetch is curl");
+        assert!(
+            result.is_err(),
+            "--expect-hash is required: an unverified fetch is curl"
+        );
     }
 
     #[test]
