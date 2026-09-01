@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A machine you acquired is now written down, and `sweep` gives back
+  the ones whose lease ran out.** `acquire` created a billable machine
+  and left its id in one place — the run's stdout. Close the terminal
+  and the machine kept running with nothing on the host that knew it
+  was there. Every real acquire now appends a row to
+  `~/.lm-provision/acquisitions.jsonl` (`--acquisitions` to move it):
+  the id, the platform, the profile hash, the release argv verbatim,
+  and a lease — `--ttl-hours`, default 24, with no opt-out, because an
+  unleased machine is one nothing ever comes back for. A release
+  appends a correction row naming the same id; rows are never
+  rewritten, so "what is still running" is an id-join over the file
+  rather than a flag somebody has to keep current. `sweep` reads it,
+  takes the expired machines, and puts each one through the same
+  release gate `release` applies before deleting it — no `--force`
+  here, since a scheduled sweep is the least informed thing in the
+  system about whether the work still on a machine may go with it.
+  `--dry-run` defaults to true, as `acquire`'s does. A gate refusal is
+  not a sweep failure; a machine that expired and could not be
+  released is, because it is still billing. The row schema lives in
+  `lm-provision-protocol` beside the ledger's — the control plane will
+  read the same file (specs 08 §Acquisitions and sweep, 09
+  §Acquisitions record).
+
 - **The license boundary, cut before the code that needs it.** The
   coming control plane (a daemon that outlives a driver run: TTL
   enforcement, ledger custody) is AGPL-3.0-or-later, and the engine is

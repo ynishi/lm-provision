@@ -1,6 +1,6 @@
 [package]
 name = "lm-provision-protocol"
-description = "Wire types shared across lm-provision's license boundary: the append-only apply-ledger row schema and its JSON Lines encoding"
+description = "Wire types shared across lm-provision's license boundary: the append-only apply-ledger and acquisitions row schemas and their JSON Lines encoding"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

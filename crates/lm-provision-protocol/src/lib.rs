@@ -19,13 +19,14 @@
 //! that has already taken outside contributions needs a CLA or DCO
 //! from every contributor.
 //!
-//! The shared vocabulary starts as one thing, the apply-ledger row
-//! schema and its JSON Lines encoding ([`ledger`]), because that is
-//! what both sides touch today: the driver appends a row, the host
-//! will take custody of the file. It grows as the host lands —
-//! acquisition records are the next wire types with a reader on each
-//! side.
+//! The shared vocabulary is two things, both of them rows a driver
+//! appends and the host will take custody of: the apply-ledger row
+//! schema and its JSON Lines encoding ([`ledger`]), and the
+//! acquisitions record ([`acquisition`]) — one row per machine bought,
+//! one per machine given back, which is what a TTL sweep on either
+//! side of the boundary reads to know what is still running.
 
 #![warn(missing_docs)]
 
+pub mod acquisition;
 pub mod ledger;
