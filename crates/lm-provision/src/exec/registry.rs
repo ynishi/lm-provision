@@ -362,7 +362,7 @@ impl ProfileOp {
                     },
                     &env,
                     self.ctx.mode,
-                    self.ctx.egress_hard_pin,
+                    self.ctx.egress_proxy_addr,
                 ),
             );
             renders.push(record_lifecycle_step(
@@ -423,7 +423,7 @@ impl ProfileOp {
             ExecMode::Real => {
                 let outcome = match effects::sh_exec(
                     argv,
-                    &effects::ShOpts::new(resolved_env).with_hard_pin(self.ctx.egress_hard_pin),
+                    &effects::ShOpts::new(resolved_env).with_hard_pin(self.ctx.egress_proxy_addr),
                 ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -1984,7 +1984,7 @@ async fn resolve_lifecycle_step(
         },
         &env,
         ctx.mode,
-        ctx.egress_hard_pin,
+        ctx.egress_proxy_addr,
     )
     .await;
     let summary = record_lifecycle_step(

@@ -196,12 +196,14 @@ pub struct ExecContext {
     /// started and owned by the apply driver, which holds it for the run and
     /// passes its URL in; this is only the injection target.
     pub egress_proxy_url: Option<String>,
-    /// Whether `sh.exec` subprocesses also run under the egress **hard pin**
-    /// (a seccomp `connect` supervisor, [`crate::egress::hardpin`]). True only
-    /// when the proxy is self-hosted on loopback: the pin refuses any connect
-    /// but loopback / DNS, catching a subprocess that ignores the proxy env.
-    /// Linux-only; the spawn path ignores it elsewhere.
-    pub egress_hard_pin: bool,
+    /// The proxy endpoint `sh.exec` subprocesses are pinned to under the
+    /// egress **hard pin** (a seccomp supervisor, [`crate::egress::hardpin`]),
+    /// or `None` when no hard pin applies. `Some(addr)` only when the proxy is
+    /// self-hosted on loopback: the pin refuses any address-carrying network
+    /// syscall whose destination is not this endpoint or a configured DNS
+    /// resolver, catching a subprocess that ignores the proxy env. Linux-only;
+    /// the spawn path ignores it elsewhere.
+    pub egress_proxy_addr: Option<std::net::SocketAddr>,
     /// `NodeId -> ProfileNode` payload lookup (dsl-kit does not pass leaf
     /// payloads into [`dsl_kit::Op::apply`]).
     pub payloads: Arc<HashMap<NodeId, ProfileNode>>,
@@ -244,7 +246,7 @@ impl ExecContext {
         mode: ExecMode,
         log: Arc<Mutex<Vec<String>>>,
         egress_proxy_url: Option<String>,
-        egress_hard_pin: bool,
+        egress_proxy_addr: Option<std::net::SocketAddr>,
     ) -> Result<Self, ExecError> {
         // Extract the five `Spec`-scoped declarations the context
         // needs, or empty defaults when `root` is not a `Spec` (the
@@ -318,7 +320,7 @@ impl ExecContext {
             http_policy,
             env_policy,
             egress_proxy_url,
-            egress_hard_pin,
+            egress_proxy_addr,
             payloads,
             step_plan,
             log,

@@ -238,6 +238,15 @@ impl HttpPolicy {
     /// (spec 05 §L3): "a literal URL prefix, optionally with a single
     /// `*` wildcard whose match is confined to the host portion ...
     /// the wildcard never matches into the path."
+    ///
+    /// **Port**: the pattern and URL are compared on the full
+    /// **authority including any `:port`** — so `https://example.com`
+    /// does **not** allow `https://example.com:8443`; a non-default port
+    /// must be declared. This is the deliberate asymmetry with
+    /// `sh_egress`, whose CONNECT pin strips the port and admits any port
+    /// on a declared host — the HTTP side is not widened to match,
+    /// because that would loosen a security allowlist (see
+    /// [`crate::egress::host_match`] §Port handling, spec 05 §L3).
     pub fn is_allowed(&self, url: &str) -> bool {
         self.allowlist
             .iter()

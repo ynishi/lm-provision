@@ -37,6 +37,12 @@ impl EgressPolicy {
     /// same authority: case-insensitive, trailing dot ignored, `*.X`
     /// matches the bare `X` and any label prefixed onto it, a literal
     /// pattern matches only itself.
+    ///
+    /// **Port**: the caller passes the CONNECT **host** here, with the
+    /// port already stripped (the proxy's `connect_host`), so a declared
+    /// host admits any port on it. That is the one place this policy
+    /// differs from `http_allowlist`, which pins the port too; see
+    /// [`super::host_match`] §Port handling and spec 05 §L3.
     pub fn allows(&self, host: &str) -> bool {
         self.patterns
             .iter()

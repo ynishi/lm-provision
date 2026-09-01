@@ -37,6 +37,37 @@
 //!   `*.example.com` covers the apex `example.com` too, and it is the
 //!   [`EgressPolicy`]'s tested behaviour (`*.hf.co` matches `hf.co`).
 //!
+//! # What `*` grants (it is a substring, not a DNS wildcard)
+//!
+//! `*` is a **cross-label substring** within the declared parent, not a
+//! single-label DNS wildcard. `*.hf.co` matches arbitrarily deep
+//! (`a.b.c.hf.co`), and `f*.b2.backblazeb2.com` matches any host that
+//! starts `f` and ends `.b2.backblazeb2.com` — the `*` spans dots. It is
+//! still anchored to the declared prefix and suffix, so it cannot escape
+//! the parent domain, but an author writing `*.hf.co` is granting every
+//! sub-label depth under `hf.co`, not just one. That is the behaviour the
+//! tests pin; it is documented here so the grant is not a surprise.
+//!
+//! # Port handling is the caller's, and the two callers differ
+//!
+//! This matcher compares the **host/authority string it is handed**; it
+//! does not itself parse or strip a `:port`. The two L3 consumers hand it
+//! different things, and that asymmetry is deliberate — widening the HTTP
+//! side would loosen a security allowlist, so it stays:
+//!
+//! - **`sh_egress`** ([`EgressPolicy`], the CONNECT proxy) strips the port
+//!   before matching — the pinned unit is the CONNECT **host**, and the
+//!   proxy admits any port on a declared host (`sh_egress: example.com`
+//!   allows `CONNECT example.com:8443`).
+//! - **`http_allowlist`** ([`crate::exec::policy::HttpPolicy`]) matches the
+//!   full **authority including the port** — `https://example.com` denies
+//!   `https://example.com:8443` (fail-closed). To allow a non-default
+//!   port on the HTTP side an author declares it (`https://example.com:8443`).
+//!
+//! So a declared host string means the same thing *as a host* on both
+//! sides; what differs is that the HTTP allowlist additionally pins the
+//! port and the egress pin does not. Spec 05 §L3 states the same.
+//!
 //! # Why not `regex` / a full DNS library
 //!
 //! Every pattern this crate handles comes from the profile author's own
@@ -85,7 +116,18 @@ pub fn matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-fn normalise(s: &str) -> String {
+/// The DNS normalisation both sides of a match run through: trailing
+/// dot trimmed, lowercased (§Semantics).
+///
+/// `pub(crate)` because [`matches`] is not the only place two host
+/// strings meet. The egress proxy compares a ClientHello's `server_name`
+/// against the CONNECT host to refuse a fronted name
+/// ([`super::proxy`]), and that comparison has to answer the way the
+/// allowlist just did — otherwise `CONNECT huggingface.co.:443` passes
+/// the policy (which trimmed the dot) and is then refused as fronting
+/// against an SNI of `huggingface.co`, for a difference DNS says is not
+/// one.
+pub(crate) fn normalise(s: &str) -> String {
     s.trim_end_matches('.').to_ascii_lowercase()
 }
 

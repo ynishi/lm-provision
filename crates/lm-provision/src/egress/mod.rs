@@ -75,13 +75,21 @@ impl EgressSupply {
         }
     }
 
-    /// Whether the hard pin (a loopback-only seccomp `connect` supervisor)
-    /// applies. Only for a self-hosted proxy, which is on loopback: pinning
-    /// connects to loopback then forces every subprocess through it. An
-    /// external gateway is off-host, so a loopback pin would sever it — there
-    /// the gateway is the enforcement and the hard pin stays off.
-    pub fn hard_pin(&self) -> bool {
-        matches!(self, EgressSupply::SelfHosted(_))
+    /// The proxy endpoint the seccomp hard pin should admit, or `None`
+    /// when the hard pin does not apply.
+    ///
+    /// Only a self-hosted proxy carries an address the pin can key on: it
+    /// binds a loopback listener, and pinning subprocess egress to *that
+    /// endpoint* (plus configured DNS resolvers, [`hardpin`]) forces every
+    /// subprocess through it. An external gateway is off-host and owns its
+    /// own enforcement, so the hard pin stays off there — `None`.
+    ///
+    /// [`hardpin`]: crate::egress::hardpin
+    pub fn hard_pin_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            EgressSupply::SelfHosted(proxy) => Some(proxy.addr()),
+            EgressSupply::External(_) => None,
+        }
     }
 }
 

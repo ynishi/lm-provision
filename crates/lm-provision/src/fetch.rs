@@ -40,6 +40,20 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use url::Url;
+
+/// Per-process counter in a staging file's name. The pid alone is not
+/// enough: one MCP server process runs concurrent `lm_apply` sessions,
+/// and two fetches to the same destination inside it would share a pid
+/// — and therefore a staging path, where the first `create_new` wins
+/// and the second refuses a file that is not a leftover but its own
+/// sibling's work in flight. Same shape as the three sibling sites
+/// ([`crate::resolve`]'s cache-temp counter, [`crate::pin`]'s
+/// verify-temp counter, and the driver session's expanded-payload
+/// counter).
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Whole-request deadline. A profile is KB-scale; a source that cannot
 /// deliver one in this window is down, not slow.
@@ -173,21 +187,55 @@ pub async fn fetch(url: &str, expect_hash: &str, out: &Path) -> Result<Fetched, 
             status: response.status().to_string(),
         });
     }
+    // The URL that actually served the bytes — after redirects, which
+    // this route follows (§The hash is the trust root, not the host).
+    // That is the anchor the body's own relative imports are written
+    // against, so it is the one [`admit`] resolves at, not the request
+    // URL and not the file the bytes are staged in.
+    let origin = response.url().clone();
     let body = crate::exec::effects::read_capped(response, MAX_PROFILE_BYTES)
         .await
         .map_err(|message| FetchError::Transport {
             url: url.to_string(),
             message,
         })?;
-    admit(&body, expect_hash, out)
+    admit(&body, expect_hash, out, &origin)
 }
 
 /// Stage `body`, hash it, and rename it to `out` only on a match.
 ///
+/// `origin` is the URL that served `body`. It is not decoration: the
+/// hash this function verifies is the *expanded* canonical hash, so the
+/// body's imports get resolved on the way — and an import's meaning
+/// depends on where its document is (spec 11 §Resolution step 2). See
+/// [`admit_into`] for what anchoring it at the staging file instead did.
+///
 /// Split from [`fetch`] so the admit-or-refuse half — the half with
 /// the invariants — is testable without a server.
-pub(crate) fn admit(body: &[u8], expect_hash: &str, out: &Path) -> Result<Fetched, FetchError> {
-    let staging = staging_path(out);
+pub(crate) fn admit(
+    body: &[u8],
+    expect_hash: &str,
+    out: &Path,
+    origin: &Url,
+) -> Result<Fetched, FetchError> {
+    let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+    admit_into(body, expect_hash, out, &staging_path(out, seq), origin)
+}
+
+/// [`admit`] with the staging path chosen by the caller.
+///
+/// The split exists for the exclusive-create test: once the staging
+/// name carries a per-call counter, no caller outside this function can
+/// predict which path a given [`admit`] will use, and a test that wants
+/// to plant something in the way has to be the one that names it.
+fn admit_into(
+    body: &[u8],
+    expect_hash: &str,
+    out: &Path,
+    staging: &Path,
+    origin: &Url,
+) -> Result<Fetched, FetchError> {
+    let staging = staging.to_path_buf();
     // Exclusive create: refuses to write through a pre-planted symlink
     // or over anything already there. A leftover from a killed earlier
     // run surfaces here as `AlreadyExists` with the path named, so the
@@ -216,7 +264,18 @@ pub(crate) fn admit(body: &[u8], expect_hash: &str, out: &Path) -> Result<Fetche
     // resolves first — `fetch` must judge the same identity or the two
     // disagree about the same document. A body with no imports resolves
     // to itself (the whole pre-spec-11 behaviour, byte-for-byte).
-    let node = match crate::resolve::resolve(node, &staging) {
+    //
+    // Resolved **at the origin URL, not at the staging file.** The
+    // staging path is where the bytes happen to sit for the length of
+    // this call; the document was written against the URL it came from.
+    // Anchoring it locally gave its relative imports the temp directory
+    // — where a legitimate `./frag.json` is simply missing, and where a
+    // resolved one would be an operator-host file the document never
+    // named. It also stood the referential sanity check down: a
+    // document reached over https may only import https sources (spec
+    // 11 §Adopted conventions), and a `File` location has no remote to
+    // be same-origin with.
+    let node = match crate::resolve::resolve_remote(node, origin) {
         Ok(node) => node,
         Err(err) => {
             std::fs::remove_file(&staging).ok();
@@ -251,17 +310,20 @@ pub(crate) fn admit(body: &[u8], expect_hash: &str, out: &Path) -> Result<Fetche
     })
 }
 
-/// The staging file: `profile.json` → `profile.part-<pid>.json`. The
-/// destination's extension is preserved because the frontend picks its
-/// parser by extension alone (`profile.json.part` would be parsed as
-/// canonical text and every JSON fetch would refuse); the pid keeps
-/// two concurrent fetches to the same destination from staging into
-/// each other's file.
-fn staging_path(out: &Path) -> PathBuf {
+/// The staging file: `profile.json` → `profile.part-<pid>-<seq>.json`.
+///
+/// The destination's extension is preserved because the frontend picks
+/// its parser by extension alone (`profile.json.part` would be parsed
+/// as canonical text and every JSON fetch would refuse). The `pid` keeps
+/// two processes fetching the same destination out of each other's
+/// file, and `seq` ([`STAGING_SEQ`]) does the same for two fetches
+/// inside one process — which is not hypothetical: an MCP server holds
+/// concurrent sessions in a single pid.
+fn staging_path(out: &Path, seq: u64) -> PathBuf {
     let pid = std::process::id();
     match out.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => out.with_extension(format!("part-{pid}.{ext}")),
-        None => out.with_extension(format!("part-{pid}")),
+        Some(ext) => out.with_extension(format!("part-{pid}-{seq}.{ext}")),
+        None => out.with_extension(format!("part-{pid}-{seq}")),
     }
 }
 
@@ -292,19 +354,52 @@ mod tests {
         dir
     }
 
+    /// The URL these tests pretend served the body. Every `admit` call
+    /// carries one because every real one does — the origin is what the
+    /// body's imports are resolved against.
+    fn origin() -> Url {
+        Url::parse("https://example.com/profiles/fetch-test-0.1.0.json").expect("a valid URL")
+    }
+
+    /// Every `.part-` file this module could have left in `dir`. The
+    /// staging name carries a counter now, so a test cannot name the
+    /// path a given `admit` used — but it can still say "nothing was
+    /// left behind", which is the invariant the assertions want.
+    fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".part-"))
+            })
+            .collect()
+    }
+
     /// The staging file keeps the destination's extension — that is
     /// what routes it to the same parser the destination would get —
-    /// and carries the pid so concurrent runs never share one.
+    /// and carries the pid *and* a per-call counter, so neither two
+    /// processes nor two concurrent fetches inside one process ever
+    /// share a staging path.
     #[test]
-    fn staging_preserves_the_extension() {
+    fn staging_preserves_the_extension_and_is_unique_per_call() {
         let pid = std::process::id();
         assert_eq!(
-            staging_path(Path::new("/x/profile.json")),
-            PathBuf::from(format!("/x/profile.part-{pid}.json"))
+            staging_path(Path::new("/x/profile.json"), 7),
+            PathBuf::from(format!("/x/profile.part-{pid}-7.json"))
         );
         assert_eq!(
-            staging_path(Path::new("/x/profile")),
-            PathBuf::from(format!("/x/profile.part-{pid}"))
+            staging_path(Path::new("/x/profile"), 7),
+            PathBuf::from(format!("/x/profile.part-{pid}-7"))
+        );
+        assert_ne!(
+            staging_path(Path::new("/x/profile.json"), 7),
+            staging_path(Path::new("/x/profile.json"), 8),
+            "two fetches in one process must not stage into one file"
         );
     }
 
@@ -316,14 +411,15 @@ mod tests {
         let out = dir.join("profile.json");
         let expected = hash_of(PROFILE, &dir);
 
-        let fetched = admit(PROFILE.as_bytes(), &expected, &out).unwrap();
+        let fetched = admit(PROFILE.as_bytes(), &expected, &out, &origin()).unwrap();
 
         assert_eq!(fetched.name, "fetch-test");
         assert_eq!(fetched.hash, expected);
         assert!(out.exists());
         assert!(
-            !staging_path(&out).exists(),
-            "staging file must be renamed away"
+            staging_leftovers(&dir).is_empty(),
+            "staging file must be renamed away: {:?}",
+            staging_leftovers(&dir)
         );
         std::fs::remove_file(&out).ok();
     }
@@ -336,7 +432,7 @@ mod tests {
         let out = dir.join("profile.json");
         let expected = hash_of(PROFILE, &dir).to_ascii_uppercase();
 
-        assert!(admit(PROFILE.as_bytes(), &expected, &out).is_ok());
+        assert!(admit(PROFILE.as_bytes(), &expected, &out, &origin()).is_ok());
         std::fs::remove_file(&out).ok();
     }
 
@@ -347,13 +443,14 @@ mod tests {
         let dir = temp_dir("mismatch");
         let out = dir.join("profile.json");
 
-        let err = admit(PROFILE.as_bytes(), &"0".repeat(64), &out).unwrap_err();
+        let err = admit(PROFILE.as_bytes(), &"0".repeat(64), &out, &origin()).unwrap_err();
 
         assert!(matches!(err, FetchError::HashMismatch { .. }), "{err}");
         assert!(!out.exists(), "the destination must not appear on mismatch");
         assert!(
-            !staging_path(&out).exists(),
-            "the staging file must be cleaned up"
+            staging_leftovers(&dir).is_empty(),
+            "the staging file must be cleaned up: {:?}",
+            staging_leftovers(&dir)
         );
     }
 
@@ -365,7 +462,7 @@ mod tests {
         let out = dir.join("profile.json");
         std::fs::write(&out, b"already here").unwrap();
 
-        assert!(admit(PROFILE.as_bytes(), &"0".repeat(64), &out).is_err());
+        assert!(admit(PROFILE.as_bytes(), &"0".repeat(64), &out, &origin()).is_err());
 
         assert_eq!(std::fs::read(&out).unwrap(), b"already here");
         std::fs::remove_file(&out).ok();
@@ -378,11 +475,11 @@ mod tests {
         let dir = temp_dir("not-a-profile");
         let out = dir.join("profile.json");
 
-        let err = admit(b"{ not json", &"0".repeat(64), &out).unwrap_err();
+        let err = admit(b"{ not json", &"0".repeat(64), &out, &origin()).unwrap_err();
 
         assert!(matches!(err, FetchError::NotAProfile { .. }), "{err}");
         assert!(!out.exists());
-        assert!(!staging_path(&out).exists());
+        assert!(staging_leftovers(&dir).is_empty());
     }
 
     /// A loadable body whose root is not a `Spec` is refused: it would
@@ -395,24 +492,71 @@ mod tests {
         let body = r#"{ "type": "ShExec", "argv": ["echo", "ok"] }"#;
         let expected = hash_of(body, &dir);
 
-        let err = admit(body.as_bytes(), &expected, &out).unwrap_err();
+        let err = admit(body.as_bytes(), &expected, &out, &origin()).unwrap_err();
 
         assert!(matches!(err, FetchError::NotASpec), "{err}");
         assert!(!out.exists());
-        assert!(!staging_path(&out).exists());
+        assert!(staging_leftovers(&dir).is_empty());
+    }
+
+    /// **A fetched body's imports belong to the URL it came from, not
+    /// to the temp file it is sitting in.** This body carries a
+    /// relative import with no pin. Resolved at the origin it is a
+    /// remote import — remote imports must be pinned (spec 11 §The
+    /// `Import` node), and that is the refusal. Resolved at the staging
+    /// file, as it was before, the same `./frag.json` read as an
+    /// operator-host path: no pin required, and a fragment picked up
+    /// from whatever happened to be next to the temp file.
+    #[test]
+    fn a_fetched_bodys_relative_import_resolves_against_the_origin_url() {
+        let dir = temp_dir("remote-origin");
+        let out = dir.join("profile.json");
+        let body = serde_json::json!({
+            "type": "Spec",
+            "name": "imports-a-sibling",
+            "phases": [{ "type": "Import", "src": "./frag.json" }]
+        })
+        .to_string();
+
+        let err = admit(body.as_bytes(), &"0".repeat(64), &out, &origin()).unwrap_err();
+
+        let FetchError::Unresolvable { message } = &err else {
+            panic!("expected an unresolvable body, got: {err}");
+        };
+        assert!(
+            message.contains("carries no hash pin"),
+            "the import must be judged as remote: {message}"
+        );
+        assert!(
+            message.contains("https://example.com/profiles/"),
+            "the chain must name the origin, not the staging file: {message}"
+        );
+        assert!(!out.exists());
+        assert!(staging_leftovers(&dir).is_empty());
     }
 
     /// The staging file is created exclusively: a file already at the
     /// staging path (a symlink someone planted, a leftover) refuses
     /// the run instead of being written through.
+    ///
+    /// Drives [`admit_into`] because the path is the subject here — a
+    /// counter-bearing name is unpredictable by design, so the test
+    /// names the staging file and hands the same one to the code.
     #[test]
     fn an_occupied_staging_path_refuses_instead_of_overwriting() {
         let dir = temp_dir("occupied");
         let out = dir.join("profile.json");
-        let staging = staging_path(&out);
+        let staging = staging_path(&out, 0);
         std::fs::write(&staging, b"planted").unwrap();
 
-        let err = admit(PROFILE.as_bytes(), &"0".repeat(64), &out).unwrap_err();
+        let err = admit_into(
+            PROFILE.as_bytes(),
+            &"0".repeat(64),
+            &out,
+            &staging,
+            &origin(),
+        )
+        .unwrap_err();
 
         assert!(matches!(err, FetchError::Io { .. }), "{err}");
         assert_eq!(
