@@ -92,35 +92,58 @@
 //! notification id reused by a later one, and this supervisor would be
 //! answering a question it never inspected.
 //!
-//! What ID_VALID does **not** close is the re-read race inherent to the
-//! `CONTINUE` response. `CONTINUE` tells the kernel to run the real
-//! `connect(2)`, and the kernel then re-reads the `sockaddr` from the
-//! tracee's own pointer — so a second thread in the tracee can rewrite
-//! that memory after the supervisor read it and before the syscall
-//! resumes, making the connect that happens a different one from the
-//! connect that was authorized. `seccomp_unotify(2)` §NOTES says so
-//! directly: the notification mechanism must not be used for a security
-//! policy that depends on the *contents* of pointer arguments unless
-//! the supervisor performs the operation itself. Closing it means
-//! emulating the `connect` in the supervisor — opening the socket there
-//! and installing it into the tracee with
-//! `SECCOMP_IOCTL_NOTIF_ADDFD` — which is a different design from this
-//! layer's, and out of scope here.
+//! ID_VALID does not, on its own, close the re-read race inherent to a
+//! `CONTINUE` response — and so the supervisor does not answer an
+//! address-carrying syscall with `CONTINUE`. `CONTINUE` tells the kernel
+//! to run the real `connect(2)`, and the kernel then re-reads the
+//! `sockaddr` from the tracee's own pointer, so a second thread in the
+//! tracee can rewrite that memory after the supervisor read it and
+//! before the syscall resumes — making the connect that happens a
+//! different one from the connect that was authorized.
+//! `seccomp_unotify(2)` §NOTES states the rule: the notifier must not be
+//! used for a security policy that depends on the *contents* of pointer
+//! arguments unless the supervisor performs the operation itself.
 //!
-//! Three things bound what that residual is worth, and none of them is
-//! a containment claim:
+//! So it does (§the re-read TOCTOU closure, [`supported::plan`] /
+//! [`supported::emulate`]). For a permitted destination the supervisor
+//! lifts a duplicate of the tracee's own socket out with
+//! `pidfd_getfd(2)` — a fd to the **same open file description**, so
+//! operating on it operates on the tracee's real socket — performs the
+//! `connect` / `send` there against **its own copy** of the sockaddr,
+//! and answers with the syscall's result value rather than `CONTINUE`.
+//! The kernel does not re-execute, so the pointer is never re-read and
+//! there is no window to race. A `CONTINUE` is left only where the
+//! decision rests on a **register** argument, fixed at the trap and
+//! beyond a sibling thread's reach — never on re-readable memory:
+//! `connect` with a NULL `addr` register; `sendto` with a NULL
+//! destination register (`args[4]`, a connected-peer send — the peer was
+//! fixed at the emulated connect); `sendmsg` with a NULL `msghdr` pointer
+//! register (`args[1]`); and `sendmmsg` with a NULL base or zero `vlen`
+//! register. A non-NULL `sendmsg` / `sendmmsg` never `CONTINUE`s even
+//! when its `msg_name` reads NULL: `msg_name` lives *inside* a re-readable
+//! `struct msghdr`, so the supervisor performs the send itself (a NULL
+//! destination standing for the connected peer).
+//!
+//! The supervisor is a single thread draining the notifications serially,
+//! so an emulated syscall runs on it. Every wait it can do on a tracee
+//! socket is bounded ([`supported::wait_writable`]) and every send is
+//! `MSG_DONTWAIT`, so no one emulated `connect`/`send` can park the thread
+//! (and thus every other tracee thread's egress) indefinitely — the
+//! emulated destinations are the loopback proxy and configured resolvers,
+//! where the waits are short in any case.
+//!
+//! Two things still bound the pin, and neither is affected by the
+//! closure above:
 //!
 //! - The soft layer ([`super::proxy`]) is where cooperative traffic
 //!   goes. This filter only ever sees a subprocess that already left
 //!   the proxy env behind.
-//! - The filter still confines the syscall itself. Racing the kernel's
-//!   re-read means already running attacker-chosen, multi-threaded code
-//!   inside the `sh.exec` step — a strictly larger capability than the
-//!   egress the pin is refusing.
-//! - Spec 05 §L3 states the register plainly: `sh_egress` is routing
-//!   plus refusal by declaration, best-effort, **not** a containment
-//!   claim. A profile that needs containment gets it from the pod
-//!   boundary, not from this filter.
+//! - Spec 05 §L3's **best-effort** register is about *availability*, not
+//!   this race: a profile cannot know the pod kernel supports the pin,
+//!   and an unsupported arch has no pin at all (§Unsupported arches), so
+//!   containment in general still comes from the pod boundary. Where the
+//!   pin *is* in force, the destination it enforces is now sound — the
+//!   re-read hole this section used to concede is closed.
 //!
 //! # Arch check
 //!
@@ -666,6 +689,658 @@ mod supported {
         }
     }
 
+    // --- the re-read TOCTOU closure: perform the syscall in the supervisor ---
+    //
+    // `is_notif_allowed` above is the *judgment* (is this destination
+    // permitted). Answering a permitted syscall with
+    // `SECCOMP_USER_NOTIF_FLAG_CONTINUE` is what leaves the re-read race
+    // (§What the supervisor's authorization is worth): the kernel re-runs
+    // the real syscall and re-reads the `sockaddr` from the tracee's
+    // pointer, so a sibling thread that rewrites that memory after this
+    // supervisor read it makes the connect/send that happens a different
+    // one from the connect/send that was authorized.
+    //
+    // The closure is the one `seccomp_unotify(2)` §NOTES prescribes:
+    // *perform the operation in the supervisor* on a duplicate of the
+    // tracee's own socket fd (`pidfd_getfd`, which returns a fd to the
+    // **same open file description**, so the connect lands on the tracee's
+    // real socket and the tracee's later sends use it), then answer with a
+    // plain result value — **not** `CONTINUE`. The kernel returns that
+    // value without re-executing, so the pointer is never re-read.
+    //
+    // Only a **NULL** address pointer stays a `CONTINUE` (`Plan::Continue`):
+    // its NULL-ness is a register argument, fixed at the trap and beyond a
+    // sibling thread's reach, so there is nothing to re-read. Every
+    // non-NULL address is performed here — a permitted inet destination
+    // with a canonical sockaddr rebuilt from the judged `(ip, port)`, and a
+    // non-inet destination (`AF_UNIX`, `AF_UNSPEC`-on-connect) with the
+    // bytes as read: local IPC is not policed, but performing it still
+    // denies the race the chance to turn it into off-host egress. A
+    // permitted destination whose payload cannot be copied fails closed
+    // (`Plan::Deny`): the supervisor cannot perform a send it cannot read.
+
+    /// The largest datagram payload the supervisor will copy to perform a
+    /// send on the tracee's behalf. A single UDP datagram maxes at 64 KiB;
+    /// the only address-carrying sends that reach an *allowed* destination
+    /// are a musl DNS query to a resolver and the odd fast-open — all far
+    /// under this. A larger claimed length denies the send rather than
+    /// copying it (a cheap fail-closed bound, not a real limit on
+    /// anything legitimate).
+    const MAX_SEND_PAYLOAD: usize = 64 * 1024;
+
+    /// The largest `sockaddr` the supervisor copies to perform a non-inet
+    /// destination as-read. `sockaddr_un` is 110 bytes (2 family + 108
+    /// path); 128 covers every real family with room to spare. An inet
+    /// destination is not copied through here — it is rebuilt canonically
+    /// from the judged `(ip, port)` ([`serialize_inet`]).
+    const MAX_ADDR_COPY: usize = 128;
+
+    /// `UIO_MAXIOV` — the kernel's own cap on `msg_iovlen`. A `sendmsg`
+    /// claiming more scatter/gather segments than this is malformed; the
+    /// gather denies rather than walking it.
+    const IOV_MAX: u64 = 1024;
+
+    /// What the supervisor must do to answer one permitted notification
+    /// without a re-readable `CONTINUE`.
+    enum Plan {
+        /// The judgment did not depend on re-readable pointer contents (a
+        /// NULL destination / connected-peer send). `CONTINUE` is safe —
+        /// there is nothing a sibling thread can rewrite.
+        Continue,
+        /// Refuse with `EPERM`: either the destination is not permitted, or
+        /// it is but the supervisor could not read what it needs to perform
+        /// the syscall itself (fail closed).
+        Deny,
+        /// Perform `op` on a `pidfd_getfd` duplicate of the tracee's `fd`,
+        /// then answer with the result value.
+        Emulate { fd: i32, op: EmOp },
+    }
+
+    /// The syscall the supervisor performs on the tracee's socket.
+    enum EmOp {
+        /// `connect(fd, &addr, addr.len())` with the supervisor's own copy
+        /// of the sockaddr.
+        Connect(Vec<u8>),
+        /// A single `sendto`/`sendmsg`: `addr` is `None` for a
+        /// connected-peer send (which does not reach here — it is
+        /// `Plan::Continue`), `Some` for an explicit destination.
+        Send {
+            addr: Option<Vec<u8>>,
+            payload: Vec<u8>,
+            flags: i32,
+        },
+        /// A `sendmmsg`: each datagram performed in turn; the answer is the
+        /// count of datagrams sent, matching the syscall's own return. The
+        /// per-message `msg_len` the kernel writes back into each `mmsghdr`
+        /// is **not** written back here — the supervisor does not write the
+        /// tracee's memory. A caller reading `msg_len[i]` would see it
+        /// unchanged. This only affects an address-carrying `sendmmsg` to an
+        /// allowed destination (glibc's parallel-DNS `sendmmsg` is on a
+        /// connected socket → NULL `msg_name` → `Plan::Continue`, unaffected),
+        /// which is rare and not security-relevant (the destinations are
+        /// allowed either way).
+        SendMulti { dgrams: Vec<Dgram>, flags: i32 },
+    }
+
+    /// One datagram of a `sendmmsg` — the same shape as [`EmOp::Send`]'s
+    /// fields, minus the per-call `flags` (shared across the array).
+    struct Dgram {
+        addr: Option<Vec<u8>>,
+        payload: Vec<u8>,
+    }
+
+    /// Build the [`Plan`] for a permitted notification: what the supervisor
+    /// must perform, keyed on the syscall the same way [`is_notif_allowed`]
+    /// judges it. Reads the tracee's memory once through `mem`; a read it
+    /// needs but cannot complete is [`Plan::Deny`] (fail closed).
+    ///
+    /// `plan` re-judges the destination itself rather than trusting the
+    /// earlier [`is_notif_allowed`] pass: the two reads bracket a window in
+    /// which a sibling thread could rewrite the address, so `plan` performs
+    /// only what *it* read and judged. If that read now shows an off-host
+    /// address, `plan` denies — the combination can only ever be more
+    /// restrictive than the gate, never less.
+    fn plan(mem: &std::fs::File, notif: &SeccompNotif, config: &super::PinConfig) -> Plan {
+        let args = &notif.data.args;
+        let fd = args[0] as i32;
+        match notif.data.nr as libc::c_long {
+            n if n == libc::SYS_connect => plan_connect(mem, fd, args[1], args[2] as usize, config),
+            n if n == libc::SYS_sendto => plan_sendto(mem, fd, args, config),
+            n if n == libc::SYS_sendmsg => plan_sendmsg(mem, fd, args[1], args[2] as i32, config),
+            n if n == libc::SYS_sendmmsg => {
+                plan_sendmmsg(mem, fd, args[1], args[2], args[3] as i32, config)
+            }
+            _ => Plan::Deny,
+        }
+    }
+
+    /// Resolve a permitted destination pointer into the sockaddr bytes the
+    /// supervisor will pass to the syscall.
+    ///
+    /// `Ok(None)` — a NULL pointer: the caller turns this into
+    /// [`Plan::Continue`] (connect) or the connected-peer case (send).
+    /// `Ok(Some(bytes))` — the sockaddr to perform: an inet destination
+    /// rebuilt canonically from the judged `(ip, port)` (stripping any
+    /// trailing bytes the tracee chose), a non-inet destination as read.
+    /// `Err(())` — deny: unreadable, or an inet address not in the
+    /// allowset.
+    #[allow(clippy::result_unit_err)]
+    fn resolve_addr(
+        mem: &std::fs::File,
+        ptr: u64,
+        len: usize,
+        unspec_is_inet: bool,
+        config: &super::PinConfig,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        if ptr == 0 {
+            return Ok(None);
+        }
+        let Some(raw) = read_addr_copy(mem, ptr, len) else {
+            return Err(());
+        };
+        match classify(&raw, unspec_is_inet) {
+            Dest::Unreadable => Err(()),
+            Dest::Inet(ip, port) => {
+                if config.permits(ip, port) {
+                    Ok(Some(serialize_inet(ip, port)))
+                } else {
+                    Err(())
+                }
+            }
+            // AF_UNIX / AF_UNSPEC-on-connect: not egress, not policed, but
+            // performed here (with the bytes as read) so the re-read race
+            // cannot turn it into an inet destination.
+            Dest::NotInet => Ok(Some(raw)),
+        }
+    }
+
+    fn plan_connect(
+        mem: &std::fs::File,
+        fd: i32,
+        ptr: u64,
+        len: usize,
+        config: &super::PinConfig,
+    ) -> Plan {
+        match resolve_addr(mem, ptr, len, false, config) {
+            // A NULL sockaddr on connect is invalid (the kernel EFAULTs);
+            // let CONTINUE carry it there rather than inventing an errno.
+            Ok(None) => Plan::Continue,
+            Ok(Some(addr)) => Plan::Emulate {
+                fd,
+                op: EmOp::Connect(addr),
+            },
+            Err(()) => Plan::Deny,
+        }
+    }
+
+    fn plan_sendto(
+        mem: &std::fs::File,
+        fd: i32,
+        args: &[u64; 6],
+        config: &super::PinConfig,
+    ) -> Plan {
+        // sendto(fd, buf, len, flags, dest_addr, addrlen).
+        let addr = match resolve_addr(mem, args[4], args[5] as usize, true, config) {
+            Ok(None) => return Plan::Continue, // connected-peer send
+            Ok(Some(a)) => Some(a),
+            Err(()) => return Plan::Deny,
+        };
+        let Some(payload) = read_payload(mem, args[1], args[2] as usize) else {
+            return Plan::Deny;
+        };
+        Plan::Emulate {
+            fd,
+            op: EmOp::Send {
+                addr,
+                payload,
+                flags: args[3] as i32,
+            },
+        }
+    }
+
+    fn plan_sendmsg(
+        mem: &std::fs::File,
+        fd: i32,
+        msghdr_ptr: u64,
+        flags: i32,
+        config: &super::PinConfig,
+    ) -> Plan {
+        if msghdr_ptr == 0 {
+            // The msghdr pointer itself is a register argument, fixed at
+            // the trap; a NULL one the kernel EFAULTs, nothing to send.
+            return Plan::Continue;
+        }
+        let Some((name_ptr, name_len, iov_ptr, iov_len)) = read_msghdr(mem, msghdr_ptr) else {
+            return Plan::Deny;
+        };
+        // `msg_name` lives *inside* the msghdr, in re-readable tracee
+        // memory — unlike `connect`/`sendto`, whose destination pointer is
+        // a register argument. So even a NULL `msg_name` cannot be answered
+        // with `CONTINUE` (a sibling could set it before the kernel
+        // re-reads): the supervisor always performs the send itself, with a
+        // NULL destination for the connected-peer case.
+        let addr = match resolve_addr(mem, name_ptr, name_len, true, config) {
+            Ok(None) => None,
+            Ok(Some(a)) => Some(a),
+            Err(()) => return Plan::Deny,
+        };
+        let Some(payload) = gather_iov(mem, iov_ptr, iov_len) else {
+            return Plan::Deny;
+        };
+        Plan::Emulate {
+            fd,
+            op: EmOp::Send {
+                addr,
+                payload,
+                flags,
+            },
+        }
+    }
+
+    fn plan_sendmmsg(
+        mem: &std::fs::File,
+        fd: i32,
+        base: u64,
+        vlen: u64,
+        flags: i32,
+        config: &super::PinConfig,
+    ) -> Plan {
+        if base == 0 || vlen == 0 {
+            // `base` and `vlen` are register arguments — a NULL / zero
+            // array is fixed at the trap; nothing to send.
+            return Plan::Continue;
+        }
+        if vlen > MMSG_MAX_ENTRIES as u64 {
+            return Plan::Deny; // cannot inspect them all → fail closed
+        }
+        // Each entry's `msg_name` is inside the re-readable array, so — as
+        // for `sendmsg` — the supervisor always performs the whole call
+        // rather than `CONTINUE`, even when every entry is a connected-peer
+        // send.
+        let mut dgrams = Vec::new();
+        for i in 0..vlen {
+            let hdr_ptr = base.saturating_add(i * MMSGHDR_SIZE);
+            let Some((name_ptr, name_len, iov_ptr, iov_len)) = read_msghdr(mem, hdr_ptr) else {
+                return Plan::Deny;
+            };
+            let addr = match resolve_addr(mem, name_ptr, name_len, true, config) {
+                Ok(None) => None,
+                Ok(Some(a)) => Some(a),
+                Err(()) => return Plan::Deny,
+            };
+            let Some(payload) = gather_iov(mem, iov_ptr, iov_len) else {
+                return Plan::Deny;
+            };
+            dgrams.push(Dgram { addr, payload });
+        }
+        Plan::Emulate {
+            fd,
+            op: EmOp::SendMulti { dgrams, flags },
+        }
+    }
+
+    /// The four fields of a `struct msghdr` (LP64) the supervisor needs:
+    /// `(msg_name, msg_namelen, msg_iov, msg_iovlen)`. Offsets: `msg_name`
+    /// at 0, `msg_namelen` at 8 (a `socklen_t`, 4 bytes), `msg_iov` at 16,
+    /// `msg_iovlen` at 24 (a `size_t`). `None` if the header cannot be read.
+    ///
+    /// `msg_control` (ancillary data) is deliberately not read: an
+    /// allowset destination (a DNS query, the proxy) carries none, and an
+    /// off-host send is denied before it reaches here — so the emulated
+    /// send omits control data rather than copying and replaying it. A
+    /// send that depended on cmsg to an *allowed* endpoint would lose it;
+    /// none in the cooperative egress path does.
+    fn read_msghdr(mem: &std::fs::File, ptr: u64) -> Option<(u64, usize, u64, u64)> {
+        let mut head = [0u8; 32];
+        let read = read_mem(mem, ptr, &mut head).ok()?;
+        if read < 32 {
+            return None;
+        }
+        let name = u64::from_ne_bytes(head[0..8].try_into().expect("8 bytes"));
+        let namelen = u32::from_ne_bytes(head[8..12].try_into().expect("4 bytes")) as usize;
+        let iov = u64::from_ne_bytes(head[16..24].try_into().expect("8 bytes"));
+        let iovlen = u64::from_ne_bytes(head[24..32].try_into().expect("8 bytes"));
+        Some((name, namelen, iov, iovlen))
+    }
+
+    /// Read a `sockaddr` copy for the supervisor to perform, bounded by
+    /// [`MAX_ADDR_COPY`]. Non-NULL only (callers handle NULL first).
+    fn read_addr_copy(mem: &std::fs::File, ptr: u64, len: usize) -> Option<Vec<u8>> {
+        let n = len.min(MAX_ADDR_COPY);
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        let mut buf = vec![0u8; n];
+        let read = read_mem(mem, ptr, &mut buf).ok()?;
+        buf.truncate(read);
+        Some(buf)
+    }
+
+    /// Read a contiguous send payload (`sendto`'s `buf`/`len`), bounded by
+    /// [`MAX_SEND_PAYLOAD`]. A length past the bound, or a non-NULL read
+    /// that fails, is `None` → the caller denies.
+    fn read_payload(mem: &std::fs::File, ptr: u64, len: usize) -> Option<Vec<u8>> {
+        if len > MAX_SEND_PAYLOAD {
+            return None;
+        }
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        if ptr == 0 {
+            return None; // a non-zero length from a NULL buffer cannot be read
+        }
+        let mut buf = vec![0u8; len];
+        let read = read_mem(mem, ptr, &mut buf).ok()?;
+        buf.truncate(read);
+        Some(buf)
+    }
+
+    /// Gather a `struct iovec` array (a `sendmsg`'s scatter/gather list)
+    /// into one contiguous buffer — the datagram the kernel would build.
+    /// Each `iovec` is `{ base: *const, len: usize }` (16 bytes, LP64).
+    /// `iov_len` past [`IOV_MAX`], or a running total past
+    /// [`MAX_SEND_PAYLOAD`], or any unreadable segment, is `None` → deny.
+    fn gather_iov(mem: &std::fs::File, iov_ptr: u64, iov_len: u64) -> Option<Vec<u8>> {
+        if iov_len == 0 || iov_ptr == 0 {
+            return Some(Vec::new());
+        }
+        if iov_len > IOV_MAX {
+            return None;
+        }
+        let mut out = Vec::new();
+        for i in 0..iov_len {
+            let entry = iov_ptr.checked_add(i.checked_mul(16)?)?;
+            let mut hdr = [0u8; 16];
+            let read = read_mem(mem, entry, &mut hdr).ok()?;
+            if read < 16 {
+                return None;
+            }
+            let base = u64::from_ne_bytes(hdr[0..8].try_into().expect("8 bytes"));
+            let seg = u64::from_ne_bytes(hdr[8..16].try_into().expect("8 bytes")) as usize;
+            if out.len().checked_add(seg)? > MAX_SEND_PAYLOAD {
+                return None;
+            }
+            if seg > 0 {
+                if base == 0 {
+                    return None;
+                }
+                let mut chunk = vec![0u8; seg];
+                let rc = read_mem(mem, base, &mut chunk).ok()?;
+                chunk.truncate(rc);
+                out.extend_from_slice(&chunk);
+            }
+        }
+        Some(out)
+    }
+
+    /// A canonical `sockaddr_in` / `sockaddr_in6` for a judged `(ip, port)`.
+    /// Built from the decoded address rather than copied from the tracee,
+    /// so the bytes the supervisor connects to are exactly the ones it
+    /// judged — no trailing tracee-chosen bytes ride along.
+    fn serialize_inet(ip: IpAddr, port: u16) -> Vec<u8> {
+        fn bytes_of<T>(value: &T) -> Vec<u8> {
+            // SAFETY: `T` is a `#[repr(C)]` libc sockaddr POD; reading its
+            // own bytes is sound and the slice does not outlive `value`.
+            unsafe {
+                std::slice::from_raw_parts(
+                    (value as *const T) as *const u8,
+                    std::mem::size_of::<T>(),
+                )
+                .to_vec()
+            }
+        }
+        match ip {
+            IpAddr::V4(v4) => {
+                let sa = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: port.to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                bytes_of(&sa)
+            }
+            IpAddr::V6(v6) => {
+                let sa = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: port.to_be(),
+                    sin6_flowinfo: 0,
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.octets(),
+                    },
+                    sin6_scope_id: 0,
+                };
+                bytes_of(&sa)
+            }
+        }
+    }
+
+    /// The thread-group id of tracee thread `tid`, read from
+    /// `/proc/<tid>/status` `Tgid:`.
+    ///
+    /// `seccomp_notif.pid` is the tracee **thread's** tid, and
+    /// `pidfd_open(2)` on a non-thread-group-leader fails `EINVAL` before
+    /// Linux 6.9's `PIDFD_THREAD`, so the supervisor resolves the tid to
+    /// its tgid before opening a pidfd. `None` — the status file could not
+    /// be read or carried no `Tgid:` — fails the emulation closed.
+    fn resolve_tgid(tid: u32) -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Tgid:") {
+                return rest.trim().parse::<u32>().ok();
+            }
+        }
+        None
+    }
+
+    /// Perform `op` on a `pidfd_getfd` duplicate of the tracee's socket and
+    /// return `(val, errno)` for the notification response: `errno == 0`
+    /// means success and `val` is the syscall's return; a non-zero `errno`
+    /// is the error to hand back (the caller negates it into
+    /// `SeccompNotifResp::error`).
+    ///
+    /// The duplicate shares the tracee's open file description
+    /// ([`pidfd_getfd(2)`]), so a `connect` on it connects the tracee's own
+    /// socket and the tracee's later sends use that connection. Any step
+    /// that cannot complete — tgid unresolved, pidfd/getfd refused (the
+    /// tracee died, or Yama denies the attach) — fails closed with `EPERM`;
+    /// the tracee's syscall never reached the network either way.
+    ///
+    /// A concurrent `close(fd)` in a sibling thread cannot turn this into
+    /// an off-host bypass: `pidfd_getfd` would then fail, or duplicate a
+    /// recycled fd — and the supervisor only ever performs an *allowed*
+    /// destination, so the worst case is an allowset connect on the wrong
+    /// socket, never an off-host one.
+    fn emulate(fd: i32, op: EmOp, tid: u32) -> (i64, i32) {
+        let Some(tgid) = resolve_tgid(tid) else {
+            return (0, libc::EPERM);
+        };
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, tgid, 0) };
+        if pidfd < 0 {
+            return (0, libc::EPERM);
+        }
+        let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd, 0) };
+        unsafe { libc::close(pidfd as RawFd) };
+        if dup < 0 {
+            return (0, libc::EPERM);
+        }
+        let dup = dup as RawFd;
+        let result = match op {
+            EmOp::Connect(addr) => do_connect(dup, &addr),
+            EmOp::Send {
+                addr,
+                payload,
+                flags,
+            } => do_send(dup, addr.as_deref(), &payload, flags),
+            EmOp::SendMulti { dgrams, flags } => {
+                let mut sent: i64 = 0;
+                let mut errno = 0;
+                for d in &dgrams {
+                    let (_, e) = do_send(dup, d.addr.as_deref(), &d.payload, flags);
+                    if e != 0 {
+                        // sendmmsg returns the count sent so far; the error
+                        // surfaces only if nothing went out at all.
+                        errno = if sent == 0 { e } else { 0 };
+                        break;
+                    }
+                    sent += 1;
+                }
+                (sent, errno)
+            }
+        };
+        unsafe { libc::close(dup) };
+        result
+    }
+
+    /// Whether `fd` is in non-blocking mode (`O_NONBLOCK`), read through
+    /// the shared open file description so it reflects the tracee's own
+    /// setting.
+    fn is_nonblocking(fd: RawFd) -> bool {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        flags >= 0 && (flags & libc::O_NONBLOCK) != 0
+    }
+
+    /// `connect(2)` the tracee's socket to the authorized `addr`.
+    ///
+    /// Returns `(0, 0)` on success. A non-blocking socket that returns
+    /// `EINPROGRESS` relays `EINPROGRESS` unchanged (`(0, EINPROGRESS)`) —
+    /// the tracee expects to poll its own fd, which works because it is the
+    /// same open file description. A blocking socket, or an `EINTR`
+    /// (§`connect(2)` proceeds asynchronously after a signal), is driven to
+    /// completion with a bounded `poll` + `SO_ERROR`. Every emulated
+    /// `connect` targets an allowset destination — the loopback proxy or a
+    /// configured resolver — so the wait is short in practice; the bound
+    /// only caps a pathological case.
+    fn do_connect(fd: RawFd, addr: &[u8]) -> (i64, i32) {
+        let r = unsafe {
+            libc::connect(
+                fd,
+                addr.as_ptr() as *const libc::sockaddr,
+                addr.len() as libc::socklen_t,
+            )
+        };
+        if r == 0 {
+            return (0, 0);
+        }
+        let e = errno();
+        if e == libc::EINPROGRESS {
+            if is_nonblocking(fd) {
+                return (0, libc::EINPROGRESS);
+            }
+            return finish_connect(fd);
+        }
+        if e == libc::EINTR {
+            return finish_connect(fd);
+        }
+        (0, e)
+    }
+
+    /// Wait for a backgrounded `connect` to settle (bounded `poll` for
+    /// writability, then `SO_ERROR`). `(0, 0)` on success, `(0, errno)`
+    /// otherwise — a `poll` timeout is reported as `ETIMEDOUT`.
+    fn finish_connect(fd: RawFd) -> (i64, i32) {
+        if !wait_writable(fd, 5_000) {
+            return (0, libc::ETIMEDOUT);
+        }
+        let mut so_error: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_error as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return (0, errno());
+        }
+        if so_error == 0 {
+            (0, 0)
+        } else {
+            (0, so_error)
+        }
+    }
+
+    /// `sendto(2)` the copied payload to the authorized destination (or the
+    /// connected peer, `addr == None`) on the tracee's socket. Returns
+    /// `(bytes_sent, 0)` or `(0, errno)`.
+    ///
+    /// The send is issued with `MSG_DONTWAIT` so it never blocks the single
+    /// supervisor thread (which drains every tracee thread's notifications
+    /// serially — a blocked send here would stall them all). If it would
+    /// block (`EAGAIN`): a non-blocking tracee socket gets the `EAGAIN`
+    /// relayed (it expects to retry); a blocking one is given a **bounded**
+    /// `poll` for buffer space and one retry, so a blocking-socket send
+    /// keeps its blocking semantics up to the cap rather than failing
+    /// spuriously or hanging forever. `EINTR` retries.
+    fn do_send(fd: RawFd, addr: Option<&[u8]>, payload: &[u8], flags: i32) -> (i64, i32) {
+        let (aptr, alen) = match addr {
+            Some(a) => (a.as_ptr() as *const libc::sockaddr, a.len() as libc::socklen_t),
+            None => (std::ptr::null(), 0),
+        };
+        let send_once = || unsafe {
+            libc::sendto(
+                fd,
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+                flags | libc::MSG_DONTWAIT,
+                aptr,
+                alen,
+            )
+        };
+        loop {
+            let n = send_once();
+            if n >= 0 {
+                return (n as i64, 0);
+            }
+            let e = errno();
+            if e == libc::EINTR {
+                continue;
+            }
+            if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                if is_nonblocking(fd) {
+                    return (0, e); // relay to a tracee that expects to poll
+                }
+                // Blocking socket: wait bounded for send-buffer space, then
+                // try once more. A timeout reports ETIMEDOUT rather than
+                // stalling the supervisor.
+                if !wait_writable(fd, 5_000) {
+                    return (0, libc::ETIMEDOUT);
+                }
+                let n2 = send_once();
+                return if n2 >= 0 { (n2 as i64, 0) } else { (0, errno()) };
+            }
+            return (0, e);
+        }
+    }
+
+    /// `poll` `fd` for `POLLOUT` up to `timeout_ms`; `true` if it became
+    /// writable, `false` on timeout or error. Bounds every wait the
+    /// supervisor does on a tracee socket so no single emulated syscall can
+    /// park the shared supervisor thread indefinitely.
+    fn wait_writable(fd: RawFd, timeout_ms: libc::c_int) -> bool {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let pr = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if pr < 0 && errno() == libc::EINTR {
+                continue;
+            }
+            return pr > 0 && (pfd.revents & libc::POLLOUT) != 0;
+        }
+    }
+
+    /// The current thread's `errno`.
+    fn errno() -> i32 {
+        io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+    }
+
     // --- child side: install the filter, hand the listener to the parent ----
 
     /// Install the user-notify filter and hand its listener fd to the parent —
@@ -1028,7 +1703,21 @@ mod supported {
         let Ok(read) = read_mem(mem, ptr, &mut buf[..n]) else {
             return Dest::Unreadable;
         };
-        if read < 2 {
+        classify(&buf[..read], unspec_is_inet)
+    }
+
+    /// Decode a `sockaddr` already read into `buf` (`read` bytes) into a
+    /// [`Dest`]. Split from [`read_sockaddr`] so the same decode serves
+    /// both the judgment path (a 28-byte read) and the emulation path,
+    /// which reads a larger copy so an `AF_UNIX` path survives; the byte
+    /// layout it decodes is identical either way.
+    ///
+    /// The family / short-read boundaries are [`read_sockaddr`]'s: two
+    /// bytes name the family, an inet family missing its address bytes is
+    /// [`Dest::Unreadable`], and `AF_UNSPEC` decodes as `AF_INET` only on
+    /// a send (`unspec_is_inet`).
+    fn classify(buf: &[u8], unspec_is_inet: bool) -> Dest {
+        if buf.len() < 2 {
             return Dest::Unreadable;
         }
         let family = u16::from_ne_bytes([buf[0], buf[1]]);
@@ -1042,7 +1731,7 @@ mod supported {
         let decode_as_inet =
             family == libc::AF_INET as u16 || (unspec_is_inet && family == libc::AF_UNSPEC as u16);
         if decode_as_inet {
-            if read < 8 {
+            if buf.len() < 8 {
                 return Dest::Unreadable;
             }
             let port = u16::from_be_bytes([buf[2], buf[3]]);
@@ -1050,7 +1739,7 @@ mod supported {
             return Dest::Inet(IpAddr::V4(ip), port);
         }
         if family == libc::AF_INET6 as u16 {
-            if read < 24 {
+            if buf.len() < 24 {
                 return Dest::Unreadable;
             }
             let port = u16::from_be_bytes([buf[2], buf[3]]);
@@ -1208,22 +1897,53 @@ mod supported {
                 }
                 break;
             }
-            let allow = is_notif_allowed(&notif, &config);
+            // Decide the answer. `is_notif_allowed` is the destination
+            // judgment; a permitted syscall is then turned into a `Plan`
+            // that says how to answer it *without* a re-readable `CONTINUE`
+            // (§the re-read TOCTOU closure). A denied destination, or a
+            // permitted one whose payload the supervisor cannot read, is
+            // `Deny`.
+            let plan = if is_notif_allowed(&notif, &config) {
+                match open_proc_mem(&format!("/proc/{}/mem", notif.pid)) {
+                    Ok(mem) => plan(&mem, &notif, &config),
+                    Err(_) => Plan::Deny, // cannot read to perform → fail closed
+                }
+            } else {
+                Plan::Deny
+            };
             // Read, then validate the id, then respond (§What the
             // supervisor's authorization is worth). A notification that
             // went invalid while its memory was being read has nothing
             // left to answer — and its id may already belong to a newer
-            // one — so drop it and go back to the poll.
+            // one — so drop it and go back to the poll. Validity is
+            // checked **before** performing an emulated syscall so the
+            // supervisor never acts for a tracee that has gone.
             if !id_is_valid(notify_fd, id_valid_ioctl, notif.id) {
                 continue;
             }
             let mut resp: SeccompNotifResp = unsafe { std::mem::zeroed() };
             resp.id = notif.id;
-            if allow {
-                resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-            } else {
-                resp.error = -libc::EPERM;
-                tracing::warn!("egress: off-host network syscall denied at the pin");
+            match plan {
+                Plan::Continue => {
+                    // NULL destination / connected-peer send: nothing a
+                    // sibling thread can rewrite, so re-execution is safe.
+                    resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                }
+                Plan::Deny => {
+                    resp.error = -libc::EPERM;
+                    tracing::warn!("egress: off-host network syscall denied at the pin");
+                }
+                Plan::Emulate { fd, op } => {
+                    // Perform the syscall here on the tracee's own socket,
+                    // then hand back the result — the kernel does not
+                    // re-execute, so the sockaddr is never re-read.
+                    let (val, err) = emulate(fd, op, notif.pid);
+                    if err == 0 {
+                        resp.val = val;
+                    } else {
+                        resp.error = -err;
+                    }
+                }
             }
             let sc = unsafe { libc::ioctl(notify_fd, send_ioctl as _, &resp) };
             if sc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
@@ -1730,6 +2450,294 @@ mod supported {
                 stdout.contains("SENDTO_BLOCKED"),
                 "an unconnected UDP sendto off-host must be denied: stdout={stdout:?} stderr={stderr:?} status={:?}",
                 out.status
+            );
+        }
+
+        /// **The 2a closure at the plan layer: a permitted inet `connect`
+        /// is *performed* by the supervisor (`Plan::Emulate`), never
+        /// answered with `CONTINUE`.** Only a NULL pointer — a register
+        /// argument, beyond a sibling thread's reach — stays `Continue`;
+        /// an `AF_UNIX` destination is performed too (so the re-read race
+        /// cannot flip it to an inet address), and a disallowed inet
+        /// destination denies.
+        #[test]
+        fn a_permitted_inet_connect_is_emulated_not_continued() {
+            let mem = self_mem();
+            let proxy: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+            let cfg = cfg_proxy(proxy);
+            let to_proxy = sockaddr_in(Ipv4Addr::LOCALHOST, 8080);
+
+            match plan(
+                &mem,
+                &notif(libc::SYS_connect, [3, to_proxy.as_ptr() as u64, 16, 0, 0, 0]),
+                &cfg,
+            ) {
+                Plan::Emulate {
+                    fd: 3,
+                    op: EmOp::Connect(addr),
+                } => {
+                    // The performed sockaddr is the canonical one, decoding
+                    // back to exactly the judged endpoint.
+                    assert_eq!(
+                        classify(&addr, false),
+                        Dest::Inet(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
+                    );
+                }
+                _ => panic!("a permitted inet connect must emulate, not CONTINUE"),
+            }
+
+            // NULL addr: register-based, nothing to re-read → Continue.
+            assert!(matches!(
+                plan(&mem, &notif(libc::SYS_connect, [3, 0, 16, 0, 0, 0]), &cfg),
+                Plan::Continue
+            ));
+
+            // Disallowed inet destination → Deny.
+            let off = sockaddr_in(Ipv4Addr::new(203, 0, 113, 1), 80);
+            assert!(matches!(
+                plan(
+                    &mem,
+                    &notif(libc::SYS_connect, [3, off.as_ptr() as u64, 16, 0, 0, 0]),
+                    &cfg
+                ),
+                Plan::Deny
+            ));
+
+            // AF_UNIX: performed (local IPC, not policed) — Emulate, never
+            // Continue, so the race cannot turn it into inet egress.
+            let mut un = Vec::new();
+            un.extend_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
+            un.extend_from_slice(b"/run/nscd/socket\0");
+            assert!(matches!(
+                plan(
+                    &mem,
+                    &notif(
+                        libc::SYS_connect,
+                        [3, un.as_ptr() as u64, un.len() as u64, 0, 0, 0]
+                    ),
+                    &cfg
+                ),
+                Plan::Emulate {
+                    op: EmOp::Connect(_),
+                    ..
+                }
+            ));
+        }
+
+        /// **A connected-peer send stays `Continue`; an explicit permitted
+        /// destination is emulated with the payload copied out of the
+        /// tracee.** The copy is what lets the supervisor send it itself
+        /// rather than let the kernel re-read (and a sibling thread rewrite)
+        /// the destination.
+        #[test]
+        fn a_send_to_a_permitted_destination_copies_the_payload() {
+            let mem = self_mem();
+            let proxy: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+            let cfg = cfg_proxy(proxy);
+            let to_proxy = sockaddr_in(Ipv4Addr::LOCALHOST, 8080);
+            let payload = b"hello dns";
+
+            match plan(
+                &mem,
+                &notif(
+                    libc::SYS_sendto,
+                    [
+                        3,
+                        payload.as_ptr() as u64,
+                        payload.len() as u64,
+                        0,
+                        to_proxy.as_ptr() as u64,
+                        16,
+                    ],
+                ),
+                &cfg,
+            ) {
+                Plan::Emulate {
+                    op:
+                        EmOp::Send {
+                            addr: Some(_),
+                            payload: got,
+                            flags: 0,
+                        },
+                    ..
+                } => assert_eq!(got, payload),
+                _ => panic!("a permitted sendto must emulate with the copied payload"),
+            }
+
+            // sendto NULL dest = connected-peer send → Continue is safe:
+            // the destination register (args[4]) is fixed at the trap.
+            assert!(matches!(
+                plan(
+                    &mem,
+                    &notif(
+                        libc::SYS_sendto,
+                        [3, payload.as_ptr() as u64, payload.len() as u64, 0, 0, 0]
+                    ),
+                    &cfg
+                ),
+                Plan::Continue
+            ));
+        }
+
+        /// **`sendmsg` / `sendmmsg` never `CONTINUE`, even for a NULL
+        /// `msg_name`** — the destination lives inside a re-readable
+        /// `struct msghdr`, so a sibling could set it after the judgment.
+        /// The supervisor performs the send itself (a NULL destination
+        /// stands for the connected peer).
+        #[test]
+        fn a_sendmsg_with_a_null_name_is_emulated_not_continued() {
+            let mem = self_mem();
+            let proxy: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+            let cfg = cfg_proxy(proxy);
+            let payload = b"query";
+
+            // A msghdr with msg_name == NULL but a real iov payload.
+            let mut hdr = [0u8; 32];
+            // msg_name (0..8) left zero; msg_namelen (8..12) zero.
+            let iov = {
+                let mut v = Vec::new();
+                v.extend_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+                v.extend_from_slice(&(payload.len() as u64).to_ne_bytes());
+                v
+            };
+            hdr[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            hdr[24..32].copy_from_slice(&1u64.to_ne_bytes());
+
+            match plan(
+                &mem,
+                &notif(libc::SYS_sendmsg, [3, hdr.as_ptr() as u64, 0, 0, 0, 0]),
+                &cfg,
+            ) {
+                Plan::Emulate {
+                    op:
+                        EmOp::Send {
+                            addr: None,
+                            payload: got,
+                            ..
+                        },
+                    ..
+                } => assert_eq!(got, payload),
+                _ => panic!("a NULL-name sendmsg must emulate a connected-peer send, not CONTINUE"),
+            }
+
+            // Only a NULL msghdr *pointer* (a register) stays Continue.
+            assert!(matches!(
+                plan(&mem, &notif(libc::SYS_sendmsg, [3, 0, 0, 0, 0, 0]), &cfg),
+                Plan::Continue
+            ));
+        }
+
+        /// **`gather_iov` concatenates the scatter/gather segments into the
+        /// one datagram the kernel would build, and refuses an oversized
+        /// `iov_len`.**
+        #[test]
+        fn gather_iov_concatenates_and_bounds() {
+            let mem = self_mem();
+            let a = b"AAAA";
+            let b = b"BBBBBB";
+            let mut iov = Vec::new();
+            iov.extend_from_slice(&(a.as_ptr() as u64).to_ne_bytes());
+            iov.extend_from_slice(&(a.len() as u64).to_ne_bytes());
+            iov.extend_from_slice(&(b.as_ptr() as u64).to_ne_bytes());
+            iov.extend_from_slice(&(b.len() as u64).to_ne_bytes());
+
+            assert_eq!(
+                gather_iov(&mem, iov.as_ptr() as u64, 2).expect("gather"),
+                b"AAAABBBBBB"
+            );
+            // Past the kernel's iovec cap → deny.
+            assert!(gather_iov(&mem, iov.as_ptr() as u64, IOV_MAX + 1).is_none());
+            // No segments → empty datagram.
+            assert_eq!(
+                gather_iov(&mem, iov.as_ptr() as u64, 0).unwrap(),
+                Vec::<u8>::new()
+            );
+        }
+
+        /// **`serialize_inet` round-trips through `classify`** for v4 and
+        /// v6 — the canonical bytes the supervisor connects to decode back
+        /// to exactly the judged endpoint, with no tracee-chosen tail.
+        #[test]
+        fn serialize_inet_round_trips() {
+            let v4 = "140.82.121.4".parse::<IpAddr>().unwrap();
+            assert_eq!(
+                classify(&serialize_inet(v4, 443), false),
+                Dest::Inet(v4, 443)
+            );
+            let v6 = "2001:4860:4860::8888".parse::<IpAddr>().unwrap();
+            assert_eq!(classify(&serialize_inet(v6, 53), false), Dest::Inet(v6, 53));
+        }
+
+        /// **`read_msghdr` reads `msg_iov` / `msg_iovlen` from the LP64
+        /// layout**, the fields the send-family emulation needs and the
+        /// judgment-only `msghdr_dest` never read (it stopped at
+        /// `msg_namelen`).
+        #[test]
+        fn read_msghdr_reads_name_and_iov_fields() {
+            let addr = sockaddr_in(Ipv4Addr::LOCALHOST, 8080);
+            let iov_marker = 0xdead_beef_u64;
+            let mut hdr = [0u8; 32];
+            hdr[0..8].copy_from_slice(&(addr.as_ptr() as u64).to_ne_bytes());
+            hdr[8..12].copy_from_slice(&(addr.len() as u32).to_ne_bytes());
+            hdr[16..24].copy_from_slice(&iov_marker.to_ne_bytes());
+            hdr[24..32].copy_from_slice(&3u64.to_ne_bytes());
+            let mem = self_mem();
+            let (name, namelen, iov, iovlen) =
+                read_msghdr(&mem, hdr.as_ptr() as u64).expect("read msghdr");
+            assert_eq!(name, addr.as_ptr() as u64);
+            assert_eq!(namelen, addr.len());
+            assert_eq!(iov, iov_marker);
+            assert_eq!(iovlen, 3);
+        }
+
+        /// **End-to-end: send-family emulation actually delivers the
+        /// payload.** A permitted `sendto` is not re-executed — the
+        /// supervisor copies the datagram and sends it on the tracee's own
+        /// socket. Proven by binding a real UDP socket as the allowed
+        /// endpoint and asserting the bytes arrive. Needs `python3`;
+        /// skipped when absent.
+        #[test]
+        fn emulated_sendto_delivers_the_payload_to_the_allowed_endpoint() {
+            use std::net::UdpSocket;
+            let Some(python) = find_python3() else {
+                eprintln!("skipping: python3 not found");
+                return;
+            };
+            // The allowed endpoint is a real UDP socket; its address is the
+            // pin's proxy, so a sendto to it is permitted and emulated.
+            let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
+            recv.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let addr = recv.local_addr().unwrap();
+            let script = format!(
+                concat!(
+                    "import socket\n",
+                    "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+                    "n = s.sendto(b'EMULATED_OK', ('127.0.0.1', {port}))\n",
+                    "print('SENT%d' % n)\n",
+                ),
+                port = addr.port()
+            );
+            let mut cmd = Command::new(python);
+            cmd.arg("-c").arg(script);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let out = run_pinned(cmd, cfg_proxy(addr)).expect("run pinned");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains("SENT11"),
+                "the emulated sendto should report 11 bytes: stdout={stdout:?} stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let mut buf = [0u8; 64];
+            let (n, _) = recv
+                .recv_from(&mut buf)
+                .expect("the emulated datagram must arrive at the allowed endpoint");
+            assert_eq!(
+                &buf[..n],
+                b"EMULATED_OK",
+                "the supervisor must deliver the copied payload"
             );
         }
 
