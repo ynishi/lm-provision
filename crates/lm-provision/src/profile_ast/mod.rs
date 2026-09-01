@@ -641,6 +641,75 @@ pub enum ProfileNode {
         path: String,
     },
 
+    // --- Fragment import (spec 11) ---
+    /// `Import`: a hash-pinned reference to a fragment document, legal
+    /// in any `phases` list position (spec 11 §The `Import` node).
+    ///
+    /// Consumed entirely by the resolve stage ([`crate::resolve`]),
+    /// which replaces it with the fragment's expanded phase list before
+    /// validate runs — so this variant never reaches canonical, plan,
+    /// or exec on the resolved pipeline. The `apply` op below is
+    /// unregistered on purpose: an `Import` that does reach the engine
+    /// (a caller that skipped resolve) fails loudly at dispatch instead
+    /// of silently running nothing.
+    #[dsl_exec(apply = "import")]
+    Import {
+        /// Stable node ID.
+        id: NodeId,
+        /// Source form: `https://` URL, relative path (resolved against
+        /// the importing document's own location), or absolute
+        /// operator-host path (spec 11 §Source forms).
+        src: String,
+        /// The fragment's **expanded canonical hash** (64-char lowercase
+        /// hex, no prefix — the spelling [`crate::canonical::hash`]
+        /// emits). Mandatory for remote sources, optional for local
+        /// ones; verified identically whenever written (spec 11 §The
+        /// `Import` node).
+        hash: Option<String>,
+    },
+
+    /// `Fragment`: a reusable top-level document — a `Spec` cut down to
+    /// what a fragment can honestly own (spec 11 §Fragment documents).
+    ///
+    /// Carries phases and the declarations those phases need; machine
+    /// requirements (`requires_*`), `provider` and `artifacts` are
+    /// deliberately absent — machine shape and run purpose belong to
+    /// the consuming profile. Like [`ProfileNode::Import`], the variant
+    /// exists only upstream of resolve: expansion splices its phases
+    /// and merges its declarations into the consumer, and the expanded
+    /// `Fragment` node itself is what the pin hashes
+    /// ([`crate::canonical::hash`] over it — spec 11 §Resolution
+    /// rule 3).
+    #[dsl_exec(seq)]
+    Fragment {
+        /// Stable node ID.
+        id: NodeId,
+        /// Fragment name (same rules as `Spec.name`).
+        name: String,
+        /// Fragment version (same rules as `Spec.version`).
+        version: Option<String>,
+        /// Human-readable description.
+        description: Option<String>,
+        /// Allowed capabilities — merged into the consumer by set union.
+        capabilities: Vec<String>,
+        /// Fragment-scoped env table, same value-node shape as
+        /// [`ProfileNode::Spec::env`] — merged disjointly (a key both
+        /// sides declare with different values is a resolve error).
+        env: BTreeMap<String, ProfileNode>,
+        /// Secret env allowlist — merged by set union.
+        env_secrets: Vec<String>,
+        /// Allowed filesystem path roots — merged by set union.
+        paths: Vec<String>,
+        /// Allowed HTTP URL patterns — merged by set union.
+        http_allowlist: Vec<String>,
+        /// Resources declared already present, same shape as
+        /// [`ProfileNode::Spec::assumes`] — merged disjointly.
+        assumes: BTreeMap<String, String>,
+        /// Sequential phase list (phase nodes per chapter 02,
+        /// [`ProfileNode::Import`] included).
+        phases: Vec<ProfileNode>,
+    },
+
     // --- Env value nodes (spec 06 §Inputs) ---
     /// A literal (non-secret) `env` map value. Occurs only as a value in
     /// an `env` keyed slot; never as a top-level phase. Canonicalizes to

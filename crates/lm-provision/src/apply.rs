@@ -71,6 +71,11 @@ pub enum AstApplyError {
     #[error("failed to load profile: {0}")]
     Frontend(#[from] crate::frontend::FrontendError),
 
+    /// A fragment import could not be resolved (spec 11 §Error
+    /// surface).
+    #[error("failed to resolve profile imports: {0}")]
+    Resolve(#[from] crate::resolve::ResolveError),
+
     /// Building the execution context failed before any step ran — the
     /// only cause is a declared capability outside the host's known set
     /// (spec 05 §L2 / [`crate::exec::ExecContext::from_root`]).
@@ -146,12 +151,19 @@ pub async fn run_apply_ast_routed(
     dry_run: bool,
     route: EffectRoute,
 ) -> Result<String, AstApplyError> {
-    // Canonical order, implicit insertion, and suppression are applied
-    // to the AST before the engine sees it, so apply runs exactly the
-    // steps the plan artifact renders (`02` §Canonical phase ordering,
-    // [`crate::normalize`]). The profile as *written* is what `hash` /
-    // `canonical` see; normalization never reaches them.
-    let root = crate::normalize::normalize(&crate::frontend::load_profile(profile)?);
+    // Fragment imports expand first (`11` §Resolution — everything
+    // downstream of resolve sees a plain expanded Spec), then canonical
+    // order, implicit insertion, and suppression are applied to the AST
+    // before the engine sees it, so apply runs exactly the steps the
+    // plan artifact renders (`02` §Canonical phase ordering,
+    // [`crate::normalize`]). `hash` / `canonical` see the *resolved*
+    // profile too — the expanded AST is the profile's identity (spec 11
+    // §Resolution) — but never the normalized one: implicit insertion
+    // must not move a hash.
+    let root = crate::normalize::normalize(&crate::resolve::resolve(
+        crate::frontend::load_profile(profile)?,
+        profile,
+    )?);
     let mode = if dry_run {
         ExecMode::DryRun
     } else {

@@ -195,6 +195,26 @@ pub enum ValidateError {
     #[error("{0}")]
     PhaseShape(String),
 
+    /// An [`ProfileNode::Import`] or [`ProfileNode::Fragment`] node
+    /// reached validate (check 0b). Validate runs on the *expanded*
+    /// profile (spec 11 §Resolution — "Validate then runs on the
+    /// expanded profile"), so either variant here means a caller
+    /// skipped the resolve stage ([`crate::resolve`]); rejecting is
+    /// what keeps that misuse from validating — and then hashing or
+    /// applying — a profile whose imports were never spliced in.
+    #[error(
+        "phases[{index}] carries an unresolved {kind} node: this entry \
+         point does not expand fragment imports (spec 11 §Resolution) — \
+         run the profile through a resolving consumer (`lm-provision \
+         validate` / `hash` / `plan` / `apply`) or inline the fragment"
+    )]
+    UnresolvedImport {
+        /// 1-based position of the offending phase.
+        index: usize,
+        /// `"Import"` or `"Fragment"`.
+        kind: &'static str,
+    },
+
     /// Two `service.start` phases share a `name` (check 7).
     #[error("phases[{index}].name ({name:?}) duplicates another service.start name")]
     DuplicateServiceName {
@@ -381,6 +401,23 @@ pub fn validate(root: &ProfileNode) -> Result<(), ValidateError> {
     // frontend invariant here — see the module doc.)
     if name.is_empty() {
         return Err(ValidateError::EmptyName);
+    }
+
+    // Check 0b: no unresolved `Import` / `Fragment` in the phase list.
+    // Resolve replaces every `Import` before validate runs (spec 11
+    // §Resolution), so hitting one means the caller skipped that stage
+    // — fail loudly here rather than let plan / normalize silently drop
+    // the node downstream.
+    for (idx, phase) in phases.iter().enumerate() {
+        let kind = match phase {
+            ProfileNode::Import { .. } => "Import",
+            ProfileNode::Fragment { .. } => "Fragment",
+            _ => continue,
+        };
+        return Err(ValidateError::UnresolvedImport {
+            index: idx + 1,
+            kind,
+        });
     }
 
     // Check 2: the five declared lists are string lists — subsumed by

@@ -103,6 +103,18 @@ pub enum FrontendError {
 /// therefore vary across invocations, but [`crate::canonical::hash`]
 /// excludes them and remains stable.
 pub fn load_profile(path: &Path) -> Result<ProfileNode, FrontendError> {
+    load_profile_with(path, &IdGen::new())
+}
+
+/// [`load_profile`] with a caller-supplied [`IdGen`].
+///
+/// The resolve stage ([`crate::resolve`]) loads a consumer document and
+/// its fragments as separate files but splices their nodes into **one**
+/// tree, whose `NodeId`s must stay injective (the exec context keys its
+/// program on them — see `normalize`'s `IdMinter` for the measured
+/// collision). Sharing one generator across those parses is what keeps
+/// them so; a fresh generator per file restarts at zero and collides.
+pub(crate) fn load_profile_with(path: &Path, ids: &IdGen) -> Result<ProfileNode, FrontendError> {
     // Reject `.lua` up front, before any I/O: the embedded-Lua authoring
     // frontend is gone, so a `.lua` file must fail loudly rather than be
     // read and misparsed as canonical text.
@@ -116,9 +128,9 @@ pub fn load_profile(path: &Path) -> Result<ProfileNode, FrontendError> {
     })?;
 
     if has_extension(path, "json") {
-        parse_json(&text)
+        parse_json(&text, ids)
     } else {
-        parse_text(&text)
+        parse_text(&text, ids)
     }
 }
 
@@ -129,26 +141,24 @@ fn has_extension(path: &Path, ext: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
-fn parse_json(text: &str) -> Result<ProfileNode, FrontendError> {
+fn parse_json(text: &str, ids: &IdGen) -> Result<ProfileNode, FrontendError> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|err| FrontendError::Parse(err.to_string()))?;
-    let ids = IdGen::new();
     let schema = ProfileNode::schema();
     let tree =
         from_json_value(&value, &schema).map_err(|err| FrontendError::Parse(err.to_string()))?;
-    ProfileNode::from_parse_tree(&tree, &ids).map_err(|err| FrontendError::Build(err.to_string()))
+    ProfileNode::from_parse_tree(&tree, ids).map_err(|err| FrontendError::Build(err.to_string()))
 }
 
-fn parse_text(text: &str) -> Result<ProfileNode, FrontendError> {
-    let ids = IdGen::new();
+fn parse_text(text: &str, ids: &IdGen) -> Result<ProfileNode, FrontendError> {
     let schema = ProfileNode::schema();
     let overrides = profile_syntax_overrides();
-    let grammar = grammar_from_schema_with(&schema, &ids, &overrides)
+    let grammar = grammar_from_schema_with(&schema, ids, &overrides)
         .map_err(|err| FrontendError::Parse(err.to_string()))?;
     let tree = grammar
         .parse(text)
         .map_err(|err| FrontendError::Parse(err.to_string()))?;
-    ProfileNode::from_parse_tree(&tree, &ids).map_err(|err| FrontendError::Build(err.to_string()))
+    ProfileNode::from_parse_tree(&tree, ids).map_err(|err| FrontendError::Build(err.to_string()))
 }
 
 #[cfg(test)]

@@ -144,7 +144,14 @@ fn normalize_phases(phases: &[ProfileNode], mut ids: IdMinter) -> Vec<ProfileNod
             // A `Spec` nested inside `phases`, or an `Env*` value node
             // outside its slot, is a malformed AST the frontend does not
             // produce; drop rather than panic to keep this total.
+            // `Import` / `Fragment` join the arm because normalize runs
+            // downstream of resolve ([`crate::resolve`]), which replaces
+            // every `Import` first (spec 11 §Resolution) — and validate
+            // rejects an unresolved one before either plan or apply gets
+            // here.
             ProfileNode::Spec { .. }
+            | ProfileNode::Import { .. }
+            | ProfileNode::Fragment { .. }
             | ProfileNode::EnvLiteral { .. }
             | ProfileNode::EnvSecret { .. }
             | ProfileNode::EnvRef { .. } => {}
@@ -280,10 +287,13 @@ impl IdMinter {
 }
 
 /// The largest [`NodeId`] anywhere in `node`'s subtree, itself included.
-fn max_node_id(node: &ProfileNode) -> u64 {
+///
+/// `pub(crate)` because [`crate::resolve`] seeds its fragment-parse
+/// `IdGen` above this same ceiling — one walker, one injectivity rule.
+pub(crate) fn max_node_id(node: &ProfileNode) -> u64 {
     let own = node.node_id().0;
     let nested: u64 = match node {
-        ProfileNode::Spec { env, phases, .. } => env
+        ProfileNode::Spec { env, phases, .. } | ProfileNode::Fragment { env, phases, .. } => env
             .values()
             .chain(phases.iter())
             .map(max_node_id)

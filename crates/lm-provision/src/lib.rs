@@ -19,6 +19,10 @@
 //! - [`profile_ast`] — the `ProfileNode` AST (spec + the phase catalog
 //!   kinds), the semantics adapter (`ProfileSemantics` / `ProfileValue`),
 //!   and the dsl-kit engine wiring that drives execution.
+//! - [`resolve`] — the fragment-import resolve stage between load and
+//!   validate (11-fragment-import.md §Resolution): every `Import` node
+//!   is replaced by its fragment's expanded phase list, so everything
+//!   downstream sees a plain expanded `Spec`.
 //! - [`validate`] — the AST validate stage (03-pipeline-stage-artifacts.md
 //!   §validate).
 //! - [`canonical`] — deterministic byte encoder + SHA-256 profile hash
@@ -75,5 +79,6 @@ pub mod machine;
 pub mod normalize;
 pub mod plan;
 pub mod profile_ast;
+pub mod resolve;
 pub mod resource;
 pub mod validate;

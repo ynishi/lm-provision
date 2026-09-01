@@ -97,6 +97,16 @@ pub enum FetchError {
         message: String,
     },
 
+    /// The body loaded but its fragment imports could not be resolved
+    /// (spec 11 §Resolution). The profile hash is the *expanded*
+    /// canonical hash, so an unresolvable body has no hash to verify
+    /// against `--expect-hash`.
+    #[error("the fetched profile's imports could not be resolved: {message}")]
+    Unresolvable {
+        /// The resolve error, verbatim.
+        message: String,
+    },
+
     /// The body is not a loadable profile — or the destination's
     /// extension routed it to the wrong parser (§module doc).
     #[error(
@@ -187,6 +197,20 @@ pub(crate) fn admit(body: &[u8], expect_hash: &str, out: &Path) -> Result<Fetche
         Err(err) => {
             std::fs::remove_file(&staging).ok();
             return Err(FetchError::NotAProfile {
+                message: err.to_string(),
+            });
+        }
+    };
+    // Resolve before hashing: the profile hash is the expanded
+    // canonical hash (spec 11 §Resolution), and `lm-provision hash`
+    // resolves first — `fetch` must judge the same identity or the two
+    // disagree about the same document. A body with no imports resolves
+    // to itself (the whole pre-spec-11 behaviour, byte-for-byte).
+    let node = match crate::resolve::resolve(node, &staging) {
+        Ok(node) => node,
+        Err(err) => {
+            std::fs::remove_file(&staging).ok();
+            return Err(FetchError::Unresolvable {
                 message: err.to_string(),
             });
         }

@@ -161,8 +161,13 @@ fn build_steps(phases: &[ProfileNode]) -> Vec<Value> {
             // A `Spec` variant nested inside `phases`, or an `Env*`
             // value node appearing outside its `env` slot, is a
             // malformed AST the frontend does not produce; skip rather
-            // than panic to keep [`expand`] total.
+            // than panic to keep [`expand`] total. `Import` / `Fragment`
+            // join the arm because plan runs downstream of resolve
+            // ([`crate::resolve`]), which replaces every `Import` before
+            // this stage sees the AST (spec 11 §Resolution).
             ProfileNode::Spec { .. }
+            | ProfileNode::Import { .. }
+            | ProfileNode::Fragment { .. }
             | ProfileNode::EnvLiteral { .. }
             | ProfileNode::EnvSecret { .. }
             | ProfileNode::EnvRef { .. } => {}
@@ -325,6 +330,11 @@ pub(crate) fn kind_of(phase: &ProfileNode) -> &'static str {
         ProfileNode::NetTransfer { .. } => "net.transfer",
         ProfileNode::MountBind { .. } => "mount.bind",
         ProfileNode::MountUmount { .. } => "mount.umount",
+        // Structural nodes the resolve stage consumes before plan runs
+        // (spec 11 §Resolution); labelled honestly in case one ever
+        // surfaces through a caller that skipped resolve.
+        ProfileNode::Import { .. } => "import",
+        ProfileNode::Fragment { .. } => "fragment",
     }
 }
 
@@ -335,7 +345,12 @@ pub(crate) fn kind_of(phase: &ProfileNode) -> &'static str {
 /// hash-parity sort rule is canonical-only).
 fn payload_of(phase: &ProfileNode) -> Value {
     match phase {
-        ProfileNode::Spec { .. } => Value::Object(Map::new()),
+        // Structural nodes: `Spec` never appears in a phase list, and
+        // `Import` / `Fragment` are consumed by resolve before plan runs
+        // (spec 11 §Resolution).
+        ProfileNode::Spec { .. } | ProfileNode::Import { .. } | ProfileNode::Fragment { .. } => {
+            Value::Object(Map::new())
+        }
         ProfileNode::SystemApt { packages, .. } => json!({ "packages": packages }),
         ProfileNode::ComfyUiInstall {
             ref_name,

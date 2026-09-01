@@ -146,6 +146,12 @@ impl From<crate::validate::ValidateError> for RunError {
     }
 }
 
+impl From<crate::resolve::ResolveError> for RunError {
+    fn from(err: crate::resolve::ResolveError) -> Self {
+        RunError(err.to_string())
+    }
+}
+
 /// The `Result` alias every read-only pipeline function below returns.
 /// `pub` for the same reason [`RunError`] is.
 pub type PipelineResult<T> = std::result::Result<T, RunError>;
@@ -169,8 +175,10 @@ fn print_json(value: &serde_json::Value) {
 }
 
 /// `validate <profile>` pipeline (07-cli.md §Invocation: load →
-/// declarations → validate). Load the profile into a
-/// [`crate::profile_ast::ProfileNode`] AST, run the AST validate checks
+/// declarations → validate; spec 11 §Resolution inserts resolve after
+/// load). Load the profile into a
+/// [`crate::profile_ast::ProfileNode`] AST, expand its fragment
+/// imports ([`crate::resolve::resolve`]), run the AST validate checks
 /// ([`crate::validate::validate`], the port of the legacy
 /// `lm.validate.validate`), and return the validated profile name read
 /// off the `Spec` node. A successful validate guarantees the root is a
@@ -179,7 +187,7 @@ fn print_json(value: &serde_json::Value) {
 /// `pub` so `lm-provision-mcp`'s `lm_validate` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_validate(profile: &Path) -> PipelineResult<String> {
-    let node = crate::frontend::load_profile(profile)?;
+    let node = crate::resolve::resolve(crate::frontend::load_profile(profile)?, profile)?;
     crate::validate::validate(&node)?;
     let name = match &node {
         crate::profile_ast::ProfileNode::Spec { name, .. } => name.clone(),
@@ -201,16 +209,18 @@ fn run_validate(profile: &Path) -> ExitCode {
 }
 
 /// `hash <profile>` pipeline (07-cli.md §Invocation: load → declarations
-/// → canonical → hash). Deliberately does **not** run validate first —
-/// 07 §Invocation's pipeline-stages column for `hash` names only load →
-/// declarations → canonical → hash. Returns the 64-character lowercase
-/// hex digest via the frontend-agnostic [`crate::canonical::hash`] (see
-/// `tests/canonical_frontend_parity.rs`).
+/// → canonical → hash; spec 11 §Resolution inserts resolve after load —
+/// "`lm-provision hash` on a document containing imports resolves first
+/// and hashes the result"). Deliberately does **not** run validate
+/// first — 07 §Invocation's pipeline-stages column for `hash` names
+/// only load → declarations → canonical → hash. Returns the
+/// 64-character lowercase hex digest via the frontend-agnostic
+/// [`crate::canonical::hash`] (see `tests/canonical_frontend_parity.rs`).
 ///
 /// `pub` so `lm-provision-mcp`'s `lm_hash` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_hash(profile: &Path) -> PipelineResult<String> {
-    let node = crate::frontend::load_profile(profile)?;
+    let node = crate::resolve::resolve(crate::frontend::load_profile(profile)?, profile)?;
     Ok(crate::canonical::hash(&node))
 }
 
@@ -225,7 +235,8 @@ fn run_hash(profile: &Path) -> ExitCode {
 }
 
 /// `plan <profile>` pipeline (07-cli.md §Invocation: load → declarations
-/// → plan — no validate step, for the same reason as [`ast_hash`]).
+/// → plan, with resolve after load per spec 11 §Resolution — no
+/// validate step, for the same reason as [`ast_hash`]).
 /// Load the profile into an AST and expand it into the plan artifact
 /// ([`crate::plan::expand`], the port of the legacy `lm.plan.expand`),
 /// returned as a `serde_json::Value` ready to pretty-print.
@@ -233,7 +244,7 @@ fn run_hash(profile: &Path) -> ExitCode {
 /// `pub` so `lm-provision-mcp`'s `lm_plan` tool
 /// can reuse this exact pipeline in-process (10-mcp.md §Tool set).
 pub fn ast_plan(profile: &Path) -> PipelineResult<serde_json::Value> {
-    let node = crate::frontend::load_profile(profile)?;
+    let node = crate::resolve::resolve(crate::frontend::load_profile(profile)?, profile)?;
     Ok(crate::plan::expand(&node))
 }
 

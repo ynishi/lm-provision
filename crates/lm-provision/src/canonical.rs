@@ -279,6 +279,58 @@ fn to_canon(node: &ProfileNode) -> CanonValue {
             CanonValue::Object(fields)
         }
 
+        // Fragment: the encoding the pin verifies. Spec 11 §Resolution
+        // rule 3 computes "the fragment's expanded canonical hash —
+        // chapter 03 rules applied to the expanded `Fragment` node" —
+        // so the variant follows `Spec`'s field rules exactly: declared
+        // lists sorted, `env` / `assumes` omitted when empty, optional
+        // fields omitted when unset, phase order preserved. A `Fragment`
+        // never appears inside a *consuming profile's* canonical bytes
+        // (resolve replaced it), but the node itself must encode so the
+        // pin has something to check.
+        ProfileNode::Fragment {
+            id: _,
+            name,
+            version,
+            description,
+            capabilities,
+            env,
+            env_secrets,
+            paths,
+            http_allowlist,
+            assumes,
+            phases,
+        } => {
+            let mut fields = variant_object("Fragment");
+            fields.insert("name".into(), CanonValue::Str(name.clone()));
+            insert_optional_str(&mut fields, "version", version);
+            insert_optional_str(&mut fields, "description", description);
+            fields.insert("capabilities".into(), sorted_string_array(capabilities));
+            insert_env(&mut fields, env);
+            fields.insert("env_secrets".into(), sorted_string_array(env_secrets));
+            fields.insert("http_allowlist".into(), sorted_string_array(http_allowlist));
+            fields.insert("paths".into(), sorted_string_array(paths));
+            insert_str_map(&mut fields, "assumes", assumes);
+            fields.insert(
+                "phases".into(),
+                CanonValue::Array(phases.iter().map(to_canon).collect()),
+            );
+            CanonValue::Object(fields)
+        }
+
+        // Import: never reaches the consuming profile's canonical bytes
+        // on the resolved pipeline (spec 11 §Resolution — resolve
+        // replaces it before canonical runs), and an *expanded* fragment
+        // contains none either. Encoded anyway so this function stays
+        // total: a library caller hashing an unresolved AST gets
+        // deterministic bytes rather than a panic.
+        ProfileNode::Import { id: _, src, hash } => {
+            let mut fields = variant_object("Import");
+            fields.insert("src".into(), CanonValue::Str(src.clone()));
+            insert_optional_str(&mut fields, "hash", hash);
+            CanonValue::Object(fields)
+        }
+
         ProfileNode::SystemApt { id: _, packages } => {
             let mut fields = variant_object("SystemApt");
             fields.insert("packages".into(), string_array(packages));

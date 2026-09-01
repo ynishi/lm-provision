@@ -101,6 +101,7 @@ Layer 5 — Integration
 | 08 | Push driver protocol (on-pod agent model) | 4 | 07, 04, 06 | G | specified |
 | 09 | Apply report + audit redact + ledger schema | 4 | 08 | G | specified |
 | 10 | MCP — lm-provision-mcp | 5 | 07, 08, 09 | H | specified |
+| 11 | Fragment import | 2 | 01, 02, 03 | post-H | draft |
 
 MVP Phase mapping follows the on-pod agent model rollout (capital
 "Phase F/G/H" always names a rollout milestone; lowercase "phase"

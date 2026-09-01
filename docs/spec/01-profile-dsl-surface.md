@@ -334,7 +334,7 @@ declares nothing here keeps the hash it had before the slot existed.
 ## Escape / Fragment Policy
 
 - **Inner escape**: `PostInstall` carries an arbitrary shell `script` string (chapter 02). This is the single sanctioned place for raw shell inside a profile.
-- **Outer escape / Code Generation**: Fragment reuse and dynamic composition are performed by external tools (e.g. Python scripts or AI tools) generating JSON/Text profiles against the exported `DslSchema`. The DSL vocabulary is not grown for templating or scripting constructs.
+- **Outer escape / Fragment import**: Fragment reuse has a sanctioned in-DSL mechanism — the hash-pinned `Import` node (chapter 11, draft). External tools generating JSON/Text profiles against the exported `DslSchema` remain a supported path, but are no longer the only one. The DSL vocabulary is still not grown for templating or scripting constructs: composition is data-level splice-and-merge, never parameter substitution.
 
 ## Output AST (`ProfileNode::Spec`)
 
