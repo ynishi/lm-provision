@@ -26,6 +26,7 @@ pub enum ProfileNode {
         env_secrets: Vec<String>,
         paths: Vec<String>,
         http_allowlist: Vec<String>,
+        sh_egress: Vec<String>,                  // opt-in sh.exec egress host allowlist (ch 05 §L3)
         phases: Vec<ProfileNode>,
     },
     // Catalog phase variants defined in chapter 02 ...
@@ -100,6 +101,7 @@ An AI-native JSON representation ideal for programmatic generation and tool inte
 | `env_secrets` | list\<string\> | no | `{}` | secret allowlist; every `EnvSecret` reference must name an entry here |
 | `paths` | list\<string\> | no | `{}` | filesystem path root allowlist (chapter 05 §L3 path policy) |
 | `http_allowlist` | list\<string\> | no | `{}` | HTTP URL pattern allowlist (chapter 05 §L3 HTTP policy) |
+| `sh_egress` | list\<string\> | no | `{}` | opt-in `sh.exec` egress **host** allowlist (chapter 05 §L3 `sh_egress`); non-empty routes subprocess egress through the pin, empty/absent means no pin; declaring it without the `sh.exec` capability is rejected (chapter 03 §validate) |
 | `assumes` | table\<string, string\> | no | `{}` | resources already present on the target, as `resource name → path` (§Assumed resources below); a key naming no resource is rejected (chapter 03 §validate check 8b) |
 | `artifacts` | list\<string\> | no | `{}` | pod-side paths the run's work product lands at, pulled back by the driver after apply (§Collected artifacts below); each absolute, `..`-free, shell-safe (chapter 03 §validate check 5b) |
 | `phases` | list\<ProfileNode\> | no | `{}` | phase nodes per chapter 02 |
@@ -109,11 +111,15 @@ Optional fields (`Option<T>` / list-typed) may be omitted on the wire
 empty list. Explicit `null` (JSON) / `none` (canonical text) / `[]`
 remain accepted spellings of the same values.
 
-The declared lists `capabilities`, `env_secrets`, `paths`, and
-`http_allowlist` are **set-shaped** (declaration order is not
-significant): the canonical encoder (chapter 03 §canonical) sorts them
-lexicographically before hashing, so two profiles that differ only in
-the order these entries were written yield the same profile hash.
+The declared lists `capabilities`, `env_secrets`, `paths`,
+`http_allowlist`, and `sh_egress` are **set-shaped** (declaration order
+is not significant): the canonical encoder (chapter 03 §canonical) sorts
+them lexicographically before hashing, so two profiles that differ only
+in the order these entries were written yield the same profile hash.
+`sh_egress` additionally follows the omit-when-empty rule `assumes` /
+`artifacts` carry — an empty list emits no canonical bytes — so a profile
+that declares no egress pin hashes exactly as it did before the field
+existed.
 `env` reaches the same order-independence as a **table** rather than
 as a sorted list: it is stored keyed by name and canonical emits it in
 key order, so no sort step applies — and an empty table is omitted
