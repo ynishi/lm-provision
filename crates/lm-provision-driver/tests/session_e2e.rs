@@ -14,6 +14,8 @@ use lm_provision_driver::local_exec::LocalExecTransport;
 use lm_provision_driver::session::{self, InvokeMode, SessionError, StepPlan};
 use lm_provision_driver::transport::Transport as _;
 
+mod common;
+
 fn lm_provision_bin() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_lm-provision") {
         return PathBuf::from(path);
@@ -54,6 +56,7 @@ fn unique_dir(name: &str) -> PathBuf {
 
 #[test]
 fn session_dry_run_collects_a_report_and_appends_one_ledger_row() {
+    let _guard = common::stage_and_run();
     let staging = unique_dir("dry-run");
     let ledger_path = staging.join("ledger.jsonl");
     let transport = LocalExecTransport::new(&staging);
@@ -92,6 +95,7 @@ fn session_dry_run_collects_a_report_and_appends_one_ledger_row() {
 
 #[test]
 fn missing_secret_fails_before_any_transfer() {
+    let _guard = common::stage_and_run();
     let staging = unique_dir("missing-secret");
     let transport = LocalExecTransport::new(&staging);
     let plan = StepPlan::default(); // Apply mode consumes secrets.
@@ -138,6 +142,7 @@ fn missing_secret_fails_before_any_transfer() {
 
 #[test]
 fn validate_only_consumes_no_secret_and_writes_no_ledger_row() {
+    let _guard = common::stage_and_run();
     let staging = unique_dir("validate-only");
     let ledger_path = staging.join("ledger.jsonl");
     let transport = LocalExecTransport::new(&staging);
@@ -190,6 +195,7 @@ fn validate_only_consumes_no_secret_and_writes_no_ledger_row() {
 
 #[test]
 fn skip_install_without_a_binary_on_the_pod_fails_as_a_precondition() {
+    let _guard = common::stage_and_run();
     let staging = unique_dir("skip-install");
     let transport = LocalExecTransport::new(&staging);
     let plan = StepPlan {
@@ -224,6 +230,7 @@ fn skip_install_without_a_binary_on_the_pod_fails_as_a_precondition() {
 
 #[test]
 fn ensure_binary_re_run_converges_without_re_transfer_and_repairs_drift() {
+    let _guard = common::stage_and_run();
     let staging = unique_dir("idempotent");
     let transport = LocalExecTransport::new(&staging);
     let binary = lm_provision_bin();

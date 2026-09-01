@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 use lm_provision_driver::acquisition::{self as record, AcquisitionRow};
 
+mod common;
+
 /// The driver binary. `CARGO_BIN_EXE_<name>` is guaranteed here: the
 /// bin target belongs to this package.
 fn driver() -> PathBuf {
@@ -143,6 +145,7 @@ fn sweep(dir: &Path, args: &[&str]) -> serde_json::Value {
 /// sweep judges, it judges from the name the platform reports.
 #[test]
 fn a_dry_run_judges_the_platforms_own_list_with_no_record_at_all() {
+    let _guard = common::stage_and_run();
     let dir = unique_dir("dry-run");
     stub_platform_cli(
         &dir,
@@ -197,6 +200,7 @@ fn a_dry_run_judges_the_platforms_own_list_with_no_record_at_all() {
 /// list is retired without a release call being spent on it.
 #[test]
 fn an_enforcing_sweep_deletes_the_expired_machine_and_corrects_the_record() {
+    let _guard = common::stage_and_run();
     let dir = unique_dir("enforcing");
     stub_platform_cli(
         &dir,
@@ -272,6 +276,7 @@ fn an_enforcing_sweep_deletes_the_expired_machine_and_corrects_the_record() {
 /// whatever is on that account is billing with nothing able to stop it.
 #[test]
 fn a_platform_that_cannot_be_listed_is_reported_and_costs_the_zero_exit() {
+    let _guard = common::stage_and_run();
     let dir = unique_dir("unlistable");
     let path = dir.join("runpod-cli");
     std::fs::write(&path, "#!/bin/sh\necho 'error: unauthorized' >&2\nexit 1\n")

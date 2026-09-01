@@ -52,6 +52,23 @@ fn state() -> SharedStatus {
     )))
 }
 
+/// Held while a test writes a stub driver and then runs it.
+///
+/// **`ETXTBSY`: the kernel refuses to exec a file some process has
+/// open for writing, and a forked child holds its parent's descriptors
+/// until it execs.** Every test here writes its stub and spawns it,
+/// and cargo runs them on parallel threads of one process — so one
+/// test's spawn can inherit another's still-open write descriptor and
+/// hold the file busy for exactly as long as it takes to exec. The
+/// driver's end-to-end suites lose runs to this; these have not been
+/// caught by it, and carry the same lock because they do the same two
+/// things [measured: 2026-09-01, `Text file busy` out of `session_e2e`
+/// and `driver_e2e`, never yet out of this file].
+///
+/// A tokio mutex, not a `std` one: the guard is held across the
+/// `tick().await` that does the spawning.
+static STAGE_AND_RUN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The document the endpoint would return right now, read the way the
 /// endpoint reads it.
 async fn health_of(config: &Config, state: &SharedStatus) -> serde_json::Value {
@@ -61,6 +78,7 @@ async fn health_of(config: &Config, state: &SharedStatus) -> serde_json::Value {
 
 #[tokio::test]
 async fn one_tick_runs_the_driver_and_publishes_what_it_said() {
+    let _guard = STAGE_AND_RUN.lock().await;
     let dir = unique_dir("good");
     let argv_log = dir.join("argv");
     let driver = stub_driver(
@@ -124,6 +142,7 @@ async fn one_tick_runs_the_driver_and_publishes_what_it_said() {
 /// false` — which is the whole reason it exists.
 #[tokio::test]
 async fn a_failing_driver_becomes_a_failed_tick_not_a_dead_daemon() {
+    let _guard = STAGE_AND_RUN.lock().await;
     let dir = unique_dir("failing");
     let driver = stub_driver(
         &dir,
@@ -162,6 +181,7 @@ async fn a_failing_driver_becomes_a_failed_tick_not_a_dead_daemon() {
 /// binary not yet on `PATH`. Same shape: recorded, reported, survived.
 #[tokio::test]
 async fn a_missing_driver_is_reported_rather_than_fatal() {
+    let _guard = STAGE_AND_RUN.lock().await;
     let dir = unique_dir("missing");
     let config = Config {
         interval_secs: 1,

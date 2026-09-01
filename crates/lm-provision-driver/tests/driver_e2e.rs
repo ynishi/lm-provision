@@ -21,6 +21,8 @@ use lm_provision_driver::ledger::{self, LedgerRow};
 use lm_provision_driver::local_exec::LocalExecTransport;
 use lm_provision_driver::{driver, transport::Transport as _};
 
+mod common;
+
 fn lm_provision_bin() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_lm-provision") {
         return PathBuf::from(path);
@@ -72,6 +74,7 @@ fn step_ops(report: &serde_json::Value) -> Vec<&str> {
 
 #[test]
 fn apply_dry_run_via_local_exec_transport_collects_a_report_with_secret_env_injected() {
+    let _guard = common::stage_and_run();
     let binary = lm_provision_bin();
     let profile = fixture("apply-secret.json");
 
@@ -164,6 +167,7 @@ fn apply_dry_run_via_local_exec_transport_collects_a_report_with_secret_env_inje
 
 #[test]
 fn apply_failing_step_report_is_collected_as_a_richer_signal_not_a_driver_error() {
+    let _guard = common::stage_and_run();
     let binary = lm_provision_bin();
     let profile = fixture("apply-failing.json");
 
@@ -202,6 +206,7 @@ fn apply_failing_step_report_is_collected_as_a_richer_signal_not_a_driver_error(
 
 #[test]
 fn upload_stages_a_real_binary_and_profile_that_can_be_re_hashed_on_the_pod() {
+    let _guard = common::stage_and_run();
     let binary = lm_provision_bin();
     let profile = fixture("apply-secret.json");
     let local_hash =
