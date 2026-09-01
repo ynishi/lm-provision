@@ -216,6 +216,8 @@ verification material travels with the consumer, not the registry.
 | `ImportSchemeDenied` | resolve | non-https remote / `file://` / `~/` / env form |
 | `ImportReferentialSanity` | resolve | remote fragment importing a local path |
 | `ImportMergeCollision` | resolve | `env` / `assumes` key declared by both sides with different values |
+| `ImportNotAFragment` | resolve | import target's root is not a `Fragment` node (importing a full `Spec` profile is not defined) |
+| `ImportPinShape` | resolve | a written pin is not a 64-char hex SHA-256 — an authoring mistake, reported before any content comparison |
 
 All resolve errors name the import chain (consumer → … → fragment)
 that produced them.
