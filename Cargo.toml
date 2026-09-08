@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
 repository = "https://github.com/ynishi/lm-provision"
@@ -28,9 +28,9 @@ categories = ["command-line-utilities", "development-tools"]
 # Getting it wrong is not silent: a requirement that no longer matches
 # the version beside it fails to resolve, so a half-done bump does not
 # build [measured: 2026-08-12, both directions].
-lm-provision = { path = "crates/lm-provision", version = "0.8.0" }
-lm-provision-driver = { path = "crates/lm-provision-driver", version = "0.8.0" }
-lm-provision-protocol = { path = "crates/lm-provision-protocol", version = "0.8.0" }
+lm-provision = { path = "crates/lm-provision", version = "0.9.0" }
+lm-provision-driver = { path = "crates/lm-provision-driver", version = "0.9.0" }
+lm-provision-protocol = { path = "crates/lm-provision-protocol", version = "0.9.0" }
 # There is no `lm-provision-host` entry and there will not be one: it
 # is AGPL-3.0-or-later, and no permissive crate here may depend on it
 # (`no_permissive_crate_depends_on_the_agpl_host` in that crate makes
@@ -58,6 +58,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # only makes the workspace-level dependency explicit for the code that
 # reasons about it directly (`crate::resolve`, the `pin` subcommand).
 url = "2"
+# The `dist` release archive the driver pushes to a pod is a `.tar.xz`,
+# and unpacking one is these two. Pure Rust both: this workspace is
+# built for five targets and a C liblzma would make the cross builds
+# need a C toolchain each.
+tar = "0.4"
+lzma-rs = "0.3"
 jiff = "0.1"
 dotenvy = "0.15"
 rmcp = { version = "2", features = ["server", "transport-io", "macros"] }
