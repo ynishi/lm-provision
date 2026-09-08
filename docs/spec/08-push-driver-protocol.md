@@ -31,8 +31,11 @@ Input  (everything the caller must know)
   ConnectionSpec  = ssh { host, port, user (default root), key_path }
                     (a provider exec-API variant is additive, later)
   profile         = local path (canonical text or JSON, chapter 01)
-  artifact        = local path to the musl binary (used by the
-                    ensure-binary step's push strategy)
+  provisioner     = a version (default: the driver's own), resolved
+                    to the release build CI published for it —
+                    downloaded once, verified against the SHA-256
+                    beside it, cached. A local path overrides it
+                    (used by the ensure-binary step's strategies)
   secrets         = present in the driver host environment; the name
                     list is derived from the profile's `env_secrets`,
                     a missing name fails before any connection
@@ -73,6 +76,15 @@ of §Session steps.
   protocol ships. Sibling crates in the same workspace produce the
   driver side and the MCP server (chapter 10); neither is uploaded
   into the pod.
+- **Who builds it: CI, not the operator.** The release workflow builds
+  the musl target on every tag and publishes the archive beside its
+  `.sha256`. The driver resolves a *version* to that asset, verifies
+  the digest, and caches the result under the operator's cache
+  directory; a local path is an override for developing the
+  provisioner itself, not the way in. Requiring the local build made
+  what runs on a pod a property of whichever machine ran the driver —
+  some working tree, some toolchain, under a version number nothing
+  recorded.
 - External tools invoked *by profiles* (`apt-get`, `git`, `pip`,
   `curl`, `b2`, `hf`, ...) are pod-image prerequisites
   of the specific profile, not of the binary. A missing tool fails
@@ -91,8 +103,11 @@ any effect runs.
 
 ```
 0. ensure-binary  — make <bin> exist at the pod path
-                    strategy: push-local-artifact (default)
-                              fetch-release  (additive, later)
+                    strategy: fetch-release (default; the version's
+                              release asset, checksum-verified and
+                              cached on the operator host)
+                              push-local-artifact (override: a path
+                              the operator names)
                               cargo-install  (additive, later)
                     idempotent: the pod-side sha256 is compared to
                     the local artifact's; identical → no-op, so
@@ -447,8 +462,11 @@ The binary half of this contract ships in Phase F (subcommands,
 report-on-stdout, exit codes, env-secret injection);
 Phase G adds the driver half without modifying the binary contract.
 
-Deferred with one-line reasons: `fetch-release` / `cargo-install`
-ensure-binary strategies (distribution surface not published yet);
+Deferred with one-line reasons: `cargo-install` ensure-binary strategy
+(the release assets cover the same need without a toolchain on the
+operator host — `fetch-release`, deferred here for the same "not
+published yet" reason, shipped in 0.9.0 once the tagged releases
+existed to fetch from);
 exec-API ConnectionSpec (no provider SDK in scope — even `acquire` /
 `release` reach the provider through its CLI, an exec adapter would
 pull an API client in deliberately); marking an unstamped machine and

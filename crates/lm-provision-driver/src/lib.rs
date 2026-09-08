@@ -76,6 +76,9 @@
 //!   and what is reported when it is not there.
 //! - [`image`] — whether the image a profile names exists in its
 //!   registry, asked before a machine exists to pull it and fail.
+//! - [`provisioner`] — where the provisioner comes from: the CI-built,
+//!   version-pinned, checksum-verified release asset, cached locally,
+//!   so an apply needs a network rather than a toolchain.
 
 #![warn(missing_docs)]
 
@@ -86,6 +89,7 @@ pub mod image;
 pub mod infra;
 pub use lm_provision_protocol::ledger;
 pub mod local_exec;
+pub mod provisioner;
 pub mod session;
 pub mod ssh;
 pub mod transport;

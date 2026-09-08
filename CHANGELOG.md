@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.9.0] - 2026-09-08
+
+### Changed
+
+- **The provisioner pushed to a pod now comes from CI, not from your
+  machine.** `apply` required `--artifact <path>`, which put a `cargo
+  build --target x86_64-unknown-linux-musl` in front of every
+  provision and made what runs as root on a pod a property of whoever
+  ran the driver: some working tree, some toolchain, some day, under a
+  version number nothing recorded. The release workflow has been
+  building that target on every tag all along
+  (`dist-workspace.toml` §targets) and publishing the archive beside a
+  `.sha256`; nothing consumed it. Now `apply` resolves a *version* —
+  by default the driver's own — to that release asset, downloads it
+  once, verifies the published digest before unpacking, and caches the
+  binary under `$XDG_CACHE_HOME/lm-provision/provisioner/<version>/`.
+  A cache hit needs no network. Provisioning a pod needs neither a
+  musl toolchain nor a checkout.
+
+  `--provisioner-version <ver>` pins another release.
+  `--provisioner-path <file>` pushes a local build instead — the
+  override for developing the provisioner itself, unverified because
+  naming the file is the authorization. This is the `fetch-release`
+  ensure-binary strategy spec 08 §Session steps had reserved and
+  deferred "distribution surface not published yet"; the surface is
+  published, so it is the default and `push-local-artifact` is the
+  override.
+
+- **The MCP server stopped requiring a binary of its own.**
+  `LM_PROVISION_BINARY` was mandatory: a server started without it
+  refused to start, so every deployment of `lm-provision-mcp` carried
+  the same local-build dependence `apply` just shed. It is now
+  optional and takes two forms — an **`https://` archive URL**,
+  verified against the `.sha256` published beside it and cached (a
+  fork's release, a mirror inside a network that cannot reach
+  github.com, an asset uploaded by hand), or a **local path**, used as
+  given. Unset resolves the release the server's own version was built
+  alongside. The reasoning that made it mandatory — "guessing at one
+  would silently point the driver at the wrong artifact" — was right
+  about guessing, and the release built by CI from this source, with
+  its digest checked before anything is pushed, is not a guess. A
+  scheme that is neither is refused rather than read as a filename, so
+  a mistyped `http://` says so instead of reporting a missing file.
+
+- **Named the pod-side binary.** It is **the provisioner** — the word
+  this workspace was already using for it (`crates/lm-provision`'s own
+  package description, spec 08 §Inputs "The provisioner binary
+  artifact") and the word Packer uses for the thing that installs and
+  configures a machine. Not an *agent*: `agentless` is the industry's
+  term for installing nothing on the managed node, so calling a
+  one-shot binary an agent makes a reader's first question — is it
+  still running, does it need stopping — the wrong one. *Artifact* was
+  free to keep its existing meaning here: what a profile declares and
+  an apply pulls back off the pod (`--artifacts-dir`). Accordingly
+  `--artifact` is now spelled `--provisioner-path`, after the
+  convention every tool that names its remote-side counterpart follows
+  (`--rsync-path`, borg's `--remote-path`, git's `--upload-pack`).
+  **The old spellings `--artifact` and `--artifact-version` keep
+  working** as aliases: they shipped in 0.8.0.
+
 ## [0.8.0] - 2026-09-01
 
 ### Changed

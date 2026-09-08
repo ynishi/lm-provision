@@ -27,3 +27,13 @@ dotenvy = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The release-artifact resolver (`artifact`): download through the core
+# crate's one downloader — which is async, hence the runtime — verify
+# the published SHA-256, and unpack the `dist` archive. `tar` and
+# `lzma-rs` are pure Rust on purpose: the driver itself is shipped for
+# five targets including musl, and a C lzma would put a cross toolchain
+# in the way of building it.
+sha2 = { workspace = true }
+tar = { workspace = true }
+lzma-rs = { workspace = true }
+tokio = { workspace = true }

@@ -12,13 +12,28 @@
 
 use std::path::PathBuf;
 
+use lm_provision_driver::provisioner;
+
 use crate::targets::{RegistrySource, TargetLoadError, TargetRegistry};
 
-/// `LM_PROVISION_BINARY` — path to the `lm-provision` provisioner
-/// binary [`lm_provision_driver::driver::run`] uploads and invokes (08
-/// §Inputs "provisioner binary artifact"). Required: the MVP
-/// [`lm_provision_driver::local_exec::LocalExecTransport`] has no
-/// other way to locate it.
+/// `LM_PROVISION_BINARY` — which provisioner
+/// [`lm_provision_driver::driver::run`] uploads and invokes (08 §Inputs
+/// "provisioner binary artifact"). Takes either form:
+///
+/// - **an `https://` URL** of a release archive, verified against the
+///   `.sha256` published beside it and cached — for a fork's release, a
+///   mirror, or a version this server was not built alongside;
+/// - **a local path**, used as given: naming the file is the
+///   authorization, which is the override for developing the
+///   provisioner itself.
+///
+/// **Optional.** Unset resolves the release the server's own version
+/// was built alongside, exactly as `lm-provision-driver apply` does
+/// with no `--provisioner-*` flag. It was required until 0.9.0, on the
+/// reasoning that a guessed path would silently push the wrong binary —
+/// which was right about *guessing*, and the release for one's own
+/// version is not a guess: CI built it from this source, and the
+/// digest is checked before anything is pushed.
 pub const BINARY_PATH_ENV: &str = "LM_PROVISION_BINARY";
 
 /// `LM_PROVISION_STAGING_DIR` — the directory
@@ -57,15 +72,24 @@ pub const ARTIFACTS_DIR_ENV: &str = "LM_PROVISION_ARTIFACTS_DIR";
 /// environment.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// [`BINARY_PATH_ENV`] was not set. Every other knob has a usable
-    /// default; the binary path does not, because guessing at one
-    /// would silently point the driver at the wrong artifact.
+    /// [`BINARY_PATH_ENV`] named a scheme this cannot fetch. Refused
+    /// rather than treated as a path, because a mistyped `http://`
+    /// would otherwise be reported as a missing file and send the
+    /// reader looking for one.
     #[error(
-        "{BINARY_PATH_ENV} is not set: the MCP server needs the path to the \
-         lm-provision provisioner binary to drive lm_apply (08-push-driver-protocol.md \
-         §Inputs)"
+        "{BINARY_PATH_ENV} = {value}: only an https:// URL or a local path is understood \
+         (a plain-http archive is refused: the provisioner runs as root on the pod)"
     )]
-    MissingBinaryPath,
+    UnsupportedScheme {
+        /// What was set.
+        value: String,
+    },
+
+    /// The provisioner could not be resolved — the release for this
+    /// server's version, or the URL [`BINARY_PATH_ENV`] named, could
+    /// not be fetched or did not verify.
+    #[error("resolving the provisioner: {0}")]
+    Provisioner(#[from] lm_provision_driver::provisioner::ProvisionerError),
 
     /// [`TARGETS_PATH_ENV`] named a file that could not be read.
     /// Startup fails rather than continuing with an empty registry:
@@ -86,6 +110,55 @@ pub enum ConfigError {
     /// [`ConfigError::ReadTargets`].
     #[error("invalid pod target registry: {0}")]
     Targets(#[from] TargetLoadError),
+}
+
+/// What [`BINARY_PATH_ENV`] said, classified before anything is
+/// fetched.
+///
+/// Split from the fetch so the reading of the variable — the part with
+/// the decisions in it — is a pure function a test can exercise without
+/// a network. The same two-step shape the driver's flags have: a
+/// version (here: none, meaning this build's own), a URL, or a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionerSource {
+    /// Unset: the release this server's version was built alongside.
+    OwnRelease,
+    /// An `https://` archive URL, verified against its `.sha256`.
+    Url(String),
+    /// A local file, used as given.
+    Path(PathBuf),
+}
+
+impl ProvisionerSource {
+    /// Read [`BINARY_PATH_ENV`]'s value. Pure.
+    ///
+    /// A value is a URL when it carries a scheme, which is what
+    /// separates the two forms without a heuristic on the text: `://`
+    /// is in no local path. Any scheme other than `https` is refused
+    /// rather than silently taken for a path (§[`ConfigError::UnsupportedScheme`]).
+    pub fn classify(value: Option<String>) -> Result<Self, ConfigError> {
+        let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+            return Ok(Self::OwnRelease);
+        };
+        if value.starts_with("https://") {
+            return Ok(Self::Url(value));
+        }
+        if value.contains("://") {
+            return Err(ConfigError::UnsupportedScheme { value });
+        }
+        Ok(Self::Path(PathBuf::from(value)))
+    }
+
+    /// Resolve to a local file. **May reach the network** (and cache
+    /// what it fetched) for the two release forms; a path is returned
+    /// as given, unchecked, because naming a file is the authorization.
+    pub fn get(&self) -> Result<PathBuf, ConfigError> {
+        Ok(match self {
+            Self::OwnRelease => provisioner::resolve(provisioner::default_version())?.path,
+            Self::Url(url) => provisioner::resolve_url(url)?.path,
+            Self::Path(path) => path.clone(),
+        })
+    }
 }
 
 /// Server deployment configuration, resolved once at startup from the
@@ -129,8 +202,16 @@ impl Config {
                 None => None,
             };
 
+        // The other impure step, and the reason it is here rather than
+        // in `from_vars`: resolving the provisioner may reach the
+        // network. It happens once, at startup, so a server that cannot
+        // get one says so before an MCP client asks it to provision
+        // anything.
+        let binary_path =
+            ProvisionerSource::classify(std::env::var(BINARY_PATH_ENV).ok())?.get()?;
+
         Self::from_vars(
-            std::env::var(BINARY_PATH_ENV).ok(),
+            binary_path,
             std::env::var(STAGING_DIR_ENV).ok(),
             std::env::var(LEDGER_PATH_ENV).ok(),
             std::env::var(ARTIFACTS_DIR_ENV).ok(),
@@ -145,6 +226,12 @@ impl Config {
     /// environment (the same pattern `cli::resolve_log_filter_from`
     /// in the `lm-provision` crate uses for `RUST_LOG`).
     ///
+    /// `binary_path` arrives already resolved
+    /// ([`ProvisionerSource::get`]): the two knobs whose resolution can
+    /// fail outside the process — the registry file and the
+    /// provisioner — are read by the caller so this stays a function of
+    /// its arguments.
+    ///
     /// `targets_json` is the registry file's contents and
     /// `targets_path` the path it was read from — both together, or
     /// neither. Either half alone cannot describe a loaded registry
@@ -152,16 +239,13 @@ impl Config {
     /// treated as "no registry configured", which is what
     /// [`Config::from_env`] produces when [`TARGETS_PATH_ENV`] is unset.
     pub fn from_vars(
-        binary_path: Option<String>,
+        binary_path: PathBuf,
         staging_dir: Option<String>,
         ledger_path: Option<String>,
         artifacts_dir: Option<String>,
         targets_json: Option<String>,
         targets_path: Option<PathBuf>,
     ) -> Result<Self, ConfigError> {
-        let binary_path = binary_path
-            .map(PathBuf::from)
-            .ok_or(ConfigError::MissingBinaryPath)?;
         let staging_dir = staging_dir
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("lm-provision-mcp-staging"));
@@ -191,17 +275,57 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Unset is no longer an error: it means the release this server's
+    /// version was built alongside, which is the same thing
+    /// `lm-provision-driver apply` means by no `--provisioner-*` flag.
     #[test]
-    fn missing_binary_path_is_a_config_error() {
-        let err = Config::from_vars(None, None, None, None, None, None)
-            .expect_err("missing binary path must error");
-        assert!(matches!(err, ConfigError::MissingBinaryPath));
+    fn an_unset_binary_variable_means_this_builds_own_release() {
+        assert_eq!(
+            ProvisionerSource::classify(None).unwrap(),
+            ProvisionerSource::OwnRelease
+        );
+        // A variable set to nothing is a variable nobody meant to set.
+        assert_eq!(
+            ProvisionerSource::classify(Some("   ".to_string())).unwrap(),
+            ProvisionerSource::OwnRelease
+        );
+    }
+
+    #[test]
+    fn an_https_value_is_an_archive_url_and_a_bare_value_is_a_path() {
+        let url = "https://example.invalid/lm-provision-x86_64-unknown-linux-musl.tar.xz";
+        assert_eq!(
+            ProvisionerSource::classify(Some(url.to_string())).unwrap(),
+            ProvisionerSource::Url(url.to_string())
+        );
+        assert_eq!(
+            ProvisionerSource::classify(Some("/usr/local/bin/lm-provision".to_string())).unwrap(),
+            ProvisionerSource::Path(PathBuf::from("/usr/local/bin/lm-provision"))
+        );
+    }
+
+    /// Refused rather than taken for a path: reporting a mistyped
+    /// `http://` as a missing file sends the reader looking for a file.
+    #[test]
+    fn any_other_scheme_is_refused_rather_than_read_as_a_path() {
+        let err = ProvisionerSource::classify(Some("http://example.invalid/a.tar.xz".to_string()))
+            .expect_err("plain http must be refused");
+        assert!(matches!(err, ConfigError::UnsupportedScheme { .. }));
+        assert!(ProvisionerSource::classify(Some("s3://bucket/key".to_string())).is_err());
+    }
+
+    /// A path is returned as given — no fetch, no check: naming the
+    /// file is the authorization.
+    #[test]
+    fn resolving_a_path_source_touches_nothing() {
+        let source = ProvisionerSource::Path(PathBuf::from("/bin/lm-provision"));
+        assert_eq!(source.get().unwrap(), PathBuf::from("/bin/lm-provision"));
     }
 
     #[test]
     fn staging_dir_and_ledger_path_default_when_unset() {
         let config = Config::from_vars(
-            Some("/usr/local/bin/lm-provision".to_string()),
+            PathBuf::from("/usr/local/bin/lm-provision"),
             None,
             None,
             None,
@@ -223,7 +347,7 @@ mod tests {
     #[test]
     fn explicit_staging_dir_and_ledger_path_override_the_default() {
         let config = Config::from_vars(
-            Some("/bin/lm-provision".to_string()),
+            PathBuf::from("/bin/lm-provision"),
             Some("/tmp/custom-staging".to_string()),
             Some("/tmp/custom-ledger.jsonl".to_string()),
             Some("/tmp/custom-artifacts".to_string()),
@@ -245,7 +369,7 @@ mod tests {
     #[test]
     fn a_local_exec_entry_without_a_staging_dir_inherits_the_servers_default() {
         let config = Config::from_vars(
-            Some("/bin/lm-provision".to_string()),
+            PathBuf::from("/bin/lm-provision"),
             Some("/tmp/custom-staging".to_string()),
             None,
             None,

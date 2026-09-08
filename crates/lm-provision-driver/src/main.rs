@@ -12,8 +12,12 @@
 //! ```sh
 //! lm-provision-driver apply \
 //!   --ssh root@<host>:<port> --key ~/.ssh/<key> \
-//!   --profile profile.json \
-//!   --artifact target/x86_64-unknown-linux-musl/release/lm-provision
+//!   --profile profile.json
+//! # the provisioner pushed to the pod is the CI-built release asset
+//! # for this driver's own version, verified and cached
+//! # (lm_provision_driver::provisioner); --provisioner-version <ver>
+//! # picks another, --provisioner-path <path> overrides it with a
+//! # local build
 //! # gates: --dry-run | --validate-only, --skip-install,
 //! #        --skip-verify, --no-artifacts, --no-ledger
 //! ```
@@ -43,6 +47,7 @@ use clap::{Args, Parser, Subcommand};
 use lm_provision_driver::acquisition::{self as record, AcquisitionRow};
 use lm_provision_driver::credentials;
 use lm_provision_driver::infra::{self, Infra, RunPodAdapter, VastAdapter};
+use lm_provision_driver::provisioner;
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
 use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
 
@@ -237,10 +242,34 @@ struct ApplyArgs {
     #[arg(long = "profile")]
     profile: PathBuf,
 
-    /// Local musl artifact for the ensure-binary push strategy.
-    /// Required unless --skip-install.
-    #[arg(long = "artifact", required_unless_present = "skip_install")]
-    artifact: Option<PathBuf>,
+    /// Push this local provisioner build instead of the released one.
+    ///
+    /// The override for developing the provisioner itself — a musl
+    /// build of a working tree. Naming the file is the authorization:
+    /// unlike the release path it is not checked against anything.
+    ///
+    /// Spelled `--<program>-path` after the convention every tool that
+    /// names its remote-side counterpart follows (`--rsync-path`,
+    /// borg's `--remote-path`, git's `--upload-pack`, unison's
+    /// `-servercmd`). `--artifact` is the pre-0.9 spelling, kept
+    /// working because it shipped.
+    #[arg(long = "provisioner-path", alias = "artifact")]
+    provisioner_path: Option<PathBuf>,
+
+    /// Release version of the provisioner to push.
+    ///
+    /// Defaults to this driver's own version, which is the provisioner
+    /// it was built alongside. The release asset is downloaded once,
+    /// verified against the SHA-256 published beside it, and cached —
+    /// so this is what makes an apply need a network rather than a
+    /// toolchain.
+    #[arg(
+        long = "provisioner-version",
+        alias = "artifact-version",
+        default_value = provisioner::default_version(),
+        conflicts_with = "provisioner_path"
+    )]
+    provisioner_version: String,
 
     /// Remote directory the binary / profile land in.
     #[arg(long = "remote-dir", default_value = DEFAULT_REMOTE_DIR)]
@@ -1500,12 +1529,41 @@ fn run_apply(args: ApplyArgs) -> ExitCode {
         ledger,
     };
 
-    // With --skip-install the artifact may be absent; the session
-    // still needs a local file name to derive the pod path from, so
-    // fall back to the canonical binary name.
-    let artifact = args
-        .artifact
-        .unwrap_or_else(|| PathBuf::from("lm-provision"));
+    // Three ways the provisioner to push is named, in the order an
+    // operator means them: the file they pointed at, the name of one
+    // already on the pod, and — the default — the release build for a
+    // version (08 §Inputs "The provisioner binary artifact").
+    let artifact = match (args.provisioner_path, args.skip_install) {
+        (Some(path), _) => path,
+        // With --skip-install nothing is pushed; the session still
+        // needs a local file name to derive the pod path from, so fall
+        // back to the canonical binary name without fetching anything.
+        (None, true) => PathBuf::from(provisioner::BINARY_NAME),
+        (None, false) => match provisioner::resolve(&args.provisioner_version) {
+            Ok(resolved) => {
+                // On stderr, because it is a trace and not the run's
+                // artifact (07-cli.md §Stream split). It says which
+                // binary is about to run as root on a machine, which is
+                // not a thing to have to reconstruct after the fact.
+                match &resolved.source {
+                    provisioner::Source::Fetched { url } => {
+                        eprintln!("provisioner: fetched and verified {url}")
+                    }
+                    provisioner::Source::Cached => eprintln!(
+                        "provisioner: {} (cached, version {})",
+                        resolved.path.display(),
+                        args.provisioner_version
+                    ),
+                    provisioner::Source::Override => {}
+                }
+                resolved.path
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        },
+    };
     let pod_id = args.pod_id.unwrap_or_else(|| host.clone());
     let transport = SshTransport::new(host, port, user, args.key, args.remote_dir);
 

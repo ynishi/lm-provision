@@ -11,7 +11,7 @@ binary with zero dependencies on the target pod.
 | Crate | What it is |
 |---|---|
 | [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]` / `fetch` / `pin`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. Fragment imports (spec 11): hash-pinned local + https fragment reuse with an XDG-cached expansion pass, plus a `pin` authoring subcommand that rewrites `name@version` imports against an `index.json`. |
-| [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push driver. `apply`: one-shot session over SSH — ensure-binary (idempotent SHA-256 push of the musl artifact), place profile, apply, collect report / transcript, append to the apply ledger. `acquire` / `release` / `sweep` / `check`: obtain a machine meeting the profile's declared requirements (stamping its lease onto the machine's own name), give it back, give back every machine whose lease has run out — from the provider's own list with `--provider`, or from the acquisitions record — or judge one that already exists. |
+| [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push driver. `apply`: one-shot session over SSH — ensure-binary (resolve the provisioner for a version to the release build CI published, verify its SHA-256, cache it, and push it idempotently), place profile, apply, collect report / transcript, append to the apply ledger. `acquire` / `release` / `sweep` / `check`: obtain a machine meeting the profile's declared requirements (stamping its lease onto the machine's own name), give it back, give back every machine whose lease has run out — from the provider's own list with `--provider`, or from the acquisitions record — or judge one that already exists. |
 | [`lm-provision-mcp`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-mcp) | MCP server exposing `lm_validate` / `lm_hash` / `lm_plan` and apply-ledger inspection as MCP tools. |
 | [`lm-provision-protocol`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-protocol) | The wire types shared across the license boundary: the append-only apply-ledger row schema (`LedgerRow` / `ArtifactRow`) and the acquisitions record (`AcquisitionRow` — the audit trail of what was bought and what came back), both in JSON Lines encoding — appended by the driver, taken custody of by the host. Neutral and permissive so both sides may depend on it. |
 | [`lm-provision-host`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-host) | The control plane, **AGPL-3.0-or-later**, `publish = false`. The TTL-enforcement daemon: it runs `lm-provision-driver sweep` every interval — as a child process, not as a linked library, so the AGPL side depends on nothing permissive — and answers one health endpoint saying whether the last sweep worked and what it did. Enforcing is its default (`--dry-run false`, the opposite of the CLI's): installing it *is* the consent to release expired machines. Ledger custody is next. |
@@ -34,8 +34,11 @@ binary with zero dependencies on the target pod.
   ready 300s, overridable per step) plus died-during-wait detection
   that fails in seconds when the supervised process crashes during
   startup instead of burning the whole timeout.
-- **Static musl binary** — the provisioner runs on the pod with zero
-  preinstalled dependencies; the driver pushes it on demand.
+- **Static musl binary, built by CI** — the provisioner runs on the pod
+  with zero preinstalled dependencies. Every tag publishes it beside a
+  `.sha256`; the driver resolves a version to that release build,
+  verifies the digest, caches it, and pushes it on demand. Provisioning
+  a pod needs a network, not a toolchain.
 
 ## Quickstart
 
@@ -62,10 +65,18 @@ lm-provision pin profile.json \
 lm-provision apply profile.json            # effectful
 lm-provision apply profile.json --dry-run  # print steps, resolve secrets, no effects
 
-# One-shot provision of a remote pod over SSH:
+# One-shot provision of a remote pod over SSH. The provisioner pushed
+# to the pod is the release build for this driver's own version —
+# fetched once, checksum-verified, cached under $XDG_CACHE_HOME:
 lm-provision-driver apply \
   --ssh root@<host>:<port> --key ~/.ssh/<key> \
-  --profile profile.json --artifact target/x86_64-unknown-linux-musl/release/lm-provision
+  --profile profile.json
+
+# Pin another released version, or push a local build of your own
+# (the override for developing the provisioner itself):
+lm-provision-driver apply ... --provisioner-version 0.8.0
+lm-provision-driver apply ... \
+  --provisioner-path target/x86_64-unknown-linux-musl/release/lm-provision
 
 # Obtain a machine the profile requires, then give it back.
 # --dry-run defaults to on: this renders the request and sends nothing.
@@ -73,6 +84,24 @@ lm-provision-driver acquire --profile profile.json
 lm-provision-driver acquire --profile profile.json --dry-run false
 lm-provision-driver release --id <id> --profile profile.json
 ```
+
+### MCP server: which provisioner it pushes
+
+`lm-provision-mcp` needs no configuration to have a provisioner: unset,
+it resolves the release its own version was built alongside, the same
+way the driver does. `LM_PROVISION_BINARY` overrides that with either
+form — an `https://` archive URL (verified against the `.sha256` beside
+it, so a fork's release or an in-network mirror works), or a local path
+(used as given, for developing the provisioner itself):
+
+```sh
+# neither line is required; this is what the two overrides look like
+export LM_PROVISION_BINARY=https://github.com/<fork>/lm-provision/releases/download/v0.8.0/lm-provision-x86_64-unknown-linux-musl.tar.xz
+export LM_PROVISION_BINARY=target/x86_64-unknown-linux-musl/release/lm-provision
+```
+
+Any other scheme is refused rather than read as a filename — a mistyped
+`http://` reported as a missing file sends you looking for a file.
 
 ### MCP server: pod target registry
 
