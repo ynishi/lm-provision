@@ -272,6 +272,35 @@ mod tests {
 
     use crate::targets::{RegistrySource, TargetRegistry};
 
+    /// Held while a test stages the provisioner into its own directory
+    /// and then runs it.
+    ///
+    /// **`ETXTBSY`: the kernel refuses to exec a file some process has
+    /// open for writing, and a forked child holds its parent's
+    /// descriptors until it execs.** Each test below copies the binary
+    /// into its own staging directory and invokes it, and cargo runs
+    /// them on parallel threads of one process — so thread A's copy is
+    /// still open for writing when thread B forks, B's child inherits
+    /// that descriptor, and A's exec then fails with `Text file busy`.
+    /// Unique paths per test do not help: the descriptor B's child
+    /// inherited is to A's file [measured: 2026-09-11, one failure in
+    /// six `cargo test -p lm-provision-mcp --lib` runs, none in six
+    /// with `--test-threads=1`].
+    ///
+    /// The same hazard and the same guard as
+    /// `lm-provision-driver/tests/common/mod.rs`, which documents it at
+    /// length; serialising costs nothing measurable here either.
+    static STAGE_AND_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock, surviving a poisoned one: a test that panicked
+    /// while holding it left a directory behind, not a broken
+    /// invariant, and the next test should fail on its own assertion.
+    fn stage_and_run() -> std::sync::MutexGuard<'static, ()> {
+        STAGE_AND_RUN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Where these tests point step 4b. None of the fixtures declares
     /// an artifact, so nothing ever lands here — the argument exists
     /// because the session's plan wants a destination either way.
@@ -286,14 +315,20 @@ mod tests {
         ))
     }
 
-    /// Locate the already-built `lm-provision` binary under the
+    /// Locate the already-built provisioner binary under the
     /// workspace's `target/{debug,release}` directory (or
-    /// `CARGO_TARGET_DIR` if overridden). `cargo test --workspace`
-    /// builds every workspace member's binaries as a normal
-    /// consequence of building the workspace, so the binary this crate
-    /// depends on as an *external artifact* (see this module's own doc
-    /// comment) is expected to already exist by the time these tests
-    /// run.
+    /// `CARGO_TARGET_DIR` if overridden). Building the workspace builds
+    /// every member's binaries as a normal consequence, so the binary
+    /// this crate depends on as an *external artifact* (see this
+    /// module's own doc comment) is expected to already exist by the
+    /// time these tests run.
+    ///
+    /// **`lm-provisioner`, not `lm-provision`.** Both land in that one
+    /// directory and only the first speaks the pod-side CLI; asking for
+    /// the other gets the operator's own command, which answers
+    /// `unrecognized subcommand 'hash'` several steps into a session
+    /// [measured: 2026-09-11, this file's two dry-run tests during the
+    /// rename].
     fn built_binary_path() -> PathBuf {
         let target_root = std::env::var("CARGO_TARGET_DIR")
             .map(PathBuf::from)
@@ -301,14 +336,14 @@ mod tests {
                 PathBuf::from(format!("{}/../../target", env!("CARGO_MANIFEST_DIR")))
             });
         for profile in ["debug", "release"] {
-            let candidate = target_root.join(profile).join("lm-provision");
+            let candidate = target_root.join(profile).join("lm-provisioner");
             if candidate.exists() {
                 return candidate;
             }
         }
         panic!(
-            "lm-provision binary not found under {}/{{debug,release}} — \
-             run `cargo build --workspace` first",
+            "lm-provisioner binary not found under {}/{{debug,release}} — \
+             build the workspace first",
             target_root.display()
         );
     }
@@ -420,6 +455,7 @@ mod tests {
     /// row's `pod_id` names an observed destination, not a claim.
     #[test]
     fn lm_apply_dry_run_through_the_registry_returns_an_ok_report_and_appends_to_the_ledger() {
+        let _guard = stage_and_run();
         let binary_path = built_binary_path();
         let staging_dir = temp_dir("staging");
         let ledger_path = temp_dir("ledger").with_extension("jsonl");
@@ -460,7 +496,7 @@ mod tests {
         assert!(output.ledger_appended, "ledger append should succeed");
         assert!(output.ledger_warning.is_none());
         assert!(
-            staging_dir.join("lm-provision").exists(),
+            staging_dir.join("lm-provisioner").exists(),
             "the apply must run against the destination the registry entry names"
         );
 
@@ -474,6 +510,7 @@ mod tests {
 
     #[test]
     fn lm_apply_appends_one_more_row_per_call_even_for_the_same_pod_and_profile() {
+        let _guard = stage_and_run();
         let binary_path = built_binary_path();
         let ledger_path = temp_dir("ledger-repeat").with_extension("jsonl");
         // A fresh staging dir per call, not one shared dir reused across
@@ -535,6 +572,7 @@ mod tests {
 
     #[test]
     fn lm_apply_reports_missing_secret_env_as_a_precondition_error_before_any_invoke() {
+        let _guard = stage_and_run();
         assert!(
             std::env::var("LM_PROVISION_MCP_TEST_DEFINITELY_UNSET_SECRET_XYZ").is_err(),
             "test precondition: this made-up secret name must not be set in the test env"
@@ -580,6 +618,7 @@ mod tests {
 
     #[test]
     fn lm_apply_profile_eval_failure_is_a_precondition_error() {
+        let _guard = stage_and_run();
         let binary_path = built_binary_path();
         let staging_dir = temp_dir("staging-missing-profile");
         let ledger_path = temp_dir("ledger-missing-profile").with_extension("jsonl");

@@ -1018,10 +1018,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lm-provision-cli"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jiff",
+ "lm-provision",
+ "lm-provision-driver",
+ "lm-provision-mcp",
+ "rmcp 2.2.0",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lm-provision-driver"
 version = "0.9.0"
 dependencies = [
- "clap",
  "dotenvy",
  "jiff",
  "lm-provision",
@@ -1033,8 +1048,6 @@ dependencies = [
  "tar",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1055,7 +1068,6 @@ dependencies = [
 name = "lm-provision-mcp"
 version = "0.9.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "dsl-kit",
  "dsl-kit-mcp",
@@ -1070,7 +1082,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

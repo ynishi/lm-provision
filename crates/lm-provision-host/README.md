@@ -1,6 +1,6 @@
 # lm-provision-host
 
-The continuously-running side of lm-provision. `lm-provision-driver
+The continuously-running side of lm-provision. `lm-provision machine
 sweep` gives back every machine whose recorded lease has run out, but
 only when somebody runs it — which is the forgotten-machine problem one
 level up. This daemon runs it on a timer and answers one question about
@@ -19,10 +19,10 @@ engine crates, and nothing there may depend on this one (a test in
 lm-provision-host --interval-secs 300 --bind 127.0.0.1:7909
 ```
 
-The daemon runs the **driver binary**, it does not link the driver's
+The daemon runs the **operator CLI**, it does not link the driver's
 code: the CLI is the contract, and exec is what keeps the AGPL side
 free of any dependency on the permissive one. So
-`lm-provision-driver` has to be on `PATH` (or named with `--driver`),
+`lm-provision` has to be on `PATH` (or named with `--driver`),
 and it needs whatever credentials a release requires — a sweep that
 cannot authenticate reports the machine as failed and leaves it
 running.
@@ -47,7 +47,7 @@ artifacts were never collected; there is no `--force` on this path.
 | Flag | Default | What it does |
 |---|---|---|
 | `--interval-secs <secs>` | `300` | Seconds between sweeps. Leases are hour-grained, so minutes-grained checking is already tight against them. Zero is refused: a timer with no period is a loop spawning the driver as fast as it can exit. |
-| `--driver <path>` | `lm-provision-driver` | The binary to run. A bare name is looked up on `PATH`. |
+| `--driver <path>` | `lm-provision` | The binary to run — the operator CLI, invoked as `machine sweep`. A bare name is looked up on `PATH`. |
 | `--provider <name>` | none | A platform each sweep asks what it is running (`runpod`, `vast`), judging those machines by the lease stamped on each one rather than by the record. Repeatable. Without it a sweep can only act on the acquisitions record — a file, which can be lost or written on another host while the machine keeps billing. Listing needs that platform's credential even in `--dry-run true`; machines carrying no `lmp-exp-` stamp are reported and never released. |
 | `--acquisitions <path>` | driver's default | The acquisitions record to sweep, passed through verbatim. Unset means the driver's own default — the file this host's `acquire` runs already wrote to. |
 | `--ledger <path>` | driver's default | The ledger the release gate reads, passed through verbatim. |

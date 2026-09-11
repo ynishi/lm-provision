@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/lm-provision",
+    "crates/lm-provision-cli",
     "crates/lm-provision-driver",
     "crates/lm-provision-mcp",
     "crates/lm-provision-protocol",
@@ -30,6 +31,7 @@ categories = ["command-line-utilities", "development-tools"]
 # build [measured: 2026-08-12, both directions].
 lm-provision = { path = "crates/lm-provision", version = "0.9.0" }
 lm-provision-driver = { path = "crates/lm-provision-driver", version = "0.9.0" }
+lm-provision-mcp = { path = "crates/lm-provision-mcp", version = "0.9.0" }
 lm-provision-protocol = { path = "crates/lm-provision-protocol", version = "0.9.0" }
 # There is no `lm-provision-host` entry and there will not be one: it
 # is AGPL-3.0-or-later, and no permissive crate here may depend on it

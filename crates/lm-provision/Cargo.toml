@@ -16,8 +16,14 @@ categories.workspace = true
 name = "lm_provision"
 path = "src/lib.rs"
 
+# The binary that lands on a pod and does the work there. Named for
+# what it is rather than for its package: `lm-provision` is the command
+# an operator types (`lm-provision-cli`), and two different programs
+# under one name on one `PATH` is the confusion this rename removes.
+# The release asset is still named after the package, so it stays
+# `lm-provision-<target>.tar.xz` with `lm-provisioner` inside it.
 [[bin]]
-name = "lm-provision"
+name = "lm-provisioner"
 path = "src/main.rs"
 
 [dependencies]

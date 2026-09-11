@@ -12,7 +12,7 @@
 //!
 //! **Applying a profile happens on the pod, never here.** That is
 //! driven through the already-frozen CLI contract (07-cli.md) of the
-//! Phase F `lm-provision` binary, from the outside, over the
+//! Phase F provisioner binary (`lm-provisioner`), from the outside, over the
 //! transport-agnostic upload / invoke / collect shape 08 defines — so
 //! no effect an apply causes is an effect this crate performs. The
 //! effects this crate does perform itself are the machine ones:
@@ -63,8 +63,8 @@
 //!   (08 §Session contract `ConnectionSpec`): scp upload, explicit
 //!   identity file, secrets over stdin (08 §Secret delivery).
 //! - [`session`] — [`session::run`], the session contract's steps 0-5
-//!   with per-step gates ([`session::StepPlan`]); the shape the
-//!   `lm-provision-driver` binary exposes as a one-shot CLI.
+//!   with per-step gates ([`session::StepPlan`]); the shape
+//!   `lm-provision apply` exposes as a one-shot CLI.
 //! - [`infra`] — [`infra::Infra`], the target a machine is placed on,
 //!   with one implementation per target: what it can provide, the
 //!   request that would obtain a machine meeting a profile's
@@ -72,6 +72,10 @@
 //!   [`infra::acquire`] and [`infra::Acquired`], which send that
 //!   request and later destroy the machine: the crate's two calls
 //!   that create and stop bills.
+//! - [`inventory`] — what a platform says it is running, read through
+//!   [`infra`] and rendered as the one JSON document both the operator
+//!   CLI's `machine list` and the MCP `lm_machine_list` tool return. A
+//!   read: it has no release path at all.
 //! - [`credentials`] — where a target's credential is resolved from,
 //!   and what is reported when it is not there.
 //! - [`image`] — whether the image a profile names exists in its
@@ -87,6 +91,7 @@ pub mod credentials;
 pub mod driver;
 pub mod image;
 pub mod infra;
+pub mod inventory;
 pub use lm_provision_protocol::ledger;
 pub mod local_exec;
 pub mod provisioner;

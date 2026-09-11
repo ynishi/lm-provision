@@ -2,7 +2,9 @@
 //!
 //! **The provisioner** is the binary that lands on a pod and does the
 //! work there: it reads a profile, installs and configures the machine,
-//! and exits with a report. The name is not coined here — the crate that
+//! and exits with a report. It is what `lm-provisioner` is called after,
+//! that being the `[[bin]]` the `lm-provision` package now produces. The
+//! name is not coined here — the crate that
 //! produces it already describes itself as a "static on-pod provisioner"
 //! (`crates/lm-provision/Cargo.toml`), and 08 §Inputs titles it "The
 //! provisioner binary artifact". It is the word Packer uses for the
@@ -80,7 +82,35 @@ pub const POD_TARGET: &str = "x86_64-unknown-linux-musl";
 
 /// The `[[bin]]` name the workspace produces, which is also the entry
 /// to pull out of the archive and the name it keeps in the cache.
-pub const BINARY_NAME: &str = "lm-provision";
+pub const BINARY_NAME: &str = "lm-provisioner";
+
+/// The package the release archive is named after.
+///
+/// **Not [`BINARY_NAME`], and the difference is load-bearing.** `dist`
+/// names an archive after the package it built, and the package is
+/// `lm-provision` whatever it calls its `[[bin]]` — so the asset stays
+/// `lm-provision-<target>.tar.xz` while the file inside it is
+/// `lm-provisioner`. Deriving the asset name from the binary name, as
+/// this module used to, would have silently started asking releases for
+/// an archive nobody publishes.
+const PACKAGE_NAME: &str = "lm-provision";
+
+/// What the entry was called in archives cut before the rename.
+///
+/// **Every release up to and including v0.9.0 ships the provisioner
+/// under this name** — the `[[bin]]` was `lm-provision` until the
+/// operator CLI took that name — so a resolver that only knew
+/// [`BINARY_NAME`] could not read a single published release, including
+/// the one this build's own version resolves to by default. It is
+/// accepted on the way *in* only: whatever the archive called it, the
+/// cache holds it as [`BINARY_NAME`], so nothing downstream has two
+/// names to know about.
+///
+/// It happens to equal [`PACKAGE_NAME`] today and is spelled separately
+/// anyway: one is what the asset is called, the other what an old entry
+/// inside it is called, and a release that renamed the package would
+/// pull those apart.
+const LEGACY_BINARY_NAME: &str = "lm-provision";
 
 /// Per-process counter in a staging file's name — the same reason the
 /// three sibling sites in the core crate have one: one process can have
@@ -182,7 +212,7 @@ pub enum ProvisionerError {
 /// The `x86_64-unknown-linux-musl` archive's asset name, as `dist`
 /// publishes it.
 pub fn archive_name() -> String {
-    format!("{BINARY_NAME}-{POD_TARGET}.tar.xz")
+    format!("{PACKAGE_NAME}-{POD_TARGET}.tar.xz")
 }
 
 /// The release download URL for `version`.
@@ -464,8 +494,13 @@ pub fn parse_sidecar(text: &str) -> Result<String, String> {
 ///
 /// The archive holds the binary under a directory named for the target,
 /// beside the README and the licences, so the entry is picked by name
-/// and by being a regular file — a directory called `lm-provision` would
-/// otherwise match and unpack as zero bytes.
+/// and by being a regular file — a directory called `lm-provisioner`
+/// would otherwise match and unpack as zero bytes.
+///
+/// **Either name is accepted**: [`BINARY_NAME`] as archives are cut now,
+/// or [`LEGACY_BINARY_NAME`] as every release up to v0.9.0 cut them.
+/// The caller writes what comes back as [`BINARY_NAME`] either way — the
+/// two names are a fact about the archive, not about the cache.
 pub fn unpack(archive: &[u8]) -> Result<Vec<u8>, String> {
     let mut tarball = Vec::new();
     lzma_rs::xz_decompress(&mut Cursor::new(archive), &mut tarball)
@@ -479,8 +514,9 @@ pub fn unpack(archive: &[u8]) -> Result<Vec<u8>, String> {
         }
         let is_binary = entry
             .path()
-            .map(|path| path.file_name() == Some(OsStr::new(BINARY_NAME)))
-            .unwrap_or(false);
+            .ok()
+            .and_then(|path| path.file_name().map(OsStr::to_os_string))
+            .is_some_and(|name| name == BINARY_NAME || name == LEGACY_BINARY_NAME);
         if !is_binary {
             continue;
         }
@@ -490,7 +526,9 @@ pub fn unpack(archive: &[u8]) -> Result<Vec<u8>, String> {
             .map_err(|error| error.to_string())?;
         return Ok(bytes);
     }
-    Err(format!("no `{BINARY_NAME}` entry in the archive"))
+    Err(format!(
+        "no `{BINARY_NAME}` (or `{LEGACY_BINARY_NAME}`) entry in the archive"
+    ))
 }
 
 #[cfg(test)]
@@ -500,8 +538,18 @@ mod tests {
     /// A `dist`-shaped archive: the binary under a target-named
     /// directory, beside the files `dist` ships with it.
     fn dist_archive(payload: &[u8]) -> Vec<u8> {
+        archive_naming_the_entry(BINARY_NAME, payload)
+    }
+
+    /// The same, as every release up to v0.9.0 was cut: the entry named
+    /// `lm-provision`, because that was the `[[bin]]` at the time.
+    fn legacy_archive(payload: &[u8]) -> Vec<u8> {
+        archive_naming_the_entry(LEGACY_BINARY_NAME, payload)
+    }
+
+    fn archive_naming_the_entry(entry_name: &str, payload: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
-        let prefix = format!("{BINARY_NAME}-{POD_TARGET}");
+        let prefix = format!("{PACKAGE_NAME}-{POD_TARGET}");
 
         let mut readme = tar::Header::new_gnu();
         readme.set_size(6);
@@ -516,7 +564,7 @@ mod tests {
         binary.set_mode(0o755);
         binary.set_cksum();
         builder
-            .append_data(&mut binary, format!("{prefix}/{BINARY_NAME}"), payload)
+            .append_data(&mut binary, format!("{prefix}/{entry_name}"), payload)
             .unwrap();
 
         let tarball = builder.into_inner().unwrap();
@@ -525,6 +573,11 @@ mod tests {
         xz
     }
 
+    /// **The asset is named after the package, the entry inside it
+    /// after the binary.** `dist` names an archive for the package it
+    /// built, and that package kept its name when its `[[bin]]` was
+    /// renamed to `lm-provisioner` — so an asset name derived from the
+    /// binary would ask every release for a file nobody publishes.
     #[test]
     fn the_url_names_the_release_asset_for_the_version() {
         let url = archive_url("0.8.0");
@@ -535,6 +588,11 @@ mod tests {
             "{url}"
         );
         assert!(url.starts_with("https://"), "{url}");
+        assert!(
+            !archive_name().starts_with(&format!("{BINARY_NAME}-")),
+            "the archive is the package's, not the binary's: {}",
+            archive_name()
+        );
     }
 
     #[test]
@@ -579,6 +637,52 @@ mod tests {
     fn unpacking_takes_the_binary_and_not_its_neighbours() {
         let payload = b"\x7fELF and the rest of it";
         assert_eq!(unpack(&dist_archive(payload)).unwrap(), payload);
+    }
+
+    /// **An archive cut before the rename still unpacks.** Every
+    /// release up to v0.9.0 named the entry `lm-provision`, including
+    /// the one a build of that version resolves to by default — so a
+    /// resolver that only knew the new name could not read a single
+    /// published release.
+    #[test]
+    fn an_archive_from_before_the_rename_still_yields_the_provisioner() {
+        let payload = b"\x7fELF built when the bin was called lm-provision";
+        assert_eq!(unpack(&legacy_archive(payload)).unwrap(), payload);
+    }
+
+    /// **Whatever the archive called it, the cache calls it
+    /// [`BINARY_NAME`].** The two accepted entry names are a fact about
+    /// old archives; everything downstream — the path pushed to a pod,
+    /// the name it lands under there — reads one name only.
+    #[test]
+    fn a_legacy_archive_is_cached_under_the_current_binary_name() {
+        let root = std::env::temp_dir().join(format!(
+            "lm-provision-legacy-unpack-test-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let dir = root.join("0.9.0");
+        let payload = b"\x7fELF from a v0.9.0 archive";
+        admit(
+            &unpack(&legacy_archive(payload)).unwrap(),
+            &dir.join(BINARY_NAME),
+        )
+        .expect("the cache is writable");
+
+        assert!(
+            dir.join(BINARY_NAME).is_file(),
+            "the cached file carries the current name"
+        );
+        assert!(
+            !dir.join(LEGACY_BINARY_NAME).exists(),
+            "and not the one the archive used"
+        );
+        // The cache layout is unchanged by any of this: `<root>/<version>/<name>`.
+        let resolved = resolve_in("0.9.0", &root).expect("the cache hit needs no network");
+        assert_eq!(resolved.source, Source::Cached);
+        assert_eq!(resolved.path, dir.join(BINARY_NAME));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

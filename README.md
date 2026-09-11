@@ -10,11 +10,12 @@ binary with zero dependencies on the target pod.
 
 | Crate | What it is |
 |---|---|
-| [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + CLI (`validate` / `hash` / `plan` / `apply [--dry-run]` / `fetch` / `pin`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. Fragment imports (spec 11): hash-pinned local + https fragment reuse with an XDG-cached expansion pass, plus a `pin` authoring subcommand that rewrites `name@version` imports against an `index.json`. |
-| [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push driver. `apply`: one-shot session over SSH — ensure-binary (resolve the provisioner for a version to the release build CI published, verify its SHA-256, cache it, and push it idempotently), place profile, apply, collect report / transcript, append to the apply ledger. `acquire` / `release` / `sweep` / `check`: obtain a machine meeting the profile's declared requirements (stamping its lease onto the machine's own name), give it back, give back every machine whose lease has run out — from the provider's own list with `--provider`, or from the acquisitions record — or judge one that already exists. |
-| [`lm-provision-mcp`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-mcp) | MCP server exposing `lm_validate` / `lm_hash` / `lm_plan` and apply-ledger inspection as MCP tools. |
+| [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + the pod-side binary **`lm-provisioner`** (`validate` / `hash` / `plan` / `apply [--dry-run]` / `fetch` / `pin`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. Fragment imports (spec 11): hash-pinned local + https fragment reuse with an XDG-cached expansion pass, plus a `pin` authoring subcommand that rewrites `name@version` imports against an `index.json`. |
+| [`lm-provision-cli`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-cli) | The operator CLI: the **`lm-provision`** binary, and the one command an operator installs. `apply` / `check` act on a pod; `machine list` / `acquire` / `release` / `sweep` are the fleet; `mcp` serves the MCP tools over stdio. |
+| [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push-driver library, behind `lm-provision apply` and the machine subcommands. The session: ensure-binary (resolve the provisioner for a version to the release build CI published, verify its SHA-256, cache it, and push it idempotently), place profile, apply, collect report / transcript, append to the apply ledger. The machine side: obtain one meeting the profile's declared requirements (stamping its lease onto the machine's own name), read a platform's own list, give a machine back, give back every machine whose lease has run out. |
+| [`lm-provision-mcp`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-mcp) | MCP server library, served by `lm-provision mcp`: `lm_validate` / `lm_hash` / `lm_plan`, `lm_apply`, `lm_machine_list`, and apply-ledger inspection as MCP tools. |
 | [`lm-provision-protocol`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-protocol) | The wire types shared across the license boundary: the append-only apply-ledger row schema (`LedgerRow` / `ArtifactRow`) and the acquisitions record (`AcquisitionRow` — the audit trail of what was bought and what came back), both in JSON Lines encoding — appended by the driver, taken custody of by the host. Neutral and permissive so both sides may depend on it. |
-| [`lm-provision-host`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-host) | The control plane, **AGPL-3.0-or-later**, `publish = false`. The TTL-enforcement daemon: it runs `lm-provision-driver sweep` every interval — as a child process, not as a linked library, so the AGPL side depends on nothing permissive — and answers one health endpoint saying whether the last sweep worked and what it did. Enforcing is its default (`--dry-run false`, the opposite of the CLI's): installing it *is* the consent to release expired machines. Ledger custody is next. |
+| [`lm-provision-host`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-host) | The control plane, **AGPL-3.0-or-later**, `publish = false`. The TTL-enforcement daemon: it runs `lm-provision machine sweep` every interval — as a child process, not as a linked library, so the AGPL side depends on nothing permissive — and answers one health endpoint saying whether the last sweep worked and what it did. Enforcing is its default (`--dry-run false`, the opposite of the CLI's): installing it *is* the consent to release expired machines. Ledger custody is next. |
 
 ## Highlights
 
@@ -40,17 +41,56 @@ binary with zero dependencies on the target pod.
   verifies the digest, caches it, and pushes it on demand. Provisioning
   a pod needs a network, not a toolchain.
 
-## Quickstart
+## Install
+
+Two binaries, and which is which matters: **`lm-provision`** is the
+operator CLI you install and run, and **`lm-provisioner`** is the static
+musl binary it pushes to a pod and runs there. The CLI is the one to
+install; the provisioner comes down from the release on demand, so you
+only want it locally to run a profile against the machine you are
+sitting at.
 
 ```sh
-# Author a profile (JSON), then locally:
-lm-provision validate profile.json
-lm-provision hash profile.json
-lm-provision plan profile.json
+# The order matters when upgrading from 0.9.0 or earlier — see below.
+cargo install lm-provision       # the pod-side binary: lm-provisioner
+cargo install lm-provision-cli   # the operator CLI: lm-provision
+```
+
+**Upgrading from 0.9.0 or earlier: install `lm-provision` first.** Up
+to 0.9.0 the `lm-provision` *package* owned the `lm-provision` *binary
+name*; from 0.10 the `lm-provision-cli` package owns it. So on a host
+with the old version installed:
+
+- `cargo install lm-provision-cli` **first** is refused — the binary
+  name is already installed by another package — and forcing past it
+  leaves the deletion below still waiting to happen.
+- Upgrading `lm-provision` **first** is the whole fix: the new version
+  produces only `lm-provisioner`, so cargo removes the `lm-provision`
+  binary it no longer produces and the name is free. Installing
+  `lm-provision-cli` after that lands the CLI on it.
+- Doing it the other way round with `--force` deletes the CLI you just
+  installed, at the moment you upgrade `lm-provision` — cargo removes
+  the binaries a package has stopped producing, and by then that list
+  includes `lm-provision`. If this has already happened, run
+  `cargo install lm-provision-cli` again; nothing else is damaged.
+
+## Quickstart
+
+The pod-side subcommands below (`validate` / `hash` / `plan` / `apply` /
+`fetch` / `pin`, chapter 07) are `lm-provisioner`'s; you rarely type
+them yourself, because `lm-provision apply` is what gets them run on the
+machine.
+
+```sh
+# Author a profile (JSON), then locally — the pod-side binary, run on
+# your own host:
+lm-provisioner validate profile.json
+lm-provisioner hash profile.json
+lm-provisioner plan profile.json
 
 # Or start from a shared profile (docs/profiles/) — verified fetch,
 # kept only if the canonical hash matches the pin from index.json:
-lm-provision fetch \
+lm-provisioner fetch \
   https://raw.githubusercontent.com/ynishi/lm-provision/main/docs/profiles/comfyui-base-0.1.0.json \
   --expect-hash <hash-from-index.json> -o profile.json
 
@@ -58,38 +98,44 @@ lm-provision fetch \
 # shorthand and let `pin` rewrite them into the explicit src+hash
 # pair against an index.json (spec 11 §The resolver layer). The
 # rewrite is verified end-to-end before it lands.
-lm-provision pin profile.json \
+lm-provisioner pin profile.json \
   --index https://raw.githubusercontent.com/ynishi/lm-provision/main/docs/profiles/index.json
 
-# Apply on the target host (or via the push driver from your machine):
-lm-provision apply profile.json            # effectful
-lm-provision apply profile.json --dry-run  # print steps, resolve secrets, no effects
+# Apply on the target host itself (or via the push driver from your
+# machine, below):
+lm-provisioner apply profile.json            # effectful
+lm-provisioner apply profile.json --dry-run  # print steps, resolve secrets, no effects
 
 # One-shot provision of a remote pod over SSH. The provisioner pushed
-# to the pod is the release build for this driver's own version —
+# to the pod is the release build for this CLI's own version —
 # fetched once, checksum-verified, cached under $XDG_CACHE_HOME:
-lm-provision-driver apply \
+lm-provision apply \
   --ssh root@<host>:<port> --key ~/.ssh/<key> \
   --profile profile.json
 
 # Pin another released version, or push a local build of your own
 # (the override for developing the provisioner itself):
-lm-provision-driver apply ... --provisioner-version 0.8.0
-lm-provision-driver apply ... \
-  --provisioner-path target/x86_64-unknown-linux-musl/release/lm-provision
+lm-provision apply ... --provisioner-version 0.8.0
+lm-provision apply ... \
+  --provisioner-path target/x86_64-unknown-linux-musl/release/lm-provisioner
 
-# Obtain a machine the profile requires, then give it back.
-# --dry-run defaults to on: this renders the request and sends nothing.
-lm-provision-driver acquire --profile profile.json
-lm-provision-driver acquire --profile profile.json --dry-run false
-lm-provision-driver release --id <id> --profile profile.json
+# The fleet. --dry-run defaults to on where something is spent or
+# destroyed: those render the request and send nothing.
+lm-provision machine list --provider runpod          # read-only
+lm-provision machine acquire --profile profile.json
+lm-provision machine acquire --profile profile.json --dry-run false
+lm-provision machine release --id <id> --profile profile.json
+lm-provision machine sweep --provider runpod --dry-run false
+
+# The MCP server, on stdio (see below for what it reads):
+lm-provision mcp
 ```
 
 ### MCP server: which provisioner it pushes
 
-`lm-provision-mcp` needs no configuration to have a provisioner: unset,
+`lm-provision mcp` needs no configuration to have a provisioner: unset,
 it resolves the release its own version was built alongside, the same
-way the driver does. `LM_PROVISION_BINARY` overrides that with either
+way `apply` does. `LM_PROVISION_BINARY` overrides that with either
 form — an `https://` archive URL (verified against the `.sha256` beside
 it, so a fork's release or an in-network mirror works), or a local path
 (used as given, for developing the provisioner itself):
@@ -97,7 +143,7 @@ it, so a fork's release or an in-network mirror works), or a local path
 ```sh
 # neither line is required; this is what the two overrides look like
 export LM_PROVISION_BINARY=https://github.com/<fork>/lm-provision/releases/download/v0.8.0/lm-provision-x86_64-unknown-linux-musl.tar.xz
-export LM_PROVISION_BINARY=target/x86_64-unknown-linux-musl/release/lm-provision
+export LM_PROVISION_BINARY=target/x86_64-unknown-linux-musl/release/lm-provisioner
 ```
 
 Any other scheme is refused rather than read as a filename — a mistyped
@@ -105,7 +151,7 @@ Any other scheme is refused rather than read as a filename — a mistyped
 
 ### MCP server: pod target registry
 
-`lm-provision-mcp` resolves `lm_apply`'s `pod_id` against a **pod target
+`lm-provision mcp` resolves `lm_apply`'s `pod_id` against a **pod target
 registry** — a JSON file naming every pod the server may provision.
 Point `LM_PROVISION_TARGETS` at it:
 
@@ -159,8 +205,9 @@ specs; the specs are the normative surface.
 
 ## License
 
-The engine — `lm-provision`, `lm-provision-driver`, `lm-provision-mcp`
-and `lm-provision-protocol` — is dual-licensed under either of:
+The engine — `lm-provision`, `lm-provision-cli`, `lm-provision-driver`,
+`lm-provision-mcp` and `lm-provision-protocol` — is dual-licensed under
+either of:
 
 - MIT License ([`LICENSE-MIT`](https://github.com/ynishi/lm-provision/blob/main/LICENSE-MIT))
 - Apache License, Version 2.0 ([`LICENSE-APACHE`](https://github.com/ynishi/lm-provision/blob/main/LICENSE-APACHE))
@@ -180,5 +227,5 @@ writes and the host reads. Those types live in
 depending on it commits no one to anything. The direction that would
 break the promise, an engine crate depending on the host, is empty and
 machine-checked: `no_permissive_crate_depends_on_the_agpl_host` in the
-host crate reads the four permissive manifests and fails if any of
-them names it.
+host crate reads the permissive manifests and fails if any of them
+names it.

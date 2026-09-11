@@ -6,7 +6,8 @@
 //! files, so a reader who takes a crate from the registry should find
 //! them. `cargo package` does not follow symlinks and `include` cannot
 //! reach outside a package directory, so the only way a workspace
-//! member ships them is by holding them — six copies of two files.
+//! member ships them is by holding them — a copy of each of the two
+//! files per crate.
 //!
 //! Prose that has to be hand-synchronised is a liability, which is why
 //! this exists: the copies are the kind of thing nobody notices going
@@ -14,7 +15,12 @@
 
 use std::path::{Path, PathBuf};
 
-const CRATES: [&str; 3] = ["lm-provision", "lm-provision-driver", "lm-provision-mcp"];
+const CRATES: [&str; 4] = [
+    "lm-provision",
+    "lm-provision-cli",
+    "lm-provision-driver",
+    "lm-provision-mcp",
+];
 const LICENSES: [&str; 2] = ["LICENSE-MIT", "LICENSE-APACHE"];
 
 /// The workspace root, or `None` when this runs from somewhere the

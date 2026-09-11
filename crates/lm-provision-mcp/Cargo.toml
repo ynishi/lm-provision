@@ -16,10 +16,10 @@ categories.workspace = true
 name = "lm_provision_mcp"
 path = "src/lib.rs"
 
-[[bin]]
-name = "lm-provision-mcp"
-path = "src/main.rs"
-
+# A library. Serving it is `lm-provision mcp`, a subcommand of the
+# operator CLI (`lm-provision-cli`), rather than a binary of its own:
+# one command for an operator to install, and one place the MCP
+# server's startup is written.
 [dependencies]
 lm-provision = { workspace = true }
 lm-provision-driver = { workspace = true }
@@ -34,6 +34,8 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# `tracing` only: this crate emits events (the redaction in `server`
+# depends on them being written) but installs no subscriber and defines
+# no `main`, so `tracing-subscriber` and `anyhow` left with the binary —
+# both now belong to `lm-provision-cli`'s `mcp` subcommand.
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }

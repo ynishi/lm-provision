@@ -300,6 +300,24 @@ pub struct Machine {
     pub name: Option<String>,
 }
 
+/// The adapter sold under `name`, or which names would have worked.
+///
+/// A static reference rather than a box because the adapters are unit
+/// structs: there is nothing to construct, only one of two vocabularies
+/// to speak.
+///
+/// Here rather than beside the caller because there are now three
+/// callers — the operator CLI, the MCP server's listing tool, and
+/// [`crate::inventory`] between them — and a second `match` on these
+/// names would be a second place a target has to be wired into.
+pub fn adapter_named(name: &str) -> Result<&'static dyn Infra, String> {
+    match name {
+        "runpod" => Ok(&RunPodAdapter),
+        "vast" => Ok(&VastAdapter),
+        other => Err(format!("unknown provider `{other}` (runpod, vast)")),
+    }
+}
+
 /// The prefix that marks a name as this tool's lease stamp.
 ///
 /// Fixed, and matched exactly: a machine named anything else was not

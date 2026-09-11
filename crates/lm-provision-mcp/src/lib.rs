@@ -9,7 +9,7 @@
 //! last layer to be built: F (01-06, on-pod apply) →
 //! G (07-09, driver + ledger) → H (10, this crate).
 //!
-//! Six tools (10 §Tool set), split across two call shapes:
+//! The tools (10 §Tool set), across three call shapes:
 //!
 //! - **Local, read-only** ([`pipeline`]): `lm_validate` / `lm_hash` /
 //!   `lm_plan` call straight into the `lm-provision` library
@@ -22,12 +22,25 @@
 //!   resolves to (see [`targets`]) and appends the result to the
 //!   append-only ledger (09 §Ledger); `lm_ledger_list` /
 //!   `lm_ledger_get` read that same ledger back.
+//! - **Platform-reading** ([`lm_provision_driver::inventory`]):
+//!   `lm_machine_list` asks a platform what it is running and reads the
+//!   lease off each machine's own name (08 §Acquisitions and sweep).
+//!   Read-only, and the same function the operator CLI's
+//!   `machine list` answers from.
 //!
-//! [`server`] wires all six as MCP tools via `rmcp`'s
+//! [`server`] wires them all as MCP tools via `rmcp`'s
 //! `#[tool_router]` / `#[tool]` macros over the plain functions in
-//! [`pipeline`] / [`apply_tool`] / [`ledger_tools`] — those functions
-//! are deliberately `rmcp`-free and directly testable at the function
-//! level, independent of any MCP transport.
+//! [`pipeline`] / [`apply_tool`] / [`ledger_tools`] / the driver's
+//! inventory module — those functions are deliberately `rmcp`-free and
+//! directly testable at the function level, independent of any MCP
+//! transport.
+//!
+//! ## Serving it
+//!
+//! There is no binary here. `lm-provision mcp` (in `lm-provision-cli`)
+//! resolves [`config::Config`] from the process environment and serves
+//! [`server::LmProvisionServer`] over stdio — one command for an
+//! operator to install, and the MCP server as a subcommand of it.
 //! [`config`] resolves the server's deployment configuration (binary
 //! path, default staging directory, ledger path, pod target registry)
 //! once at startup.

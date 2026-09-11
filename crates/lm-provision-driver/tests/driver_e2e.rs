@@ -1,6 +1,6 @@
 //! M5-1/M5-2 end-to-end regression: [`LocalExecTransport`] driving the
-//! real Phase F `lm-provision` binary through the full upload → hash
-//! integrity check → invoke → collect sequence
+//! real Phase F provisioner binary (`lm-provisioner`) through the full
+//! upload → hash integrity check → invoke → collect sequence
 //! (08-push-driver-protocol.md), followed by an append-only ledger
 //! round trip (09-apply-report-and-ledger.md §Ledger).
 //!
@@ -23,23 +23,22 @@ use lm_provision_driver::{driver, transport::Transport as _};
 
 mod common;
 
-fn lm_provision_bin() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_lm-provision") {
+fn provisioner_bin() -> PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_lm-provisioner") {
         return PathBuf::from(path);
     }
     let mut exe = std::env::current_exe().expect("current test executable path");
     exe.pop(); // target/<profile>/deps/
     exe.pop(); // target/<profile>/
     exe.push(if cfg!(windows) {
-        "lm-provision.exe"
+        "lm-provisioner.exe"
     } else {
-        "lm-provision"
+        "lm-provisioner"
     });
     assert!(
         exe.exists(),
-        "expected the lm-provision binary at {}; this test assumes `cargo test --workspace` \
-         (or another invocation that builds every workspace member) built it alongside this \
-         crate's own tests",
+        "expected the lm-provisioner binary at {}; this test assumes an invocation that \
+         builds every workspace member built it alongside this crate's own tests",
         exe.display()
     );
     exe
@@ -75,7 +74,7 @@ fn step_ops(report: &serde_json::Value) -> Vec<&str> {
 #[test]
 fn apply_dry_run_via_local_exec_transport_collects_a_report_with_secret_env_injected() {
     let _guard = common::stage_and_run();
-    let binary = lm_provision_bin();
+    let binary = provisioner_bin();
     let profile = fixture("apply-secret.json");
 
     let local_hash =
@@ -168,7 +167,7 @@ fn apply_dry_run_via_local_exec_transport_collects_a_report_with_secret_env_inje
 #[test]
 fn apply_failing_step_report_is_collected_as_a_richer_signal_not_a_driver_error() {
     let _guard = common::stage_and_run();
-    let binary = lm_provision_bin();
+    let binary = provisioner_bin();
     let profile = fixture("apply-failing.json");
 
     let local_hash =
@@ -207,7 +206,7 @@ fn apply_failing_step_report_is_collected_as_a_richer_signal_not_a_driver_error(
 #[test]
 fn upload_stages_a_real_binary_and_profile_that_can_be_re_hashed_on_the_pod() {
     let _guard = common::stage_and_run();
-    let binary = lm_provision_bin();
+    let binary = provisioner_bin();
     let profile = fixture("apply-secret.json");
     let local_hash =
         driver::hash_locally(&binary, &profile).expect("local hash subcommand should succeed");

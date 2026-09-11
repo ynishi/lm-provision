@@ -9,11 +9,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lm-provision-cli`: one command an operator installs.** The
+  binary is `lm-provision`, and everything an operator does is a
+  subcommand of it: `apply` and `check` act on a pod, the new
+  `machine` group is the fleet, and `mcp` serves the MCP tools over
+  stdio. Two binaries and a server to install and keep in step was a
+  deployment story nobody asked for; one is the shape every tool of
+  this kind has.
+
+- **`lm-provision machine list --provider <name>`** (repeatable) says
+  what a platform is running and changes nothing. One JSON document on
+  stdout, one row per machine: its id, what it is called, the platform,
+  the `expires_at` read off the machine's own name, and whether it
+  carried a lease stamp at all — so a machine this tool never named is
+  reported rather than invisible, and never released on that evidence.
+  A platform that could not be asked lands in `failed` and costs the
+  zero exit, because a listing that read as an empty account is the one
+  way this could do harm. Listing needs the platform's credential: the
+  key buys the question.
+
+- **MCP tool `lm_machine_list(provider)`** — the same document, from
+  the same function, over MCP (10 §Tool set; backing surface 08
+  §Acquisitions and sweep, the listing half).
+
 ### Changed
+
+- **The machine subcommands moved under `machine`.** `acquire` /
+  `release` / `sweep` are now `lm-provision machine acquire` /
+  `machine release` / `machine sweep`, beside the new `machine list`.
+  Their flags are unchanged, including the `--dry-run true` defaults on
+  the two that spend or destroy. These four are the only subcommands
+  that talk to a platform about a machine, and typing one's way into a
+  group is the cheapest boundary there is between "provision this pod"
+  and "delete these machines".
+
+- **The pod-side binary is `lm-provisioner`.** The package
+  (`lm-provision`) has described itself as a "static on-pod
+  provisioner" all along, and the binary now carries that name — so the
+  command an operator types and the program that runs as root on a pod
+  are no longer the same word on one `PATH`. The release archive is
+  unchanged (`dist` names it after the package): still
+  `lm-provision-x86_64-unknown-linux-musl.tar.xz`, with
+  `lm-provisioner` inside it.
+
+  **Older releases still work.** Every archive up to v0.9.0 holds the
+  entry under the old name, so the resolver accepts either — and writes
+  what it finds into the cache as `lm-provisioner` regardless, leaving
+  one name for everything downstream. The visible cost is one re-fetch:
+  a cache entry from before this version sits under the old file name
+  and is a miss, so the next `apply` downloads and verifies the archive
+  once more. The cache directory layout is unchanged.
+
+  **Install in this order when upgrading**: `lm-provision` first, then
+  `lm-provision-cli`. Until 0.9.0 the `lm-provision` package owned the
+  `lm-provision` binary *name*; now `lm-provision-cli` does. Installing
+  the CLI first is refused because the name is taken, and forcing past
+  that only defers the problem — upgrading `lm-provision` afterwards
+  removes the binaries it has stopped producing, and that list now
+  includes `lm-provision`, so it deletes the CLI. Upgrading
+  `lm-provision` first frees the name by the same mechanism, and the
+  CLI installs onto it cleanly. (Recovering from the wrong order is one
+  `cargo install lm-provision-cli`; nothing else is damaged.)
+
+  **`--skip-install` against a pod last provisioned by ≤0.9.0 fails at
+  step 2.** That pod holds `<remote-dir>/lm-provision`, and the session
+  derives the remote path from the binary's name, so step 2 invokes
+  `<remote-dir>/lm-provisioner hash` — a file that is not there. It
+  surfaces as "remote hash invocation failed", which is exactly what
+  that error is for: the gated-off step's postcondition is not met (08
+  §Error surface). One `apply` without `--skip-install` pushes the
+  provisioner under the new name and the gate closes again. The old
+  file stays where it is at `<remote-dir>/lm-provision`; nothing
+  deletes it for you.
+
+- **`lm-provision-host` spawns `lm-provision machine sweep`.** The
+  `--driver` default is now `lm-provision`. A host upgraded without its
+  CLI reports the tick as failed — "could not run" — rather than
+  silently enforcing nothing.
+
+  **A host upgraded before the CLI is reinstalled reports exit 2 every
+  tick.** If the old `lm-provision` binary is still on `PATH` — the
+  pre-rename provisioner, which has no `machine` subcommand — the
+  daemon spawns it successfully and it exits 2 on `machine sweep`
+  (clap's usage-error class). The health endpoint says `ok: false` with
+  "`lm-provision machine sweep` exited with exit status: 2" until the
+  CLI is installed, and no machine is released in the meantime.
 
 ### Deprecated
 
 ### Removed
+
+- **The `lm-provision-driver` and `lm-provision-mcp` binaries.** Both
+  crates remain, as libraries, under the same names and with the same
+  public API; what they no longer ship is a `[[bin]]`. `lm-provision
+  apply` / `machine …` is the first one's surface, `lm-provision mcp`
+  the second's.
 
 ### Fixed
 

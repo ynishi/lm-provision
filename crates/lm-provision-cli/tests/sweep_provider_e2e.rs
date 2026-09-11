@@ -1,7 +1,12 @@
-//! End-to-end for provider-as-truth sweeping (08 §Acquisitions and
-//! sweep): the real `lm-provision-driver sweep`, run as a process,
-//! against a stub platform CLI that answers `pods list-pods` with a
-//! canned fleet and records every argv it is handed.
+//! End-to-end for the platform's own list as the inventory (08
+//! §Acquisitions and sweep), through both subcommands that read it:
+//! the real `lm-provision machine sweep` and `machine list`, run as
+//! processes against a stub platform CLI that answers `pods list-pods`
+//! with a canned fleet and records every argv it is handed.
+//!
+//! One file rather than two because they share the stub *and* the
+//! claim: the two subcommands must see the same account, and the
+//! cheapest way to keep that true is to read it here the same way.
 //!
 //! The stub is reached the way the real one is — by name, off `PATH` —
 //! so nothing in the driver is overridden for the test. What that
@@ -23,15 +28,16 @@ use lm_provision_driver::acquisition::{self as record, AcquisitionRow};
 
 mod common;
 
-/// The driver binary. `CARGO_BIN_EXE_<name>` is guaranteed here: the
-/// bin target belongs to this package.
-fn driver() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_lm-provision-driver"))
+/// The operator CLI. `CARGO_BIN_EXE_<name>` is guaranteed here: the
+/// bin target belongs to this package, which is why this suite moved
+/// here with it.
+fn cli() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_lm-provision"))
 }
 
 fn unique_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "lm-provision-driver-sweep-e2e-{name}-{}-{}",
+        "lm-provision-cli-sweep-e2e-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -117,14 +123,14 @@ fn sweep(dir: &Path, args: &[&str]) -> serde_json::Value {
         dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = std::process::Command::new(driver())
-        .arg("sweep")
+    let output = std::process::Command::new(cli())
+        .args(["machine", "sweep"])
         .args(args)
         .env("PATH", path)
         .env("HOME", dir)
         .env("RUNPOD_API_KEY", "test-key-not-a-real-one")
         .output()
-        .expect("the driver binary runs");
+        .expect("the CLI binary runs");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
@@ -284,8 +290,9 @@ fn a_platform_that_cannot_be_listed_is_reported_and_costs_the_zero_exit() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .expect("the stub is made executable");
 
-    let output = std::process::Command::new(driver())
+    let output = std::process::Command::new(cli())
         .args([
+            "machine",
             "sweep",
             "--provider",
             "runpod",
@@ -307,7 +314,7 @@ fn a_platform_that_cannot_be_listed_is_reported_and_costs_the_zero_exit() {
         .env("HOME", &dir)
         .env("RUNPOD_API_KEY", "test-key-not-a-real-one")
         .output()
-        .expect("the driver binary runs");
+        .expect("the CLI binary runs");
 
     assert_eq!(
         output.status.code(),
@@ -322,6 +329,113 @@ fn a_platform_that_cannot_be_listed_is_reported_and_costs_the_zero_exit() {
             .as_str()
             .is_some_and(|it| it.contains("list-pods")),
         "the reason names what could not be run: {artifact}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **`machine list` reports the whole account and destroys nothing.**
+/// The leased machines carry the expiry read off their own names, the
+/// one this tool never named is reported with `stamped: false` — the
+/// operator still needs to know it is there — and the platform is
+/// asked with the same listing argv a sweep uses. Not one delete is
+/// spent, whatever any machine's lease says.
+#[test]
+fn machine_list_reports_the_account_and_releases_nothing() {
+    let _guard = common::stage_and_run();
+    let dir = unique_dir("list");
+    stub_platform_cli(
+        &dir,
+        &fleet(&[
+            ("pod-expired", LONG_EXPIRED),
+            ("pod-live", LONG_LIVE),
+            ("pod-someone-elses", "jupyter-scratch"),
+        ]),
+    );
+
+    // The platform is named twice on purpose: a repeated `--provider`
+    // is a typo, and asking twice would report the account twice —
+    // an operator counting machines that do not exist. `sweep`
+    // deduplicates, and so does this.
+    let output = std::process::Command::new(cli())
+        .args([
+            "machine",
+            "list",
+            "--provider",
+            "runpod",
+            "--provider",
+            "runpod",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("HOME", &dir)
+        .env("RUNPOD_API_KEY", "test-key-not-a-real-one")
+        .output()
+        .expect("the CLI binary runs");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "every named platform answered: {stderr}"
+    );
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+            panic!(
+                "07 §Stream split gives stdout one machine-readable document: {err}\n\
+             stdout: {}\nstderr: {stderr}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+
+    assert_eq!(artifact["failed"], serde_json::json!([]));
+    assert_eq!(
+        artifact["machines"],
+        serde_json::json!([
+            {
+                "id": "pod-expired",
+                "name": LONG_EXPIRED,
+                "provider": "runpod",
+                "expires_at": "2020-01-01T00:00:00Z",
+                "stamped": true,
+            },
+            {
+                "id": "pod-live",
+                "name": LONG_LIVE,
+                "provider": "runpod",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "stamped": true,
+            },
+            {
+                "id": "pod-someone-elses",
+                "name": "jupyter-scratch",
+                "provider": "runpod",
+                "expires_at": null,
+                "stamped": false,
+            },
+        ]),
+        "the whole account, each machine's lease as its own name states it: {artifact}"
+    );
+
+    let calls = stub_calls(&dir);
+    assert!(
+        calls.contains("pods list-pods -o json"),
+        "the same listing argv a sweep runs: {calls}"
+    );
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "the platform named twice is asked once: {calls}"
+    );
+    assert!(
+        !calls.contains("delete-pod"),
+        "a listing is read-only, and one of these machines expired in 2020: {calls}"
     );
 
     std::fs::remove_dir_all(&dir).ok();

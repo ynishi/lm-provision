@@ -1,7 +1,7 @@
 //! End-to-end for one tick: a real child process, spawned from a real
 //! [`Config`], read back through the health document.
 //!
-//! The child is a stub `lm-provision-driver` — a shell script that
+//! The child is a stub `lm-provision` — a shell script that
 //! records the argv it was handed, says something on stderr, and
 //! prints a canned sweep artifact. Two things are being tested that no
 //! unit test can reach: that the daemon's flags survive the trip
@@ -39,7 +39,7 @@ fn unique_dir(name: &str) -> PathBuf {
 /// Write an executable stub driver whose body is `script`, and give
 /// back the path the daemon will run it by.
 fn stub_driver(dir: &std::path::Path, script: &str) -> PathBuf {
-    let path = dir.join("lm-provision-driver");
+    let path = dir.join("lm-provision");
     std::fs::write(&path, script).expect("the stub is writable");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .expect("the stub is made executable");
@@ -108,7 +108,7 @@ async fn one_tick_runs_the_driver_and_publishes_what_it_said() {
     assert_eq!(
         argv.trim(),
         format!(
-            "sweep --dry-run false --provider runpod --acquisitions {} --ledger {}",
+            "machine sweep --dry-run false --provider runpod --acquisitions {} --ledger {}",
             dir.join("acquisitions.jsonl").display(),
             dir.join("ledger.jsonl").display()
         ),

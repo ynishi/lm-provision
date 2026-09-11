@@ -8,9 +8,9 @@
 //! operator's machines and the record of what was spent on them stay
 //! on their own hardware — is what this crate is becoming.
 //!
-//! **What it is today: the scheduler around `sweep`.** The driver can
+//! **What it is today: the scheduler around `sweep`.** The CLI can
 //! give back every machine whose lease has run out
-//! (`lm-provision-driver sweep`, 08 §Acquisitions and sweep), but only
+//! (`lm-provision machine sweep`, 08 §Acquisitions and sweep), but only
 //! when somebody runs it — which is the forgotten-machine problem one
 //! level up. This daemon runs it on a timer and answers one question
 //! about itself over HTTP: [`Config`] says what to run and how often,
@@ -19,7 +19,7 @@
 //!
 //! ## Exec, not link
 //!
-//! The daemon **runs the `lm-provision-driver` binary** rather than
+//! The daemon **runs the `lm-provision` binary** rather than
 //! calling driver code as a library. The CLI is the frozen contract —
 //! the specs are the normative surface, and 08 §Acquisitions and sweep
 //! defines sweep's single stdout artifact — and the driver already
@@ -51,8 +51,9 @@
 //! ## The dependency rule
 //!
 //! **No other crate in this workspace may depend on this one.** The
-//! engine crates (`lm-provision`, `lm-provision-driver`,
-//! `lm-provision-mcp`) and the neutral `lm-provision-protocol` are
+//! engine crates (`lm-provision`, `lm-provision-cli`,
+//! `lm-provision-driver`, `lm-provision-mcp`) and the neutral
+//! `lm-provision-protocol` are
 //! dual-licensed MIT / Apache-2.0 permanently; a dependency edge from
 //! any of them to an AGPL crate would put their users under the AGPL's
 //! terms, which is precisely what the permissive promise rules out.
@@ -61,7 +62,7 @@
 //!
 //! The rule is machine-checked rather than remembered:
 //! `no_permissive_crate_depends_on_the_agpl_host` in this crate's test
-//! module reads the four permissive manifests and fails if any of them
+//! module reads the permissive manifests and fails if any of them
 //! names this crate.
 
 #![warn(missing_docs)]
@@ -173,7 +174,7 @@ pub enum TickFailure {
     /// The child ran and ended badly. A sweep exits non-zero only when
     /// a machine that expired could not be released — a gate refusal
     /// exits 0 — so this is always a machine still billing.
-    #[error("`{program} sweep` exited with {status}")]
+    #[error("`{program} machine sweep` exited with {status}")]
     Exit {
         /// The binary that was run.
         program: String,
@@ -189,7 +190,7 @@ pub enum TickFailure {
     },
     /// The child's stdout was not the artifact the contract promises
     /// (07 §Stream split: exactly one machine-readable document there).
-    #[error("`{program} sweep` did not write a JSON artifact to stdout: {source}")]
+    #[error("`{program} machine sweep` did not write a JSON artifact to stdout: {source}")]
     Unparseable {
         /// The binary that was run.
         program: String,
@@ -215,6 +216,7 @@ pub enum TickFailure {
 pub fn sweep_argv(config: &Config) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
         config.driver.clone().into_os_string(),
+        "machine".into(),
         "sweep".into(),
         "--dry-run".into(),
         if config.dry_run { "true" } else { "false" }.into(),
@@ -551,7 +553,7 @@ mod tests {
     fn config() -> Config {
         Config {
             interval_secs: 300,
-            driver: "lm-provision-driver".into(),
+            driver: "lm-provision".into(),
             providers: Vec::new(),
             acquisitions: None,
             ledger: None,
@@ -575,7 +577,7 @@ mod tests {
     fn the_sweep_command_always_says_which_dry_run_it_means() {
         assert_eq!(
             argv_of(&config()),
-            ["lm-provision-driver", "sweep", "--dry-run", "false"],
+            ["lm-provision", "machine", "sweep", "--dry-run", "false"],
             "the enforcing default is passed, not left to the child's opposite one"
         );
 
@@ -585,7 +587,7 @@ mod tests {
         };
         assert_eq!(
             argv_of(&observing),
-            ["lm-provision-driver", "sweep", "--dry-run", "true"],
+            ["lm-provision", "machine", "sweep", "--dry-run", "true"],
             "and observation mode says so just as explicitly"
         );
     }
@@ -596,7 +598,7 @@ mod tests {
     #[test]
     fn the_record_paths_are_passed_through_or_left_to_the_driver() {
         let both = Config {
-            driver: "/opt/bin/lm-provision-driver".into(),
+            driver: "/opt/bin/lm-provision".into(),
             acquisitions: Some("/srv/acquisitions.jsonl".into()),
             ledger: Some("/srv/ledger.jsonl".into()),
             ..config()
@@ -604,7 +606,8 @@ mod tests {
         assert_eq!(
             argv_of(&both),
             [
-                "/opt/bin/lm-provision-driver",
+                "/opt/bin/lm-provision",
+                "machine",
                 "sweep",
                 "--dry-run",
                 "false",
@@ -640,7 +643,8 @@ mod tests {
         assert_eq!(
             argv_of(&asking),
             [
-                "lm-provision-driver",
+                "lm-provision",
+                "machine",
                 "sweep",
                 "--dry-run",
                 "false",
@@ -666,7 +670,7 @@ mod tests {
     fn a_finished_sweep_is_read_as_its_artifact() {
         let stdout =
             br#"{"dry_run":false,"expired":2,"released":["pod-a"],"refused":[],"failed":[]}"#;
-        let artifact = interpret_sweep("lm-provision-driver", exit(0), stdout)
+        let artifact = interpret_sweep("lm-provision", exit(0), stdout)
             .expect("a zero exit with the contract's document is a good tick");
         assert_eq!(artifact["expired"], 2);
         assert_eq!(artifact["released"][0], "pod-a");
@@ -682,7 +686,7 @@ mod tests {
     #[test]
     fn a_nonzero_sweep_is_a_failed_tick_that_keeps_what_the_sweep_reported() {
         let stdout = br#"{"dry_run":false,"expired":1,"released":[],"refused":[],"failed":[{"id":"pod-a","reason":"no credential"}]}"#;
-        let failure = interpret_sweep("lm-provision-driver", exit(1), stdout)
+        let failure = interpret_sweep("lm-provision", exit(1), stdout)
             .expect_err("exit 1 means a machine is still running");
         assert!(
             failure.to_string().contains("exited with"),
@@ -697,7 +701,7 @@ mod tests {
             "the machine still billing is named, not discarded"
         );
 
-        let failure = interpret_sweep("lm-provision-driver", exit(1), b"Killed\n")
+        let failure = interpret_sweep("lm-provision", exit(1), b"Killed\n")
             .expect_err("exit 1 fails the tick with or without an artifact");
         assert!(matches!(failure, TickFailure::Exit { artifact: None, .. }));
     }
@@ -705,7 +709,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stdout_that_is_not_the_artifact_is_a_failed_tick_that_says_so() {
-        let failure = interpret_sweep("lm-provision-driver", exit(0), b"Killed\n")
+        let failure = interpret_sweep("lm-provision", exit(0), b"Killed\n")
             .expect_err("the contract promises one JSON document there");
         assert!(
             failure
@@ -717,13 +721,13 @@ mod tests {
 
     #[test]
     fn only_what_the_driver_actually_said_is_relayed() {
-        assert!(attributed("lm-provision-driver", b"").is_empty());
-        assert!(attributed("lm-provision-driver", b"  \n").is_empty());
+        assert!(attributed("lm-provision", b"").is_empty());
+        assert!(attributed("lm-provision", b"  \n").is_empty());
         assert_eq!(
-            attributed("lm-provision-driver", b"acquired pod-a\nreleased pod-a\n"),
+            attributed("lm-provision", b"acquired pod-a\nreleased pod-a\n"),
             [
-                "lm-provision-driver: acquired pod-a",
-                "lm-provision-driver: released pod-a",
+                "lm-provision: acquired pod-a",
+                "lm-provision: released pod-a",
             ],
             "every line carries the attribution, not just the first"
         );
@@ -781,6 +785,11 @@ mod tests {
     /// the reason readable, and no stale artifact left under the fresh
     /// timestamp claiming a sweep happened — only the failing sweep's
     /// own document, when it wrote one.
+    ///
+    /// `#[cfg(unix)]` like its siblings above: the exit status it reads
+    /// a reason out of is built from a raw wait status, which is a unix
+    /// encoding.
+    #[cfg(unix)]
     #[test]
     fn a_failed_sweep_replaces_the_last_good_one() {
         let mut status = Status::started("2026-09-01T00:00:00Z".to_string());
@@ -793,7 +802,7 @@ mod tests {
             &mut status,
             "2026-09-01T00:10:00Z".to_string(),
             Err(FailedTick {
-                reason: "could not run `lm-provision-driver`: No such file".to_string(),
+                reason: "could not run `lm-provision`: No such file".to_string(),
                 artifact: None,
             }),
         );
@@ -808,11 +817,17 @@ mod tests {
         );
         assert_eq!(
             rendered.last_tick_error,
-            Some("could not run `lm-provision-driver`: No such file")
+            Some("could not run `lm-provision`: No such file")
         );
 
         // An exit-1 sweep wrote a real document naming what is still
         // billing; `ok: false` and that document belong side by side.
+        //
+        // The failure is taken from `interpret_sweep` rather than
+        // written out here: the reason an operator reads is the
+        // `TickFailure` Display, and a hand-copied string would keep
+        // asserting a sentence the daemon had stopped producing (it
+        // said "`lm-provision sweep`" for as long as nothing checked).
         let still_billing = serde_json::json!({
             "dry_run": false,
             "expired": 1,
@@ -820,11 +835,22 @@ mod tests {
             "refused": [],
             "failed": [{ "id": "pod-a", "reason": "no credential" }],
         });
+        let failure = interpret_sweep(
+            "lm-provision",
+            exit(1),
+            still_billing.to_string().as_bytes(),
+        )
+        .expect_err("a non-zero exit is a failed tick");
+        let reason = failure.to_string();
+        assert!(
+            reason.starts_with("`lm-provision machine sweep` exited with"),
+            "the reason names the command the daemon actually spawns: {reason}"
+        );
         record(
             &mut status,
             "2026-09-01T00:15:00Z".to_string(),
             Err(FailedTick {
-                reason: "`lm-provision-driver sweep` exited with exit status: 1".to_string(),
+                reason: reason.clone(),
                 artifact: Some(still_billing.clone()),
             }),
         );
@@ -835,6 +861,7 @@ mod tests {
             doc["last_artifact"], still_billing,
             "the reader of ok: false sees which machine is still billing"
         );
+        assert_eq!(doc["last_tick_error"], serde_json::json!(reason));
     }
 
     #[test]
@@ -873,6 +900,7 @@ mod tests {
 
         for permissive in [
             "lm-provision",
+            "lm-provision-cli",
             "lm-provision-driver",
             "lm-provision-mcp",
             "lm-provision-protocol",

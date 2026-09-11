@@ -1,8 +1,10 @@
-//! `lm-provision` binary entry point (07-cli.md).
+//! `lm-provisioner` binary entry point (07-cli.md).
 //!
-//! This is the same binary the push driver ships into the pod
+//! This is the binary the push driver ships into the pod
 //! (08-push-driver-protocol.md) — the CLI contract *is* the pod-side
-//! invocation contract.
+//! invocation contract. The command an operator runs on their own
+//! machine is `lm-provision` (`lm-provision-cli`), which is what pushes
+//! this one.
 
 use std::process::ExitCode;
 
@@ -14,7 +16,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if let Err(err) = init_tracing(&cli::resolve_log_filter(&cli.log_level)) {
-        eprintln!("lm-provision: failed to initialize logging: {err:#}");
+        eprintln!("lm-provisioner: failed to initialize logging: {err:#}");
         return ExitCode::from(1);
     }
 

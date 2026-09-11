@@ -20,9 +20,10 @@ row. Individual session steps can be gated on or off, but the base
 shape is declarative one-shot apply: given a reachable pod, one
 driver invocation converges it (the Terraform / K8s `apply` posture).
 
-Pod lifecycle: the driver's `acquire` / `release` / `sweep`
-subcommands create and delete a machine through the provider's own
-CLI; start / stop stay outside — see §Stability.
+Pod lifecycle: the CLI's `machine acquire` / `machine release` /
+`machine sweep` subcommands create and delete a machine through the
+provider's own CLI, and `machine list` says what is out there without
+touching any of it; start / stop stay outside — see §Stability.
 
 ### Session contract
 
@@ -71,11 +72,14 @@ of §Session steps.
   domain logic is compiled Rust and a profile is data (chapter 05 L1).
   The pod needs zero preinstalled dependencies for the binary itself
   to run.
-- Build shape (crate contract): one Cargo workspace; the host crate
-  produces `[[bin]] name = "lm-provision"` — the artifact this
+- Build shape (crate contract): one Cargo workspace; the engine crate
+  produces `[[bin]] name = "lm-provisioner"` — the artifact this
   protocol ships. Sibling crates in the same workspace produce the
-  driver side and the MCP server (chapter 10); neither is uploaded
-  into the pod.
+  operator CLI (`[[bin]] name = "lm-provision"`, which is what pushes
+  it), the driver library behind that CLI, and the MCP server
+  (chapter 10); none of them is uploaded into the pod. The published
+  archive is named for the package rather than the binary, so it stays
+  `lm-provision-<target>.tar.xz` with `lm-provisioner` inside it.
 - **Who builds it: CI, not the operator.** The release workflow builds
   the musl target on every tag and publishes the archive beside its
   `.sha256`. The driver resolves a *version* to that asset, verifies
@@ -174,7 +178,7 @@ That is why step 1 uploads the expansion — the pod cannot be asked to
 redo work whose inputs it does not have. It is also why the hash step
 2 compares is the *expanded* canonical hash: chapter 11 §Identity
 makes that hash the profile's identity, and the pod's own
-`lm-provision hash` computes the same number because it, too,
+`lm-provisioner hash` computes the same number because it, too,
 resolves before hashing.
 
 The pod's half of steps 1-2 is therefore unchanged: it re-parses and
@@ -269,7 +273,7 @@ scrollback and a machine that billed until someone noticed.
   the API, read the policy off the resource's own tag, act. It is what
   lets anything holding the account's credential enforce leases with no
   state to keep in step.
-- **`sweep --provider <name>` is that mode** (repeatable). For each
+- **`machine sweep --provider <name>` is that mode** (repeatable). For each
   named platform it lists the account's machines, reads the stamp off
   each one, and splits them three ways: *expired* (stamp read, lease
   reached) go through the same release gate and are released from the
@@ -284,7 +288,17 @@ scrollback and a machine that billed until someone noticed.
   keep; neither is in this MVP, so the answer stops at telling the
   operator it is there. Listing needs the platform's credential **even
   under `--dry-run`**: there the key buys the question, not the kill.
-- **`sweep` also reads the record**, with or without `--provider`. It
+- **`machine list --provider <name>` is the listing on its own**
+  (repeatable), and the MCP tool `lm_machine_list` is the same answer
+  over that transport. One JSON document: every machine the platform
+  reports, each with its `id`, what it is called, the platform it is
+  on, the `expires_at` read off its own name, and whether it carried a
+  stamp at all. **Nothing is released, under any flag** — an unstamped
+  machine and an expired one are reported alike, and what to do about
+  either is the operator's. A platform that could not be asked is named
+  in `failed` and costs the zero exit rather than reading as an empty
+  account, which would be the one way a listing could do harm.
+- **`machine sweep` also reads the record**, with or without `--provider`. It
   takes the outstanding rows (chapter 09), keeps those whose
   `expires_at` has been reached (`<= now`, one clock reading for the
   run), and for each one applies **the same release gate** against the
@@ -435,9 +449,9 @@ scrollback and a machine that billed until someone noticed.
   protocol, not the caller, is the contract.~~ Superseded
   (2026-08-01): with no in-repo driver, every caller re-implemented
   the session by hand (first real-pod usage was scp + ssh + manual
-  env assembly + manual report retrieval). The in-repo
-  `lm-provision-driver` binary is now the **reference
-  implementation** of the session contract; an external pod manager
+  env assembly + manual report retrieval). The in-repo operator CLI
+  (`lm-provision apply`, over the `lm-provision-driver` library) is now
+  the **reference implementation** of the session contract; an external pod manager
   may still drive the protocol directly — the session contract, not
   the reference binary, remains the normative surface.
 
