@@ -28,7 +28,7 @@ use crate::targets::{RegistrySource, TargetLoadError, TargetRegistry};
 ///   provisioner itself.
 ///
 /// **Optional.** Unset resolves the release the server's own version
-/// was built alongside, exactly as `lm-provision-driver apply` does
+/// was built alongside, exactly as `lm-provision apply` does
 /// with no `--provisioner-*` flag. It was required until 0.9.0, on the
 /// reasoning that a guessed path would silently push the wrong binary —
 /// which was right about *guessing*, and the release for one's own
@@ -277,7 +277,7 @@ mod tests {
 
     /// Unset is no longer an error: it means the release this server's
     /// version was built alongside, which is the same thing
-    /// `lm-provision-driver apply` means by no `--provisioner-*` flag.
+    /// `lm-provision apply` means by no `--provisioner-*` flag.
     #[test]
     fn an_unset_binary_variable_means_this_builds_own_release() {
         assert_eq!(

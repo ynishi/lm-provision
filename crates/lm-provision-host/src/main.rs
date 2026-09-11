@@ -1,5 +1,5 @@
 //! `lm-provision-host` — the TTL-enforcement daemon: run
-//! `lm-provision-driver sweep` on a timer, and answer one question
+//! `lm-provision machine sweep` on a timer, and answer one question
 //! about itself over HTTP.
 //!
 //! ```sh
@@ -29,7 +29,7 @@ use lm_provision_host::{Config, SharedStatus, Status};
 #[derive(Parser)]
 #[command(
     name = "lm-provision-host",
-    about = "Enforce recorded pod leases without being invoked: run `lm-provision-driver sweep` every interval and report what it did"
+    about = "Enforce recorded pod leases without being invoked: run `lm-provision machine sweep` every interval and report what it did"
 )]
 struct Cli {
     /// Seconds between sweeps.
@@ -50,7 +50,7 @@ struct Cli {
     /// the contract, and exec is what keeps this AGPL binary from
     /// depending on the permissive crates (crate docs, §Exec, not
     /// link).
-    #[arg(long = "driver", default_value = "lm-provision-driver")]
+    #[arg(long = "driver", default_value = "lm-provision")]
     driver: PathBuf,
 
     /// A platform each sweep asks what it is running, judging those
@@ -81,7 +81,7 @@ struct Cli {
 
     /// Only name what would be released, and release nothing.
     ///
-    /// **Defaults to false, unlike `lm-provision-driver sweep`, whose
+    /// **Defaults to false, unlike `lm-provision machine sweep`, whose
     /// default is true.** On the CLI, an operator asking which
     /// machines would go must not find out by them being gone.
     /// Installing a long-lived TTL-enforcement service is the opposite

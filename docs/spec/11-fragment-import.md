@@ -169,7 +169,7 @@ Validate then runs on the expanded profile, so every existing check
 contributions exactly as if they had been written inline.
 
 **Identity**: `canonical::hash` of the expanded AST is *the* profile
-hash — `lm-provision hash` on a document containing imports resolves
+hash — `lm-provisioner hash` on a document containing imports resolves
 first and hashes the result. A profile with no `Import` node expands
 to itself, byte-for-byte: every existing profile keeps the hash its
 ledger rows already carry.

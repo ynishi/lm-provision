@@ -34,7 +34,8 @@ uses the terms in exactly this sense.
 
 | Vocabulary | Meaning |
 |---|---|
-| `lm-provision` | Tool name — the CLI binary, the crate group, the MCP server. What operators install and invoke. |
+| `lm-provision` | Tool name — the operator CLI binary (`apply` / `check`, the `machine` group, `mcp`), the crate group, the MCP server. What operators install and invoke. |
+| `lm-provisioner` | The binary that runs **on a pod**: what `lm-provision apply` pushes there and invokes, and whose contract chapter 07 freezes. Same program under either name until 0.10; renamed so one `PATH` does not carry two of them. |
 | `lm.profile/1` | Wire schema tag — literal string embedded in every canonical artifact. Identifies the artifact format, not the tool. |
 | `ProfileNode` (dsl-kit AST) | The typed Rust enum AST (`dsl-kit`) defining the Profile Spec and Phase variants. Single source of truth for Schema, PEG Parser, JSON bridge, Builder, and MCP debugging. |
 
@@ -75,17 +76,22 @@ Layer 3 — Runtime
                      ▼
 Layer 4 — Operator surface
     07  CLI          08  Push driver      09  Apply report,
-                         protocol             audit redact,
-                         (upload /            ledger schema
-                          invoke /
+        (the pod-        protocol             audit redact,
+         side binary,    (upload /            ledger schema
+         lm-provisioner)  invoke /
                           collect)
                      │
               ┌──────┴──────┐
               ▼             ▼
 Layer 5 — Integration
-    10  MCP — lm-provision-mcp
+    10  MCP — lm-provision mcp
         (wraps 07 subcommands, cites 08 protocol and 09 schema)
 ```
+
+The operator's own command, `lm-provision`, is where 08 and 10 are
+reached from: `apply` / `check` and the `machine` group are chapter 08's
+surface, `mcp` is chapter 10's. Chapter 07 is the other binary — the one
+that is pushed.
 
 ## Chapters
 
@@ -327,7 +333,8 @@ absorbs it, so the graph stays acyclic.
 ### On-pod agent model (from 07 and 08)
 
 - **On-pod agent binary.** The profile is applied by an
-  `lm-provision` binary shipped into the pod. ~~The outer driver only
+  `lm-provisioner` binary shipped into the pod (named `lm-provision`
+  until 0.10, when the operator CLI took that name). ~~The outer driver only
   uploads the binary, invokes it, and collects the report.~~
   **Superseded (2026-08-12):** the driver also acquires and releases
   the machine itself (08 §Stability); within an apply it still only

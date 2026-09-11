@@ -55,6 +55,13 @@ pub struct ApplyParams {
     pub dry_run: bool,
 }
 
+/// `lm_machine_list(provider)` request shape (10 §Tool set).
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MachineListParams {
+    /// The platform to ask what it is running (`runpod`, `vast`).
+    pub provider: String,
+}
+
 /// `lm_ledger_list(pod_id?, profile_hash?, limit?)` request shape (10
 /// §Tool set).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -279,6 +286,101 @@ impl LmProvisionServer {
         let value = serde_json::to_value(output)
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
         json_result(value)
+    }
+
+    /// `lm_machine_list` (10 §Tool set: `provider`; backing surface 08
+    /// §Acquisitions and sweep, the listing half).
+    ///
+    /// The same document `lm-provision machine list` puts on stdout,
+    /// from the same function
+    /// ([`lm_provision_driver::inventory::list`]) — two surfaces
+    /// answering one question about an account must not be able to
+    /// answer it differently.
+    ///
+    /// **Read-only**: there is no release path in the module this calls.
+    /// The platform's credential still has to be in this server's
+    /// environment, because listing an account needs the account's key.
+    ///
+    /// # What is an error and what is a field
+    ///
+    /// A platform that could not be **asked** — no credential, the
+    /// platform's CLI missing or failing — is `failed` in the document,
+    /// not an error on the channel. 08 §Acquisitions and sweep makes
+    /// that field the observable: the client is owed the machines that
+    /// *were* listed alongside the platform that was not, and an error
+    /// that replaced the whole document would contradict the paragraph
+    /// above. Only a `provider` that **cannot be asked for** — blank, or
+    /// a name no adapter answers to — is an error, because there the
+    /// call itself cannot start (10 §Error surface, precondition class).
+    ///
+    /// # Redaction
+    ///
+    /// A `failed` reason from the driver can carry the platform CLI's
+    /// own stderr verbatim (`infra::ExecuteError::Failed` embeds it),
+    /// which names an account to a client that was never given it. The
+    /// reasons that travel are therefore replaced with the same form
+    /// [`log_and_map_apply_error`] uses — "(see server log)" — and the
+    /// full text is written to the server's log in the same breath,
+    /// which is the only thing that makes dropping it acceptable. The
+    /// CLI's own `machine list` prints those reasons in full, and
+    /// rightly: its reader is the operator whose account it is.
+    #[tool(
+        description = "List the machines a platform is running, with the lease read off each \
+                        machine's own name (08 §Acquisitions and sweep). Read-only: nothing is \
+                        created and nothing is released. A platform that could not be asked is \
+                        reported in the result's `failed`, not as an error."
+    )]
+    async fn lm_machine_list(
+        &self,
+        Parameters(MachineListParams { provider }): Parameters<MachineListParams>,
+    ) -> Result<String, McpError> {
+        // Before anything runs: a name no adapter speaks for cannot be
+        // asked at all, and the refusal is this crate's own words (the
+        // known names), so it carries nothing external.
+        if provider.trim().is_empty() {
+            return Err(precondition_error(
+                "provider is required: name a platform to list (runpod, vast)",
+            ));
+        }
+        lm_provision_driver::infra::adapter_named(&provider).map_err(precondition_error)?;
+
+        let asked = provider.clone();
+        let listing = tokio::task::spawn_blocking(move || {
+            lm_provision_driver::inventory::list(std::slice::from_ref(&provider))
+        })
+        .await
+        .map_err(join_error)?;
+
+        for (program, said) in &listing.said {
+            if !said.is_empty() {
+                tracing::debug!(
+                    program,
+                    said = %String::from_utf8_lossy(said).trim(),
+                    "platform cli output while listing"
+                );
+            }
+        }
+        let redacted: Vec<(String, String)> = listing
+            .failed
+            .iter()
+            .map(|(platform, reason)| {
+                tracing::error!(
+                    provider = %asked,
+                    platform,
+                    reason,
+                    "lm_machine_list could not list a platform"
+                );
+                (
+                    platform.clone(),
+                    format!("could not list {platform} (see server log)"),
+                )
+            })
+            .collect();
+        let listing = lm_provision_driver::inventory::Listing {
+            failed: redacted,
+            ..listing
+        };
+        json_result(listing.artifact())
     }
 
     /// `lm_ledger_list` (10 §Tool set: `pod_id?`, `profile_hash?`,
@@ -668,10 +770,10 @@ mod tests {
     }
 
     /// The `#[tool_router]` macro must generate schema entries for
-    /// exactly the six tools 10 §Tool set specifies, under their
+    /// exactly the tools 10 §Tool set specifies, under their
     /// spec-literal names.
     #[test]
-    fn tool_router_lists_exactly_the_six_spec_tools() {
+    fn tool_router_lists_exactly_the_spec_tools() {
         let router = LmProvisionServer::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -686,15 +788,115 @@ mod tests {
                 "lm_hash",
                 "lm_ledger_get",
                 "lm_ledger_list",
+                "lm_machine_list",
                 "lm_plan",
                 "lm_validate",
             ]
         );
     }
 
+    /// **`lm_machine_list` asks for a platform and nothing else.** The
+    /// CLI and this tool read one account through one function, so the
+    /// argument shape is pinned here beside the two failure classes the
+    /// tool separates.
+    #[tokio::test]
+    async fn lm_machine_list_takes_a_provider_and_nothing_else() {
+        let router = LmProvisionServer::tool_router();
+        let tool = router
+            .get("lm_machine_list")
+            .expect("lm_machine_list should be registered");
+        let required: Vec<&str> = tool
+            .input_schema
+            .get("required")
+            .and_then(|it| it.as_array())
+            .expect("the schema declares required fields")
+            .iter()
+            .filter_map(|it| it.as_str())
+            .collect();
+        assert_eq!(required, vec!["provider"]);
+    }
+
+    /// A `Config` for the listing tests. None of its paths is touched:
+    /// listing reaches no ledger, no staging directory and no pod.
+    fn listing_server() -> LmProvisionServer {
+        LmProvisionServer::new(Config {
+            binary_path: PathBuf::from("/nonexistent/lm-provisioner"),
+            staging_dir: temp_path("machine-list-staging"),
+            ledger_path: temp_path("machine-list-ledger").with_extension("jsonl"),
+            artifacts_dir: temp_path("machine-list-artifacts"),
+            targets: TargetRegistry::empty(RegistrySource::Unset),
+        })
+    }
+
+    /// **A `provider` nothing speaks for is an error; a platform that
+    /// could not be asked is a field.** The first is the call failing
+    /// to start (10 §Error surface, precondition), and its message is
+    /// this crate's own words. The second is 08 §Acquisitions and
+    /// sweep's `failed`, which the client is owed alongside whatever
+    /// *was* listed.
+    #[tokio::test]
+    async fn an_unknown_provider_is_an_error_and_an_unaskable_platform_is_a_failed_row() {
+        let server = listing_server();
+
+        for bad in ["not-a-platform", "", "   "] {
+            let err = server
+                .lm_machine_list(Parameters(MachineListParams {
+                    provider: bad.to_string(),
+                }))
+                .await
+                .expect_err("a platform nothing speaks for cannot be asked at all");
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "for {bad:?}");
+            assert!(
+                err.message.contains("runpod"),
+                "the refusal names what would have worked: {}",
+                err.message
+            );
+        }
+
+        // A real adapter with no credential in this server's
+        // environment: the listing runs, fails to ask, and the document
+        // still comes back.
+        let previous = std::env::var("RUNPOD_API_KEY").ok();
+        std::env::remove_var("RUNPOD_API_KEY");
+        let text = server
+            .lm_machine_list(Parameters(MachineListParams {
+                provider: "runpod".to_string(),
+            }))
+            .await
+            .expect("a platform that could not be asked is reported, not raised");
+        if let Some(previous) = previous {
+            std::env::set_var("RUNPOD_API_KEY", previous);
+        }
+
+        let document: serde_json::Value =
+            serde_json::from_str(&text).expect("the tool's result is the listing document");
+        assert_eq!(
+            document["machines"],
+            serde_json::json!([]),
+            "nothing was listed: {document}"
+        );
+        assert_eq!(
+            document["failed"][0]["provider"],
+            serde_json::json!("runpod"),
+            "and the platform that could not be asked is named: {document}"
+        );
+
+        // Redaction: the reason a client sees is this crate's own
+        // sentence, not the driver's — which can carry a platform CLI's
+        // stderr verbatim. The operator's copy went to the log.
+        let reason = document["failed"][0]["reason"]
+            .as_str()
+            .expect("a reason travels with it");
+        assert_eq!(reason, "could not list runpod (see server log)");
+        assert!(
+            !reason.contains("searched:") && !reason.contains("RUNPOD_API_KEY"),
+            "the driver's own text, which names files and variables, must not travel: {reason}"
+        );
+    }
+
     /// Every tool's generated JSON schema must at least carry its
-    /// declared required fields — a schema is generated for each of the
-    /// six, and each one is complete.
+    /// declared required fields — each tool gets a schema, and each
+    /// schema is complete.
     #[test]
     fn lm_apply_schema_requires_profile_path_and_pod_id() {
         let router = LmProvisionServer::tool_router();

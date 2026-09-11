@@ -31,7 +31,7 @@ path = "src/main.rs"
 
 [dependencies]
 # No `lm-provision*` dependency, and there will not be one. The daemon
-# reaches the engine by running `lm-provision-driver` as a child
+# reaches the engine by running `lm-provision` as a child
 # process (see the crate docs): the CLI is the contract, and exec keeps
 # the AGPL crate from linking a permissive one — the cleanest the
 # boundary can be.

@@ -1,0 +1,39 @@
+[package]
+name = "lm-provision-cli"
+description = "The lm-provision operator CLI: apply / check a profile against a pod, machine lifecycle (list / acquire / release / sweep), and the MCP server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/lm-provision-cli"
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# The operator-facing binary, and the one command an operator installs.
+# Named for the tool rather than for this package (00-overview.md
+# §Naming: `lm-provision` is "what operators install and invoke"); the
+# package carries `-cli` because `lm-provision` is taken by the crate
+# that produces the pod-side `lm-provisioner`.
+[[bin]]
+name = "lm-provision"
+path = "src/main.rs"
+
+[dependencies]
+lm-provision = { workspace = true }
+lm-provision-driver = { workspace = true }
+# The `mcp` subcommand is this crate's only reason to know the server
+# exists: it resolves the configuration and serves stdio, which is what
+# the `lm-provision-mcp` binary used to be. The server itself stays
+# where it is — mcp depends on driver, so the subcommand could not live
+# in the driver crate without a cycle.
+lm-provision-mcp = { workspace = true }
+clap = { workspace = true }
+jiff = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+rmcp = { workspace = true }

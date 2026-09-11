@@ -16,21 +16,21 @@ use lm_provision_driver::transport::Transport as _;
 
 mod common;
 
-fn lm_provision_bin() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_lm-provision") {
+fn provisioner_bin() -> PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_lm-provisioner") {
         return PathBuf::from(path);
     }
     let mut exe = std::env::current_exe().expect("current test executable path");
     exe.pop(); // target/<profile>/deps/
     exe.pop(); // target/<profile>/
     exe.push(if cfg!(windows) {
-        "lm-provision.exe"
+        "lm-provisioner.exe"
     } else {
-        "lm-provision"
+        "lm-provisioner"
     });
     assert!(
         exe.exists(),
-        "expected the lm-provision binary at {} (build the whole workspace)",
+        "expected the lm-provisioner binary at {} (build the whole workspace)",
         exe.display()
     );
     exe
@@ -71,7 +71,7 @@ fn session_dry_run_collects_a_report_and_appends_one_ledger_row() {
     let output = session::run(
         &transport,
         &plan,
-        &lm_provision_bin(),
+        &provisioner_bin(),
         &fixture("apply-secret.json"),
         "pod-session-e2e",
     )
@@ -125,7 +125,7 @@ fn missing_secret_fails_before_any_transfer() {
     let err = session::run(
         &transport,
         &plan,
-        &lm_provision_bin(),
+        &provisioner_bin(),
         &profile,
         "pod-missing-secret",
     )
@@ -179,7 +179,7 @@ fn validate_only_consumes_no_secret_and_writes_no_ledger_row() {
     let output = session::run(
         &transport,
         &plan,
-        &lm_provision_bin(),
+        &provisioner_bin(),
         &profile,
         "pod-validate-only",
     )
@@ -208,7 +208,7 @@ fn skip_install_without_a_binary_on_the_pod_fails_as_a_precondition() {
     let err = session::run(
         &transport,
         &plan,
-        &lm_provision_bin(),
+        &provisioner_bin(),
         &fixture("apply-secret.json"),
         "pod-skip-install",
     )
@@ -233,7 +233,7 @@ fn ensure_binary_re_run_converges_without_re_transfer_and_repairs_drift() {
     let _guard = common::stage_and_run();
     let staging = unique_dir("idempotent");
     let transport = LocalExecTransport::new(&staging);
-    let binary = lm_provision_bin();
+    let binary = provisioner_bin();
 
     let staged = transport.ensure_binary(&binary).expect("first ensure");
     let first_mtime = std::fs::metadata(&staged)

@@ -9,19 +9,22 @@ trustworthy source once the hash checks out.
 ## Fetch and verify
 
 `index.json` lists every profile with its expected `profile_hash`.
-`lm-provision fetch` downloads a profile and keeps it **only** if its
-canonical hash matches that pin — on a mismatch nothing is written:
+`lm-provisioner fetch` downloads a profile and keeps it **only** if its
+canonical hash matches that pin — on a mismatch nothing is written.
+(`lm-provisioner` is the pod-side binary; `fetch` and `hash` are its
+subcommands, and they are just as usable on your own machine. The
+operator CLI that pushes it to a pod is `lm-provision`.)
 
 ```sh
-lm-provision fetch \
+lm-provisioner fetch \
   https://raw.githubusercontent.com/ynishi/lm-provision/main/docs/profiles/comfyui-base-0.1.0.json \
   --expect-hash 426ee76b2e055bd80003697443d5b1a2703396f0158013f5a48a0b0fc1c4daed \
   -o profile.json
 ```
 
 The hash is computed over the canonical AST encoding, so it is stable
-across whitespace and key order (`lm-provision hash` prints the same
-value locally). Plain `curl` + `lm-provision hash` works too if you
+across whitespace and key order (`lm-provisioner hash` prints the same
+value locally). Plain `curl` + `lm-provisioner hash` works too if you
 prefer to compare by eye.
 
 Keep a `.json` extension on the `-o` destination: the parser is

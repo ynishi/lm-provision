@@ -1246,7 +1246,7 @@ async fn the_call_route_gates_the_http_ops_exactly_as_the_op_route_does() {
 // ---------------------------------------------------------------------
 
 fn bin() -> Command {
-    Command::cargo_bin("lm-provision").expect("lm-provision binary should build")
+    Command::cargo_bin("lm-provisioner").expect("lm-provisioner binary should build")
 }
 
 #[test]

@@ -6,17 +6,19 @@ this chapter freezes its operator contract).
 
 ## Purpose
 
-The `lm-provision` command-line binary. Defines subcommands, flags,
-stdout / stderr split, and exit codes. This same binary is what the
-push driver ships into the pod (chapter 08) — the CLI contract *is*
-the pod-side invocation contract.
+The pod-side command-line binary, invoked as **`lm-provisioner`**.
+Defines subcommands, flags, stdout / stderr split, and exit codes. This
+is the binary the push driver ships into the pod (chapter 08) — the CLI
+contract *is* the pod-side invocation contract. The operator's own
+command is `lm-provision` (00 §Naming), and what it does with this one
+is chapter 08's subject, not this chapter's.
 
 ## Inputs
 
 ### Invocation
 
 ```
-lm-provision <subcommand> <profile-path> [flags]
+lm-provisioner <subcommand> <profile-path> [flags]
 ```
 
 | subcommand | pipeline stages run | effects |

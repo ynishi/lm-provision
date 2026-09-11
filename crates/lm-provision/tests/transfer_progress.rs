@@ -125,7 +125,7 @@ fn apply_prints_transfer_progress_on_stderr() {
         &dst.to_string_lossy(),
     );
 
-    let output = Command::cargo_bin("lm-provision")
+    let output = Command::cargo_bin("lm-provisioner")
         .expect("lm-provision binary should build")
         .args(["apply", path.to_str().expect("utf8 path")])
         .output()
@@ -187,7 +187,7 @@ fn a_dry_run_prints_no_transfer_progress() {
         &dst.to_string_lossy(),
     );
 
-    let output = Command::cargo_bin("lm-provision")
+    let output = Command::cargo_bin("lm-provisioner")
         .expect("lm-provision binary should build")
         .args(["apply", path.to_str().expect("utf8 path"), "--dry-run"])
         .output()

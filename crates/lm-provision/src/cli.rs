@@ -20,10 +20,14 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-/// `lm-provision <subcommand> <profile-path> [flags]`
+/// `lm-provisioner <subcommand> <profile-path> [flags]`
 /// (07-cli.md §Invocation).
+///
+/// The command name is the pod-side one: this binary is what the driver
+/// pushes and invokes there (08-push-driver-protocol.md), and the
+/// operator's own command is `lm-provision` in `lm-provision-cli`.
 #[derive(Debug, Parser)]
-#[command(name = "lm-provision", version, about, propagate_version = true)]
+#[command(name = "lm-provisioner", version, about, propagate_version = true)]
 pub struct Cli {
     /// Tracing filter for the human-readable stderr stream. `RUST_LOG`
     /// takes precedence when set (07-cli.md §Global flags).

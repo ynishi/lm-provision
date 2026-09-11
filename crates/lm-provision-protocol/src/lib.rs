@@ -3,6 +3,7 @@
 //! The types that cross the license boundary, and nothing else.
 //!
 //! The workspace has two sides. The engine — `lm-provision`,
+//! `lm-provision-cli`,
 //! [`lm-provision-driver`](https://docs.rs/lm-provision-driver),
 //! `lm-provision-mcp` — is dual-licensed MIT / Apache-2.0 and stays
 //! that way. The control plane — `lm-provision-host`, the

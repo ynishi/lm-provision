@@ -21,7 +21,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn bin() -> Command {
-    Command::cargo_bin("lm-provision").expect("lm-provision binary should build")
+    Command::cargo_bin("lm-provisioner").expect("lm-provisioner binary should build")
 }
 
 fn run_hash(profile_path: &Path) -> (i32, String, String) {

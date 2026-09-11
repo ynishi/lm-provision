@@ -1,42 +1,52 @@
-//! `lm-provision-driver` — the reference implementation of the
-//! session contract (08-push-driver-protocol.md §Session contract),
-//! plus the machine side around it. Five subcommands: `apply`
-//! converges a reachable pod (steps 0-5) with per-step gates as
-//! flags, `acquire` obtains a machine that meets a profile's
+//! `lm-provision` — the operator CLI, and the one command an operator
+//! installs (00-overview.md §Naming: the tool name is "what operators
+//! install and invoke"). It is not the binary that runs on a pod; that
+//! one is `lm-provisioner`, and this is what pushes it there.
+//!
+//! What it does, in the order an operator meets it: `apply` converges a
+//! reachable pod (the session contract's steps 0-5,
+//! 08-push-driver-protocol.md §Session contract) with per-step gates as
+//! flags; `check` judges a machine that already exists against a
+//! profile; the `machine` group is the fleet — `list` says what a
+//! platform is running, `acquire` obtains a machine meeting a profile's
 //! requirements, `release` gives one back, `sweep` gives back every
-//! machine whose lease has run out — from the platform's own list of
-//! what it is running with `--provider`, and from the acquisitions
-//! record either way — `check` judges an existing machine against a
-//! profile.
+//! machine whose lease has run out; and `mcp` serves the same
+//! capabilities to MCP clients over stdio (10-mcp.md).
 //!
 //! ```sh
-//! lm-provision-driver apply \
+//! lm-provision apply \
 //!   --ssh root@<host>:<port> --key ~/.ssh/<key> \
 //!   --profile profile.json
 //! # the provisioner pushed to the pod is the CI-built release asset
-//! # for this driver's own version, verified and cached
+//! # for this CLI's own version, verified and cached
 //! # (lm_provision_driver::provisioner); --provisioner-version <ver>
 //! # picks another, --provisioner-path <path> overrides it with a
 //! # local build
 //! # gates: --dry-run | --validate-only, --skip-install,
 //! #        --skip-verify, --no-artifacts, --no-ledger
+//!
+//! lm-provision machine list --provider runpod
+//! lm-provision machine acquire --profile profile.json --dry-run false
+//! lm-provision mcp
 //! ```
 //!
 //! Exit codes, across all subcommands: 0 = the run produced its
-//! artifact (an apply report, an acquisition, a release, a satisfied
-//! verdict); 1 = the run failed, or `check` found the machine
+//! artifact (an apply report, a listing, an acquisition, a release, a
+//! satisfied verdict); 1 = the run failed, or `check` found the machine
 //! wanting; 2 = the input could not be used (usage via clap, an
 //! unreadable or invalid profile, a description that is not JSON, an
 //! unrenderable acquisition); 3 = a refusal before anything was spent
-//! or destroyed (`acquire` at admission; `release` while the ledger
-//! records uncollected artifacts on the machine); 4 = a credential
-//! was missing (`acquire` before creating; `release` while the
-//! machine keeps running and billing). `sweep` deals with many
-//! machines in one run and so reports per machine rather than by exit
-//! class: 0 when every expired machine was released or refused by the
-//! gate, 1 when one of them could not be released. The artifact JSON goes to
-//! stdout, diagnostics and the pod's stderr transcript to stderr —
-//! the same stream split the binary itself contracts (chapter 07).
+//! or destroyed (`machine acquire` at admission; `machine release`
+//! while the ledger records uncollected artifacts on the machine); 4 =
+//! a credential was missing (`machine acquire` before creating;
+//! `machine release` while the machine keeps running and billing).
+//! `machine sweep` and `machine list` deal with many machines in one
+//! run and so report per machine rather than by exit class: 0 when
+//! every expired machine was released or refused by the gate and every
+//! named platform answered, 1 when one of them could not be released or
+//! could not be listed. The artifact JSON goes to stdout, diagnostics
+//! and the pod's stderr transcript to stderr — the same stream split
+//! the provisioner itself contracts (chapter 07).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -46,15 +56,17 @@ use clap::{Args, Parser, Subcommand};
 
 use lm_provision_driver::acquisition::{self as record, AcquisitionRow};
 use lm_provision_driver::credentials;
-use lm_provision_driver::infra::{self, Infra, RunPodAdapter, VastAdapter};
+use lm_provision_driver::infra;
+use lm_provision_driver::inventory;
 use lm_provision_driver::provisioner;
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
 use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
 
 #[derive(Parser)]
 #[command(
-    name = "lm-provision-driver",
-    about = "Obtain a machine a profile requires (acquire / release / sweep / check), and converge one over SSH (apply: ensure-binary → place-profile → hash-verify → invoke → collect → pull-artifacts → ledger)"
+    name = "lm-provision",
+    version,
+    about = "Provision a pod from a profile (apply / check), run the fleet it needs (machine list / acquire / release / sweep), and serve the same over MCP (mcp)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -65,6 +77,42 @@ struct Cli {
 enum Command {
     /// Run one driver session against a pod over SSH.
     Apply(ApplyArgs),
+    /// Judge a machine that already exists against a profile.
+    ///
+    /// Reads a description the service gave and says, requirement by
+    /// requirement, whether the machine is what the profile asked for.
+    /// Nothing is created and nothing is destroyed.
+    Check(CheckArgs),
+    /// The machines a profile runs on: what is out there, getting one,
+    /// giving it back.
+    ///
+    /// Grouped rather than spread across the top level because these
+    /// four are the only subcommands that talk to a platform about a
+    /// machine, and two of them cost or destroy something. `apply` and
+    /// `check` act on a machine that already exists.
+    Machine {
+        /// Which of the fleet's operations to run.
+        #[command(subcommand)]
+        command: MachineCommand,
+    },
+    /// Serve the MCP tools over stdio (10-mcp.md).
+    ///
+    /// The transport MCP clients spawn a local server on: the protocol
+    /// speaks JSON-RPC over this process's stdin and stdout, so
+    /// diagnostics go to stderr and nothing else may be printed.
+    Mcp,
+}
+
+#[derive(Subcommand)]
+enum MachineCommand {
+    /// Say what a platform is running, and change nothing.
+    ///
+    /// **Read-only.** Every machine on the account is reported — the
+    /// ones this tool leased, with the expiry read off the machine's own
+    /// name, and the ones it did not, marked as carrying no lease. What
+    /// to do about either is the operator's call; nothing is released
+    /// here, under any flag.
+    List(ListArgs),
     /// Obtain a machine that meets a profile's requirements.
     ///
     /// **This spends money.** It is a subcommand of its own rather than
@@ -81,12 +129,26 @@ enum Command {
     /// acquisitions record is the list, which is what still reaches
     /// machines created before leases were stamped onto them.
     Sweep(SweepArgs),
-    /// Judge a machine that already exists against a profile.
+}
+
+#[derive(Args)]
+struct ListArgs {
+    /// Ask this platform what it is running (`runpod`, `vast`).
+    /// Repeatable, and **required**.
     ///
-    /// Reads a description the service gave and says, requirement by
-    /// requirement, whether the machine is what the profile asked for.
-    /// Nothing is created and nothing is destroyed.
-    Check(CheckArgs),
+    /// There is no "all platforms" default and no empty run: a listing
+    /// of nothing is indistinguishable from an account with nothing on
+    /// it, and this command exists to tell an operator which machines
+    /// are theirs. Omitting it is a usage error rather than an empty
+    /// document.
+    ///
+    /// Listing needs the platform's credential even though it destroys
+    /// nothing — the key buys the question. A platform that cannot be
+    /// asked is reported in `failed` and costs the zero exit; the others
+    /// are still listed, because one unreadable key must not hide what
+    /// is running elsewhere.
+    #[arg(long = "provider", required = true, num_args = 1..)]
+    providers: Vec<String>,
 }
 
 #[derive(Args)]
@@ -324,10 +386,97 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Apply(args) => run_apply(args),
-        Command::Acquire(args) => run_acquire(args),
-        Command::Release(args) => run_release(args),
-        Command::Sweep(args) => run_sweep(args),
         Command::Check(args) => run_check(args),
+        Command::Machine { command } => match command {
+            MachineCommand::List(args) => run_machine_list(args),
+            MachineCommand::Acquire(args) => run_acquire(args),
+            MachineCommand::Release(args) => run_release(args),
+            MachineCommand::Sweep(args) => run_sweep(args),
+        },
+        Command::Mcp => run_mcp(),
+    }
+}
+
+/// Serve the MCP tools over stdio until the client goes away
+/// (10-mcp.md), which is what the `lm-provision-mcp` binary used to do.
+///
+/// **The runtime is built here rather than around `main`.** Every other
+/// subcommand is synchronous — a session is a sequence of subprocesses
+/// and file reads — and wrapping the whole binary in `#[tokio::main]`
+/// to serve one of them would put a runtime under commands that have no
+/// use for one, including the `block_on` hazard the provisioner
+/// resolver documents (`lm_provision_driver::provisioner::download`).
+///
+/// Tracing is initialized on **stderr**, never stdout: stdout is the
+/// MCP transport here, and a log line written there is a malformed
+/// JSON-RPC frame.
+fn run_mcp() -> ExitCode {
+    use rmcp::transport::io::stdio;
+    use rmcp::ServiceExt as _;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
+    let served = tokio::runtime::Runtime::new()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                let config = lm_provision_mcp::config::Config::from_env()?;
+                let service = lm_provision_mcp::server::LmProvisionServer::new(config)
+                    .serve(stdio())
+                    .await?;
+                service.waiting().await?;
+                Ok(())
+            })
+        });
+    match served {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `machine list`: ask each named platform what it is running and put
+/// the answer on stdout as one document.
+///
+/// The reading and the rendering are
+/// [`lm_provision_driver::inventory`]'s, because the MCP
+/// `lm_machine_list` tool answers the same question and the two must
+/// not drift; what is here is the stream split and the exit code.
+///
+/// **A platform that could not be listed costs the zero exit**, the
+/// same judgement `sweep` makes about a plane it could not ask: a
+/// listing that reported nothing wrong would have an operator believe
+/// an account is empty when it is merely unreadable.
+///
+/// Repeated `--provider` names are asked once, as `sweep` asks them
+/// once: naming a platform twice is a typo, and listing its machines
+/// twice would have an operator counting an account that does not
+/// exist.
+fn run_machine_list(args: ListArgs) -> ExitCode {
+    let providers: Vec<String> = args
+        .providers
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .cloned()
+        .collect();
+    let listing = inventory::list(&providers);
+    for (program, said) in &listing.said {
+        relay(program, said);
+    }
+    for (provider, reason) in &listing.failed {
+        eprintln!("error: could not list {provider}: {reason}");
+    }
+    println!("{}", listing.artifact());
+    if listing.complete() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -354,7 +503,7 @@ fn run_check(args: CheckArgs) -> ExitCode {
         }
     };
 
-    let adapter = match adapter_named(&args.provider) {
+    let adapter = match infra::adapter_named(&args.provider) {
         Ok(adapter) => adapter,
         Err(message) => {
             eprintln!("error: {message}");
@@ -380,19 +529,6 @@ fn run_check(args: CheckArgs) -> ExitCode {
     match verdict {
         lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
-    }
-}
-
-/// The adapter sold under `name`, or which names would have worked.
-///
-/// A static reference rather than a box because the adapters are unit
-/// structs: there is nothing to construct, only one of two vocabularies
-/// to speak.
-fn adapter_named(name: &str) -> Result<&'static dyn Infra, String> {
-    match name {
-        "runpod" => Ok(&RunPodAdapter),
-        "vast" => Ok(&VastAdapter),
-        other => Err(format!("unknown provider `{other}` (runpod, vast)")),
     }
 }
 
@@ -492,7 +628,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         }
     };
 
-    let adapter = match adapter_named(&args.provider) {
+    let adapter = match infra::adapter_named(&args.provider) {
         Ok(adapter) => adapter,
         Err(message) => {
             eprintln!("error: {message}");
@@ -644,7 +780,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         // would cost them another round trip to find the rest.
         eprintln!(
             "note: {} is running and unrecorded — no sweep will find it; \
-             release it with `lm-provision-driver release --id {} --provider {} --profile {}`",
+             release it with `lm-provision machine release --id {} --provider {} --profile {}`",
             acquired.id,
             acquired.id,
             args.provider,
@@ -859,7 +995,7 @@ fn run_release(args: ReleaseArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let adapter = match adapter_named(&args.provider) {
+    let adapter = match infra::adapter_named(&args.provider) {
         Ok(adapter) => adapter,
         Err(message) => {
             eprintln!("error: {message}");
@@ -1337,29 +1473,22 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
     ExitCode::from(sweep_exit(&outcome))
 }
 
-/// Ask one platform what it is running.
+/// Ask one platform what it is running, and relay what it said.
 ///
-/// The credential is required first, as everywhere else: a listing
-/// without one is the platform CLI's own error in the middle of a
-/// sweep, and this way the refusal names the variable and where it was
-/// looked for.
+/// The reading is [`inventory::fetch`]'s — the same one `machine list`
+/// goes through, credential requirement included, so a sweep and a
+/// listing cannot come to see the account differently. What is added
+/// here is the relay: this half of the sweep has a stream to write the
+/// platform's own words to, and that module deliberately has none.
 ///
 /// Comes back with the [`infra::Fleet`] it was read through, so a
 /// machine that has to be released is released from the same
 /// description the listing came from rather than from a second lookup.
 fn listing(name: &str) -> Result<(infra::Fleet, Vec<infra::Machine>), String> {
-    let adapter = adapter_named(name)?;
-    credentials::require(adapter.provider_namespace(), adapter.credentials())
-        .map_err(|missing| missing.to_string())?;
-    let fleet = adapter
-        .fleet()
-        .ok_or_else(|| format!("{name} cannot be asked what it is running"))?;
-    let listing = infra::list(&fleet).map_err(|err| err.to_string())?;
-    relay(
-        fleet.list.first().map(String::as_str).unwrap_or(name),
-        &listing.said,
-    );
-    Ok((fleet, listing.machines))
+    let fetched = inventory::fetch(name)?;
+    let (program, said) = &fetched.said;
+    relay(program, said);
+    Ok((fetched.fleet, fetched.machines))
 }
 
 /// Release one recorded machine and write the correction that retires
@@ -1380,7 +1509,7 @@ fn release_recorded(
     row: &AcquisitionRow,
     acquisitions_path: &std::path::Path,
 ) -> Result<(), String> {
-    let adapter = adapter_named(&row.provider)?;
+    let adapter = infra::adapter_named(&row.provider)?;
     credentials::require(adapter.provider_namespace(), adapter.credentials())
         .map_err(|missing| missing.to_string())?;
     run_release_argv(&substitute(&row.release, &row.id))?;
@@ -1781,7 +1910,7 @@ fn correction_row(
 mod tests {
     use super::{
         attributed, exit_status, parse_ssh_target, record, ssh_help, AcquisitionRow, Cli, Command,
-        PathBuf,
+        MachineCommand, PathBuf,
     };
     use clap::Parser as _;
     use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
@@ -1831,7 +1960,7 @@ mod tests {
     #[test]
     fn cli_defaults_are_the_shared_ssh_constants() {
         let cli = Cli::parse_from([
-            "lm-provision-driver",
+            "lm-provision",
             "apply",
             "--ssh",
             "1.2.3.4:22",
@@ -1950,7 +2079,7 @@ mod tests {
         use lm_provision_driver::ledger::{self, ArtifactRow, LedgerRow};
 
         let path = std::env::temp_dir().join(format!(
-            "lm-provision-driver-release-gate-test-{}-{}",
+            "lm-provision-cli-release-gate-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -2017,7 +2146,7 @@ mod tests {
     /// own tests use.
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "lm-provision-driver-{name}-{}-{}",
+            "lm-provision-cli-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -2313,9 +2442,12 @@ mod tests {
     /// no opt-out: every acquire records a lease.
     #[test]
     fn sweep_and_acquire_default_to_doing_nothing_and_to_a_recorded_lease() {
-        let cli = Cli::parse_from(["lm-provision-driver", "sweep"]);
-        let Command::Sweep(args) = cli.command else {
-            panic!("the parsed subcommand is `sweep`");
+        let cli = Cli::parse_from(["lm-provision", "machine", "sweep"]);
+        let Command::Machine {
+            command: MachineCommand::Sweep(args),
+        } = cli.command
+        else {
+            panic!("the parsed subcommand is `machine sweep`");
         };
         assert!(
             args.dry_run,
@@ -2323,16 +2455,89 @@ mod tests {
         );
 
         let cli = Cli::parse_from([
-            "lm-provision-driver",
+            "lm-provision",
+            "machine",
             "acquire",
             "--profile",
             "profile.json",
         ]);
-        let Command::Acquire(args) = cli.command else {
-            panic!("the parsed subcommand is `acquire`");
+        let Command::Machine {
+            command: MachineCommand::Acquire(args),
+        } = cli.command
+        else {
+            panic!("the parsed subcommand is `machine acquire`");
         };
         assert!(args.dry_run);
         assert_eq!(args.ttl_hours, 24, "a day, the fleet's ephemeral default");
+    }
+
+    /// **The machines a platform is running are under `machine`, and
+    /// the profile subcommands are not.** The group is what keeps
+    /// "spends money" and "destroys a machine" in one place an operator
+    /// has to type their way into; `apply` and `check` act on a machine
+    /// that already exists and stay at the top level.
+    #[test]
+    fn the_fleet_subcommands_live_under_machine_and_the_profile_ones_do_not() {
+        let cli = Cli::parse_from(["lm-provision", "machine", "list", "--provider", "runpod"]);
+        let Command::Machine {
+            command: MachineCommand::List(args),
+        } = cli.command
+        else {
+            panic!("the parsed subcommand is `machine list`");
+        };
+        assert_eq!(args.providers, vec!["runpod".to_string()]);
+
+        let cli = Cli::parse_from([
+            "lm-provision",
+            "machine",
+            "list",
+            "--provider",
+            "runpod",
+            "--provider",
+            "vast",
+        ]);
+        let Command::Machine {
+            command: MachineCommand::List(args),
+        } = cli.command
+        else {
+            panic!("the parsed subcommand is `machine list`");
+        };
+        assert_eq!(
+            args.providers,
+            vec!["runpod".to_string(), "vast".to_string()],
+            "--provider is repeatable, as it is on sweep"
+        );
+
+        assert!(
+            Cli::try_parse_from(["lm-provision", "sweep"]).is_err(),
+            "the old top-level spelling is gone, not silently accepted"
+        );
+        assert!(matches!(
+            Cli::parse_from(["lm-provision", "mcp"]).command,
+            Command::Mcp
+        ));
+    }
+
+    /// **`machine list` with no platform named is a usage error, not an
+    /// empty account.** There is nothing to default to — an empty
+    /// document would read exactly like an account with nothing on it,
+    /// which is the one way a read-only listing could mislead an
+    /// operator. clap refuses it, which is the exit-2 class the module
+    /// docs give to input that cannot be used.
+    #[test]
+    fn machine_list_demands_a_platform_rather_than_reporting_an_empty_account() {
+        let Err(err) = Cli::try_parse_from(["lm-provision", "machine", "list"]) else {
+            panic!("a listing of nothing is not a listing");
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{err}"
+        );
+        assert!(
+            Cli::try_parse_from(["lm-provision", "machine", "list", "--provider"]).is_err(),
+            "and the flag needs a value: --provider with nothing after it names no platform"
+        );
     }
 
     /// **What a sweep does with a machine it found by asking the
