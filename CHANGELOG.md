@@ -60,16 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and is a miss, so the next `apply` downloads and verifies the archive
   once more. The cache directory layout is unchanged.
 
-  **Install in this order when upgrading**: `lm-provision` first, then
-  `lm-provision-cli`. Until 0.9.0 the `lm-provision` package owned the
-  `lm-provision` binary *name*; now `lm-provision-cli` does. Installing
-  the CLI first is refused because the name is taken, and forcing past
-  that only defers the problem — upgrading `lm-provision` afterwards
-  removes the binaries it has stopped producing, and that list now
-  includes `lm-provision`, so it deletes the CLI. Upgrading
-  `lm-provision` first frees the name by the same mechanism, and the
-  CLI installs onto it cleanly. (Recovering from the wrong order is one
-  `cargo install lm-provision-cli`; nothing else is damaged.)
+  **Upgrading from ≤0.9.0: `cargo uninstall lm-provision` first**, then
+  `cargo install lm-provision` and `cargo install lm-provision-cli`.
+  Until 0.9.0 the `lm-provision` package owned the `lm-provision`
+  binary *name*; now `lm-provision-cli` does, and cargo does not hand a
+  binary name from one installed package to another. Installing the CLI
+  onto the old install is refused because the name is taken; reinstalling
+  `lm-provision` does not free it (measured: a reinstall over 0.9.0 left
+  the old binary in place), which is why the step is an uninstall.
+  Forcing past the refusal leaves the install record attributing
+  `lm-provision` to the old package, so a later `cargo install
+  lm-provision` may delete the CLI as a binary that package stopped
+  producing. (Recovering from that is one `cargo install
+  lm-provision-cli`; nothing else is damaged.)
 
   **`--skip-install` against a pod last provisioned by ≤0.9.0 fails at
   step 2.** That pod holds `<remote-dir>/lm-provision`, and the session

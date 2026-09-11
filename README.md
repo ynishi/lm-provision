@@ -51,28 +51,34 @@ only want it locally to run a profile against the machine you are
 sitting at.
 
 ```sh
-# The order matters when upgrading from 0.9.0 or earlier — see below.
+# Fresh install. Upgrading from 0.9.0 or earlier: see below first.
 cargo install lm-provision       # the pod-side binary: lm-provisioner
 cargo install lm-provision-cli   # the operator CLI: lm-provision
 ```
 
-**Upgrading from 0.9.0 or earlier: install `lm-provision` first.** Up
-to 0.9.0 the `lm-provision` *package* owned the `lm-provision` *binary
-name*; from 0.10 the `lm-provision-cli` package owns it. So on a host
-with the old version installed:
+**Upgrading from 0.9.0 or earlier: uninstall the old `lm-provision`
+package first.** Up to 0.9.0 the `lm-provision` *package* owned the
+`lm-provision` *binary name*; from 0.10 the `lm-provision-cli` package
+owns it, and cargo does not hand a binary name from one installed
+package to another. On a host with the old version installed:
 
-- `cargo install lm-provision-cli` **first** is refused — the binary
-  name is already installed by another package — and forcing past it
-  leaves the deletion below still waiting to happen.
-- Upgrading `lm-provision` **first** is the whole fix: the new version
-  produces only `lm-provisioner`, so cargo removes the `lm-provision`
-  binary it no longer produces and the name is free. Installing
-  `lm-provision-cli` after that lands the CLI on it.
-- Doing it the other way round with `--force` deletes the CLI you just
-  installed, at the moment you upgrade `lm-provision` — cargo removes
-  the binaries a package has stopped producing, and by then that list
-  includes `lm-provision`. If this has already happened, run
-  `cargo install lm-provision-cli` again; nothing else is damaged.
+```sh
+cargo uninstall lm-provision     # frees the name (removes the old lm-provision binary)
+cargo install lm-provision       # the pod-side binary: lm-provisioner
+cargo install lm-provision-cli   # the operator CLI: lm-provision
+```
+
+- Without the uninstall, `cargo install lm-provision-cli` is refused:
+  "binary `lm-provision` already exists in destination as part of
+  `lm-provision`". Reinstalling `lm-provision` on its own does **not**
+  free the name — measured on this rename, a reinstall over 0.9.0 left
+  the old `lm-provision` binary in place and the refusal stood — which
+  is why the step is an uninstall, not a reinstall.
+- `--force` on the CLI install overwrites the file but leaves cargo's
+  install record attributing `lm-provision` to the old package, so a
+  later `cargo install lm-provision` may delete the CLI as a binary
+  that package stopped producing. If that has happened, run
+  `cargo install lm-provision-cli` once more; nothing else is damaged.
 
 ## Quickstart
 
