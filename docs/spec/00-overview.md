@@ -34,7 +34,7 @@ uses the terms in exactly this sense.
 
 | Vocabulary | Meaning |
 |---|---|
-| `lm-provision` | Tool name — the operator CLI binary (`apply` / `check`, the `machine` group, `mcp`), the crate group, the MCP server. What operators install and invoke. |
+| `lm-provision` | Tool name — the operator CLI binary (`apply` / `check`, the pod verbs `logs` / `exec` / `cp`, the `machine` group, `mcp`), the crate group, the MCP server. What operators install and invoke. |
 | `lm-provisioner` | The binary that runs **on a pod**: what `lm-provision apply` pushes there and invokes, and whose contract chapter 07 freezes. Same program under either name until 0.10; renamed so one `PATH` does not carry two of them. |
 | `lm.profile/1` | Wire schema tag — literal string embedded in every canonical artifact. Identifies the artifact format, not the tool. |
 | `ProfileNode` (dsl-kit AST) | The typed Rust enum AST (`dsl-kit`) defining the Profile Spec and Phase variants. Single source of truth for Schema, PEG Parser, JSON bridge, Builder, and MCP debugging. |
@@ -89,8 +89,9 @@ Layer 5 — Integration
 ```
 
 The operator's own command, `lm-provision`, is where 08 and 10 are
-reached from: `apply` / `check` and the `machine` group are chapter 08's
-surface, `mcp` is chapter 10's. Chapter 07 is the other binary — the one
+reached from: `apply` / `check`, the pod verbs `logs` / `exec` / `cp`
+and the `machine` group are chapter 08's surface, `mcp` is chapter
+10's. Chapter 07 is the other binary — the one
 that is pushed.
 
 ## Chapters

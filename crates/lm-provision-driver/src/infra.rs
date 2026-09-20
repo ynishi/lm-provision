@@ -286,6 +286,16 @@ pub struct Fleet {
     /// machine released off the record and one released off the list
     /// are released by the same command.
     pub release: Vec<String>,
+    /// How to read back one machine, `{id}` unsubstituted — again the
+    /// template [`Acquisition::inspect`] carries, from the same
+    /// source.
+    ///
+    /// What it buys: a machine can be asked about by its id alone,
+    /// with nothing written down. That is how an operator who has only
+    /// the identifier the platform printed reaches the machine's own
+    /// address ([`Infra::connection`]) instead of hand-carrying a
+    /// `host:port` out of whatever printed it last.
+    pub inspect: Vec<String>,
 }
 
 /// One machine a target says it is running.
@@ -476,6 +486,27 @@ pub fn list(fleet: &Fleet) -> Result<Listing, ExecuteError> {
             .map_err(|detail| ExecuteError::Unreadable { command, detail })?,
         said: output.stderr,
     })
+}
+
+/// Ask a target about **one** machine, by the id it lists it under.
+///
+/// The read [`Acquired::inspect`] performs, for a caller that never
+/// held an [`Acquired`]: the machine may have been created in another
+/// process, another day, or by an operator at a terminal, and the
+/// identifier is the whole of what is needed to ask about it.
+///
+/// **Nothing fills the blanks here.** [`Acquired::inspect`] restores
+/// what the creation-time description said and this cannot, because
+/// there is no creation-time description in reach — so a field the
+/// platform states only when it creates a machine (the managed pod
+/// service's `machine.gpuTypeId`, which comes back `{}` from every
+/// read-back afterwards) is **absent** from what this returns, and a
+/// caller reading it for the requirements would find them
+/// `NotChecked`. What it is for is [`Infra::connection`], which reads
+/// `publicIp` and `portMappings` — fields a read-back always carries,
+/// because they are what the platform learned *after* the create.
+pub fn inspect(fleet: &Fleet, id: &str) -> Result<serde_json::Value, ExecuteError> {
+    run_json(&substitute(&fleet.inspect, id), None)
 }
 
 /// An acquisition that cannot be rendered.
@@ -761,12 +792,7 @@ impl Infra for RunPodAdapter {
             ],
             body: Some(body),
             created_id_key: "id",
-            inspect: vec![
-                "runpod-cli".into(),
-                "pods".into(),
-                "get-pod".into(),
-                "{id}".into(),
-            ],
+            inspect: runpod_inspect(),
             release: runpod_release(),
         })
     }
@@ -790,6 +816,7 @@ impl Infra for RunPodAdapter {
             id: "id",
             stamp: "name",
             release: runpod_release(),
+            inspect: runpod_inspect(),
         })
     }
 
@@ -928,6 +955,22 @@ impl Infra for RunPodAdapter {
         });
         Connection { ssh, endpoints }
     }
+}
+
+/// What reads one pod back, `{id}` unsubstituted.
+///
+/// One spelling, read by both halves, for the reason `runpod_release`
+/// gives below: the acquisition records it so a machine can be asked
+/// about from what was written down, and the fleet carries it so a
+/// machine the platform lists can be asked about with nothing written
+/// down at all.
+fn runpod_inspect() -> Vec<String> {
+    vec![
+        "runpod-cli".into(),
+        "pods".into(),
+        "get-pod".into(),
+        "{id}".into(),
+    ]
 }
 
 /// What destroys one pod, `{id}` unsubstituted.
@@ -1365,6 +1408,7 @@ impl Infra for VastAdapter {
             id: "id",
             stamp: "label",
             release: vast_release(),
+            inspect: vast_inspect(),
         })
     }
 
@@ -1590,15 +1634,21 @@ fn vast_acquisition(
         create,
         body: None,
         created_id_key: "new_contract",
-        inspect: vec![
-            "vastai".to_string(),
-            "show".to_string(),
-            "instance".to_string(),
-            "{id}".to_string(),
-            "--raw".to_string(),
-        ],
+        inspect: vast_inspect(),
         release: vast_release(),
     })
+}
+
+/// What reads one instance back, `{id}` unsubstituted — one spelling
+/// for the record and for the listing, as `runpod_inspect` is.
+fn vast_inspect() -> Vec<String> {
+    vec![
+        "vastai".to_string(),
+        "show".to_string(),
+        "instance".to_string(),
+        "{id}".to_string(),
+        "--raw".to_string(),
+    ]
 }
 
 /// What destroys one instance, `{id}` unsubstituted — one spelling for
@@ -3158,39 +3208,68 @@ mod tests {
         assert_eq!(body["name"], serde_json::json!(expiry_stamp(expires_at)));
     }
 
-    /// **One release template, whichever half of a sweep found the
-    /// machine.** A machine released from the record and one released
-    /// from the platform's own list are released by the same command;
-    /// two copies would be two commands that could drift, and the
-    /// drifted one would be found by a machine that would not die.
+    /// **One release template and one read-back template, whichever
+    /// half of a sweep or a lookup found the machine.** A machine
+    /// released from the record and one released from the platform's
+    /// own list are released by the same command; a machine asked
+    /// about by an id alone is asked with the command the acquisition
+    /// would have used. Two copies would be two commands that could
+    /// drift, and the drifted release would be found by a machine that
+    /// would not die.
     #[test]
-    fn the_listing_and_the_acquisition_release_a_machine_the_same_way() {
+    fn the_listing_and_the_acquisition_reach_a_machine_the_same_way() {
         let pod = RunPodAdapter
             .acquisition(&full_requirements(), &image_provider(), None)
             .expect("an image was declared");
-        assert_eq!(
-            RunPodAdapter
-                .fleet()
-                .expect("this target can be asked")
-                .release,
-            pod.release
-        );
+        let pods = RunPodAdapter.fleet().expect("this target can be asked");
+        assert_eq!(pods.release, pod.release);
+        assert_eq!(pods.inspect, pod.inspect);
 
         let instance = VastAdapter
             .acquisition(&marketplace_requirements(), &marketplace_provider(), None)
             .expect("an image was declared");
-        assert_eq!(
-            VastAdapter
-                .fleet()
-                .expect("this target can be asked")
-                .release,
-            instance.release
-        );
+        let instances = VastAdapter.fleet().expect("this target can be asked");
+        assert_eq!(instances.release, instance.release);
+        assert_eq!(instances.inspect, instance.inspect);
+
+        // Both templates take the machine's id in the same place, so a
+        // caller holding one identifier can reach either.
+        for argv in [&pods.inspect, &instances.inspect] {
+            assert!(
+                argv.contains(&"{id}".to_string()),
+                "the read-back is a template an id fills: {argv:?}"
+            );
+        }
 
         assert!(
             ContainerAdapter.fleet().is_none(),
             "a target that acquires nothing has no fleet to enumerate"
         );
+    }
+
+    /// **One machine, read back by its id and nothing else.** The
+    /// identifier substitutes into the fleet's own template and what
+    /// the platform printed comes back parsed — which is what lets an
+    /// operator who has only the id reach the machine's address.
+    #[test]
+    fn one_machine_is_read_back_from_its_id_alone() {
+        let described = inspect(
+            &Fleet {
+                list: vec!["true".into()],
+                id: "id",
+                stamp: "name",
+                release: vec!["true".into()],
+                inspect: vec![
+                    "printf".into(),
+                    r#"{"id": "%s", "publicIp": "203.0.113.9"}"#.into(),
+                    "{id}".into(),
+                ],
+            },
+            "pod-7",
+        )
+        .expect("the stub printed a description");
+        assert_eq!(described["id"], serde_json::json!("pod-7"));
+        assert_eq!(described["publicIp"], serde_json::json!("203.0.113.9"));
     }
 
     /// **The rows each platform prints, read into the same two facts.**
@@ -3315,6 +3394,7 @@ mod tests {
             id: "id",
             stamp: "label",
             release: vec!["true".into()],
+            inspect: vec!["true".into()],
         })
         .expect("the stub printed a list");
         assert_eq!(

@@ -1154,7 +1154,12 @@ fn expand_llm_models(json: &str) -> Result<Vec<PlannedStep>, ExecError> {
 
 /// `service.start` / `service.ready` launch log for a service `name`
 /// (spec 02 §Built-in path constants).
-fn service_log_path(name: &str) -> String {
+///
+/// Public because it is also what `lm-provision logs` reads on the
+/// pod: the operator verb names a service, not a path, and the
+/// convention is fixed here — spelling `/tmp/<name>.log` a second
+/// time in the CLI would be two places to change it.
+pub fn service_log_path(name: &str) -> String {
     format!("/tmp/{name}.log")
 }
 

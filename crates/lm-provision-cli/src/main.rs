@@ -7,7 +7,10 @@
 //! reachable pod (the session contract's steps 0-5,
 //! 08-push-driver-protocol.md §Session contract) with per-step gates as
 //! flags; `check` judges a machine that already exists against a
-//! profile; the `machine` group is the fleet — `list` says what a
+//! profile; `logs` / `exec` / `cp` are the pod once it is up — a
+//! service's launch log, one command, a file in either direction, all
+//! on the connection `apply` already knows how to open; the `machine`
+//! group is the fleet — `list` says what a
 //! platform is running, `acquire` obtains a machine meeting a profile's
 //! requirements, `release` gives one back, `sweep` gives back every
 //! machine whose lease has run out; and `mcp` serves the same
@@ -17,6 +20,11 @@
 //! lm-provision apply \
 //!   --ssh root@<host>:<port> --key ~/.ssh/<key> \
 //!   --profile profile.json
+//! # or name the machine and let the platform say where it is; the
+//! # identity file may come from LM_PROVISION_SSH_KEY
+//! lm-provision apply \
+//!   --provider runpod --pod-id <id> \
+//!   --profile profile.json
 //! # the provisioner pushed to the pod is the CI-built release asset
 //! # for this CLI's own version, verified and cached
 //! # (lm_provision_driver::provisioner); --provisioner-version <ver>
@@ -24,6 +32,11 @@
 //! # local build
 //! # gates: --dry-run | --validate-only, --skip-install,
 //! #        --skip-verify, --no-artifacts, --no-ledger
+//!
+//! # after an apply: the pod's own output, without typing an ssh line
+//! lm-provision logs --provider runpod --pod-id <id> vllm-qwen --follow
+//! lm-provision exec --provider runpod --pod-id <id> -- nvidia-smi
+//! lm-provision cp   --provider runpod --pod-id <id> :/tmp/vllm-qwen.log ./
 //!
 //! lm-provision machine list --provider runpod
 //! lm-provision machine acquire --profile profile.json --dry-run false
@@ -35,11 +48,17 @@
 //! satisfied verdict); 1 = the run failed, or `check` found the machine
 //! wanting; 2 = the input could not be used (usage via clap, an
 //! unreadable or invalid profile, a description that is not JSON, an
-//! unrenderable acquisition); 3 = a refusal before anything was spent
-//! or destroyed (`machine acquire` at admission; `machine release`
-//! while the ledger records uncollected artifacts on the machine); 4 =
-//! a credential was missing (`machine acquire` before creating;
-//! `machine release` while the machine keeps running and billing).
+//! unrenderable acquisition, a pod named in a way that cannot be
+//! resolved — no identity file, an unknown platform); 3 = a refusal
+//! before anything was spent or destroyed (`machine acquire` at
+//! admission; `machine release` while the ledger records uncollected
+//! artifacts on the machine); 4 = a platform credential was missing
+//! (`machine acquire` before creating; `machine release` while the
+//! machine keeps running and billing; `apply` resolving `--provider`
+//! before anything was dialed).
+//! `logs` and `exec` are outside that mapping entirely: they relay a
+//! command and exit with **its** code, whatever it is, the way `ssh`
+//! itself does.
 //! `machine sweep` and `machine list` deal with many machines in one
 //! run and so report per machine rather than by exit class: 0 when
 //! every expired machine was released or refused by the gate and every
@@ -49,10 +68,10 @@
 //! the provisioner itself contracts (chapter 07).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use lm_provision_driver::acquisition::{self as record, AcquisitionRow};
 use lm_provision_driver::credentials;
@@ -61,12 +80,13 @@ use lm_provision_driver::inventory;
 use lm_provision_driver::provisioner;
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
 use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
+use lm_provision_driver::transport::{Transport as _, TransportError};
 
 #[derive(Parser)]
 #[command(
     name = "lm-provision",
     version,
-    about = "Provision a pod from a profile (apply / check), run the fleet it needs (machine list / acquire / release / sweep), and serve the same over MCP (mcp)"
+    about = "Provision a pod from a profile (apply / check), work the pod it left (logs / exec / cp), run the fleet it needs (machine list / acquire / release / sweep), and serve the same over MCP (mcp)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -83,6 +103,17 @@ enum Command {
     /// requirement, whether the machine is what the profile asked for.
     /// Nothing is created and nothing is destroyed.
     Check(CheckArgs),
+    /// Print a service's launch log from the pod.
+    ///
+    /// The service is named the way the profile names it
+    /// (`service.start`'s `name`), not by a path: where a launch log
+    /// lands is fixed by spec 02 §Built-in path constants, and this
+    /// reads it there.
+    Logs(LogsArgs),
+    /// Run one command on the pod.
+    Exec(ExecArgs),
+    /// Copy a file or directory to or from the pod.
+    Cp(CpArgs),
     /// The machines a profile runs on: what is out there, getting one,
     /// giving it back.
     ///
@@ -285,20 +316,66 @@ struct ReleaseArgs {
     acquisitions: Option<PathBuf>,
 }
 
+/// Which pod an operator command acts on, in the two spellings the CLI
+/// accepts: an address to dial, or a machine's identifier on a
+/// platform that knows where it is.
+///
+/// Its own struct, flattened into each verb that acts on a pod, so
+/// that the flags and their help text are written once and every verb
+/// takes the same two spellings (08 §Session contract
+/// `ConnectionSpec`).
+#[derive(Args)]
+#[command(group = ArgGroup::new("target").required(true).args(["ssh", "provider"]))]
+struct TargetArgs {
+    // SSH target as `[user@]host:port` (user defaults to
+    // `DEFAULT_SSH_USER`).
+    //
+    // A plain comment, not a doc comment: clap turns a doc comment into
+    // the flag's help, and the help here is built from the constant
+    // instead (`ssh_help`) so the documented default and
+    // `parse_ssh_target`'s fallback cannot drift apart. A doc comment
+    // beside `help =` would still become the long help and print its
+    // rustdoc links to the operator [measured: 2026-09-20, `logs --help`].
+    #[arg(long = "ssh", help = ssh_help())]
+    ssh: Option<String>,
+
+    /// Ask this platform (`runpod`, `vast`) where `--pod-id` is,
+    /// instead of naming an address.
+    ///
+    /// The address and port come from the platform's own description
+    /// of the machine, through the same projection `machine acquire`
+    /// reports — so an operator who has a pod id does not hand-carry a
+    /// `host:port` out of whatever printed it last.
+    #[arg(long = "provider", conflicts_with = "ssh", requires = "pod_id")]
+    provider: Option<String>,
+
+    /// The machine, as the platform names it. With `--provider` it is
+    /// what is looked up. For `apply` it is also the ledger `pod_id`
+    /// context (defaulting to the host under `--ssh`), which is what
+    /// the release gate judges a machine by (08 §Release gate).
+    #[arg(long = "pod-id")]
+    pod_id: Option<String>,
+
+    /// Identity file. Falls back to the `LM_PROVISION_SSH_KEY`
+    /// environment variable (resolved from the same files as the
+    /// platform credentials), and to nothing else — there is no
+    /// default-key guess.
+    #[arg(long = "key")]
+    key: Option<PathBuf>,
+}
+
 #[derive(Args)]
 struct ApplyArgs {
-    /// SSH target as `[user@]host:port` (user defaults to
-    /// [`DEFAULT_SSH_USER`]).
-    ///
-    /// The `--help` text is built from that constant rather than
-    /// spelling the default a second time, so the documented default
-    /// and [`parse_ssh_target`]'s fallback cannot drift apart.
-    #[arg(long = "ssh", help = ssh_help())]
-    ssh: String,
+    /// The pod this session converges.
+    #[command(flatten)]
+    target: TargetArgs,
 
-    /// Identity file — explicit, no default-key fallback.
-    #[arg(long = "key")]
-    key: PathBuf,
+    /// Remote directory the binary / profile land in.
+    ///
+    /// On `apply` alone: the pod verbs stage nothing, so the flag is
+    /// not part of the shared target and does not appear on them.
+    #[arg(long = "remote-dir", default_value = DEFAULT_REMOTE_DIR)]
+    remote_dir: PathBuf,
 
     /// Local profile path (canonical text or JSON).
     #[arg(long = "profile")]
@@ -332,14 +409,6 @@ struct ApplyArgs {
         conflicts_with = "provisioner_path"
     )]
     provisioner_version: String,
-
-    /// Remote directory the binary / profile land in.
-    #[arg(long = "remote-dir", default_value = DEFAULT_REMOTE_DIR)]
-    remote_dir: PathBuf,
-
-    /// Ledger pod_id context; defaults to the SSH host.
-    #[arg(long = "pod-id")]
-    pod_id: Option<String>,
 
     /// Gate step 0 off (binary already on the pod).
     #[arg(long = "skip-install")]
@@ -377,6 +446,92 @@ struct ApplyArgs {
     no_artifacts: bool,
 }
 
+/// The three verbs an operator reaches for once a pod is up: read the
+/// log, run one command, move a file.
+///
+/// **The names are looked up, not chosen.** `kubectl` and `docker`
+/// both spell exactly these three as `logs` / `exec` / `cp`, and
+/// `fly` spells the same set as `logs` / `ssh console -C` / `sftp
+/// get` [documented: kubectl, docker and flyctl command references].
+/// An operator who has used any container tool already knows what
+/// these do; inventing a fourth spelling would have bought nothing.
+///
+/// They ride the same target flags and the same transport as `apply`,
+/// and they are **not session steps** (08 §Operator pod verbs): no
+/// ledger row, no artifact record, no secret delivery, no provisioner.
+#[derive(Args)]
+struct LogsArgs {
+    /// The pod to read from.
+    #[command(flatten)]
+    target: TargetArgs,
+
+    /// The service whose launch log to print — the `name` the
+    /// profile's `service.start` gave it (`comfyui`, `vllm-qwen`).
+    service: String,
+
+    /// Print this many lines from the end of the log.
+    ///
+    /// Without it the whole file is printed, which is `kubectl logs`'s
+    /// own default (`--tail=-1`, "all lines"): an operator asking for
+    /// a log wants the log, and a pod's launch log is a file of a
+    /// startup, not an endless stream. With `--follow` and no
+    /// `--tail`, `tail`'s own default of 10 applies instead — the
+    /// interesting lines when following are the ones about to arrive.
+    #[arg(long = "tail")]
+    tail: Option<u64>,
+
+    /// Keep printing as the service writes more.
+    #[arg(short = 'f', long = "follow")]
+    follow: bool,
+}
+
+/// `exec`: one command, run on the pod, with the operator's own
+/// terminal on both ends.
+///
+/// **Nothing is injected into its environment.** A profile's
+/// `env_secrets` are resolved for an apply and delivered over the
+/// session's stdin (08 §Secret delivery); this verb runs what the
+/// operator typed and nothing else, so a command here cannot silently
+/// inherit a credential an apply would have had. A command that needs
+/// one is given it by the operator, the way any other shell command
+/// is.
+#[derive(Args)]
+struct ExecArgs {
+    /// The pod to run on.
+    #[command(flatten)]
+    target: TargetArgs,
+
+    /// The command and its arguments, after `--`.
+    ///
+    /// Everything from here on belongs to the pod: flags in it are the
+    /// remote command's, not this one's. stdin is the operator's, so
+    /// `lm-provision exec … -- sh -s < script.sh` feeds a script to
+    /// the pod from the local shell.
+    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+    command: Vec<String>,
+}
+
+/// `cp`: one file or directory, in whichever direction the `:` says.
+#[derive(Args)]
+struct CpArgs {
+    /// The pod one of the two paths is on.
+    #[command(flatten)]
+    target: TargetArgs,
+
+    /// What to copy. A leading `:` means the path is on the pod
+    /// (`:/tmp/vllm-qwen.log`).
+    ///
+    /// The spelling is `docker cp`'s `CONTAINER:PATH` with the
+    /// container already named — the target flags said which machine,
+    /// so what is left to say is which side of the copy is on it
+    /// [documented: docker cp].
+    src: String,
+
+    /// Where it lands, in the same two spellings. Exactly one of the
+    /// two paths carries the `:`.
+    dst: String,
+}
+
 fn main() -> ExitCode {
     // Before the command runs, so every subcommand sees the same
     // environment — a key that works for `acquire` and not for
@@ -387,6 +542,9 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Apply(args) => run_apply(args),
         Command::Check(args) => run_check(args),
+        Command::Logs(args) => run_logs(args),
+        Command::Exec(args) => run_exec(args),
+        Command::Cp(args) => run_cp(args),
         Command::Machine { command } => match command {
             MachineCommand::List(args) => run_machine_list(args),
             MachineCommand::Acquire(args) => run_acquire(args),
@@ -529,6 +687,134 @@ fn run_check(args: CheckArgs) -> ExitCode {
     match verdict {
         lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
+    }
+}
+
+/// `logs`: print a service's launch log off the pod, through `tail`
+/// there.
+///
+/// The path is [`lm_provision::exec::lifecycle::service_log_path`]'s,
+/// not a string spelled here: where a launch writes its log is spec 02
+/// §Built-in path constants' decision, and the engine that writes it
+/// is where that decision lives.
+///
+/// Only the path is quoted for the remote shell — `tail` and its flags
+/// are this program's own literals, and the service name the operator
+/// typed reaches the pod inside the path, quoted.
+fn run_logs(args: LogsArgs) -> ExitCode {
+    let transport = match pod(&args.target) {
+        Ok(transport) => transport,
+        Err(code) => return code,
+    };
+    let path = lm_provision::exec::lifecycle::service_log_path(&args.service);
+    // `+1` is "from the first line", i.e. the whole file (POSIX
+    // `tail -n +number`); 10 is what `tail` itself shows when it is
+    // following.
+    let lines = match (args.tail, args.follow) {
+        (Some(count), _) => count.to_string(),
+        (None, false) => "+1".to_string(),
+        (None, true) => "10".to_string(),
+    };
+    let follow = if args.follow { " -f" } else { "" };
+    relayed(transport.attach(&format!(
+        "tail -n {lines}{follow} {}",
+        SshTransport::remote_command(std::slice::from_ref(&path))
+    )))
+}
+
+/// `exec`: run what the operator typed on the pod, with their terminal
+/// on both ends of it.
+fn run_exec(args: ExecArgs) -> ExitCode {
+    let transport = match pod(&args.target) {
+        Ok(transport) => transport,
+        Err(code) => return code,
+    };
+    relayed(transport.attach(&SshTransport::remote_command(&args.command)))
+}
+
+/// `cp`: move one file or directory in the direction the `:` names.
+///
+/// **Nothing is printed on success.** "When a program has nothing
+/// surprising to say, it should say nothing" [documented: Raymond,
+/// *The Art of Unix Programming*, Rule of Silence] — the same
+/// judgement [`relay`] makes about a service that said nothing.
+fn run_cp(args: CpArgs) -> ExitCode {
+    // Before the target is resolved: a command naming two pod paths or
+    // none cannot be carried out whichever machine it named, and
+    // asking a platform about a pod first would spend a call on it.
+    let (remote, local, from_pod) = match (args.src.strip_prefix(':'), args.dst.strip_prefix(':')) {
+        (Some(remote), None) => (remote, args.dst.as_str(), true),
+        (None, Some(remote)) => (remote, args.src.as_str(), false),
+        _ => {
+            eprintln!(
+                "error: exactly one of the two paths is on the pod, spelled with a leading ':': \
+                 `cp :/tmp/vllm-qwen.log ./` reads from the pod, `cp ./profile.json :/root/` \
+                 writes to it (given: {:?} {:?})",
+                args.src, args.dst
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let transport = match pod(&args.target) {
+        Ok(transport) => transport,
+        Err(code) => return code,
+    };
+    let (remote, local) = (std::path::Path::new(remote), std::path::Path::new(local));
+    let copied = if from_pod {
+        transport.download(remote, local)
+    } else {
+        transport.upload(local, remote)
+    };
+    match copied {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// The pod a verb acts on, or the exit code refusing to name one
+/// costs: 4 when a platform credential was missing, 2 when the input
+/// could not be used at all (no identity file, an unknown platform),
+/// 1 when the platform was asked and the machine has no address yet —
+/// the classes [`resolve_target`] assigns, unchanged, because `apply`
+/// and these verbs fail to find a pod in exactly the same ways.
+///
+/// The ledger context [`resolve_target`] also derives is dropped here:
+/// these verbs record nothing (08 §Operator pod verbs).
+fn pod(target: &TargetArgs) -> Result<SshTransport, ExitCode> {
+    // The remote directory is where a session stages its uploads;
+    // these verbs stage nothing, so the transport's default stands.
+    match resolve_target(target, Path::new(DEFAULT_REMOTE_DIR)) {
+        Ok((transport, _pod_id)) => Ok(transport),
+        Err((code, message)) => {
+            eprintln!("error: {message}");
+            Err(ExitCode::from(code))
+        }
+    }
+}
+
+/// What a relayed verb exits with: **the remote command's own code**.
+///
+/// These verbs produce no artifact of their own — the pod's output
+/// already went to the operator's terminal — so the only status worth
+/// reporting is the one the command on the pod ended with, which is
+/// what makes `lm-provision exec … -- test -f /root/model` usable in a
+/// script. 255 rides through as it arrives, meaning either the remote
+/// command exited 255 or `ssh` could not connect
+/// ([`SshTransport::attach`]).
+///
+/// A command a signal ended has no code to pass through; it exits 1,
+/// the class for a run that did not produce what was asked.
+fn relayed(attached: Result<Option<i32>, TransportError>) -> ExitCode {
+    match attached {
+        Ok(Some(code)) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+        Ok(None) => ExitCode::from(1),
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -1626,11 +1912,15 @@ fn attributed(program: &str, bytes: &[u8]) -> Vec<String> {
 }
 
 fn run_apply(args: ApplyArgs) -> ExitCode {
-    let (user, host, port) = match parse_ssh_target(&args.ssh) {
-        Ok(parts) => parts,
-        Err(message) => {
+    // First, and before the provisioner is resolved: a target that
+    // cannot be worked out costs nothing here, and resolving the
+    // release build first would spend a download on a session that was
+    // never going to connect.
+    let (transport, pod_id) = match resolve_target(&args.target, &args.remote_dir) {
+        Ok(resolved) => resolved,
+        Err((code, message)) => {
             eprintln!("error: {message}");
-            return ExitCode::from(2);
+            return ExitCode::from(code);
         }
     };
 
@@ -1693,9 +1983,6 @@ fn run_apply(args: ApplyArgs) -> ExitCode {
             }
         },
     };
-    let pod_id = args.pod_id.unwrap_or_else(|| host.clone());
-    let transport = SshTransport::new(host, port, user, args.key, args.remote_dir);
-
     match session::run(&transport, &plan, &artifact, &args.profile, &pod_id) {
         Ok(output) => {
             // Same stream split as the binary itself (chapter 07):
@@ -1753,6 +2040,115 @@ fn exit_status(report_ok: bool, ledger_warning: Option<&str>, uncollected_artifa
     } else {
         1
     }
+}
+
+/// The transport a verb acts through, and the `pod_id` its ledger
+/// context is written under — or the exit code and the message a
+/// caller that cannot be resolved has earned.
+///
+/// One function because every pod verb takes the same two spellings
+/// and has to make the same three judgements about them: which
+/// identity file, where the machine is, and what the ledger calls it.
+///
+/// The exit classes it hands back, in the CLI's own vocabulary (module
+/// header): `2` for an input that cannot be used — no identity file
+/// named anywhere, a platform nobody wired — `4` for a platform
+/// credential the environment does not have (the class `machine
+/// acquire` and `release` give the same absence, so a script keyed on
+/// it reads one number), and `1` for a lookup that ran and did not
+/// produce an address.
+fn resolve_target(
+    args: &TargetArgs,
+    remote_dir: &Path,
+) -> Result<(SshTransport, String), (u8, String)> {
+    let key = match &args.key {
+        Some(path) => path.clone(),
+        None => match std::env::var_os(credentials::SSH_KEY_ENV) {
+            Some(named) if !named.is_empty() => PathBuf::from(named),
+            _ => return Err((2, no_identity_file())),
+        },
+    };
+
+    if let Some(target) = &args.ssh {
+        let (user, host, port) = parse_ssh_target(target).map_err(|message| (2, message))?;
+        // The ledger context an operator did not name is the host, as
+        // it has always been: with an address and nothing else, that is
+        // the only name for the machine in reach.
+        let pod_id = args.pod_id.clone().unwrap_or_else(|| host.clone());
+        return Ok((
+            SshTransport::new(host, port, user, key, remote_dir.to_path_buf()),
+            pod_id,
+        ));
+    }
+
+    // clap's group admits exactly one of the two, and `--provider`
+    // requires `--pod-id`. Checked again rather than assumed: this
+    // struct is flattened into every pod verb, and a verb that
+    // declared the group differently would otherwise reach a panic
+    // instead of a message.
+    let (Some(provider), Some(id)) = (&args.provider, &args.pod_id) else {
+        return Err((
+            2,
+            "name the pod: --ssh [user@]host:port, or --provider <name> --pod-id <id>".to_string(),
+        ));
+    };
+
+    // Asked here as well as inside the lookup, so that the exit code
+    // says which kind of failure this was: the lookup reports every
+    // one of them as prose, and a missing credential (4, the class
+    // `machine acquire` / `release` give it) and an unreachable
+    // platform (1) are not the same news.
+    let adapter = infra::adapter_named(provider).map_err(|message| (2, message))?;
+    credentials::require(adapter.provider_namespace(), adapter.credentials())
+        .map_err(|missing| (4, missing.to_string()))?;
+
+    let connection = inventory::connection(provider, id).map_err(|reason| (1, reason))?;
+    let Some(endpoint) = connection.ssh else {
+        return Err((
+            1,
+            format!(
+                "machine {id} reports no ssh endpoint yet (a pod still booting answers this \
+                 way; retry, or pass --ssh)"
+            ),
+        ));
+    };
+    Ok((
+        SshTransport::new(
+            endpoint.host,
+            endpoint.port,
+            endpoint.user,
+            key,
+            remote_dir.to_path_buf(),
+        ),
+        // The ledger context is the machine's own id, which is what the
+        // release gate judges by (08 §Release gate).
+        id.clone(),
+    ))
+}
+
+/// What an operator reads when nothing named an identity file: both
+/// ways to name one, and every file the fallback was looked for in.
+///
+/// Worded like [`credentials::Missing`]'s own report, and built from
+/// the same [`credentials::candidates`], because it is the same
+/// question — which of several files was this line supposed to go in —
+/// and an answer that named only the variable would leave the reader
+/// guessing.
+fn no_identity_file() -> String {
+    let mut message = format!(
+        "no identity file: pass --key <path>, or set {} (it is read from the same files as \
+         the platform credentials)",
+        credentials::SSH_KEY_ENV
+    );
+    for path in credentials::candidates() {
+        let what = if path.exists() {
+            "read, does not define it"
+        } else {
+            "no such file"
+        };
+        message.push_str(&format!("\n  searched: {} ({what})", path.display()));
+    }
+    message
 }
 
 /// `--ssh` help text, built from [`DEFAULT_SSH_USER`] so the CLI's
@@ -1909,8 +2305,8 @@ fn correction_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        attributed, exit_status, parse_ssh_target, record, ssh_help, AcquisitionRow, Cli, Command,
-        MachineCommand, PathBuf,
+        attributed, credentials, exit_status, parse_ssh_target, record, resolve_target, ssh_help,
+        AcquisitionRow, Cli, Command, MachineCommand, Path, PathBuf, TargetArgs,
     };
     use clap::Parser as _;
     use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
@@ -1981,6 +2377,104 @@ mod tests {
             ssh_help().contains(DEFAULT_SSH_USER),
             "--help must document the same default it applies"
         );
+    }
+
+    /// **A pod is named one way or the other, and never neither.**
+    /// `--ssh` carries an address; `--provider` carries the platform
+    /// that knows one, and is useless without the id to look up. clap
+    /// enforces all three at parse time so no verb has to decide what
+    /// a run with two targets, or none, was supposed to mean.
+    #[test]
+    fn a_pod_is_named_by_an_address_or_by_a_platform_and_an_id() {
+        let parsed = |args: &[&str]| {
+            let mut argv = vec!["lm-provision", "apply", "--profile", "profile.json"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv)
+        };
+
+        assert!(parsed(&["--ssh", "1.2.3.4:22"]).is_ok());
+        assert!(parsed(&["--provider", "runpod", "--pod-id", "pod-1"]).is_ok());
+
+        assert!(
+            parsed(&[]).is_err(),
+            "a session with no pod named is not a session"
+        );
+        assert!(
+            parsed(&["--provider", "runpod"]).is_err(),
+            "a platform without an id names no machine"
+        );
+        assert!(
+            parsed(&[
+                "--ssh",
+                "1.2.3.4:22",
+                "--provider",
+                "runpod",
+                "--pod-id",
+                "p"
+            ])
+            .is_err(),
+            "two targets in one run is a question this cannot answer"
+        );
+    }
+
+    /// **With `--provider`, the ledger context is the machine's own
+    /// id**; with `--ssh` and nothing else, it is the host, which is
+    /// the only name for the machine in reach. The release gate reads
+    /// rows by machine id (08 §Release gate), so the first is what
+    /// arms it correctly.
+    #[test]
+    fn the_ledger_context_is_the_machine_id_when_the_platform_named_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-cli-target-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("the temp directory is writable");
+        let key = dir.join("id_test");
+        std::fs::write(&key, b"not a real key\n").expect("the temp directory is writable");
+
+        let by_address = TargetArgs {
+            ssh: Some("1.2.3.4:2222".to_string()),
+            provider: None,
+            pod_id: None,
+            key: Some(key.clone()),
+        };
+        let (transport, pod_id) = resolve_target(&by_address, Path::new(DEFAULT_REMOTE_DIR))
+            .expect("an address needs no lookup");
+        assert_eq!(pod_id, "1.2.3.4");
+        assert_eq!(transport.host, "1.2.3.4");
+        assert_eq!(transport.port, 2222);
+        assert_eq!(transport.user, DEFAULT_SSH_USER);
+        assert_eq!(transport.key_path, key);
+
+        let named = TargetArgs {
+            pod_id: Some("pod-7".to_string()),
+            ..by_address
+        };
+        let (_, pod_id) = resolve_target(&named, Path::new(DEFAULT_REMOTE_DIR))
+            .expect("an address needs no lookup");
+        assert_eq!(pod_id, "pod-7", "an operator who named the context gets it");
+
+        // No identity file anywhere is an input that cannot be used,
+        // and it is found before any platform is asked.
+        let unnamed_key = TargetArgs {
+            ssh: Some("1.2.3.4:2222".to_string()),
+            provider: None,
+            pod_id: None,
+            key: None,
+        };
+        if std::env::var_os(credentials::SSH_KEY_ENV).is_none() {
+            let (code, message) = resolve_target(&unnamed_key, Path::new(DEFAULT_REMOTE_DIR))
+                .expect_err("no key was named");
+            assert_eq!(code, 2);
+            assert!(message.contains(credentials::SSH_KEY_ENV), "{message}");
+            assert!(message.contains("--key"), "{message}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -11,7 +11,7 @@ binary with zero dependencies on the target pod.
 | Crate | What it is |
 |---|---|
 | [`lm-provision`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision) | Core library + the pod-side binary **`lm-provisioner`** (`validate` / `hash` / `plan` / `apply [--dry-run]` / `fetch` / `pin`). Typed `ProfileNode` AST, deterministic canonical encoding + SHA-256 profile hash, pure-Rust effect engine — no embedded scripting runtime. Fragment imports (spec 11): hash-pinned local + https fragment reuse with an XDG-cached expansion pass, plus a `pin` authoring subcommand that rewrites `name@version` imports against an `index.json`. |
-| [`lm-provision-cli`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-cli) | The operator CLI: the **`lm-provision`** binary, and the one command an operator installs. `apply` / `check` act on a pod; `machine list` / `acquire` / `release` / `sweep` are the fleet; `mcp` serves the MCP tools over stdio. |
+| [`lm-provision-cli`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-cli) | The operator CLI: the **`lm-provision`** binary, and the one command an operator installs. `apply` / `check` act on a pod; `logs` / `exec` / `cp` work the pod an apply left running; `machine list` / `acquire` / `release` / `sweep` are the fleet; `mcp` serves the MCP tools over stdio. |
 | [`lm-provision-driver`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-driver) | Push-driver library, behind `lm-provision apply` and the machine subcommands. The session: ensure-binary (resolve the provisioner for a version to the release build CI published, verify its SHA-256, cache it, and push it idempotently), place profile, apply, collect report / transcript, append to the apply ledger. The machine side: obtain one meeting the profile's declared requirements (stamping its lease onto the machine's own name), read a platform's own list, give a machine back, give back every machine whose lease has run out. |
 | [`lm-provision-mcp`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-mcp) | MCP server library, served by `lm-provision mcp`: `lm_validate` / `lm_hash` / `lm_plan`, `lm_apply`, `lm_machine_list`, and apply-ledger inspection as MCP tools. |
 | [`lm-provision-protocol`](https://github.com/ynishi/lm-provision/blob/main/crates/lm-provision-protocol) | The wire types shared across the license boundary: the append-only apply-ledger row schema (`LedgerRow` / `ArtifactRow`) and the acquisitions record (`AcquisitionRow` — the audit trail of what was bought and what came back), both in JSON Lines encoding — appended by the driver, taken custody of by the host. Neutral and permissive so both sides may depend on it. |
@@ -118,6 +118,19 @@ lm-provisioner apply profile.json --dry-run  # print steps, resolve secrets, no 
 lm-provision apply \
   --ssh root@<host>:<port> --key ~/.ssh/<key> \
   --profile profile.json
+
+# Or name the machine and let the platform say where it is — the
+# address and port come out of the platform's own description of it.
+# The identity file can live in ~/.config/lm-provision/.env as
+# LM_PROVISION_SSH_KEY, beside RUNPOD_API_KEY, instead of --key:
+lm-provision apply \
+  --provider runpod --pod-id <id> \
+  --profile profile.json
+
+# After apply: the pod's own output, without typing an ssh line.
+lm-provision logs --provider runpod --pod-id <id> vllm-qwen --follow
+lm-provision exec --provider runpod --pod-id <id> -- nvidia-smi
+lm-provision cp   --provider runpod --pod-id <id> :/tmp/vllm-qwen.log ./
 
 # Pin another released version, or push a local build of your own
 # (the override for developing the provisioner itself):
