@@ -57,6 +57,40 @@ pub fn fetch(provider: &str) -> Result<Fetched, String> {
     })
 }
 
+/// Where one machine can be reached, read from the platform's own
+/// description.
+///
+/// The same projection `acquire` reports after it creates a machine
+/// ([`infra::Infra::connection`]), reached by an identifier instead of
+/// by having just created it. That is the whole point: an operator who
+/// has a pod id should not have to hand-carry a `host:port` out of
+/// whatever printed it last, and a second caller re-deriving the
+/// address by querying the platform directly would need the platform
+/// credential arranged in its own shell for a fact the driver already
+/// pays to learn.
+///
+/// Read-only and costs nothing but the question. The credential is
+/// required first for the reason [`fetch`] requires it: otherwise the
+/// refusal is the platform CLI's own error in the middle of somebody
+/// else's run, rather than a line naming the variable and the files it
+/// was looked for in.
+///
+/// **A machine still booting is not an error.** It answers with a
+/// description carrying no address yet, and that projects to a
+/// [`infra::Connection`] whose `ssh` is `None` — the caller decides
+/// what to do about a pod that is not up, which is not something this
+/// can decide for it.
+pub fn connection(provider: &str, id: &str) -> Result<infra::Connection, String> {
+    let adapter = infra::adapter_named(provider)?;
+    credentials::require(adapter.provider_namespace(), adapter.credentials())
+        .map_err(|missing| missing.to_string())?;
+    let fleet = adapter
+        .fleet()
+        .ok_or_else(|| format!("{provider} cannot be asked about a machine"))?;
+    let inspected = infra::inspect(&fleet, id).map_err(|err| err.to_string())?;
+    Ok(adapter.connection(&inspected))
+}
+
 /// A listing of every named platform: the machines, the platforms that
 /// could not be asked, and what each platform CLI said while being
 /// asked.
@@ -211,6 +245,54 @@ mod tests {
         );
         assert_eq!(nameless["name"], serde_json::Value::Null);
         assert_eq!(nameless["stamped"], serde_json::json!(false));
+    }
+
+    /// **What `connection` hands back is the platform's own
+    /// description, projected by the adapter that speaks that
+    /// platform** — the same projection `acquire` reports, so the
+    /// address an operator gets from an id and the one they got at
+    /// creation are the same fields read the same way.
+    ///
+    /// The read itself is a subprocess and is covered end to end by
+    /// the CLI suite; what is checked here is the half that decides
+    /// what an operator can dial, including the booting machine that
+    /// has no address yet.
+    #[test]
+    fn a_read_back_projects_to_the_endpoint_an_operator_dials() {
+        let adapter = infra::adapter_named("runpod").expect("a wired platform");
+        // A `get-pod` answer, in the shape a read-back has: the
+        // address fields are there, the creation-time `machine` object
+        // is not.
+        let described = serde_json::json!({
+            "id": "pod-1",
+            "desiredStatus": "RUNNING",
+            "publicIp": "203.0.113.9",
+            "portMappings": { "22": 21001, "8188": 21002 },
+            "machine": {}
+        });
+        let connection = adapter.connection(&described);
+        let ssh = connection.ssh.expect("22 is mapped and the address is set");
+        assert_eq!(ssh.host, "203.0.113.9");
+        assert_eq!(ssh.port, 21001);
+        assert_eq!(
+            connection.endpoints.get(&8188),
+            Some(&"203.0.113.9:21002".to_string()),
+            "every declared port's public address comes back with it"
+        );
+
+        let booting = serde_json::json!({ "id": "pod-1", "publicIp": "" });
+        assert!(
+            adapter.connection(&booting).ssh.is_none(),
+            "a pod that has no address yet reports none, rather than one to dial"
+        );
+    }
+
+    /// A platform nobody wired is a request that cannot be used, and it
+    /// is refused before anything is run.
+    #[test]
+    fn asking_an_unknown_platform_about_a_machine_names_what_was_wrong() {
+        let refusal = connection("not-a-platform", "pod-1").expect_err("no such platform");
+        assert!(refusal.contains("unknown provider"), "{refusal}");
     }
 
     /// **A platform that cannot be asked is reported, not fatal**, and

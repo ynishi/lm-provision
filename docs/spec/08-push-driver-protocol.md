@@ -5,7 +5,11 @@ target; revised 2026-08-01 from first real-pod usage feedback;
 revised 2026-08-30 to add the artifacts retrieval contract — step 4b
 and the release gate; revised 2026-09-01 to name the operator-side
 preflight, whose resolve stage decides what step 1 uploads, and to add
-the acquisition lease and the expiry sweep).
+the acquisition lease and the expiry sweep; revised 2026-09-20 to let
+a caller name the machine by `(provider, id)` and have the driver read
+its address off the platform, and to add the operator pod verbs —
+`logs` / `exec` / `cp`, which ride the same resolution and transport
+without being session steps).
 Layer 4. Upstream deps: 07, 04, 06, 11.
 MVP: Phase G.
 
@@ -31,6 +35,18 @@ touching any of it; start / stop stay outside — see §Stability.
 Input  (everything the caller must know)
   ConnectionSpec  = ssh { host, port, user (default root), key_path }
                     (a provider exec-API variant is additive, later)
+                    The operator CLI takes this in two spellings: the
+                    address itself, or `(provider, id)` — the machine
+                    as the platform names it. The second is resolved by
+                    reading the platform's own description of that
+                    machine and projecting the address out of it, the
+                    same projection `machine acquire` reports for a
+                    machine it just created; a machine still booting
+                    projects to no endpoint and is refused rather than
+                    dialed. `key_path` may arrive as the
+                    `LM_PROVISION_SSH_KEY` environment variable instead
+                    of a flag — an operator-host input, resolved out of
+                    the same files as the platform credentials
   profile         = local path (canonical text or JSON, chapter 01)
   provisioner     = a version (default: the driver's own), resolved
                     to the release build CI published for it —
@@ -356,6 +372,53 @@ scrollback and a machine that billed until someone noticed.
   being invoked is the control plane's job (chapter 09's record is
   the shared vocabulary for exactly that); `sweep` is the operator's
   hand on the same file.
+
+## Operator pod verbs
+
+An apply leaves a pod running something. Everything an operator does
+with it afterwards — read the service's log, run one command, fetch a
+file — was a hand-typed `ssh -p … -i … root@…`, while the address, the
+key, the shared connection and the path conventions were all already
+inside the driver. Three verbs put them behind the same command:
+
+```
+lm-provision logs <target> <service> [--tail <n>] [-f]
+lm-provision exec <target> -- <cmd> [args...]
+lm-provision cp   <target> <src> <dst>   (one side spelled :<path>)
+```
+
+- **The names are looked up, not chosen.** `kubectl` and `docker`
+  spell exactly these three as `logs` / `exec` / `cp`; `fly` spells
+  the same set as `logs` / `ssh console -C` / `sftp get`. `cp`'s
+  leading `:` is `docker cp`'s `CONTAINER:PATH` with the container
+  already named by the target flags — so exactly one of the two
+  operands carries it, and both or neither is a usage error.
+- **`<target>` is the `ConnectionSpec` of §Session contract**, in the
+  same two spellings `apply` takes and resolved by the same code,
+  including a machine still booting being refused rather than dialed.
+- **They are not session steps.** Nothing here appends a ledger row,
+  records an artifact, resolves or delivers a secret, or involves the
+  provisioner at all: a verb is a relay between the operator and a pod
+  that is already provisioned. `exec` in particular injects **no**
+  environment — a profile's `env_secrets` belong to an apply
+  (§Secret delivery), and a command typed by an operator runs with
+  what they gave it and nothing else.
+- **Their stdio is the operator's terminal**, so §Outputs' stream
+  split does not describe them: there is no report to put on stdout,
+  and the artifact of the run is the pod's own output as it is
+  produced — which is what makes `logs -f` and `exec … -- sh -s <
+  script` work at all. `logs` and `exec` exit with the **remote**
+  command's code, with `ssh`'s own 255 riding through unremapped; `cp`
+  prints nothing on success.
+- **`logs` reads the path, it does not take one.** The operator names
+  the service (`service.start`'s `name`) and the launch log's location
+  is the one chapter 02 §Built-in path constants fixes — the same
+  constant the engine writes through, so the two cannot drift.
+- Stability: **provisional** — the verb set is the established three,
+  but their flags are additive (a `--since` on `logs`, an explicit
+  recursion switch on `cp`), and a carrier other than `ssh` — a
+  provider's own exec API, the additive `ConnectionSpec` variant —
+  would change how they reach the pod without changing what they are.
 
 ## Outputs
 

@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lm-provision apply --provider <name> --pod-id <id>`** — name the
+  machine instead of its address. The address and port come from the
+  platform's own description of that machine, through the same
+  projection `machine acquire` reports, so a pod id is enough to
+  provision with and there is no `host:port` to carry out of whatever
+  printed it last. The id is also the ledger context, which is what the
+  release gate judges by (08 §Release gate). A machine still booting
+  reports no endpoint and is refused rather than dialed. `--ssh` is
+  unchanged and exactly one of the two is required; the identity file
+  may come from `LM_PROVISION_SSH_KEY`, read out of the same files as
+  the platform credentials, when no `--key` names one.
+
+- **`lm-provision logs` / `exec` / `cp`** — the pod after an apply,
+  without a hand-typed `ssh` line. `logs <service>` prints the launch
+  log the profile's `service.start` writes (`--tail`, `--follow`),
+  `exec -- <cmd>` runs one command with the operator's own stdin and
+  stdout on it, and `cp` moves a file or directory in whichever
+  direction the leading `:` names (`:/tmp/vllm-qwen.log ./`). All
+  three take the same target flags `apply` does and travel on the
+  connection it already opened; none of them touches the ledger,
+  resolves a secret or involves the provisioner. `logs` and `exec`
+  exit with the remote command's own code. The names are `kubectl`'s
+  and `docker`'s (08 §Operator pod verbs).
+
+- **One SSH connection per session instead of one per step.** The
+  transport asks `ssh` and `scp` to share a connection
+  (`ControlMaster=auto` / `ControlPersist=60`, `ssh_config(5)`), so the
+  steps of one apply — and a command run just after it — travel on the
+  connection the first step opened rather than each paying for a TCP
+  handshake and an authentication. The sockets live under
+  `$XDG_RUNTIME_DIR/lm-provision`; a host where that directory cannot
+  be made falls back to the old behaviour and says nothing about it.
+
 ### Changed
 
 ### Deprecated

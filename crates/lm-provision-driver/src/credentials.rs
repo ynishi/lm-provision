@@ -47,6 +47,20 @@ use std::path::PathBuf;
 /// locations, named by the environment.
 pub const ENV_FILE: &str = "LM_PROVISION_ENV_FILE";
 
+/// The identity file an operator command falls back to when no `--key`
+/// names one.
+///
+/// **Not a platform credential**, and the only name here that is not:
+/// it is an operator-host input — the path of the private key this
+/// host's `ssh` is to use — and the file it names never leaves this
+/// machine. It lives with the credentials because it is resolved the
+/// same way, out of the same files ([`candidates`]): an operator who
+/// has written `RUNPOD_API_KEY` into `~/.config/lm-provision/.env` has
+/// already learned where inputs of this kind go, and a second
+/// mechanism for the second line of the same file would be one more
+/// place to look when a run cannot reach a pod.
+pub const SSH_KEY_ENV: &str = "LM_PROVISION_SSH_KEY";
+
 /// Fill the process environment from the first of these that says
 /// something, without overwriting what is already set.
 ///
