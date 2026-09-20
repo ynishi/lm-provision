@@ -251,6 +251,10 @@ fn a_machine_that_reports_no_address_is_refused_before_anything_is_dialed() {
         "the message says what the machine reported, and what to do: {stderr}"
     );
     assert!(
+        stderr.contains("read from the platform: publicIp: empty;"),
+        "and which field the projection found wanting: {stderr}"
+    );
+    assert!(
         !dir.join("ssh-argv").exists(),
         "nothing was dialed: {}",
         recorded(&dir, "ssh-argv")

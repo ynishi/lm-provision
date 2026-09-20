@@ -210,6 +210,46 @@ pub struct Connection {
     /// without asking the service where things landed.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub endpoints: BTreeMap<u16, String>,
+    /// What the projection read to arrive at the above, one `field:
+    /// shape` entry per field the adapter consulted (`publicIp: empty`,
+    /// `portMappings: [22]`, `ssh_port: absent`) — presence and shape,
+    /// never a value.
+    ///
+    /// For the operator who is refused because `ssh` is `None`: an
+    /// empty projection says only "no endpoint", and whether that is a
+    /// pod still booting or a description that came back without the
+    /// field cannot be told from the outside [measured: 2026-09-20, a
+    /// RUNNING pod's read-back projected to no endpoint once, with the
+    /// three read-backs after it complete — nothing recorded which
+    /// field was missing]. Not serialized: `machine acquire`'s artifact
+    /// is a caller's input, and this is a diagnostic.
+    #[serde(skip)]
+    pub read: Vec<String>,
+}
+
+/// The `field: shape` entry [`Connection::read`] carries for one
+/// string-valued field: present, empty, or absent.
+fn read_text(inspected: &serde_json::Value, key: &str) -> String {
+    let shape = match inspected.get(key).and_then(|it| it.as_str()) {
+        Some("") => "empty",
+        Some(_) => "present",
+        None => "absent",
+    };
+    format!("{key}: {shape}")
+}
+
+/// The `field: shape` entry for a field expected to be an object keyed
+/// by port: its keys, or why there are none.
+fn read_keys(inspected: &serde_json::Value, key: &str) -> String {
+    match inspected.get(key) {
+        Some(serde_json::Value::Object(map)) => {
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            format!("{key}: [{}]", keys.join(", "))
+        }
+        Some(serde_json::Value::Null) => format!("{key}: null"),
+        Some(_) => format!("{key}: not an object"),
+        None => format!("{key}: absent"),
+    }
 }
 
 /// One SSH endpoint, in the fields spec 08's `ConnectionSpec` takes.
@@ -953,7 +993,14 @@ impl Infra for RunPodAdapter {
                     user: crate::ssh::DEFAULT_SSH_USER.to_string(),
                 })
         });
-        Connection { ssh, endpoints }
+        Connection {
+            ssh,
+            endpoints,
+            read: vec![
+                read_text(inspected, "publicIp"),
+                read_keys(inspected, "portMappings"),
+            ],
+        }
     }
 }
 
@@ -1533,7 +1580,22 @@ impl Infra for VastAdapter {
                 }
             }
         }
-        Connection { ssh, endpoints }
+        Connection {
+            ssh,
+            endpoints,
+            read: vec![
+                read_text(inspected, "ssh_host"),
+                format!(
+                    "ssh_port: {}",
+                    match inspected.get("ssh_port").and_then(|it| it.as_u64()) {
+                        Some(port) => port.to_string(),
+                        None => "absent".to_string(),
+                    }
+                ),
+                read_text(inspected, "public_ipaddr"),
+                read_keys(inspected, "ports"),
+            ],
+        }
     }
 }
 
@@ -2596,7 +2658,12 @@ mod tests {
             "publicIp": "",
             "ports": ["22/tcp"]
         });
-        assert_eq!(RunPodAdapter.connection(&booting), Connection::default());
+        let projected = RunPodAdapter.connection(&booting);
+        assert_eq!(projected.ssh, None);
+        assert!(projected.endpoints.is_empty());
+        // What was read is on record, so a refusal can say which field
+        // was missing rather than only that the endpoint was.
+        assert_eq!(projected.read, ["publicIp: empty", "portMappings: absent"]);
     }
 
     /// **The loop closes** — over what the service said across both of

@@ -2104,11 +2104,17 @@ fn resolve_target(
 
     let connection = inventory::connection(provider, id).map_err(|reason| (1, reason))?;
     let Some(endpoint) = connection.ssh else {
+        // The second line is what the projection read (field by field,
+        // presence and shape, no values): a pod still booting and a
+        // description that came back without the field look the same
+        // from the endpoint alone, and this is the one moment the
+        // difference can be written down.
         return Err((
             1,
             format!(
                 "machine {id} reports no ssh endpoint yet (a pod still booting answers this \
-                 way; retry, or pass --ssh)"
+                 way; retry, or pass --ssh)\n  read from the platform: {}",
+                connection.read.join("; ")
             ),
         ));
     };

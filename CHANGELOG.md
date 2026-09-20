@@ -16,7 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provision with and there is no `host:port` to carry out of whatever
   printed it last. The id is also the ledger context, which is what the
   release gate judges by (08 §Release gate). A machine still booting
-  reports no endpoint and is refused rather than dialed. `--ssh` is
+  reports no endpoint and is refused rather than dialed, and the
+  refusal says which of the platform's fields were read and what shape
+  each had (`publicIp: empty; portMappings: [22]`), so a pod still
+  booting and a description that came back short can be told apart
+  afterwards. `--ssh` is
   unchanged and exactly one of the two is required; the identity file
   may come from `LM_PROVISION_SSH_KEY`, read out of the same files as
   the platform credentials, when no `--key` names one.
