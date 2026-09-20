@@ -35,6 +35,14 @@ dotenvy = { workspace = true }
 # `lzma-rs` are pure Rust on purpose: the driver itself is shipped for
 # five targets including musl, and a C lzma would put a cross toolchain
 # in the way of building it.
+# The foreground `port-forward` passes the signals it is asked to stop
+# on to its `ssh` child, so a `kill` of the CLI cannot leave a tunnel
+# behind; `nix` spells the dispositions and `libc::kill` is what the
+# handler itself may call. Both are already workspace dependencies —
+# the process group a detached forward gets is `std`'s
+# (`CommandExt::process_group`), which needs neither.
+nix = { workspace = true }
+libc = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
 lzma-rs = { workspace = true }

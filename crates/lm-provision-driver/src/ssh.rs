@@ -23,8 +23,14 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
+use std::net::TcpStream;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
+
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 use crate::transport::{ExecOutput, PodPaths, Transport, TransportError};
 
@@ -70,6 +76,85 @@ pub struct SshTransport {
     control_dir: Option<PathBuf>,
 }
 
+/// One `-L` an operator asked for: a port on their own host,
+/// carried to the pod's own `127.0.0.1:<remote>`.
+///
+/// The remote end is the literal `127.0.0.1` and not `localhost`,
+/// which a pod may resolve to `::1` while the service bound only the
+/// IPv4 loopback — the address is what `ssh` hands the pod's sshd to
+/// connect to, so an unambiguous one is the whole of the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forward {
+    /// The port on the operator's host, which they chose.
+    pub local: u16,
+    /// The port on the pod, reached from the pod's own loopback.
+    pub remote: u16,
+}
+
+/// How a [`SshTransport::forward`] ended.
+#[derive(Debug)]
+pub enum ForwardOutcome {
+    /// Foreground: `ssh` ran until something ended it, and this is
+    /// the code it ended with (`None` when a signal did) — the same
+    /// answer [`SshTransport::attach`] gives.
+    Exited(Option<i32>),
+    /// Detached: every local port is accepting, and `ssh` lives on as
+    /// this pid after this process is gone. The pid is the handle:
+    /// stopping the forward is `kill` on it.
+    Detached {
+        /// The `ssh` process still carrying the forward.
+        pid: u32,
+    },
+}
+
+/// How often the local ports are probed while waiting for `ssh` to
+/// bind them, and how long that wait may go on.
+///
+/// The bound is not a readiness timeout for anything on the pod: what
+/// is being waited for is a local `bind`, which happens as soon as the
+/// connection is authenticated. A minute is long enough for a cold
+/// handshake on a loaded host and short enough that a forward which is
+/// never coming up says so rather than hanging.
+const FORWARD_POLL: Duration = Duration::from_millis(100);
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The `ssh` a foreground forward is waiting on, for
+/// [`relay_to_forward`] to reach. `0` means there is none — set back
+/// to it before the child is reaped, so a handler can never name a
+/// pid the system has since handed to somebody else.
+static FOREGROUND_FORWARD: AtomicI32 = AtomicI32::new(0);
+
+/// Pass the signal on to that `ssh`, and do nothing else.
+///
+/// Async-signal-safe by construction: an atomic load and `kill(2)`,
+/// which POSIX lists among the functions a handler may call
+/// [documented: `signal-safety(7)`]. Nothing here allocates, takes a
+/// lock, or writes to a stream.
+extern "C" fn relay_to_forward(signo: i32) {
+    let pid = FOREGROUND_FORWARD.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: a pid this process spawned and has not yet reaped.
+        // A child that exited in the meantime costs an `ESRCH` that
+        // is not read.
+        unsafe { libc::kill(pid, signo) };
+    }
+}
+
+/// Give `SIGINT` / `SIGTERM` / `SIGHUP` the disposition `handler`.
+///
+/// `SA_RESTART` so the waits around it are not turned into `EINTR`
+/// the callers would have to re-try by hand.
+fn forward_signal_disposition(handler: SigHandler) -> Result<(), TransportError> {
+    let action = SigAction::new(handler, SaFlags::SA_RESTART, SigSet::empty());
+    for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
+        // SAFETY: the handler is async-signal-safe (see above), and
+        // `SigDfl` restores what the process started with.
+        unsafe { sigaction(signal, &action) }
+            .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
+    }
+    Ok(())
+}
+
 impl SshTransport {
     /// Build a transport for `user@host:port` with the mandatory
     /// identity file, staging uploads under `remote_dir`.
@@ -104,11 +189,55 @@ impl SshTransport {
         format!("{}@{}", self.user, self.host)
     }
 
-    /// Shared non-interactive options, in the one spelling both `ssh`
-    /// and `scp` are given them. `BatchMode=yes` forbids any prompt (a
-    /// wrong key fails loudly instead of hanging on a password
-    /// prompt); host-key learning is accept-new so a fresh pod's first
-    /// contact succeeds while a changed key still fails.
+    /// Everything about the connection itself, in the one spelling
+    /// every program and every verb is given it — the part that has
+    /// nothing to do with whether the connection is shared.
+    ///
+    /// `BatchMode=yes` forbids any prompt (a wrong key fails loudly
+    /// instead of hanging on a password prompt); host-key learning is
+    /// accept-new so a fresh pod's first contact succeeds while a
+    /// changed key still fails.
+    ///
+    /// `ServerAliveInterval=15` with `ServerAliveCountMax=6` asks the
+    /// pod for a reply every 15 seconds and gives up after six went
+    /// unanswered, so ninety seconds of silence ends the connection
+    /// instead of leaving a client attached to a socket with nothing
+    /// on the other end of it [documented: OpenSSH `ssh_config(5)`].
+    /// It is here, in the part nothing opts out of, because both kinds
+    /// of connection need it: the shared master a session's steps ride
+    /// (a keepalive only one caller asked for would be missing from a
+    /// master another caller opened first) and the private one
+    /// [`forward_args`](Self::forward_args) dials. `TCPKeepAlive` is
+    /// not spelled beside them: `yes` is already its default
+    /// [documented: same page]. The trigger is a measured one — a
+    /// tunnel on a shared host at load 47 died mid-run [measured:
+    /// 2026-09-05, the consumer's runbook].
+    fn connection_options() -> Vec<String> {
+        [
+            "BatchMode=yes",
+            "StrictHostKeyChecking=accept-new",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=6",
+        ]
+        .into_iter()
+        .flat_map(|option| ["-o".to_string(), option.to_string()])
+        .collect()
+    }
+
+    /// The port flag — which `ssh` spells `-p` and `scp` spells `-P` —
+    /// and the mandatory identity file, for a caller that then says
+    /// which options go after them.
+    fn dial_args(&self, port_flag: &str) -> Vec<String> {
+        vec![
+            port_flag.to_string(),
+            self.port.to_string(),
+            "-i".to_string(),
+            self.key_path.display().to_string(),
+        ]
+    }
+
+    /// [`connection_options`](Self::connection_options) plus the
+    /// connection **sharing** the session's steps ride on.
     ///
     /// The three `Control*` options share **one** TCP connection and
     /// one authentication across a session's steps: `ControlMaster=auto`
@@ -132,12 +261,7 @@ impl SshTransport {
     /// it had nowhere to keep a socket would have traded the contract
     /// for the optimisation.
     fn shared_options(&self) -> Vec<String> {
-        let mut options = vec![
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-            "-o".to_string(),
-            "StrictHostKeyChecking=accept-new".to_string(),
-        ];
+        let mut options = Self::connection_options();
         if let Some(dir) = &self.control_dir {
             options.extend([
                 "-o".to_string(),
@@ -154,12 +278,7 @@ impl SshTransport {
     /// The `ssh` argv prefix: the port flag this program spells `-p`,
     /// the identity file, and [`shared_options`](Self::shared_options).
     fn base_ssh_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "-p".to_string(),
-            self.port.to_string(),
-            "-i".to_string(),
-            self.key_path.display().to_string(),
-        ];
+        let mut args = self.dial_args("-p");
         args.extend(self.shared_options());
         args
     }
@@ -170,12 +289,7 @@ impl SshTransport {
     /// two file transfers, which is how the three multiplexing options
     /// would otherwise have been spelled three times.
     fn base_scp_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "-P".to_string(),
-            self.port.to_string(),
-            "-i".to_string(),
-            self.key_path.display().to_string(),
-        ];
+        let mut args = self.dial_args("-P");
         args.extend(self.shared_options());
         args
     }
@@ -278,6 +392,171 @@ impl SshTransport {
             .stderr(Stdio::inherit())
             .status()?;
         Ok(status.code())
+    }
+
+    /// The `ssh` argv of a port forward: a connection of its **own**,
+    /// no remote command (`-N`), a refusal to sit there connected if a
+    /// port could not be bound (`ExitOnForwardFailure=yes` — without
+    /// it `ssh` reports the failure and stays up forwarding nothing
+    /// [documented: OpenSSH `ssh_config(5)`]), one `-L` per pair, and
+    /// the target.
+    ///
+    /// **Not [`base_ssh_args`](Self::base_ssh_args): a forward must
+    /// not be multiplexed.** `ControlMaster=no` and `ControlPath=none`
+    /// are spelled explicitly rather than merely left out, because
+    /// leaving them out is not a refusal — an operator's own
+    /// `~/.ssh/config` can turn sharing back on for this host, and
+    /// `none` is the documented way to say there is no socket
+    /// [documented: OpenSSH `ssh_config(5)`, `ControlMaster` /
+    /// `ControlPath`]. Everything else about the connection is the
+    /// same one source the other verbs use
+    /// ([`connection_options`](Self::connection_options)), keepalive
+    /// included.
+    ///
+    /// Built apart from [`forward`](Self::forward) so what `ssh` is
+    /// given can be read in a test without a pod, a socket or a
+    /// spawn, the way [`base_ssh_args`](Self::base_ssh_args) is. No
+    /// `--` closes it: that separator introduces a remote command,
+    /// and `-N` is the statement that there is none.
+    fn forward_args(&self, address: &str, forwards: &[Forward]) -> Vec<String> {
+        let mut args = self.dial_args("-p");
+        args.extend(Self::connection_options());
+        args.extend([
+            "-o".to_string(),
+            "ControlMaster=no".to_string(),
+            "-o".to_string(),
+            "ControlPath=none".to_string(),
+        ]);
+        args.push("-N".to_string());
+        args.push("-o".to_string());
+        args.push("ExitOnForwardFailure=yes".to_string());
+        for forward in forwards {
+            args.push("-L".to_string());
+            args.push(format!(
+                "{address}:{}:127.0.0.1:{}",
+                forward.local, forward.remote
+            ));
+        }
+        args.push(self.target());
+        args
+    }
+
+    /// Carry `forwards` between this host and the pod, either for as
+    /// long as this process lives or past it.
+    ///
+    /// The operator verb behind `lm-provision port-forward`, and the
+    /// one reach a provider's own endpoints cannot give: a service
+    /// bound to the pod's loopback, a port the profile never declared,
+    /// a proxy that ends a long request. Nothing on the pod is
+    /// changed — a forward is a relay, the way the other verbs are (08
+    /// §Operator pod verbs).
+    ///
+    /// **The forward gets its own connection, never the shared one**
+    /// ([`forward_args`](Self::forward_args)). Under
+    /// `ControlMaster=auto` an `ssh -N -L …` does not carry the
+    /// tunnel at all: it hands the `-L` to the master and returns, so
+    /// the process this spawns is not the thing to wait on, to report
+    /// a pid for, or to signal [measured: 2026-09-20, a RunPod
+    /// pod — `--detach` printed a pid that `kill -0`
+    /// accepted and `kill` then could not find a second later, while
+    /// the port went on answering; the foreground form returned from
+    /// `wait()` before the operator's `kill -TERM` arrived, and the
+    /// master was still carrying the forward afterwards].
+    ///
+    /// Both modes wait for the same thing before they answer: every
+    /// local port accepting a connection. Connecting to a `-L`
+    /// listener succeeds at the TCP level whatever the pod does with
+    /// the channel afterwards, so what the wait establishes is that
+    /// `ssh` has **bound** the ports — which is the whole of what a
+    /// caller can be told here, and what makes `--detach`'s "it is up"
+    /// mean something. `on_ready` is called once at that moment, with
+    /// the pairs that came up; it is the caller's, because this crate
+    /// writes to no stream of its own.
+    ///
+    /// - **Foreground** (`detach` false): stdout and stderr are the
+    ///   operator's, stdin is `/dev/null` (`ssh -N` reads none), and
+    ///   this returns when `ssh` does. `SIGINT` / `SIGTERM` / `SIGHUP`
+    ///   are passed on to it first: a `kill` of the CLI that left the
+    ///   `ssh` behind would leave exactly the orphaned tunnel an
+    ///   operator then has to hunt with `pgrep`. A terminal's Ctrl-C
+    ///   already reaches the child through the process group; the
+    ///   handler is for the other way of being asked to stop.
+    /// - **Detached** (`detach` true): the child gets its own process
+    ///   group, so a Ctrl-C in the shell that started it does not
+    ///   reach it, and stdin and stdout are `/dev/null`. **stderr
+    ///   stays the operator's** — a bind or authentication failure
+    ///   during the wait has to be readable, and after the wait `ssh`
+    ///   writes nothing in normal operation. This returns
+    ///   [`ForwardOutcome::Detached`] **without** waiting on the
+    ///   child: outliving this process is the point of it. `ssh -f` is
+    ///   not used for the same reason it is not used by anyone who
+    ///   wants the pid — it forks, and the pid of the process that
+    ///   remains is then only recoverable by matching on a command
+    ///   line.
+    ///
+    /// A child that ends before the ports are up is the answer
+    /// instead: the code it ended with, as
+    /// [`ForwardOutcome::Exited`] in the foreground and as
+    /// [`TransportError::ForwardFailed`] when detaching, where there
+    /// is no forward to hand back.
+    pub fn forward(
+        &self,
+        address: &str,
+        forwards: &[Forward],
+        detach: bool,
+        on_ready: impl FnOnce(&[Forward]),
+    ) -> Result<ForwardOutcome, TransportError> {
+        let mut command = Command::new("ssh");
+        command.args(self.forward_args(address, forwards));
+        command.stdin(Stdio::null());
+        if detach {
+            command
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .process_group(0);
+        } else {
+            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        }
+        let mut child = command.spawn()?;
+        if detach {
+            return match bound(&mut child, address, forwards)? {
+                Bound::Listening => {
+                    on_ready(forwards);
+                    Ok(ForwardOutcome::Detached { pid: child.id() })
+                }
+                Bound::Exited(code) => Err(TransportError::ForwardFailed(code)),
+            };
+        }
+
+        FOREGROUND_FORWARD.store(child.id() as i32, Ordering::SeqCst);
+        if let Err(err) = forward_signal_disposition(SigHandler::Handler(relay_to_forward)) {
+            // A forward that cannot promise to take its `ssh` with it
+            // is not one to leave running: that promise is the whole
+            // difference between stopping this command and hunting an
+            // orphan afterwards.
+            FOREGROUND_FORWARD.store(0, Ordering::SeqCst);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+        let outcome = match bound(&mut child, address, forwards) {
+            Ok(Bound::Listening) => {
+                on_ready(forwards);
+                // Not `?`: an early return here would leave the
+                // dispositions installed and the pid published.
+                child
+                    .wait()
+                    .map(|it| ForwardOutcome::Exited(it.code()))
+                    .map_err(TransportError::from)
+            }
+            Ok(Bound::Exited(code)) => Ok(ForwardOutcome::Exited(code)),
+            Err(err) => Err(err),
+        };
+        // Before the dispositions go back: a handler that fired
+        // between the two would name a pid already reaped.
+        FOREGROUND_FORWARD.store(0, Ordering::SeqCst);
+        let _ = forward_signal_disposition(SigHandler::SigDfl);
+        outcome
     }
 
     /// `argv` as one remote command string: every word quoted for the
@@ -485,6 +764,60 @@ fn prepared_control_dir(dir: &Path) -> Option<PathBuf> {
     Some(dir.to_path_buf())
 }
 
+/// What the wait in [`SshTransport::forward`] ended on.
+enum Bound {
+    /// Every local port accepts a connection.
+    Listening,
+    /// `ssh` ended first, with this code (`None` when a signal ended
+    /// it).
+    Exited(Option<i32>),
+}
+
+/// Wait until `ssh` has bound every local port, or ended, or
+/// [`FORWARD_TIMEOUT`] has passed — in which case the child is killed
+/// and the wait is the error, since a forward nobody can reach is not
+/// one to leave running.
+///
+/// The child is checked on every pass, not only after the timeout: a
+/// port that cannot be bound makes `ExitOnForwardFailure=yes` end
+/// `ssh` in the first second, and waiting out the full minute to say
+/// so would be a minute of silence about something already decided.
+///
+/// Each probe connection is dropped as it is made. It costs the pod
+/// one channel opened and closed, which is the cheapest question that
+/// can be asked of a listener without a protocol to speak into it.
+fn bound(child: &mut Child, address: &str, forwards: &[Forward]) -> Result<Bound, TransportError> {
+    let deadline = Instant::now() + FORWARD_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Bound::Exited(status.code()));
+        }
+        if forwards
+            .iter()
+            .all(|it| TcpStream::connect((address, it.local)).is_ok())
+        {
+            return Ok(Bound::Listening);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "ssh did not have {} listening within {}s",
+                    forwards
+                        .iter()
+                        .map(|it| format!("{address}:{}", it.local))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    FORWARD_TIMEOUT.as_secs()
+                ),
+            )));
+        }
+        std::thread::sleep(FORWARD_POLL);
+    }
+}
+
 /// POSIX single-quote escaping: wraps in `'...'`, spelling an embedded
 /// `'` as `'\''`. Total for any byte string without NUL.
 fn shell_quote(s: &str) -> String {
@@ -598,6 +931,15 @@ mod tests {
             assert!(args.contains(&"ControlMaster=auto".to_string()), "{args:?}");
             assert!(args.contains(&expected_path), "{args:?}");
             assert!(args.contains(&"ControlPersist=60".to_string()), "{args:?}");
+            assert!(
+                args.contains(&"ServerAliveInterval=15".to_string()),
+                "the master both programs may become is the one that \
+                 has to notice a dead peer: {args:?}"
+            );
+            assert!(
+                args.contains(&"ServerAliveCountMax=6".to_string()),
+                "{args:?}"
+            );
         }
         assert_eq!(
             ssh[..2],
@@ -672,9 +1014,129 @@ mod tests {
                 args.contains(&"BatchMode=yes".to_string()),
                 "the non-interactive options are not the optional part: {args:?}"
             );
+            assert!(
+                args.contains(&"ServerAliveInterval=15".to_string()),
+                "nor is the keepalive: a host with nowhere to keep a \
+                 socket is if anything the one whose connections \
+                 die: {args:?}"
+            );
+            assert!(
+                args.contains(&"ServerAliveCountMax=6".to_string()),
+                "{args:?}"
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A forward is an `ssh` with no remote command, one `-L` per
+    /// pair, and a connection of its own.** Every word of that is
+    /// load-bearing: `-N` is what says there is no command (and why no
+    /// `--` closes the argv), `ExitOnForwardFailure=yes` is the
+    /// difference between a port that could not be bound failing and a
+    /// connection sitting there forwarding nothing, `127.0.0.1` as the
+    /// remote host is the address the pod's sshd connects to — a name
+    /// it could resolve to `::1` is not the same question — and the
+    /// refusal to multiplex is what makes the spawned process the
+    /// tunnel: handed to a master, an `ssh -N` returns at once and the
+    /// pid names nothing [measured: 2026-09-20, a real pod].
+    #[test]
+    fn a_forward_asks_for_no_remote_command_and_one_l_per_pair() {
+        let dir = scratch("forward");
+        let control = dir.join("control");
+        let t = SshTransport::new("203.0.113.9", 21001, "root", "/k", "/root")
+            .with_control_dir(&control);
+
+        let args = t.forward_args(
+            "127.0.0.1",
+            &[
+                Forward {
+                    local: 18000,
+                    remote: 8000,
+                },
+                Forward {
+                    local: 18188,
+                    remote: 8188,
+                },
+            ],
+        );
+
+        assert!(args.contains(&"-N".to_string()), "{args:?}");
+        assert!(
+            args.contains(&"ExitOnForwardFailure=yes".to_string()),
+            "{args:?}"
+        );
+        let forwards: Vec<&String> = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter(|(flag, _)| *flag == "-L")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            forwards,
+            [
+                "127.0.0.1:18000:127.0.0.1:8000",
+                "127.0.0.1:18188:127.0.0.1:8188"
+            ],
+            "in the order the operator gave them: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--".to_string()),
+            "the separator introduces a remote command, and -N says there is none: {args:?}"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("root@203.0.113.9"),
+            "the target is the last word: {args:?}"
+        );
+        assert!(
+            args.contains(&"ControlMaster=no".to_string())
+                && args.contains(&"ControlPath=none".to_string()),
+            "a forward refuses sharing in writing, so an operator's own ssh_config cannot \
+             turn it back on: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|it| it.contains("ControlPersist")
+                || it.starts_with("ControlPath=") && it != "ControlPath=none"),
+            "and no socket of this transport's is offered to it: {args:?}"
+        );
+        assert!(
+            args.contains(&"ServerAliveInterval=15".to_string())
+                && args.contains(&"ServerAliveCountMax=6".to_string())
+                && args.contains(&"BatchMode=yes".to_string()),
+            "everything that is about the connection rather than about sharing it is \
+             still the one source: {args:?}"
+        );
+        assert_eq!(
+            args[..4],
+            [
+                "-p".to_string(),
+                "21001".to_string(),
+                "-i".to_string(),
+                "/k".to_string()
+            ],
+            "{args:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `--address` an operator gives is the local end, and only
+    /// the local end: the pod's side stays its own loopback.
+    #[test]
+    fn a_forward_binds_the_address_it_was_given_and_reaches_the_pods_loopback() {
+        let t = SshTransport::new("h", 22, "root", "/k", "/root");
+        let args = t.forward_args(
+            "0.0.0.0",
+            &[Forward {
+                local: 18000,
+                remote: 8000,
+            }],
+        );
+        assert!(
+            args.contains(&"0.0.0.0:18000:127.0.0.1:8000".to_string()),
+            "{args:?}"
+        );
     }
 
     #[test]
