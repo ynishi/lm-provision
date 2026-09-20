@@ -43,7 +43,12 @@ Input  (everything the caller must know)
                     same projection `machine acquire` reports for a
                     machine it just created; a machine still booting
                     projects to no endpoint and is refused rather than
-                    dialed. `key_path` may arrive as the
+                    dialed — and the refusal names which of the
+                    platform's fields the projection read and what
+                    shape each had (presence and keys, never a value),
+                    since from the endpoint alone a pod still booting
+                    and a description that came back without the field
+                    cannot be told apart. `key_path` may arrive as the
                     `LM_PROVISION_SSH_KEY` environment variable instead
                     of a flag — an operator-host input, resolved out of
                     the same files as the platform credentials

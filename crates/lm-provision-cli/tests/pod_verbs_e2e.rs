@@ -360,6 +360,10 @@ fn a_machine_that_reports_no_address_is_refused_before_anything_is_dialed() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("no ssh endpoint"), "{stderr}");
     assert!(
+        stderr.contains("read from the platform: publicIp: empty; portMappings: []"),
+        "{stderr}"
+    );
+    assert!(
         !dir.join("ssh-argv").exists(),
         "nothing was dialed: {}",
         recorded(&dir, "ssh-argv")
