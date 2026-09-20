@@ -132,6 +132,17 @@ lm-provision logs --provider runpod --pod-id <id> vllm-qwen --follow
 lm-provision exec --provider runpod --pod-id <id> -- nvidia-smi
 lm-provision cp   --provider runpod --pod-id <id> :/tmp/vllm-qwen.log ./
 
+# A port of the pod's on a port of yours — the reach a platform's own
+# endpoints do not have (a service on the pod's loopback, a port the
+# profile never declared, a proxy that ends a long request). This one
+# verb dials its own ssh rather than the shared connection, so the
+# process you stop is the process carrying the tunnel. Foreground
+# until Ctrl-C, or --detach for a pid to kill later:
+lm-provision port-forward --provider runpod --pod-id <id> 18000:8000
+lm-provision port-forward --provider runpod --pod-id <id> --detach 18000:8000
+# {"pid":12345,"address":"127.0.0.1","forwards":[{"local":18000,"remote":8000}]}
+# on stdout; kill that pid to stop it.
+
 # Pin another released version, or push a local build of your own
 # (the override for developing the provisioner itself):
 lm-provision apply ... --provisioner-version 0.8.0

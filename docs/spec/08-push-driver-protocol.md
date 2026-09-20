@@ -382,19 +382,24 @@ scrollback and a machine that billed until someone noticed.
 
 An apply leaves a pod running something. Everything an operator does
 with it afterwards — read the service's log, run one command, fetch a
-file — was a hand-typed `ssh -p … -i … root@…`, while the address, the
-key, the shared connection and the path conventions were all already
-inside the driver. Three verbs put them behind the same command:
+file, reach a port of its own — was a hand-typed `ssh -p … -i …
+root@…`, while the address, the key, the shared connection and the
+path conventions were all already inside the driver. Four verbs put
+them behind the same command:
 
 ```
 lm-provision logs <target> <service> [--tail <n>] [-f]
 lm-provision exec <target> -- <cmd> [args...]
 lm-provision cp   <target> <src> <dst>   (one side spelled :<path>)
+lm-provision port-forward <target> <LOCAL:REMOTE>... [--address <addr>] [--detach]
 ```
 
 - **The names are looked up, not chosen.** `kubectl` and `docker`
-  spell exactly these three as `logs` / `exec` / `cp`; `fly` spells
-  the same set as `logs` / `ssh console -C` / `sftp get`. `cp`'s
+  spell exactly the first three as `logs` / `exec` / `cp`; `fly` spells
+  the same set as `logs` / `ssh console -C` / `sftp get`. The fourth is
+  `kubectl port-forward`, down to its `LOCAL:REMOTE` operands and
+  `--address`; `docker` has no forward of its own, and lends only the
+  `-d` of `--detach`. `cp`'s
   leading `:` is `docker cp`'s `CONTAINER:PATH` with the container
   already named by the target flags — so exactly one of the two
   operands carries it, and both or neither is a usage error.
@@ -413,13 +418,75 @@ lm-provision cp   <target> <src> <dst>   (one side spelled :<path>)
   and the artifact of the run is the pod's own output as it is
   produced — which is what makes `logs -f` and `exec … -- sh -s <
   script` work at all. `logs` and `exec` exit with the **remote**
-  command's code, with `ssh`'s own 255 riding through unremapped; `cp`
-  prints nothing on success.
+  command's code, with `ssh`'s own 255 riding through unremapped; a
+  foreground `port-forward` exits with `ssh`'s, since there is no
+  remote command to have one; `cp` prints nothing on success.
+  `port-forward --detach` is the one exception to all of it: it
+  produces a handle to something it leaves running, and a handle is a
+  report — one JSON document on stdout, and §Outputs' split again.
 - **`logs` reads the path, it does not take one.** The operator names
   the service (`service.start`'s `name`) and the launch log's location
   is the one chapter 02 §Built-in path constants fixes — the same
   constant the engine writes through, so the two cannot drift.
-- Stability: **provisional** — the verb set is the established three,
+- **`port-forward` is the reach a platform's endpoints do not have.**
+  A profile declares ports and the platform publishes them (§Session
+  contract, the `Connection` projection), which covers the ports a
+  profile named and nothing else: a service bound to the pod's own
+  `127.0.0.1`, a port declared after the machine was acquired, and a
+  request long enough for a provider's HTTP proxy to end are all
+  reachable only through the pod's sshd. So the pod side of every pair
+  is the literal `127.0.0.1` — a name the pod might resolve to `::1`
+  is a different question than the one being asked — and the local
+  side is the operator's to choose, on `--address 127.0.0.1` by
+  default, since a forward of a service that authenticates nobody is
+  not one to offer to the operator's whole network. `LOCAL:REMOTE` and
+  `--address` are `kubectl port-forward`'s spelling, and one bare port
+  means the same number on both sides, as there. `-R`, `-D`, UDP and
+  reconnection are **not** offered: the first three are a different
+  verb's worth of surface, and reconnection is the resilience layer
+  this driver does not build — the keepalive below is a probe, not a
+  retry.
+- **`--detach` is `docker run -d`, and the handle is a pid.** Without
+  it the forward lives as long as the command, `kubectl`-style, and
+  `Forwarding from <address>:<local> -> <remote>` goes to stderr with
+  the rest of a verb's transcript. With it the `ssh` is left running in
+  its own process group and the run's one stdout artifact names it —
+  `{"pid":…,"address":…,"forwards":[{"local":…,"remote":…}]}` — which
+  is §Outputs' stream split, the one place a verb has something to put
+  there. Stopping the forward is `kill` on that pid; nothing records
+  it, exactly as nothing records any other background process. Either
+  way the answer comes only once **every local port is accepting**, so
+  a pid that was printed is a forward that was up; an `ssh` that ended
+  first is the exit code instead (`ExitOnForwardFailure=yes` makes an
+  unbindable port end it rather than leave it connected and
+  forwarding nothing). The foreground form passes `SIGINT` / `SIGTERM`
+  / `SIGHUP` on to its child, so a `kill` of the CLI cannot leave a
+  tunnel behind for someone to find with `pgrep` later.
+- **A forward dials its own connection; the other verbs share one.**
+  `port-forward` is the one verb that spells `ControlMaster=no` and
+  `ControlPath=none`, in writing rather than by omission, so neither
+  this driver's socket nor an operator's own `ssh_config` can put it on
+  a shared connection. The reason is that a multiplexed forward is not
+  carried by the process that asked for it: handed to a master, `ssh
+  -N -L …` returns as soon as the master has the forward, so the pid
+  `--detach` would print names a process that has already exited, and a
+  Ctrl-C or a `kill` of the foreground form reaches nothing while the
+  tunnel stays up on the master [measured: 2026-09-20, a real pod — a
+  printed pid that `kill` could not find a second later while the local
+  port went on answering]. Everything else about the connection is the
+  same for every verb.
+- **The keepalive is on every connection.**
+  `ServerAliveInterval=15` and `ServerAliveCountMax=6` are in the part
+  of the options nothing opts out of, so both kinds of connection carry
+  them: the shared master (where they have to be asked for by whoever
+  dials first, since they are that connection's options and another
+  caller's invocation may be the one that opened it) and the forward's
+  private one. Ninety seconds of silence ends such a connection instead
+  of leaving a tunnel attached to a peer that is gone [measured:
+  2026-09-05, a tunnel on a shared host at load 47 died mid-run].
+  `apply` / `logs` / `exec` / `cp` carry the two options too, at the
+  cost of a silent probe every 15 seconds.
+- Stability: **provisional** — the verb set is the established four,
   but their flags are additive (a `--since` on `logs`, an explicit
   recursion switch on `cp`), and a carrier other than `ssh` — a
   provider's own exec API, the additive `ConnectionSpec` variant —

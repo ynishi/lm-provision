@@ -7,9 +7,12 @@
 //! reachable pod (the session contract's steps 0-5,
 //! 08-push-driver-protocol.md §Session contract) with per-step gates as
 //! flags; `check` judges a machine that already exists against a
-//! profile; `logs` / `exec` / `cp` are the pod once it is up — a
-//! service's launch log, one command, a file in either direction, all
-//! on the connection `apply` already knows how to open; the `machine`
+//! profile; `logs` / `exec` / `cp` / `port-forward` are the pod once it
+//! is up — a service's launch log, one command, a file in either
+//! direction, all on the connection `apply` already knows how to open,
+//! and a local port carried to one of the pod's on a connection of its
+//! own (a multiplexed forward would outlive the command that asked for
+//! it); the `machine`
 //! group is the fleet — `list` says what a
 //! platform is running, `acquire` obtains a machine meeting a profile's
 //! requirements, `release` gives one back, `sweep` gives back every
@@ -37,6 +40,9 @@
 //! lm-provision logs --provider runpod --pod-id <id> vllm-qwen --follow
 //! lm-provision exec --provider runpod --pod-id <id> -- nvidia-smi
 //! lm-provision cp   --provider runpod --pod-id <id> :/tmp/vllm-qwen.log ./
+//! # a port of the pod's on a port of yours; --detach prints the pid
+//! # that carries it and returns
+//! lm-provision port-forward --provider runpod --pod-id <id> 18000:8000
 //!
 //! lm-provision machine list --provider runpod
 //! lm-provision machine acquire --profile profile.json --dry-run false
@@ -58,7 +64,9 @@
 //! before anything was dialed).
 //! `logs` and `exec` are outside that mapping entirely: they relay a
 //! command and exit with **its** code, whatever it is, the way `ssh`
-//! itself does.
+//! itself does, and a foreground `port-forward` exits with `ssh`'s own.
+//! `port-forward --detach` is back inside it: 0 with the pid of the
+//! `ssh` now carrying the forward on stdout, 1 when it never came up.
 //! `machine sweep` and `machine list` deal with many machines in one
 //! run and so report per machine rather than by exit class: 0 when
 //! every expired machine was released or refused by the gate and every
@@ -79,14 +87,16 @@ use lm_provision_driver::infra;
 use lm_provision_driver::inventory;
 use lm_provision_driver::provisioner;
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
-use lm_provision_driver::ssh::{SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
+use lm_provision_driver::ssh::{
+    Forward, ForwardOutcome, SshTransport, DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER,
+};
 use lm_provision_driver::transport::{Transport as _, TransportError};
 
 #[derive(Parser)]
 #[command(
     name = "lm-provision",
     version,
-    about = "Provision a pod from a profile (apply / check), work the pod it left (logs / exec / cp), run the fleet it needs (machine list / acquire / release / sweep), and serve the same over MCP (mcp)"
+    about = "Provision a pod from a profile (apply / check), work the pod it left (logs / exec / cp / port-forward), run the fleet it needs (machine list / acquire / release / sweep), and serve the same over MCP (mcp)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -114,6 +124,24 @@ enum Command {
     Exec(ExecArgs),
     /// Copy a file or directory to or from the pod.
     Cp(CpArgs),
+    /// Carry a local port to one of the pod's, over an ssh of its own.
+    ///
+    /// The spelling is `kubectl port-forward`'s: one or more
+    /// `LOCAL:REMOTE` pairs, `--address` for which local address to
+    /// bind. `--detach` is `docker run -d`'s: the forward outlives
+    /// this command and the pid that carries it is printed.
+    ///
+    /// Its own connection rather than the shared one the other verbs
+    /// ride: handed to a multiplexing master, an `ssh -N -L` returns
+    /// as soon as the master has the forward, and both the pid and the
+    /// Ctrl-C would then name a process that is not carrying anything
+    /// [measured: 2026-09-20, a real pod].
+    ///
+    /// What a platform's own endpoints cannot reach: a service bound
+    /// to the pod's loopback, a port the profile never declared, a
+    /// provider proxy that ends a long request.
+    #[command(name = "port-forward")]
+    PortForward(PortForwardArgs),
     /// The machines a profile runs on: what is out there, getting one,
     /// giving it back.
     ///
@@ -532,6 +560,52 @@ struct CpArgs {
     dst: String,
 }
 
+/// `port-forward`: a port of the operator's, carried to one of the
+/// pod's, for as long as this command runs or past it.
+///
+/// The pod side of every pair is reached from the pod's **own**
+/// loopback, which is the reach a provider's endpoints do not have: a
+/// service that bound `127.0.0.1` is unreachable from outside the pod
+/// however the platform maps its ports, and a port the profile never
+/// declared has no mapping at all.
+#[derive(Args)]
+struct PortForwardArgs {
+    /// The pod whose ports are carried.
+    #[command(flatten)]
+    target: TargetArgs,
+
+    /// What to carry, as `LOCAL:REMOTE` — or one port, meaning the
+    /// same number on both sides.
+    ///
+    /// Both spellings are `kubectl port-forward`'s, and so is the
+    /// order (the local port first) [documented: kubectl
+    /// port-forward]. More than one pair may be given; each becomes
+    /// its own `-L` on the one connection.
+    #[arg(required = true, num_args = 1..)]
+    ports: Vec<String>,
+
+    /// The local address to bind the listening ports on.
+    ///
+    /// The default keeps them on this host's loopback: a forward is
+    /// the operator's own reach into the pod, and binding `0.0.0.0`
+    /// would offer the pod's service to everything that can reach
+    /// this machine — which for a service with no authentication of
+    /// its own is the thing the forward was a way around.
+    #[arg(long, default_value = "127.0.0.1")]
+    address: String,
+
+    /// Leave the forward running and return, printing the pid that
+    /// carries it.
+    ///
+    /// `docker run -d`'s spelling and its bargain: what comes back on
+    /// stdout is the handle, and stopping the forward is `kill` on
+    /// that pid. Nothing else records it — a shell script that starts
+    /// one keeps the pid the way it keeps any other background
+    /// process's.
+    #[arg(long, short = 'd')]
+    detach: bool,
+}
+
 fn main() -> ExitCode {
     // Before the command runs, so every subcommand sees the same
     // environment — a key that works for `acquire` and not for
@@ -545,6 +619,7 @@ fn main() -> ExitCode {
         Command::Logs(args) => run_logs(args),
         Command::Exec(args) => run_exec(args),
         Command::Cp(args) => run_cp(args),
+        Command::PortForward(args) => run_port_forward(args),
         Command::Machine { command } => match command {
             MachineCommand::List(args) => run_machine_list(args),
             MachineCommand::Acquire(args) => run_acquire(args),
@@ -771,6 +846,136 @@ fn run_cp(args: CpArgs) -> ExitCode {
             eprintln!("error: {err}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// `port-forward`: carry the pairs the operator named, and either sit
+/// there carrying them or leave something behind that does.
+///
+/// The two modes answer on different streams because they produce
+/// different things. Foreground has no artifact — the forward *is* the
+/// run, and `kubectl`'s own `Forwarding from …` line is a diagnostic
+/// about a session in progress, so it goes to stderr like every other
+/// verb's transcript (08 §Operator pod verbs). `--detach` does have
+/// one: the pid is what the operator stops the forward with, and it
+/// goes on stdout as the single JSON document a run may put there
+/// (07 §Stream split).
+fn run_port_forward(args: PortForwardArgs) -> ExitCode {
+    // Before the target is resolved, the ordering `run_cp` uses: a
+    // pair that cannot be read is unusable whichever machine it named,
+    // and asking a platform about a pod first would spend a call on it.
+    let forwards = match parse_forwards(&args.ports) {
+        Ok(forwards) => forwards,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let transport = match pod(&args.target) {
+        Ok(transport) => transport,
+        Err(code) => return code,
+    };
+    let address = args.address.as_str();
+
+    if args.detach {
+        return match transport.forward(address, &forwards, true, |_| {}) {
+            Ok(ForwardOutcome::Detached { pid }) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "pid": pid,
+                        "address": args.address,
+                        "forwards": forwards
+                            .iter()
+                            .map(|it| serde_json::json!({
+                                "local": it.local,
+                                "remote": it.remote,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                );
+                ExitCode::SUCCESS
+            }
+            // The driver reports an `ssh` that ended before the ports
+            // were up as `ForwardFailed`; this arm is the same event
+            // with the same answer.
+            Ok(ForwardOutcome::Exited(code)) => {
+                eprintln!("error: ssh ended before the forward was up");
+                ExitCode::from(forward_failure_code(code))
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::from(match err {
+                    TransportError::ForwardFailed(code) => forward_failure_code(code),
+                    _ => 1,
+                })
+            }
+        };
+    }
+
+    relayed(
+        transport
+            .forward(address, &forwards, false, |ready| {
+                for forward in ready {
+                    eprintln!(
+                        "Forwarding from {address}:{} -> {}",
+                        forward.local, forward.remote
+                    );
+                }
+            })
+            .map(|outcome| match outcome {
+                ForwardOutcome::Exited(code) => code,
+                // Unreachable with `detach` false, and there would be
+                // nothing to relay if it were reached.
+                ForwardOutcome::Detached { .. } => None,
+            }),
+    )
+}
+
+/// Every `LOCAL:REMOTE` the operator typed, or what is wrong with the
+/// first one that is not a pair.
+fn parse_forwards(ports: &[String]) -> Result<Vec<Forward>, String> {
+    ports.iter().map(|it| parse_forward(it)).collect()
+}
+
+/// `LOCAL:REMOTE`, or one port standing for both sides — both
+/// spellings `kubectl port-forward` takes [documented: kubectl
+/// port-forward].
+fn parse_forward(spec: &str) -> Result<Forward, String> {
+    let (local, remote) = match spec.split_once(':') {
+        Some((local, remote)) => (local, remote),
+        None => (spec, spec),
+    };
+    Ok(Forward {
+        local: forward_port(local, spec)?,
+        remote: forward_port(remote, spec)?,
+    })
+}
+
+/// One side of a pair. Port 0 is refused along with everything
+/// unparseable: to `bind` it means "any free port", and a local end
+/// the operator cannot predict is not a forward they can then connect
+/// to — the reason for naming the local port at all.
+///
+/// The message shows a correct spelling rather than naming the rule it
+/// broke: what the operator needs is the line that would have worked.
+fn forward_port(value: &str, spec: &str) -> Result<u16, String> {
+    match value.parse::<u16>() {
+        Ok(0) | Err(_) => Err(format!(
+            "{spec:?} is not a port forward: spell it LOCAL:REMOTE, or one port for both sides \
+             (`port-forward … 18000:8000`, `port-forward … 8188`), each between 1 and 65535"
+        )),
+        Ok(port) => Ok(port),
+    }
+}
+
+/// What a `--detach` whose forward never came up exits with: `ssh`'s
+/// own code when it had one, 1 otherwise — and never 0, since no
+/// forward was left running for whatever reads this to use.
+fn forward_failure_code(code: Option<i32>) -> u8 {
+    match code.and_then(|it| u8::try_from(it).ok()) {
+        Some(0) | None => 1,
+        Some(code) => code,
     }
 }
 
@@ -2311,11 +2516,81 @@ fn correction_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        attributed, credentials, exit_status, parse_ssh_target, record, resolve_target, ssh_help,
-        AcquisitionRow, Cli, Command, MachineCommand, Path, PathBuf, TargetArgs,
+        attributed, credentials, exit_status, forward_failure_code, parse_forwards,
+        parse_ssh_target, record, resolve_target, ssh_help, AcquisitionRow, Cli, Command, Forward,
+        MachineCommand, Path, PathBuf, TargetArgs,
     };
     use clap::Parser as _;
     use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
+
+    /// **The local port comes first, and one port means both** — the
+    /// two spellings `kubectl port-forward` takes, in its order. An
+    /// operator who has the order backwards would otherwise get a
+    /// forward that binds the pod's port number locally and works
+    /// often enough to be confusing.
+    #[test]
+    fn a_pair_is_local_then_remote_and_a_lone_port_means_both_sides() {
+        let given = |it: &[&str]| {
+            parse_forwards(&it.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+                .expect("these are pairs")
+        };
+        assert_eq!(
+            given(&["18000:8000"]),
+            [Forward {
+                local: 18000,
+                remote: 8000
+            }]
+        );
+        assert_eq!(
+            given(&["8188"]),
+            [Forward {
+                local: 8188,
+                remote: 8188
+            }]
+        );
+        assert_eq!(
+            given(&["18000:8000", "18188:8188"]),
+            [
+                Forward {
+                    local: 18000,
+                    remote: 8000
+                },
+                Forward {
+                    local: 18188,
+                    remote: 8188
+                }
+            ],
+            "several pairs keep the order they were typed in"
+        );
+    }
+
+    /// **A pair that cannot be read is refused with a line that would
+    /// have worked.** Port 0 is among them: `bind(0)` means "any free
+    /// port", and a local end the operator cannot predict is not one
+    /// they can then connect to.
+    #[test]
+    fn a_pair_that_is_not_one_is_refused_and_the_refusal_shows_a_spelling() {
+        for spec in ["0:8000", "8000:0", "abc", "18000:", ":8000", "70000:8000"] {
+            let refused = parse_forwards(&[spec.to_string()])
+                .expect_err(&format!("{spec:?} is not a port forward"));
+            assert!(refused.contains(spec), "it names what was given: {refused}");
+            assert!(
+                refused.contains("18000:8000"),
+                "and shows one that works: {refused}"
+            );
+        }
+    }
+
+    /// **A forward that never came up does not exit 0.** The exit code
+    /// is what a script reads to decide whether the port is there, and
+    /// `ssh`'s own is passed through where it had one.
+    #[test]
+    fn a_detached_forward_that_never_came_up_reports_ssh_s_code_but_never_success() {
+        assert_eq!(forward_failure_code(Some(255)), 255);
+        assert_eq!(forward_failure_code(Some(1)), 1);
+        assert_eq!(forward_failure_code(Some(0)), 1, "nothing was forwarded");
+        assert_eq!(forward_failure_code(None), 1, "a signal ended it");
+    }
 
     /// **What the service says goes to stderr, in `program: message`
     /// form, and only when it says something.**

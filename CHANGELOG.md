@@ -9,7 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lm-provision port-forward <target> <LOCAL:REMOTE>… [--address
+  <addr>] [--detach]`** — the fourth operator pod verb, and the reach a
+  platform's own endpoints do not have: a service bound to the pod's
+  `127.0.0.1`, a port declared after the machine was acquired, a
+  request long enough for a provider's HTTP proxy to end. Each pair
+  becomes a `-L` to the pod's own loopback; a bare port means the same
+  number on both sides, and
+  `--address` (default `127.0.0.1`) says where the local ends are
+  bound. The spelling is `kubectl port-forward`'s. Without `--detach`
+  it runs until stopped, printing `Forwarding from …` on stderr and
+  passing `SIGINT` / `SIGTERM` / `SIGHUP` on to its `ssh` so a `kill`
+  of the CLI cannot leave a tunnel orphaned. With `--detach` the `ssh`
+  is left running in its own process group and the run's one stdout
+  artifact is the handle —
+  `{"pid":…,"address":…,"forwards":[{"local":…,"remote":…}]}` — with
+  `kill <pid>` the way to stop it. Either form answers only once every
+  local port is accepting, so a pid that was printed is a forward that
+  was up; an `ssh` that ended first (an unbindable port, under
+  `ExitOnForwardFailure=yes`) is that exit code instead. Unlike the
+  other three verbs it dials its **own** connection
+  (`ControlMaster=no`, `ControlPath=none`): a forward handed to a
+  shared master is not carried by the process that asked for it, which
+  made both the printed pid and the foreground Ctrl-C name a process
+  that had already exited while the tunnel stayed up [measured:
+  2026-09-20, a real pod].
+
 ### Changed
+
+- **Every `ssh` and `scp` the CLI spawns now carries
+  `ServerAliveInterval=15` and `ServerAliveCountMax=6`** — `apply`'s
+  session steps included, not only the new forward. They are the
+  master connection's options and `ControlMaster=auto` means whichever
+  invocation dials first becomes the master, so a keepalive only one
+  verb asked for would be missing from the connection the others ride.
+  Ninety seconds of silence now ends such a connection instead of
+  leaving it attached to a peer that is gone [measured: 2026-09-05, a
+  tunnel on a shared host at load 47 died mid-run]. `TCPKeepAlive` is
+  not spelled beside them: `yes` is already its default.
 
 ### Deprecated
 

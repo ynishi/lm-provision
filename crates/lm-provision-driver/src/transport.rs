@@ -56,6 +56,23 @@ pub enum TransportError {
     /// Captured process output was not valid UTF-8.
     #[error("process output was not valid utf-8: {0}")]
     NonUtf8Output(#[from] std::string::FromUtf8Error),
+
+    /// `ssh` ended before the port forward it was asked for was
+    /// listening ([`crate::ssh::SshTransport::forward`] with
+    /// `detach`), carrying the code it ended with (`None` when a
+    /// signal did).
+    ///
+    /// The code is kept rather than rendered into the message because
+    /// the caller exits with it: a forward that could not bind its
+    /// local port is `ssh` exiting 255 under
+    /// `ExitOnForwardFailure=yes` [documented: OpenSSH
+    /// `ssh_config(5)`], and an operator's script reads the same
+    /// number `ssh` itself would have handed them.
+    #[error("ssh ended before the forward was up ({})", match .0 {
+        Some(code) => format!("exit code {code}"),
+        None => "ended by a signal".to_string(),
+    })]
+    ForwardFailed(Option<i32>),
 }
 
 /// The transport-agnostic seam of the session contract (08 §Session
