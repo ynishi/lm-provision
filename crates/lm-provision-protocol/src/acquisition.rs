@@ -48,7 +48,7 @@ pub struct AcquisitionRow {
     /// [`outstanding`], and the same id the ledger's `pod_id` carries
     /// for a session driven against it.
     pub id: String,
-    /// Which platform it was bought from (`runpod`, `vast`), as the
+    /// Which platform it was bought from (`runpod`, `vast`, `deepinfra`), as the
     /// operator named it. What a sweep looks the adapter up by, since
     /// the credential to release it is the platform's.
     pub provider: String,

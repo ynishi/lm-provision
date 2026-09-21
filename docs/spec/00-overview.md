@@ -345,8 +345,9 @@ absorbs it, so the graph stays acyclic.
   (create / start / stop) stays with the external pod manager; only
   provisioning is owned by lm-provision.~~ **Superseded
   (2026-08-12):** machine create / delete is owned by the driver
-  through the provider's own CLI; start / stop stays with the
-  external pod manager (08 §Stability). The pod-provider API client
+  through a program already on the operator host — the provider's
+  own CLI, or `curl` where it has none (08 §Stability); start / stop
+  stays with the external pod manager. The pod-provider API client
   is not pulled into the core.
   Absorbed by 08; referenced by 10.
 - **Static provisioner.** The binary is musl-static and carries no

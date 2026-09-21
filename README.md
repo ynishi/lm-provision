@@ -157,6 +157,20 @@ lm-provision machine acquire --profile profile.json --dry-run false
 lm-provision machine release --id <id> --profile profile.json
 lm-provision machine sweep --provider runpod --dry-run false
 
+# A third platform: DeepInfra GPU Instances — a container with an
+# address, reached over ssh as `ubuntu`. The token goes in the .env as
+# DEEPINFRA_TOKEN (curl >= 8.3.0 reads it by name; the value is never
+# on an argv). The profile names the image and your public key under
+# the platform's own keys and declares no ports: the service maps
+# none, so anything past sshd is reached with port-forward.
+#   "provider": {
+#     "deepinfra.container_image": "di-cont-ubuntu-torch:latest",
+#     "deepinfra.ssh_authorized_key": "ssh-ed25519 AAAA... you@host"
+#   }
+lm-provision machine acquire --provider deepinfra --profile profile.json --dry-run false
+lm-provision apply --provider deepinfra --pod-id <id> --remote-dir /home/ubuntu \
+  --profile profile.json
+
 # The MCP server, on stdio (see below for what it reads):
 lm-provision mcp
 ```

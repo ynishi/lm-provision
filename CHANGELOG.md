@@ -34,8 +34,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   made both the printed pid and the foreground Ctrl-C name a process
   that had already exited while the tunnel stayed up [measured:
   2026-09-20, a real pod].
+- **A third platform: DeepInfra GPU Instances (`--provider
+  deepinfra`).** A container with an address and nothing in front of
+  it — no port mapping, no proxy, no sizeable disk — reached over ssh
+  as the image's `ubuntu` user once the service calls it `running`.
+  The adapter declares **no exposure**, so a profile with
+  `requires_ports` is refused at admission rather than handed a port
+  nobody mapped; anything past sshd is `port-forward`'s job. The
+  service has no CLI for its machines, so the adapter drives `curl`
+  against its REST surface (`/v1/containers`), with the token
+  imported **by name** inside curl (`--variable %DEEPINFRA_TOKEN`,
+  `--expand-header`, curl ≥ 8.3.0) — the value is in no argv, no
+  dry-run, no process listing. The create call takes a cloud-init
+  document, so the profile names the public key
+  (`provider."deepinfra.ssh_authorized_key"`) beside the image
+  (`provider."deepinfra.container_image"`), and the adapter writes
+  the document the service's own example shows; a profile writing
+  `deepinfra.cloud_init_user_data` itself is sent unchanged. GPU
+  selection is the one catalogued model (`B200-180GB`) in the
+  service's `{count}x{model}` spelling, overridable with
+  `deepinfra.gpu_config`; a persistent disk level is refused (the
+  service keeps nothing past the container's life), and an ephemeral
+  size cannot be asked for. The lease rides in `name`, which the
+  create call requires — so an unstamped container cannot be created
+  here at all. An apply against it wants `--remote-dir /home/ubuntu`,
+  and phases needing root on the machine fail there as on any
+  non-root session.
 
 ### Changed
+
+- **`machine acquire` keeps waiting while the platform itself still
+  calls the machine materializing**, not only while a declared port
+  is unanswered. A container service that maps no port left the port
+  wait nothing to wait on, so the verdict and the (absent) address
+  were reported seconds after create, while the service still said
+  `creating`. Unchanged on the pod service, which never makes that
+  claim; on the marketplace, `loading` already implied unmapped ports.
 
 - **Every `ssh` and `scp` the CLI spawns now carries
   `ServerAliveInterval=15` and `ServerAliveCountMax=6`** — `apply`'s

@@ -7,7 +7,7 @@
 //! one file would cost more than the convention is worth — `Transport`
 //! set that precedent, naming itself for what it does.
 //!
-//! # Two adapters from the start, deliberately
+//! # Two adapters from the start, deliberately (and a fourth since)
 //!
 //! [`RunPodAdapter`] is the target this repo actually provisions.
 //! [`ContainerAdapter`] is here to keep the vocabulary honest: a
@@ -19,7 +19,10 @@
 //!
 //! The second adapter earns its place immediately: it is the one that
 //! *cannot* provide [`Exposure::PublicHttp`], so it is what proves the
-//! refusal path is real rather than theoretical.
+//! refusal path is real rather than theoretical. [`VastAdapter`] and
+//! [`DeepInfraAdapter`] came after, each with a shape the first two do
+//! not have — offers selected before create, and a machine with an
+//! address and no mapping at all.
 //!
 //! # What an adapter does not do
 //!
@@ -353,8 +356,8 @@ pub struct Machine {
 /// The adapter sold under `name`, or which names would have worked.
 ///
 /// A static reference rather than a box because the adapters are unit
-/// structs: there is nothing to construct, only one of two vocabularies
-/// to speak.
+/// structs: there is nothing to construct, only one of three
+/// vocabularies to speak.
 ///
 /// Here rather than beside the caller because there are now three
 /// callers — the operator CLI, the MCP server's listing tool, and
@@ -364,7 +367,10 @@ pub fn adapter_named(name: &str) -> Result<&'static dyn Infra, String> {
     match name {
         "runpod" => Ok(&RunPodAdapter),
         "vast" => Ok(&VastAdapter),
-        other => Err(format!("unknown provider `{other}` (runpod, vast)")),
+        "deepinfra" => Ok(&DeepInfraAdapter),
+        other => Err(format!(
+            "unknown provider `{other}` (runpod, vast, deepinfra)"
+        )),
     }
 }
 
@@ -586,6 +592,29 @@ pub enum AcquisitionError {
         /// The adapter's own words.
         reason: String,
     },
+}
+
+/// The answer's `using`, or the refusal an adapter that builds the
+/// request has to make of anything short of `Met`.
+///
+/// `NotExamined` is refused here as well as `Unmet`, deliberately: on a
+/// target that selects the machine, a requirement the adapter could not
+/// decide is one it cannot ask for, and a request sent without it would
+/// produce a machine that is not what was declared — the failure
+/// [`AcquisitionError::Unmet`] records. The container runtime, which
+/// builds no request, is where `NotExamined` stays an honest answer.
+fn admitted(target: &'static str, answer: Answer) -> Result<Vec<String>, AcquisitionError> {
+    match answer {
+        Answer::Met { using } => Ok(using),
+        Answer::Unmet { reason } => Err(AcquisitionError::Unmet { target, reason }),
+        Answer::NotExamined { reason } => Err(AcquisitionError::Unmet {
+            target,
+            reason: format!(
+                "{reason} — this target selects the machine, so a requirement it \
+                 cannot decide is one it cannot ask for"
+            ),
+        }),
+    }
 }
 
 /// A GPU model, how much memory it carries, and what renting one costs.
@@ -1071,20 +1100,7 @@ fn runpod_body(
             missing: "provider.runpod.imageName",
         })?;
 
-    let refuse = |answer: Answer| match answer {
-        Answer::Met { using } => Ok(using),
-        Answer::Unmet { reason } => Err(AcquisitionError::Unmet {
-            target: "runpod",
-            reason,
-        }),
-        Answer::NotExamined { reason } => Err(AcquisitionError::Unmet {
-            target: "runpod",
-            reason: format!(
-                "{reason} — this target selects the machine, so a requirement it \
-                 cannot decide is one it cannot ask for"
-            ),
-        }),
-    };
+    let refuse = |answer: Answer| admitted("runpod", answer);
 
     let mut body = serde_json::Map::new();
     body.insert("imageName".into(), serde_json::json!(image));
@@ -1621,20 +1637,7 @@ fn vast_acquisition(
             missing: "provider.vast.image",
         })?;
 
-    let refuse = |answer: Answer| match answer {
-        Answer::Met { using } => Ok(using),
-        Answer::Unmet { reason } => Err(AcquisitionError::Unmet {
-            target: "vast",
-            reason,
-        }),
-        Answer::NotExamined { reason } => Err(AcquisitionError::Unmet {
-            target: "vast",
-            reason: format!(
-                "{reason} — this target selects the machine, so a requirement it \
-                 cannot decide is one it cannot ask for"
-            ),
-        }),
-    };
+    let refuse = |answer: Answer| admitted("vast", answer);
 
     // `rentable=true`: listed and not currently taken. `verified=true`:
     // the fenced tier — see the adapter doc.
@@ -1730,6 +1733,468 @@ fn vast_release() -> Vec<String> {
         "--yes".to_string(),
         "--raw".to_string(),
     ]
+}
+
+/// The containers collection on the container-rental service's REST
+/// surface [documented: docs.deepinfra.com/api-reference/gpu-rentals,
+/// read 2026-09-21].
+const DEEPINFRA_CONTAINERS: &str = "https://api.deepinfra.com/v1/containers";
+
+/// The variable the service's own examples read the bearer token from.
+const DEEPINFRA_TOKEN: &str = "DEEPINFRA_TOKEN";
+
+/// The user the service's image creates and its documentation connects
+/// as (`ssh ubuntu@<container-ip>`) — not root, which is why the
+/// projection below names it rather than [`crate::ssh::DEFAULT_SSH_USER`].
+const DEEPINFRA_SSH_USER: &str = "ubuntu";
+
+/// The service's catalogue, in the spelling its `gpu_config` field
+/// takes after the count (`8xB200-180GB`).
+///
+/// One row, because one model is documented [documented:
+/// docs.deepinfra.com/gpu-instances/overview, read 2026-09-21] and the
+/// rate is the published per-card hour (1× at $3.69, 8× at $29.52 —
+/// linear in the count) [read 2026-09-21 from deepinfra.com/gpu-instances].
+/// A configuration outside it is named directly with
+/// `provider.deepinfra.gpu_config`, as a model outside the pod
+/// service's catalogue is named with `gpuTypeIds`.
+const DEEPINFRA_CATALOGUE: &[Gpu] = &[Gpu {
+    id: "B200-180GB",
+    vram_gb: 180,
+    usd_cents_hr: 369,
+}];
+
+/// A GPU container service that gives the machine an address and puts
+/// nothing in front of it: no port mapping, no proxy, no sizeable disk
+/// — a container with an IP, reached over SSH as the user its image
+/// creates [documented: docs.deepinfra.com/gpu-instances/overview and
+/// api-reference/gpu-rentals/*, read 2026-09-21].
+///
+/// **It exposes nothing, and says so.** The description a container
+/// comes back with carries an `ip` and no port at all — the create call
+/// takes no port list and the read-back publishes none — so a profile
+/// that declares `requires_ports` is refused at admission rather than
+/// handed a port nobody mapped. The one address the service states is
+/// the container's own and the one port it documents on it is sshd's;
+/// everything else on the machine is reached the way a platform's
+/// endpoints never cover, through `port-forward`.
+///
+/// **No CLI to drive.** The service's own CLI (`deepctl`) manages model
+/// deployments and has no container verb [documented:
+/// github.com/deepinfra/deepctl README — `auth` / `model` / `deploy` /
+/// `infer` / `log` / `version`, read 2026-09-21], so this adapter speaks
+/// the REST surface through `curl`: the same judgment [`crate::image`]
+/// makes, for the same reason — a program already on the host over a
+/// second HTTP client tracking somebody else's schema. The credential
+/// travels **by name**: `--variable %DEEPINFRA_TOKEN` imports the
+/// variable inside curl and `--expand-header` writes it into the header
+/// there, so the value is in no argv, no dry-run artifact, and no
+/// process listing [measured: 2026-09-21, a local listener saw
+/// `Authorization: Bearer <value>` from an argv that named only the
+/// variable; curl ≥ 8.3.0, where `--variable` landed].
+///
+/// **The key rides in the request.** The other two platforms register
+/// SSH keys at the account and inject them into every machine; this one
+/// takes a cloud-init document on create, and the documented way to
+/// reach the container is a public key written into that document under
+/// the image's `ubuntu` user. So the profile names the key
+/// (`provider."deepinfra.ssh_authorized_key"`, the public line verbatim)
+/// and the adapter writes the document the service's own example shows.
+/// A profile that writes `provider."deepinfra.cloud_init_user_data"`
+/// itself gets its own document sent unchanged instead.
+///
+/// **Not root.** The session this projects to runs as `ubuntu`, so an
+/// apply against it wants `--remote-dir /home/ubuntu`, and a phase that
+/// needs root on the machine (system packages) fails there as it would
+/// on any non-root session — the image grants passwordless `sudo`, but
+/// the provisioner does not call it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeepInfraAdapter;
+
+impl Infra for DeepInfraAdapter {
+    /// No exposure at all: the service maps no port and proxies
+    /// nothing, and a machine's own address is not an exposure this
+    /// vocabulary can name (the other adapters' `raw_tcp` is a mapping
+    /// the platform performs and reports). Saying none is what makes
+    /// the refusal of a `requires_ports` profile real.
+    fn capability(&self) -> Capability {
+        Capability {
+            target: "deepinfra",
+            exposures: &[],
+        }
+    }
+
+    /// Nothing to render: the create call takes no port list, and
+    /// admission has already refused any profile that declared one.
+    fn render(&self, _required: &Requirements) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn provider_namespace(&self) -> &'static str {
+        "deepinfra"
+    }
+
+    /// The token, by the name the service's own examples use. Required
+    /// out here because there is no CLI holding its own key: `curl`
+    /// reads it from the environment at the adapter's instruction, and
+    /// a missing one is found before anything is spent rather than as
+    /// a 401 in the middle of a create.
+    fn credentials(&self) -> &'static [&'static str] {
+        &[DEEPINFRA_TOKEN]
+    }
+
+    /// The cheapest catalogued model that clears the floor, in the
+    /// service's own `{count}x{model}` spelling. **One configuration,
+    /// not a list**: the create call takes a single `gpu_config`, so
+    /// unlike the pod service there is no fallback to send alongside.
+    fn gpu_answer(&self, required: &GpuRequirement) -> Answer {
+        if required.count == 0 {
+            return Answer::unmet(
+                "this service rents GPU containers; a profile asking for none has \
+                 nothing to rent here",
+            );
+        }
+        let floor = required.min_vram_gb.unwrap_or(0);
+        let cheapest = DEEPINFRA_CATALOGUE
+            .iter()
+            .filter(|it| it.vram_gb >= floor)
+            .min_by_key(|it| (it.usd_cents_hr, it.id));
+        match cheapest {
+            Some(gpu) => Answer::met_using([format!("{}x{}", required.count, gpu.id)]),
+            None => Answer::unmet(format!(
+                "no catalogued GPU carries {floor} GB; the largest known here is {} GB \
+                 (name a configuration directly with provider.deepinfra.gpu_config if \
+                 the catalogue is behind)",
+                DEEPINFRA_CATALOGUE
+                    .iter()
+                    .map(|it| it.vram_gb)
+                    .max()
+                    .unwrap_or(0),
+            )),
+        }
+    }
+
+    /// One disk that lives and dies with the container, and no way to
+    /// size it.
+    ///
+    /// A persistent level is refused, as on the marketplace and for the
+    /// same reason — the service states that all container data is
+    /// lost when it is terminated, and calling that "persisted" would
+    /// promise exactly what the two-level vocabulary keeps apart. An
+    /// ephemeral size is not examined: the create call takes none, so
+    /// how much there is comes with the GPU configuration rather than
+    /// from a request.
+    fn disk_answer(&self, required: &DiskRequirement) -> Answer {
+        if required.persistent_gb.is_some() || required.persistent_at.is_some() {
+            return Answer::unmet(
+                "a container here keeps nothing past its own life (the service states \
+                 that all container data is lost when it is terminated), so there is \
+                 no persisted volume to size or mount",
+            );
+        }
+        match required.ephemeral_gb {
+            Some(gb) => Answer::not_examined(format!(
+                "this service takes no disk size; how much a container gets comes with \
+                 its GPU configuration, so {gb} GB is a property of the configuration \
+                 rather than something to ask for"
+            )),
+            None => Answer::met(),
+        }
+    }
+
+    /// One `POST` with the four fields the create call takes, through
+    /// `curl` — the body is the argument after `--json`, which is why
+    /// `--json` is the last word of the argv: [`acquire`] appends the
+    /// body as the final argument.
+    fn acquisition(
+        &self,
+        required: &Requirements,
+        provider: &BTreeMap<String, String>,
+        expires_at: Option<jiff::Timestamp>,
+    ) -> Result<Acquisition, AcquisitionError> {
+        // Every answer taken here and handed to the builder, for the
+        // reason `runpod_body` gives: a builder that reads a
+        // requirement without its answer can emit a request that
+        // quietly dropped one.
+        let body = deepinfra_body(
+            provider,
+            required.gpu.as_ref().map(|it| self.gpu_answer(it)),
+            required.disk.as_ref().map(|it| self.disk_answer(it)),
+            expires_at,
+        )?;
+        let mut create = deepinfra_curl(DEEPINFRA_CONTAINERS);
+        create.push("--json".to_string());
+        Ok(Acquisition {
+            // The create call describes the machine itself.
+            discover: None,
+            create,
+            body: Some(body),
+            // The create answers with `container_id`; every read-back
+            // and every listed row says `id`. Both are the container.
+            created_id_key: "container_id",
+            inspect: deepinfra_inspect(),
+            release: deepinfra_release(),
+        })
+    }
+
+    /// The service lists this account's active containers as a bare
+    /// array, each row carrying the `name` the create call set — where
+    /// `deepinfra_body` writes the lease. `name` is required by the
+    /// create call and settable afterwards (`PATCH`), and its length
+    /// limit (64) clears the stamp with room.
+    fn fleet(&self) -> Option<Fleet> {
+        Some(Fleet {
+            list: deepinfra_curl(DEEPINFRA_CONTAINERS),
+            id: "id",
+            stamp: "name",
+            release: deepinfra_release(),
+            inspect: deepinfra_inspect(),
+        })
+    }
+
+    /// None, deliberately, though the create call takes an image. The
+    /// service's own images (`di-cont-ubuntu-torch:latest`) are names
+    /// on no registry the preflight could ask — a bare name resolves to
+    /// Docker Hub's `library/`, which would answer 404 and refuse a
+    /// create the service accepts. A brought image could be asked
+    /// about, but nothing in the name says which kind it is, and a
+    /// preflight that refuses the documented default costs more than
+    /// the pull it prevents. The service reports a bad image as
+    /// `failed` with a `fail_reason` rather than retrying on billing,
+    /// so the marketplace's failure this check exists for does not
+    /// arise here.
+    fn image_key(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// `creating` and `starting` are the service's own words for it
+    /// [documented: docs.deepinfra.com/gpu-instances/overview, the
+    /// state list]; `running`, `failed`, and everything else make no
+    /// such claim.
+    fn still_materializing(&self, inspected: &serde_json::Value) -> bool {
+        matches!(
+            inspected.get("state").and_then(|it| it.as_str()),
+            Some("creating") | Some("starting")
+        )
+    }
+
+    /// The description names the configuration (`gpu_config`, in the
+    /// `{count}x{model}` form the create took) and nothing about disk
+    /// or ports. The count is read off it; the memory is looked up in
+    /// the catalogue as the pod service's is, and lands through
+    /// [`gb_to_mib`] as the bound that function documents. A
+    /// configuration outside the catalogue leaves the memory unobserved.
+    ///
+    /// Ports are never observed: the service publishes none, and a
+    /// profile could not have declared any past admission.
+    fn read_state(&self, inspected: &serde_json::Value) -> MachineState {
+        let parsed = inspected
+            .get("gpu_config")
+            .and_then(|it| it.as_str())
+            .and_then(deepinfra_gpu_config);
+        MachineState {
+            exposed: BTreeMap::new(),
+            ports_observed: false,
+            gpu_count: parsed.map(|(count, _)| count),
+            gpu_vram_mib: parsed.and_then(|(_, model)| {
+                DEEPINFRA_CATALOGUE
+                    .iter()
+                    .find(|it| it.id == model)
+                    .map(|it| gb_to_mib(it.vram_gb))
+            }),
+            ephemeral_gb: None,
+            persistent_gb: None,
+            persistent_at: None,
+        }
+    }
+
+    /// `ip`, port 22, the image's user — **and only once the service
+    /// calls the container `running`**. The address is assigned before
+    /// sshd is up, and an endpoint reported while the state is still
+    /// `starting` would be one nothing can dial yet; absent means not
+    /// reachable *yet*, same rule as everywhere else. No endpoints:
+    /// nothing is mapped, so there is nothing per port to project.
+    ///
+    /// The `state` value itself is in what was read, beside the usual
+    /// presence-and-shape entries: for an operator refused because
+    /// there is no endpoint, `starting` and `failed` are different news,
+    /// and the word is the service's enum rather than anything that
+    /// identifies a machine.
+    fn connection(&self, inspected: &serde_json::Value) -> Connection {
+        let state = inspected.get("state").and_then(|it| it.as_str());
+        let ip = inspected
+            .get("ip")
+            .and_then(|it| it.as_str())
+            .filter(|it| !it.is_empty());
+        let ssh = match (state, ip) {
+            (Some("running"), Some(host)) => Some(SshEndpoint {
+                host: host.to_string(),
+                port: 22,
+                user: DEEPINFRA_SSH_USER.to_string(),
+            }),
+            _ => None,
+        };
+        Connection {
+            ssh,
+            endpoints: BTreeMap::new(),
+            read: vec![
+                read_text(inspected, "ip"),
+                format!("state: {}", state.unwrap_or("absent")),
+                read_text(inspected, "fail_reason"),
+            ],
+        }
+    }
+}
+
+/// `curl` against `url`, authenticated by the token's **name**.
+///
+/// `-sS`: no progress meter on stderr, errors still spoken there. `-f`:
+/// an HTTP error is a non-zero exit with the status on stderr, rather
+/// than an error document on stdout that the next step would try to
+/// read as a machine. `--variable %NAME` imports the environment
+/// variable inside curl and `--expand-header` substitutes it there — the
+/// value never appears in this argv, which is what the dry-run prints
+/// and what a process listing shows.
+fn deepinfra_curl(url: &str) -> Vec<String> {
+    vec![
+        "curl".to_string(),
+        "-sS".to_string(),
+        "-f".to_string(),
+        "--variable".to_string(),
+        format!("%{DEEPINFRA_TOKEN}"),
+        "--expand-header".to_string(),
+        format!("Authorization: Bearer {{{{{DEEPINFRA_TOKEN}}}}}"),
+        url.to_string(),
+    ]
+}
+
+/// What reads one container back, `{id}` unsubstituted — one spelling
+/// for the record and for the listing, as `runpod_inspect` is.
+fn deepinfra_inspect() -> Vec<String> {
+    deepinfra_curl(&format!("{DEEPINFRA_CONTAINERS}/{{id}}"))
+}
+
+/// What destroys one container, `{id}` unsubstituted — one spelling for
+/// the record and for the listing, as `runpod_release` is. `DELETE`
+/// answers 200 with an empty document; nothing is read from it, and
+/// `-f` makes a container that was not there a failed release rather
+/// than a silent one.
+fn deepinfra_release() -> Vec<String> {
+    let mut argv = deepinfra_curl(&format!("{DEEPINFRA_CONTAINERS}/{{id}}"));
+    argv.push("-X".to_string());
+    argv.push("DELETE".to_string());
+    argv
+}
+
+/// The count and model in a `gpu_config` (`8xB200-180GB` → `(8,
+/// "B200-180GB")`), or `None` for any other shape — which is a
+/// configuration this cannot read, not one with zero devices.
+fn deepinfra_gpu_config(config: &str) -> Option<(u32, &str)> {
+    let (count, model) = config.split_once('x')?;
+    Some((count.parse().ok()?, model))
+}
+
+/// The cloud-init document the service's own create example shows: the
+/// image's user, a shell, passwordless sudo, and the one key. The key is
+/// written as a JSON string, which is a valid YAML double-quoted scalar
+/// — so a comment field carrying a character YAML would otherwise read
+/// (a `#`, a `: `) cannot break the document.
+fn deepinfra_cloud_init(key: &str) -> String {
+    let quoted = serde_json::Value::String(key.trim().to_string()).to_string();
+    format!(
+        "#cloud-config\n\
+         users:\n  \
+           - name: {DEEPINFRA_SSH_USER}\n    \
+             shell: /bin/bash\n    \
+             sudo: \"ALL=(ALL) NOPASSWD:ALL\"\n    \
+             ssh_authorized_keys:\n      \
+               - {quoted}\n"
+    )
+}
+
+/// The request body for [`DeepInfraAdapter::acquisition`], built from
+/// the adapter's answers — the same gate `runpod_body` stands behind.
+///
+/// Four fields, all of which the create call requires: `container_image`
+/// from the provider slot, `gpu_config` from the GPU answer (or the
+/// slot), `cloud_init_user_data` built from the slot's key (or taken
+/// from the slot whole), and `name`, which is the lease.
+///
+/// `gpu_answer` / `disk_answer` are `None` exactly when the profile
+/// declared no such requirement — and with no GPU requirement the body
+/// has no `gpu_config` unless the slot names one, which is refused as
+/// incomplete rather than sent for the service to refuse.
+fn deepinfra_body(
+    provider: &BTreeMap<String, String>,
+    gpu_answer: Option<Answer>,
+    disk_answer: Option<Answer>,
+    expires_at: Option<jiff::Timestamp>,
+) -> Result<String, AcquisitionError> {
+    // The image is the platform's own key, as on every target that
+    // takes one (see `runpod_body`), spelled as the API's field is.
+    let image = provider
+        .get("deepinfra.container_image")
+        .ok_or(AcquisitionError::Incomplete {
+            target: "deepinfra",
+            missing: "provider.deepinfra.container_image",
+        })?;
+
+    let mut body = serde_json::Map::new();
+    body.insert("container_image".into(), serde_json::json!(image));
+
+    if let Some(answer) = gpu_answer {
+        if let Some(config) = admitted("deepinfra", answer)?.into_iter().next() {
+            body.insert("gpu_config".into(), serde_json::json!(config));
+        }
+    }
+    if let Some(answer) = disk_answer {
+        admitted("deepinfra", answer)?;
+    }
+
+    // Whatever the profile addressed to this target, verbatim and after
+    // the fields derived above, so the profile gets the last word on
+    // `gpu_config` the way it does on every target. The key the
+    // cloud-init document is built from is consumed here rather than
+    // forwarded: it is this adapter's vocabulary, not a field the
+    // service takes.
+    for (key, value) in provider {
+        if let Some(field) = key.strip_prefix("deepinfra.") {
+            if field == "ssh_authorized_key" {
+                continue;
+            }
+            body.insert(field.to_string(), serde_json::json!(value));
+        }
+    }
+
+    if !body.contains_key("gpu_config") {
+        return Err(AcquisitionError::Incomplete {
+            target: "deepinfra",
+            missing: "requires_gpu (or provider.deepinfra.gpu_config)",
+        });
+    }
+    if !body.contains_key("cloud_init_user_data") {
+        let key = provider
+            .get("deepinfra.ssh_authorized_key")
+            .ok_or(AcquisitionError::Incomplete {
+                target: "deepinfra",
+                missing: "provider.deepinfra.ssh_authorized_key (or provider.deepinfra.cloud_init_user_data)",
+            })?;
+        body.insert(
+            "cloud_init_user_data".into(),
+            serde_json::json!(deepinfra_cloud_init(key)),
+        );
+    }
+
+    // The lease, last, for the reason `runpod_body` gives — the one
+    // field the profile does not get the last word on. `name` is
+    // required by the create call, so a rendering with no lease
+    // carries none and *cannot be sent*: an unstamped container is
+    // refused by the service itself, before it exists.
+    if let Some(expires_at) = expires_at {
+        body.insert("name".into(), serde_json::json!(expiry_stamp(expires_at)));
+    }
+
+    Ok(serde_json::Value::Object(body).to_string())
 }
 
 /// A machine that exists because [`acquire`] made it.
@@ -3248,8 +3713,28 @@ mod tests {
             .expect("the marketplace takes a label");
         assert_eq!(instance.create.get(label + 1), Some(&stamp));
 
+        let container = DeepInfraAdapter
+            .acquisition(
+                &container_requirements(),
+                &container_provider(),
+                Some(expires_at),
+            )
+            .expect("an image and a key were declared");
+        let body: serde_json::Value =
+            serde_json::from_str(container.body.as_deref().expect("this target takes a body"))
+                .unwrap();
+        assert_eq!(body["name"], serde_json::json!(stamp));
+
         // Nothing bought, nothing stamped: a rendering wanted for its
-        // release template does not claim a lease.
+        // release template does not claim a lease. On the container
+        // service `name` is required by the create call, so the
+        // unstamped rendering is one the service would refuse.
+        let unstamped = DeepInfraAdapter
+            .acquisition(&container_requirements(), &container_provider(), None)
+            .expect("an image and a key were declared");
+        let body: serde_json::Value =
+            serde_json::from_str(unstamped.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body.get("name"), None);
         let unstamped = RunPodAdapter
             .acquisition(&full_requirements(), &image_provider(), None)
             .expect("an image was declared");
@@ -3299,11 +3784,20 @@ mod tests {
         assert_eq!(instances.release, instance.release);
         assert_eq!(instances.inspect, instance.inspect);
 
-        // Both templates take the machine's id in the same place, so a
-        // caller holding one identifier can reach either.
-        for argv in [&pods.inspect, &instances.inspect] {
+        let container = DeepInfraAdapter
+            .acquisition(&container_requirements(), &container_provider(), None)
+            .expect("an image and a key were declared");
+        let containers = DeepInfraAdapter.fleet().expect("this target can be asked");
+        assert_eq!(containers.release, container.release);
+        assert_eq!(containers.inspect, container.inspect);
+
+        // Every template takes the machine's id — as a word of its own
+        // on the two CLIs, inside the URL on the REST surface; `substitute`
+        // fills either — so a caller holding one identifier can reach
+        // any of them.
+        for argv in [&pods.inspect, &instances.inspect, &containers.inspect] {
             assert!(
-                argv.contains(&"{id}".to_string()),
+                argv.iter().any(|it| it.contains("{id}")),
                 "the read-back is a template an id fills: {argv:?}"
             );
         }
@@ -3472,5 +3966,441 @@ mod tests {
             }]
         );
         assert_eq!(String::from_utf8_lossy(&listing.said).trim(), "fetching...");
+    }
+
+    // ---- The container-rental service ----
+
+    /// A profile for the container-rental service: a GPU and nothing
+    /// mapped — the service exposes no port, so none is declared.
+    fn container_requirements() -> Requirements {
+        Requirements::from_slots(
+            &BTreeMap::new(),
+            &[("count", "2"), ("min_vram_gb", "80")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &BTreeMap::new(),
+        )
+        .expect("well-formed fixture")
+    }
+
+    /// The image and the key, under the service's own field name and
+    /// this adapter's one word of vocabulary.
+    fn container_provider() -> BTreeMap<String, String> {
+        [
+            ("deepinfra.container_image", "di-cont-ubuntu-torch:latest"),
+            (
+                "deepinfra.ssh_authorized_key",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnly operator@host",
+            ),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// **The four fields the create call takes, and nothing else** —
+    /// each traceable to a line the profile wrote or to the lease: the
+    /// image from the slot, the configuration from the GPU answer in
+    /// the service's `{count}x{model}` spelling, the cloud-init
+    /// document from the key, and the stamp as `name`.
+    #[test]
+    fn the_container_request_is_the_four_fields_the_service_defines() {
+        let expires_at = at("2026-09-02T06:30:00Z");
+        let acquisition = DeepInfraAdapter
+            .acquisition(
+                &container_requirements(),
+                &container_provider(),
+                Some(expires_at),
+            )
+            .expect("an image and a key were declared");
+        let body: serde_json::Value = serde_json::from_str(
+            acquisition
+                .body
+                .as_deref()
+                .expect("this target takes a body"),
+        )
+        .unwrap();
+        let fields: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["cloud_init_user_data", "container_image", "gpu_config", "name"],
+            "every field emitted is one the create call defines, and every one it requires is there"
+        );
+        assert_eq!(body["container_image"], "di-cont-ubuntu-torch:latest");
+        assert_eq!(body["gpu_config"], "2xB200-180GB");
+        assert_eq!(body["name"], serde_json::json!(expiry_stamp(expires_at)));
+
+        let cloud_init = body["cloud_init_user_data"].as_str().unwrap();
+        assert!(cloud_init.starts_with("#cloud-config\n"), "{cloud_init}");
+        assert!(cloud_init.contains("- name: ubuntu\n"), "{cloud_init}");
+        assert!(
+            cloud_init.contains("- \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnly operator@host\""),
+            "the key is the one line the profile gave, quoted so nothing in it reads as YAML: {cloud_init}"
+        );
+
+        // The body is the argument after `--json`, which `acquire`
+        // appends last — so `--json` has to be the last word here.
+        assert_eq!(
+            acquisition.create.last().map(String::as_str),
+            Some("--json")
+        );
+        assert_eq!(acquisition.create[0], "curl");
+        assert!(
+            acquisition.discover.is_none(),
+            "the create call selects by itself"
+        );
+        assert_eq!(acquisition.created_id_key, "container_id");
+    }
+
+    /// **The credential travels by name.** The argv names the variable
+    /// twice — once to import it into curl, once to place it in the
+    /// header — and nowhere carries a value; the adapter declares the
+    /// same name so it is required before anything is spent.
+    #[test]
+    fn the_container_service_is_authenticated_without_a_value_in_the_argv() {
+        assert_eq!(DeepInfraAdapter.credentials(), &["DEEPINFRA_TOKEN"]);
+        let fleet = DeepInfraAdapter.fleet().expect("this target can be asked");
+        for argv in [&fleet.list, &fleet.inspect, &fleet.release] {
+            assert!(argv.contains(&"%DEEPINFRA_TOKEN".to_string()), "{argv:?}");
+            assert!(
+                argv.contains(&"Authorization: Bearer {{DEEPINFRA_TOKEN}}".to_string()),
+                "{argv:?}"
+            );
+            assert!(
+                !argv
+                    .iter()
+                    .any(|it| it.starts_with("Authorization: Bearer ") && !it.contains("{{")),
+                "no argument carries a literal bearer value: {argv:?}"
+            );
+        }
+        assert!(
+            fleet.release.windows(2).any(|it| it == ["-X", "DELETE"]),
+            "the release is the DELETE: {:?}",
+            fleet.release
+        );
+        assert!(
+            !fleet.list.iter().any(|it| it == "-X"),
+            "the listing is the plain GET: {:?}",
+            fleet.list
+        );
+    }
+
+    /// Each of the two things the create call cannot do without is
+    /// refused by name when absent — and the profile's own cloud-init
+    /// document stands in for the key when it writes one.
+    #[test]
+    fn the_container_service_refuses_without_an_image_or_a_key() {
+        let mut no_image = container_provider();
+        no_image.remove("deepinfra.container_image");
+        assert_eq!(
+            DeepInfraAdapter.acquisition(&container_requirements(), &no_image, None),
+            Err(AcquisitionError::Incomplete {
+                target: "deepinfra",
+                missing: "provider.deepinfra.container_image",
+            })
+        );
+
+        let mut no_key = container_provider();
+        no_key.remove("deepinfra.ssh_authorized_key");
+        let refusal = DeepInfraAdapter
+            .acquisition(&container_requirements(), &no_key, None)
+            .expect_err("nothing could reach the container");
+        assert!(
+            refusal
+                .to_string()
+                .contains("provider.deepinfra.ssh_authorized_key"),
+            "{refusal}"
+        );
+
+        no_key.insert(
+            "deepinfra.cloud_init_user_data".to_string(),
+            "#cloud-config\nusers: []\n".to_string(),
+        );
+        let own_document = DeepInfraAdapter
+            .acquisition(&container_requirements(), &no_key, None)
+            .expect("a document of the profile's own is enough");
+        let body: serde_json::Value =
+            serde_json::from_str(own_document.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cloud_init_user_data"], "#cloud-config\nusers: []\n");
+
+        // No GPU requirement and no configuration named: the service
+        // requires one, and the refusal says so rather than sending a
+        // request the service would refuse.
+        let no_gpu = Requirements::from_slots(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
+            .expect("an empty declaration is well-formed");
+        assert_eq!(
+            DeepInfraAdapter.acquisition(&no_gpu, &container_provider(), None),
+            Err(AcquisitionError::Incomplete {
+                target: "deepinfra",
+                missing: "requires_gpu (or provider.deepinfra.gpu_config)",
+            })
+        );
+    }
+
+    /// The profile's own `gpu_config` replaces the selected one, and the
+    /// key is consumed rather than forwarded as a field the service
+    /// would not know.
+    #[test]
+    fn a_named_configuration_wins_and_the_key_is_not_forwarded() {
+        let mut provider = container_provider();
+        provider.insert(
+            "deepinfra.gpu_config".to_string(),
+            "4xB200-180GB".to_string(),
+        );
+        let acquisition = DeepInfraAdapter
+            .acquisition(&container_requirements(), &provider, None)
+            .expect("an image and a key were declared");
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["gpu_config"], "4xB200-180GB");
+        assert!(body.get("ssh_authorized_key").is_none(), "{body}");
+    }
+
+    /// A floor the one catalogued model clears is met in the service's
+    /// spelling; one it does not is refused with the way out; a profile
+    /// asking for no GPU has nothing to rent here.
+    #[test]
+    fn the_container_service_selects_one_configuration_or_says_why_not() {
+        let fits = DeepInfraAdapter.gpu_answer(&GpuRequirement {
+            count: 8,
+            min_vram_gb: Some(180),
+        });
+        assert_eq!(
+            fits,
+            Answer::Met {
+                using: vec!["8xB200-180GB".to_string()]
+            }
+        );
+
+        let beyond = DeepInfraAdapter.gpu_answer(&GpuRequirement {
+            count: 1,
+            min_vram_gb: Some(200),
+        });
+        match beyond {
+            Answer::Unmet { reason } => {
+                assert!(reason.contains("200 GB"), "{reason}");
+                assert!(reason.contains("provider.deepinfra.gpu_config"), "{reason}");
+            }
+            other => panic!("nothing catalogued carries 200 GB: {other:?}"),
+        }
+
+        assert!(DeepInfraAdapter
+            .gpu_answer(&GpuRequirement {
+                count: 0,
+                min_vram_gb: None
+            })
+            .blocks());
+    }
+
+    /// A persistent level is refused, as on the marketplace; an
+    /// ephemeral size is not examined — and, because this target builds
+    /// the request, that becomes a refusal at the body.
+    #[test]
+    fn the_container_service_takes_no_disk_size() {
+        assert!(DeepInfraAdapter
+            .disk_answer(&DiskRequirement {
+                ephemeral_gb: None,
+                persistent_gb: Some(80),
+                persistent_at: None,
+            })
+            .blocks());
+        let sized = DeepInfraAdapter.disk_answer(&DiskRequirement {
+            ephemeral_gb: Some(60),
+            persistent_gb: None,
+            persistent_at: None,
+        });
+        assert!(matches!(sized, Answer::NotExamined { .. }), "{sized:?}");
+
+        let with_disk = Requirements::from_slots(
+            &BTreeMap::new(),
+            &[("count", "1")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &[("ephemeral_gb", "60")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+        .unwrap();
+        let refusal = DeepInfraAdapter
+            .acquisition(&with_disk, &container_provider(), None)
+            .expect_err("a size nothing can ask for is not sent");
+        assert!(
+            matches!(
+                refusal,
+                AcquisitionError::Unmet {
+                    target: "deepinfra",
+                    ..
+                }
+            ),
+            "{refusal}"
+        );
+    }
+
+    /// **The refusal of a port declaration is real.** The service maps
+    /// nothing, so the capability lists no exposure, and admission
+    /// turns a `requires_ports` profile away by name.
+    #[test]
+    fn a_port_declaration_is_refused_at_admission_on_the_container_service() {
+        let capability = DeepInfraAdapter.capability();
+        assert!(capability.exposures.is_empty());
+        let refusal = lm_provision::machine::admit(&required(&[("8000", "raw_tcp")]), &capability)
+            .expect_err("nothing here maps a port");
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("deepinfra"), "{rendered}");
+        assert!(rendered.contains("8000"), "{rendered}");
+        assert!(rendered.contains("no exposure at all"), "{rendered}");
+        assert!(
+            DeepInfraAdapter
+                .render(&required(&[("8000", "raw_tcp")]))
+                .is_empty(),
+            "and there is nothing to render for one"
+        );
+    }
+
+    /// **The address is reported only once the service calls the
+    /// container running**, and the state is in what was read — so the
+    /// operator refused for want of an endpoint learns whether the
+    /// machine is still coming up or has failed.
+    #[test]
+    fn the_container_address_is_reachable_only_once_running() {
+        let starting = serde_json::json!({
+            "id": "c-1", "name": "lmp-exp-20260902T063000Z", "state": "starting",
+            "ip": "203.0.113.20", "gpu_config": "2xB200-180GB", "fail_reason": null
+        });
+        let connection = DeepInfraAdapter.connection(&starting);
+        assert!(
+            connection.ssh.is_none(),
+            "an address sshd is not yet behind is not one to dial"
+        );
+        assert!(
+            connection.read.contains(&"state: starting".to_string()),
+            "{:?}",
+            connection.read
+        );
+        assert!(
+            connection.read.contains(&"ip: present".to_string()),
+            "{:?}",
+            connection.read
+        );
+        assert!(DeepInfraAdapter.still_materializing(&starting));
+
+        let mut running = starting.clone();
+        running["state"] = serde_json::json!("running");
+        let connection = DeepInfraAdapter.connection(&running);
+        let ssh = connection.ssh.expect("running, with an address");
+        assert_eq!(ssh.host, "203.0.113.20");
+        assert_eq!(ssh.port, 22);
+        assert_eq!(ssh.user, "ubuntu", "the image's user, not root");
+        assert!(
+            connection.endpoints.is_empty(),
+            "nothing is mapped, so nothing per port is projected"
+        );
+        assert!(!DeepInfraAdapter.still_materializing(&running));
+
+        let mut failed = starting.clone();
+        failed["state"] = serde_json::json!("failed");
+        failed["fail_reason"] = serde_json::json!("image pull failed");
+        let connection = DeepInfraAdapter.connection(&failed);
+        assert!(connection.ssh.is_none());
+        assert!(
+            connection.read.contains(&"state: failed".to_string()),
+            "{:?}",
+            connection.read
+        );
+        assert!(
+            connection
+                .read
+                .contains(&"fail_reason: present".to_string()),
+            "{:?}",
+            connection.read
+        );
+        assert!(
+            !DeepInfraAdapter.still_materializing(&failed),
+            "a failure is not a machine still coming up"
+        );
+
+        let created = serde_json::json!({ "container_id": "c-1" });
+        assert!(DeepInfraAdapter.connection(&created).ssh.is_none());
+        assert!(
+            !DeepInfraAdapter.still_materializing(&created),
+            "absence of a claim is not a claim"
+        );
+    }
+
+    /// The configuration reads back into a count and a catalogued
+    /// memory; ports are never observed; a configuration this cannot
+    /// read leaves both unobserved rather than zero.
+    #[test]
+    fn the_container_description_reads_back_into_a_judgeable_state() {
+        let described = serde_json::json!({
+            "id": "c-1", "state": "running", "ip": "203.0.113.20", "gpu_config": "2xB200-180GB"
+        });
+        let state = DeepInfraAdapter.read_state(&described);
+        assert_eq!(state.gpu_count, Some(2));
+        assert_eq!(state.gpu_vram_mib, Some(gb_to_mib(180)));
+        assert!(!state.ports_observed);
+        assert_eq!(state.ephemeral_gb, None);
+
+        let findings = lm_provision::machine::observe(&container_requirements(), &state);
+        assert_eq!(
+            lm_provision::machine::verdict(&findings),
+            lm_provision::machine::Outcome::Satisfied,
+            "{findings:#?}"
+        );
+
+        let unreadable =
+            DeepInfraAdapter.read_state(&serde_json::json!({ "gpu_config": "B200-180GB" }));
+        assert_eq!(unreadable.gpu_count, None);
+        assert_eq!(unreadable.gpu_vram_mib, None);
+    }
+
+    /// The listing is a bare array under `id` and `name`, read into
+    /// the same two facts as the other platforms'.
+    #[test]
+    fn the_container_listing_reads_into_an_id_and_a_name() {
+        let containers = DeepInfraAdapter.fleet().expect("this target can be asked");
+        let listed = serde_json::json!([
+            { "id": "c-a", "name": "lmp-exp-20260902T063000Z", "state": "running" },
+            { "id": "c-b", "name": "scratch", "state": "creating" },
+        ]);
+        assert_eq!(
+            machines(&listed, &containers).expect("a bare array is the rows"),
+            vec![
+                Machine {
+                    id: "c-a".to_string(),
+                    name: Some("lmp-exp-20260902T063000Z".to_string()),
+                },
+                Machine {
+                    id: "c-b".to_string(),
+                    name: Some("scratch".to_string()),
+                },
+            ]
+        );
+    }
+
+    /// The image is not preflighted here, and the reason is stated: the
+    /// service's own image names are on no registry the check could
+    /// ask, and a refusal of the documented default would cost more
+    /// than the pull it prevents.
+    #[test]
+    fn the_container_service_names_no_image_to_preflight() {
+        assert_eq!(DeepInfraAdapter.image_key(), None);
+        assert_eq!(DeepInfraAdapter.provider_namespace(), "deepinfra");
+        assert!(adapter_named("deepinfra").is_ok());
+        let refusal = adapter_named("deepinfra-serverless")
+            .err()
+            .expect("no such platform");
+        assert!(
+            refusal.contains("deepinfra"),
+            "the way out names every wired platform: {refusal}"
+        );
     }
 }
