@@ -192,7 +192,7 @@ enum MachineCommand {
 
 #[derive(Args)]
 struct ListArgs {
-    /// Ask this platform what it is running (`runpod`, `vast`).
+    /// Ask this platform what it is running (`runpod`, `vast`, `deepinfra`).
     /// Repeatable, and **required**.
     ///
     /// There is no "all platforms" default and no empty run: a listing
@@ -240,7 +240,7 @@ struct AcquireArgs {
     #[arg(long = "dry-run", default_value_t = true, action = clap::ArgAction::Set)]
     dry_run: bool,
 
-    /// Which platform to buy from (`runpod`, `vast`).
+    /// Which platform to buy from (`runpod`, `vast`, `deepinfra`).
     ///
     /// The operator's choice, not the profile's: the profile says what
     /// the machine must be, and where to buy one meeting it is decided
@@ -271,7 +271,7 @@ struct AcquireArgs {
 #[derive(Args)]
 struct SweepArgs {
     /// Ask this platform what it is running, and judge those machines
-    /// by the lease stamped on each one (`runpod`, `vast`). Repeatable.
+    /// by the lease stamped on each one (`runpod`, `vast`, `deepinfra`). Repeatable.
     ///
     /// **This is the inventory when it is given.** A machine whose
     /// acquisitions row was never written, was written on another host,
@@ -317,7 +317,7 @@ struct ReleaseArgs {
     #[arg(long = "id")]
     id: String,
 
-    /// The platform the machine was acquired from (`runpod`, `vast`).
+    /// The platform the machine was acquired from (`runpod`, `vast`, `deepinfra`).
     #[arg(long = "provider", default_value = "runpod")]
     provider: String,
 
@@ -367,7 +367,7 @@ struct TargetArgs {
     #[arg(long = "ssh", help = ssh_help())]
     ssh: Option<String>,
 
-    /// Ask this platform (`runpod`, `vast`) where `--pod-id` is,
+    /// Ask this platform (`runpod`, `vast`, `deepinfra`) where `--pod-id` is,
     /// instead of naming an address.
     ///
     /// The address and port come from the platform's own description
@@ -1306,8 +1306,18 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     let deadline = started + ACQUIRE_REACHABILITY_TIMEOUT;
     let cap = started + ACQUIRE_MATERIALIZING_CAP;
     let mut extended = false;
+    //
+    // And not while the platform itself still calls the machine
+    // materializing: a container service that maps no port has nothing
+    // for the port wait to wait on, and would otherwise be judged — and
+    // its address reported absent — seconds after create, while the
+    // service still said `creating`. A machine the platform has not
+    // finished bringing up is not one to report on, whatever it has
+    // answered for so far.
     let mut connection = adapter.connection(&acquired.inspected);
-    while !connection_covers(&required.ports, &connection) {
+    while !connection_covers(&required.ports, &connection)
+        || adapter.still_materializing(&acquired.inspected)
+    {
         let now = std::time::Instant::now();
         if now >= deadline {
             // The deadline is for a machine that went quiet, and a
@@ -1330,7 +1340,8 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
                 }
             } else {
                 eprintln!(
-                    "warning: {} still has unanswered ports after {}s; reporting what is known",
+                    "warning: {} is still not up after {}s (ports unanswered, or the \
+                     platform still calls it materializing); reporting what is known",
                     acquired.id,
                     now.duration_since(started).as_secs()
                 );

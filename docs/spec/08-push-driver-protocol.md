@@ -25,9 +25,11 @@ shape is declarative one-shot apply: given a reachable pod, one
 driver invocation converges it (the Terraform / K8s `apply` posture).
 
 Pod lifecycle: the CLI's `machine acquire` / `machine release` /
-`machine sweep` subcommands create and delete a machine through the
-provider's own CLI, and `machine list` says what is out there without
-touching any of it; start / stop stay outside — see §Stability.
+`machine sweep` subcommands create and delete a machine through a
+program already on the operator host — the provider's own CLI, or
+`curl` against its REST surface where it has none — and `machine list`
+says what is out there without touching any of it; start / stop stay
+outside — see §Stability.
 
 ### Session contract
 
@@ -543,6 +545,14 @@ lm-provision port-forward <target> <LOCAL:REMOTE>... [--address <addr>] [--detac
   external pod manager. What remains **stable** is the narrower
   half of the old bullet: no provider SDK is linked into this repo —
   the provider is reached only through its CLI.
+
+  Revised (2026-09-21): the stable half is **no provider client linked**,
+  not "a CLI". The container-rental service (`--provider deepinfra`) has
+  no CLI for its machines, so its adapter drives `curl` against the
+  service's REST surface — the same program the image preflight already
+  drives — with the token imported by name inside curl. The argv is
+  still what a dry-run prints and what the record carries; nothing
+  links a client.
 
   Revised (2026-08-30): `acquire`'s artifact also carries the
   **created-machine connection data** — the caller's `ConnectionSpec`
