@@ -95,7 +95,7 @@ pub struct EndpointListParams {
 /// `lm_price_sync(provider, prices?)` request shape (10 §Tool set).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct PriceSyncParams {
-    /// The platform to ask (`deepinfra`).
+    /// The platform to ask (`deepinfra`, `together`).
     pub provider: String,
     /// The price record to append to; default
     /// `~/.lm-provision/prices.jsonl`.
@@ -498,7 +498,7 @@ impl LmProvisionServer {
     #[tool(
         description = "Ask a platform what its models cost and append what changed to the price \
                         record (09 §Price record). Writes the record; nothing is bought or \
-                        released. `deepinfra` today."
+                        released. `deepinfra`, `together` today."
     )]
     async fn lm_price_sync(
         &self,

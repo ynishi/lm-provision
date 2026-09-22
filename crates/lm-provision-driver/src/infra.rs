@@ -2498,7 +2498,7 @@ const TOGETHER_INFERENCE: &str = "https://api-inference.together.ai/v1";
 /// and the one LiteLLM's `together_ai/` provider does not use
 /// (`TOGETHERAI_API_KEY`); the platform's spelling wins here, as for every
 /// other target.
-const TOGETHER_API_KEY: &str = "TOGETHER_API_KEY";
+pub(crate) const TOGETHER_API_KEY: &str = "TOGETHER_API_KEY";
 /// The second variable the CLI reads: v2 scopes every resource under a
 /// project, and in `--json --non-interactive` mode its mutating verbs
 /// require the project explicitly [documented: `tg --help`, "mutating

@@ -453,7 +453,14 @@ model, as of when":
   `as_of` on a row is when the amounts were first seen, not the last
   time anybody looked. What the platform states in a shape this tool
   does not read (a model priced per second, an amount that is not a
-  number) is reported in the artifact's `skipped`, by name.
+  number) is reported in the artifact's `skipped`, by name. DeepInfra's
+  `discount` is a fraction off its list price and what it bills is
+  list × (1 − discount) [measured 2026-09-23 against OpenRouter's
+  DeepInfra row and the page's "List price" label]; the record holds the
+  billed amount, and when a discount ends the next sync appends the
+  list-price row. Together's `/v1/models` is read the same way (USD per
+  million tokens, `cached_input` as `cache_read`); a model it prices by
+  the hour is skipped by name.
 - **The join is (`provider`, `model`)**, by the same words the endpoint
   row carries (§Endpoint inventory). Nothing translates between the
   two: the record names a model exactly as the platform that bills for

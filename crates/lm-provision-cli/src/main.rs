@@ -287,7 +287,7 @@ enum PricesCommand {
 
 #[derive(Args)]
 struct PricesSyncArgs {
-    /// The platform to ask (`deepinfra`).
+    /// The platform to ask (`deepinfra`, `together`).
     #[arg(long = "provider")]
     provider: String,
     /// The price record to append to; defaults to
@@ -3585,7 +3585,7 @@ mod tests {
             "prices",
             "sync",
             "--provider",
-            "together",
+            "runpod",
             "--prices",
             path.to_str().expect("the scratch path is utf-8"),
         ]);
@@ -3596,7 +3596,7 @@ mod tests {
             panic!("the parsed subcommand is `machine prices sync`");
         };
         let PricesCommand::Sync(args) = args;
-        assert_eq!(args.provider, "together");
+        assert_eq!(args.provider, "runpod");
 
         let code = run_prices_sync(args);
 

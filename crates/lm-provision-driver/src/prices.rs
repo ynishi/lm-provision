@@ -1,11 +1,13 @@
 //! The price record's writer: ask a platform what its models cost and
-//! append what changed (09 §Price record). One platform for now; the
-//! function per platform is the adapter knowledge, the loop around it
-//! is shared.
+//! append what changed (09 §Price record). Two platforms; the function
+//! per platform is the adapter knowledge, the loop around it is shared.
 
 use std::path::Path;
 
 use lm_provision_protocol::price::{self, format_usd, Price, PriceRow, UNIT_USD_PER_MTOK};
+
+use crate::credentials;
+use crate::infra::TOGETHER_API_KEY;
 
 /// Where DeepInfra publishes every model's price, with no key
 /// [documented: docs.deepinfra.com/api-reference/models/models-list;
@@ -13,6 +15,12 @@ use lm_provision_protocol::price::{self, format_usd, Price, PriceRow, UNIT_USD_P
 /// `cents_per_input_token` / `cents_per_output_token` as US cents per
 /// one token and `rate_per_input_token_cached` as a ratio of the input rate].
 pub const DEEPINFRA_MODELS: &str = "https://api.deepinfra.com/models/list";
+
+/// Where Together lists every model it serves with its price, behind
+/// the account's key [documented: docs.together.ai/reference/models;
+/// read 2026-09-23: 271 rows, `pricing.input` / `.output` /
+/// `.cached_input` as USD per million tokens, floats].
+pub const TOGETHER_MODELS: &str = "https://api.together.xyz/v1/models";
 
 /// What a sync found: the rows the platform states now, and the rows
 /// it stated in a shape this tool does not read, each with why.
@@ -76,42 +84,73 @@ pub fn now_utc() -> String {
 
 /// Ask `provider` for its prices.
 ///
-/// `runpod` / `vast` / `deepinfra-deploy` / `together` are refused by
-/// name: they rent machines or serve endpoints this tool has no price
-/// list for. An unknown name is refused as [`crate::infra::adapter_named`]
-/// refuses it, so one spelling mistake gets one answer wherever it is
-/// made. `now` is RFC 3339 UTC `Z` form ([`now_utc`]) and becomes every
-/// row's `as_of`.
+/// `runpod` / `vast` / `deepinfra-deploy` are refused by name: they rent
+/// machines, or serve the operator's own models, and publish no list of
+/// what a token costs. An unknown name is refused as
+/// [`crate::infra::adapter_named`] refuses it, so one spelling mistake
+/// gets one answer wherever it is made. `now` is RFC 3339 UTC `Z` form
+/// ([`now_utc`]) and becomes every row's `as_of`.
 pub fn read(provider: &str, now: &str) -> Result<Read, String> {
     match provider {
-        "deepinfra" => {}
+        // The shape `inventory::served_model_at` asks its question in:
+        // one subprocess, `-f` so an HTTP error is a non-zero exit
+        // rather than an error document parsed as prices, `-sS` so what
+        // curl has to say is on stderr and comes back in the refusal.
+        // The list needs no key.
+        "deepinfra" => {
+            let argv = ["curl", "-sS", "-f", "-m", TIMEOUT_SEC, DEEPINFRA_MODELS]
+                .map(str::to_string)
+                .to_vec();
+            Ok(deepinfra_rows(&answered(&argv, DEEPINFRA_MODELS)?, now))
+        }
+        // Together's list is behind the account's key, so the key
+        // reaches curl **by name only** ([`crate::infra::curl_bearer`]
+        // imports the variable inside curl) and `-m 20` bounds the
+        // wait — the shape `balance::asked` asks in.
+        "together" => {
+            credentials::require("together", &[TOGETHER_API_KEY]).map_err(|it| it.to_string())?;
+            let mut argv = crate::infra::curl_bearer(TOGETHER_API_KEY, TOGETHER_MODELS);
+            for argument in ["-m", TIMEOUT_SEC] {
+                argv.push(argument.to_string());
+            }
+            Ok(together_rows(&answered(&argv, TOGETHER_MODELS)?, now))
+        }
         other => {
             // A name no adapter speaks for is that refusal, with every
             // platform this tool knows in it; a name that is a platform
             // but publishes no token price list is this one.
             let _ = crate::infra::adapter_named(other)?;
-            return Err(format!("{other} publishes no token prices this tool reads"));
+            Err(format!("{other} publishes no token prices this tool reads"))
         }
     }
+}
 
-    // The shape `inventory::served_model_at` asks its question in: one
-    // subprocess, `-f` so an HTTP error is a non-zero exit rather than
-    // an error document parsed as prices, `-sS` so what curl has to say
-    // is on stderr and comes back in the refusal.
-    let output = std::process::Command::new("curl")
-        .args(["-sS", "-f", "-m", "20", DEEPINFRA_MODELS])
+/// How long one question waits for an answer, in seconds — the bound
+/// the other questions this crate asks over HTTP are given.
+const TIMEOUT_SEC: &str = "20";
+
+/// One curl, and the document it answered with.
+///
+/// The refusal carries curl's status and **its stderr only**: a body a
+/// key opened is never relayed, as [`crate::balance`] does not relay
+/// one.
+fn answered(argv: &[String], url: &str) -> Result<serde_json::Value, String> {
+    let Some((program, rest)) = argv.split_first() else {
+        return Err("no command to run".to_string());
+    };
+    let output = std::process::Command::new(program)
+        .args(rest)
         .output()
         .map_err(|err| format!("could not run curl: {err}"))?;
     if !output.status.success() {
         return Err(format!(
-            "could not read {DEEPINFRA_MODELS} ({}): {}",
+            "could not read {url} ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("{DEEPINFRA_MODELS} did not answer with JSON: {err}"))?;
-    Ok(deepinfra_rows(&document, now))
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("{url} did not answer with JSON: {err}"))
 }
 
 /// The DeepInfra document → rows. Pure; the fixture test runs this.
@@ -121,11 +160,23 @@ pub fn read(provider: &str, now: &str) -> Result<Read, String> {
 /// a model this tool silently did not price is indistinguishable from
 /// a model the platform stopped serving.
 ///
-/// **The amounts are the list price; the platform's `discount` field is
-/// recorded nowhere until its meaning is confirmed.** The same goes for
-/// `rate_per_service_tier_priority` / `_flex`: a row here states what
-/// the pricing page states, and a multiplier applied on a guess would
-/// be a number nobody could check against that page.
+/// **`cents_per_*` is the list price and `discount` is the fraction off
+/// it; what the platform bills is `list × (1 − discount)`, and that is
+/// what a row here holds** [measured 2026-09-23: for
+/// `deepseek-ai/DeepSeek-V4.1-Flash` the list is `2e-05` cents per input
+/// token with `discount: 0.3`, and OpenRouter's DeepInfra endpoint row
+/// for the same model bills `0.00000014` per input token — exactly
+/// `0.20 × 0.7` USD per million; the platform's own page renders the
+/// pair as "{percent}% off / Limited-time offer / List price"]. The
+/// cache ratios are ratios of that billed input rate.
+///
+/// `discount_ends_at` is not recorded: when a discount ends, the next
+/// sync reads the list price and appends it as the model's new row,
+/// which is the change log doing its job — an expiry written down in
+/// advance would be a second statement about the future to keep true.
+/// `rate_per_service_tier_priority` / `_flex` stay unapplied: a row here
+/// is the standard tier, and a multiplier applied on a guess would be a
+/// number nobody could check against the page.
 pub fn deepinfra_rows(document: &serde_json::Value, now: &str) -> Read {
     let mut rows = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
@@ -175,10 +226,30 @@ pub fn deepinfra_rows(document: &serde_json::Value, now: &str) -> Read {
             }
         };
 
-        // The cache rates are ratios of the input rate, not amounts:
-        // absent (or `null`) is "not priced separately", which is the
-        // key left out rather than a zero (09 §Price record: absent is
-        // not zero).
+        // What the platform bills, from the list price and the fraction
+        // off it. Absent, `null` or zero leaves the amounts where they
+        // are; a number outside `(0, 1)` is skipped rather than guessed
+        // at — a platform stating 130 % off is stating something this
+        // reader has no reading of.
+        let (input, output) = match pricing.get("discount").and_then(serde_json::Value::as_f64) {
+            None => (input, output),
+            Some(discount) if (0.0..1.0).contains(&discount) => {
+                let billed = |micros: u64| (micros as f64 * (1.0 - discount)).round() as u64;
+                (billed(input), billed(output))
+            }
+            Some(discount) => {
+                skipped.push((
+                    name.to_string(),
+                    format!("discount is `{discount}`, which is not a fraction off"),
+                ));
+                continue;
+            }
+        };
+
+        // The cache rates are ratios of the input rate — the billed
+        // one, the discount already applied — not amounts: absent (or
+        // `null`) is "not priced separately", which is the key left out
+        // rather than a zero (09 §Price record: absent is not zero).
         let of_input = |key: &str| -> Option<String> {
             let rate = pricing.get(key).and_then(serde_json::Value::as_f64)?;
             if !rate.is_finite() || rate < 0.0 {
@@ -207,6 +278,118 @@ pub fn deepinfra_rows(document: &serde_json::Value, now: &str) -> Read {
     Read { rows, skipped }
 }
 
+/// The Together document → rows. Pure; the fixture test runs this.
+///
+/// One row per entry whose `type` is `chat` or `language` and whose
+/// `pricing.input` or `.output` is above zero; a model priced by the
+/// hour (a dedicated-endpoint base, `pricing.hourly > 0` and no token
+/// price) and every other `type` is reported in [`Read::skipped`] by
+/// name. `cached_input` above zero becomes `cache_read`; zero is "not
+/// priced apart" and is left out (09 §Price record: absent is not
+/// zero).
+///
+/// Together's dedicated endpoints name their `model` by the endpoint
+/// name, so a row here joins the operator's static rows and not an
+/// acquisition; the price of a dedicated endpoint is its hourly rate,
+/// which this record does not hold.
+pub fn together_rows(document: &serde_json::Value, now: &str) -> Read {
+    let mut rows = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    let entries = document.as_array().map(Vec::as_slice).unwrap_or_default();
+
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(name) = entry.get("id").and_then(|it| it.as_str()) else {
+            skipped.push((format!("<entry {index}>"), "no id".to_string()));
+            continue;
+        };
+        let Some(kind) = entry.get("type").and_then(|it| it.as_str()) else {
+            skipped.push((name.to_string(), "no type".to_string()));
+            continue;
+        };
+        if !matches!(kind, "chat" | "language") {
+            // The platform's own word for what it serves, so an
+            // operator looking for a model finds why it is not priced
+            // here rather than that it is missing.
+            skipped.push((name.to_string(), format!("type is `{kind}`")));
+            continue;
+        }
+        let Some(pricing) = entry.get("pricing") else {
+            skipped.push((name.to_string(), "no pricing".to_string()));
+            continue;
+        };
+
+        let amount = |key: &str| -> Result<u64, String> {
+            let stated = pricing
+                .get(key)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| format!("pricing.{key} is not a number"))?;
+            micros_from_usd_per_mtok(stated).ok_or_else(|| {
+                format!("pricing.{key} is `{stated}`, which is not an amount at or above zero")
+            })
+        };
+        let input = match amount("input") {
+            Ok(input) => input,
+            Err(why) => {
+                skipped.push((name.to_string(), why));
+                continue;
+            }
+        };
+        let output = match amount("output") {
+            Ok(output) => output,
+            Err(why) => {
+                skipped.push((name.to_string(), why));
+                continue;
+            }
+        };
+        if input == 0 && output == 0 {
+            // A dedicated endpoint's base model: what it costs is the
+            // hour the endpoint runs for, which is not a token price
+            // and not something this record holds.
+            let hourly = pricing
+                .get("hourly")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            skipped.push((
+                name.to_string(),
+                if hourly > 0.0 {
+                    format!("priced by the hour (`hourly` is `{hourly}`), not by the token")
+                } else {
+                    "no token price".to_string()
+                },
+            ));
+            continue;
+        }
+
+        // `cached_input` is an amount like the others, not a ratio, and
+        // zero there is the platform saying it does not price cache
+        // reads apart — the key is left out rather than written as a
+        // charge of nothing.
+        let cache_read = pricing
+            .get("cached_input")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|cached| *cached > 0.0)
+            .and_then(micros_from_usd_per_mtok)
+            .map(format_usd);
+
+        rows.push(PriceRow {
+            provider: "together".to_string(),
+            model: name.to_string(),
+            price: Price {
+                input: format_usd(input),
+                output: format_usd(output),
+                cache_read,
+                cache_write: None,
+                reasoning: None,
+            },
+            unit: UNIT_USD_PER_MTOK.to_string(),
+            as_of: now.to_string(),
+            source: TOGETHER_MODELS.to_string(),
+        });
+    }
+
+    Read { rows, skipped }
+}
+
 /// US cents per one token → micro-dollars per million tokens, the
 /// integer the record holds.
 ///
@@ -224,6 +407,23 @@ fn micros_from_cents_per_token(cents: f64) -> Option<u64> {
         return None;
     }
     let micros = (cents * 1e10).round();
+    (micros < u64::MAX as f64).then_some(micros as u64)
+}
+
+/// US dollars per million tokens → micro-dollars per million tokens,
+/// the integer the record holds: `1.32` is `1_320_000`, which prints
+/// back as `1.32`.
+///
+/// The unit Together states its prices in is the one the record prints
+/// in, so the conversion is the one factor of `1e6`, rounded to the
+/// nearest micro-dollar. `None` for the same statements
+/// [`micros_from_cents_per_token`] refuses — not finite, below zero,
+/// too large to hold.
+fn micros_from_usd_per_mtok(usd: f64) -> Option<u64> {
+    if !usd.is_finite() || usd < 0.0 {
+        return None;
+    }
+    let micros = (usd * 1e6).round();
     (micros < u64::MAX as f64).then_some(micros as u64)
 }
 
@@ -268,6 +468,7 @@ pub fn sync(provider: &str, path: &Path, now: &str) -> Result<Synced, String> {
 fn source_of(provider: &str) -> &'static str {
     match provider {
         "deepinfra" => DEEPINFRA_MODELS,
+        "together" => TOGETHER_MODELS,
         _ => "",
     }
 }
@@ -378,6 +579,22 @@ mod tests {
         assert_eq!(micros_from_cents_per_token(f64::NAN), None);
     }
 
+    /// The same, for the unit Together states: `1.32` USD per million
+    /// tokens is `1_320_000` micro-dollars, the amount its pricing page
+    /// advertises `deepseek-ai/DeepSeek-V4-Pro-0813` at.
+    #[test]
+    fn together_usd_per_million_tokens_become_micro_usd_exactly() {
+        assert_eq!(micros_from_usd_per_mtok(1.32), Some(1_320_000));
+        assert_eq!(micros_from_usd_per_mtok(0.13), Some(130_000));
+        assert_eq!(micros_from_usd_per_mtok(0.0), Some(0));
+        assert_eq!(
+            micros_from_usd_per_mtok(-1.0),
+            None,
+            "a negative price is not a discount, it is a document this reader does not understand"
+        );
+        assert_eq!(micros_from_usd_per_mtok(f64::NAN), None);
+    }
+
     /// The instant a sync stamps a row with is the shape the record's
     /// own writer accepts — the sub-second digits `Timestamp::now()`
     /// carries would be refused by [`PriceRow::check`] at the file.
@@ -429,13 +646,36 @@ mod tests {
                     "discount": null
                 }
             },
+            {
+                "model_name": "deepseek-ai/DeepSeek-V4.1-Flash",
+                "type": "text-generation",
+                "pricing": {
+                    "type": "tokens",
+                    "cents_per_input_token": 2e-05,
+                    "cents_per_output_token": 6e-05,
+                    "rate_per_input_token_cached": 0.03,
+                    "rate_per_input_token_cache_write": null,
+                    "discount": 0.3,
+                    "discount_ends_at": null
+                }
+            },
+            {
+                "model_name": "x/half-off-twice-over",
+                "type": "text-generation",
+                "pricing": {
+                    "type": "tokens",
+                    "cents_per_input_token": 2e-05,
+                    "cents_per_output_token": 6e-05,
+                    "discount": 1.5
+                }
+            },
             { "model_name": "x/whisper", "pricing": { "type": "time", "cents_per_sec": 0.001 } },
             { "pricing": { "type": "tokens" } }
         ]);
 
         let found = deepinfra_rows(&document, NOW);
 
-        assert_eq!(found.rows.len(), 2, "{:?}", found.rows);
+        assert_eq!(found.rows.len(), 3, "{:?}", found.rows);
         let pro = &found.rows[0];
         assert_eq!(pro.model, "deepseek-ai/DeepSeek-V4-Pro");
         assert_eq!(pro.provider, "deepinfra");
@@ -458,14 +698,119 @@ mod tests {
         assert_eq!(flash.price.input, "0.06");
         assert_eq!(flash.price.cache_read.as_deref(), Some("0.015"));
 
-        assert_eq!(found.skipped.len(), 2, "{:?}", found.skipped);
-        assert_eq!(found.skipped[0].0, "x/whisper");
+        let discounted = &found.rows[2];
+        assert_eq!(discounted.model, "deepseek-ai/DeepSeek-V4.1-Flash");
+        assert_eq!(
+            (
+                discounted.price.input.as_str(),
+                discounted.price.output.as_str()
+            ),
+            ("0.14", "0.42"),
+            "the list price is `0.20` / `0.60`; 30 % off it is what the platform bills"
+        );
+        assert_eq!(
+            discounted.price.cache_read.as_deref(),
+            Some("0.0042"),
+            "the cache ratio applies to the discounted input rate, not the list one"
+        );
+
+        assert_eq!(found.skipped.len(), 3, "{:?}", found.skipped);
+        assert_eq!(found.skipped[0].0, "x/half-off-twice-over");
         assert!(
-            found.skipped[0].1.contains("time"),
-            "the report carries the platform's own word: {}",
+            found.skipped[0].1.contains("discount"),
+            "a discount outside `(0, 1)` is a statement this reader has no reading of: {}",
             found.skipped[0].1
         );
-        assert_eq!(found.skipped[1].0, "<entry 3>");
+        assert_eq!(found.skipped[1].0, "x/whisper");
+        assert!(
+            found.skipped[1].1.contains("time"),
+            "the report carries the platform's own word: {}",
+            found.skipped[1].1
+        );
+        assert_eq!(found.skipped[2].0, "<entry 5>");
+    }
+
+    /// One row per token-priced text model, and the rest reported by
+    /// name: a dedicated endpoint's base model, whose price is the hour
+    /// it runs for and not a token; and a model that is not text.
+    #[test]
+    fn the_together_document_reads_as_one_row_per_token_priced_model() {
+        let document = serde_json::json!([
+            {
+                "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
+                "type": "chat",
+                "pricing": {
+                    "hourly": 0,
+                    "input": 1.32,
+                    "output": 3.96,
+                    "base": 0,
+                    "finetune": 0,
+                    "cached_input": 0.12999999999999998,
+                    "image_pixel": 0,
+                    "transcribe": 0,
+                    "image": 0,
+                    "video": 0
+                }
+            },
+            {
+                "id": "meta-llama/Llama-4-70B-Instruct-Reference",
+                "type": "chat",
+                "pricing": { "input": 0, "output": 0, "hourly": 3.5, "cached_input": 0 }
+            },
+            {
+                "id": "BAAI/bge-large-en-v1.5",
+                "type": "embedding",
+                "pricing": { "input": 0.02, "output": 0, "hourly": 0, "cached_input": 0 }
+            },
+            {
+                "id": "mistralai/Mistral-7B-v0.1",
+                "type": "language",
+                "pricing": { "input": 0.2, "output": 0.2, "hourly": 0, "cached_input": 0 }
+            }
+        ]);
+
+        let found = together_rows(&document, NOW);
+
+        assert_eq!(found.rows.len(), 2, "{:?}", found.rows);
+        let pro = &found.rows[0];
+        assert_eq!(pro.model, "deepseek-ai/DeepSeek-V4-Pro-0813");
+        assert_eq!(pro.provider, "together");
+        assert_eq!(pro.price.input, "1.32");
+        assert_eq!(pro.price.output, "3.96");
+        assert_eq!(
+            pro.price.cache_read.as_deref(),
+            Some("0.13"),
+            "the amount is USD per million tokens, rounded to the micro-dollar"
+        );
+        assert_eq!(pro.price.cache_write, None);
+        assert_eq!(pro.as_of, NOW);
+        assert_eq!(pro.source, TOGETHER_MODELS);
+        assert_eq!(pro.unit, UNIT_USD_PER_MTOK);
+
+        let language = &found.rows[1];
+        assert_eq!(language.model, "mistralai/Mistral-7B-v0.1");
+        assert_eq!(language.price.input, "0.2");
+        assert_eq!(
+            language.price.cache_read, None,
+            "a `cached_input` of zero is not priced apart, which is not priced at nothing"
+        );
+
+        assert_eq!(found.skipped.len(), 2, "{:?}", found.skipped);
+        assert_eq!(
+            found.skipped[0].0,
+            "meta-llama/Llama-4-70B-Instruct-Reference"
+        );
+        assert!(
+            found.skipped[0].1.contains("hourly"),
+            "what a dedicated endpoint costs is the hour, which this record does not hold: {}",
+            found.skipped[0].1
+        );
+        assert_eq!(found.skipped[1].0, "BAAI/bge-large-en-v1.5");
+        assert!(
+            found.skipped[1].1.contains("embedding"),
+            "the report carries the platform's own word: {}",
+            found.skipped[1].1
+        );
     }
 
     /// **A sync writes the change log, not the snapshot.** Running it
@@ -519,8 +864,8 @@ mod tests {
     /// to is refused the way every other subcommand refuses it.
     #[test]
     fn a_platform_that_publishes_no_token_prices_is_refused_by_name() {
-        let refusal = read("together", NOW).expect_err("together publishes no token price list");
-        assert!(refusal.contains("together"), "{refusal}");
+        let refusal = read("runpod", NOW).expect_err("runpod publishes no token price list");
+        assert!(refusal.contains("runpod"), "{refusal}");
 
         let refusal = read("nope", NOW).expect_err("no platform answers to `nope`");
         assert!(refusal.contains("unknown provider"), "{refusal}");

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`machine prices sync` applies DeepInfra's discount and reads
+  Together.** DeepInfra's `cents_per_*` is the list price and `discount`
+  a fraction off it; what it bills is list × (1 − discount) [measured:
+  2026-09-23, OpenRouter's DeepInfra row for a 30 %-off model bills
+  exactly that], so the record now holds the billed amount and a
+  discount that ends shows up as the next sync's row. `--provider
+  together` reads `GET /v1/models` (USD per million tokens;
+  `cached_input` → `cache_read`; hourly-priced and non-text models
+  skipped by name) with the account's key.
 - **A price record, and the inventory reads it** (09 §Price record):
   `~/.lm-provision/prices.jsonl`, one append-only row per (platform,
   model, instant) saying what a token costs there — `input` / `output`
@@ -29,8 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only for a model whose newest row states different amounts: the record
   is a change log, not a snapshot. What the platform prices in a shape
   this tool does not read (per second, per image) is reported in
-  `skipped` by name. The platform's `discount` and service-tier fields
-  are not applied.
+  `skipped` by name. The platform's service-tier fields are not applied.
 - **`lm-provision machine cost --provider <p> --model <m> --usage
   <json|@file> [--usage-format plain|openai|deepseek|anthropic] [--at
   <instant>]`** and the MCP tool `lm_cost` — usage × price, the
