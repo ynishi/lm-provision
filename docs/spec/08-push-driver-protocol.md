@@ -414,6 +414,20 @@ scrollback and a machine that billed until someone noticed.
   the shared vocabulary for exactly that); `sweep` is the operator's
   hand on the same file.
 
+- **`machine endpoints` is the inventory of what the fleet *serves***,
+  where `machine list` is the inventory of what it *runs*. It reads
+  what this host recorded — every outstanding acquisition, asked about
+  through its platform for the endpoint or address it projects now;
+  every detached forward whose `ssh` is still the process recorded;
+  the operator's static rows — into one document of
+  `{name, kind, base_url, model, api_key_env, …}` rows, the key **by
+  name** (chapter 06), and renders it for a named consumer
+  (`--format env` / `--format litellm`). The row schema and the
+  forwards record it reads are chapter 09's; the platform reads are
+  this chapter's `Connection` projection, reached by id. A source that
+  cannot be read is reported in the document's `failed` and costs the
+  zero exit, as a platform that cannot be listed does.
+
 ## Operator pod verbs
 
 An apply leaves a pod running something. Everything an operator does

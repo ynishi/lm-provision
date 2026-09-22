@@ -87,6 +87,7 @@
 #![warn(missing_docs)]
 
 pub use lm_provision_protocol::acquisition;
+pub use lm_provision_protocol::forward;
 pub mod credentials;
 pub mod driver;
 pub mod image;

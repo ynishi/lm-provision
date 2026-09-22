@@ -79,10 +79,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 use lm_provision_driver::acquisition::{self as record, AcquisitionRow};
 use lm_provision_driver::credentials;
+use lm_provision_driver::forward::{self as forwards_record, ForwardPair, ForwardPod, ForwardRow};
 use lm_provision_driver::infra;
 use lm_provision_driver::inventory;
 use lm_provision_driver::provisioner;
@@ -188,6 +189,16 @@ enum MachineCommand {
     /// acquisitions record is the list, which is what still reaches
     /// machines created before leases were stamped onto them.
     Sweep(SweepArgs),
+    /// Say every OpenAI-compatible endpoint this tool knows, and change
+    /// nothing.
+    ///
+    /// **Read-only.** The machines this host acquired (asked about
+    /// through their platforms), the forwards it left running (only
+    /// those whose `ssh` is still the process recorded), and the static
+    /// rows in the operator's endpoints file — one document, the key
+    /// named and never valued, rendered for the consumer named by
+    /// `--format` (09 §Endpoint inventory).
+    Endpoints(EndpointsArgs),
 }
 
 #[derive(Args)]
@@ -311,6 +322,45 @@ struct SweepArgs {
     /// find out by them being gone.
     #[arg(long = "dry-run", default_value_t = true, action = clap::ArgAction::Set)]
     dry_run: bool,
+}
+
+#[derive(Args)]
+struct EndpointsArgs {
+    /// The acquisitions record to read outstanding machines from;
+    /// defaults to `~/.lm-provision/acquisitions.jsonl`.
+    #[arg(long = "acquisitions")]
+    acquisitions: Option<PathBuf>,
+    /// The forwards record to read detached tunnels from (09
+    /// §Forwards record); defaults to `~/.lm-provision/forwards.jsonl`.
+    #[arg(long = "forwards")]
+    forwards: Option<PathBuf>,
+    /// The operator's static rows — a JSON array of `{name, base_url,
+    /// model?, api_key_env?}`. Defaults to
+    /// `~/.config/lm-provision/endpoints.json` when that file exists;
+    /// named explicitly, it has to.
+    #[arg(long = "endpoints-file")]
+    endpoints_file: Option<PathBuf>,
+    /// How to render the inventory on stdout.
+    ///
+    /// `json` is the artifact (07 §Stream split). `env` is a shell
+    /// fragment of `export` lines a consumer that reads
+    /// `<NAME>_BASE_URL` / `<NAME>_MODEL` / `<NAME>_API_KEY` can `eval`
+    /// — the key as `"$<api_key_env>"`, expanded by the consumer's
+    /// shell, never written here. `litellm` is a `model_list` for the
+    /// LiteLLM proxy, the key as `os.environ/<api_key_env>`.
+    #[arg(long = "format", value_enum, default_value_t = EndpointFormat::Json)]
+    format: EndpointFormat,
+}
+
+/// The renderings `machine endpoints` offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EndpointFormat {
+    /// The inventory artifact.
+    Json,
+    /// `export` lines, one triple per endpoint that has a `base_url`.
+    Env,
+    /// A LiteLLM proxy `model_list` document.
+    Litellm,
 }
 
 #[derive(Args)]
@@ -608,6 +658,14 @@ struct PortForwardArgs {
     /// process's.
     #[arg(long, short = 'd')]
     detach: bool,
+
+    /// The forwards record a detached forward is written to (09
+    /// §Forwards record), so the tunnel is still known once the
+    /// terminal that printed its pid is gone; defaults to
+    /// `~/.lm-provision/forwards.jsonl`. Rows whose `ssh` has since
+    /// ended are pruned on each write.
+    #[arg(long = "forwards")]
+    forwards: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -629,6 +687,7 @@ fn main() -> ExitCode {
             MachineCommand::Acquire(args) => run_acquire(args),
             MachineCommand::Release(args) => run_release(args),
             MachineCommand::Sweep(args) => run_sweep(args),
+            MachineCommand::Endpoints(args) => run_endpoints(args),
         },
         Command::Mcp => run_mcp(),
     }
@@ -884,6 +943,39 @@ fn run_port_forward(args: PortForwardArgs) -> ExitCode {
     if args.detach {
         return match transport.forward(address, &forwards, true, |_| {}) {
             Ok(ForwardOutcome::Detached { pid }) => {
+                // Recorded before it is printed, for the reason the
+                // acquisition is: the handle on stdout is the caller's,
+                // and what outlives the caller's terminal is the row.
+                // A row that fails to land costs the inventory a
+                // tunnel, not the operator the tunnel — so it is a
+                // warning, and the handle still prints.
+                let row = ForwardRow {
+                    pid,
+                    started_at: inventory::process_start_time(pid),
+                    opened_at: jiff::Timestamp::now().to_string(),
+                    address: args.address.clone(),
+                    forwards: forwards
+                        .iter()
+                        .map(|it| ForwardPair {
+                            local: it.local,
+                            remote: it.remote,
+                        })
+                        .collect(),
+                    pod: match (&args.target.provider, &args.target.pod_id) {
+                        (Some(provider), Some(id)) => Some(ForwardPod {
+                            provider: provider.clone(),
+                            id: id.clone(),
+                        }),
+                        _ => None,
+                    },
+                };
+                let path = args.forwards.clone().unwrap_or_else(default_forwards_path);
+                if let Err(err) = record_forward(&path, row) {
+                    eprintln!(
+                        "warning: could not record the forward (pid {pid}) in {}: {err}",
+                        path.display()
+                    );
+                }
                 println!(
                     "{}",
                     serde_json::json!({
@@ -1265,6 +1357,10 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         profile_hash,
         release: release_template,
         released_at: None,
+        // The profile's own name for the service this machine was
+        // bought to run — what the endpoint inventory names its
+        // endpoint by (09 §Endpoint inventory).
+        service: required.serving.as_ref().map(|it| it.name.clone()),
     };
     if let Err(err) = record_acquisition(&acquisitions_path, &row) {
         // Not an exit code, and not a failure: the machine exists and
@@ -2526,6 +2622,200 @@ fn default_ledger_path() -> PathBuf {
     }
 }
 
+fn run_endpoints(args: EndpointsArgs) -> ExitCode {
+    let acquisitions = args.acquisitions.unwrap_or_else(default_acquisitions_path);
+    let forwards = args.forwards.unwrap_or_else(default_forwards_path);
+    // Named explicitly, the static file has to exist — a typo reported
+    // as "no static rows" would be a file that quietly did not count.
+    // Left to the default, it is read only when it is there.
+    let statics = match args.endpoints_file {
+        Some(path) => Some(path),
+        None => Some(default_endpoints_file()).filter(|it| it.exists()),
+    };
+    let inventory = inventory::endpoints(&inventory::EndpointSources {
+        acquisitions: &acquisitions,
+        forwards: &forwards,
+        statics: statics.as_deref(),
+    });
+    for (program, said) in &inventory.said {
+        relay(program, said);
+    }
+    for (source, reason) in &inventory.failed {
+        eprintln!("error: could not read {source}: {reason}");
+    }
+    match args.format {
+        EndpointFormat::Json => println!("{}", inventory.artifact()),
+        EndpointFormat::Env => print!("{}", render_env(&inventory)),
+        EndpointFormat::Litellm => print!("{}", render_litellm(&inventory)),
+    }
+    if inventory.complete() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// The forwards record's default location, beside the acquisitions
+/// record and for the same reason.
+fn default_forwards_path() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".lm-provision")
+            .join("forwards.jsonl"),
+        None => PathBuf::from("lm-provision-forwards.jsonl"),
+    }
+}
+
+/// Where the operator's static rows live by default: with the
+/// credential file, since both are things the operator writes by hand
+/// about services outside this tool's reach.
+fn default_endpoints_file() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".config")
+            .join("lm-provision")
+            .join("endpoints.json"),
+        None => PathBuf::from("lm-provision-endpoints.json"),
+    }
+}
+
+/// Append a forward to the record, dropping first every recorded row
+/// whose process is gone — the record stays the list of tunnels that
+/// exist, not of every tunnel ever opened. A record that cannot be
+/// read is not rewritten (nothing is dropped from a file nobody could
+/// read), and the new row is appended after it.
+fn record_forward(path: &Path, row: ForwardRow) -> Result<(), forwards_record::ForwardError> {
+    if let Some(parent) = path.parent().filter(|it| !it.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Ok(rows) = forwards_record::list(path) {
+        let live: Vec<ForwardRow> = rows
+            .into_iter()
+            .filter(inventory::forward_is_live)
+            .collect();
+        forwards_record::rewrite(path, &live)?;
+    }
+    forwards_record::append(path, &row)
+}
+
+/// The environment-variable prefix a row's name makes: the name in
+/// upper case with everything that is not a letter or digit as `_`,
+/// and a leading letter guaranteed — `vllm-qwen` → `VLLM_QWEN`,
+/// `8b` → `E_8B`.
+fn env_prefix(name: &str) -> String {
+    let mut prefix: String = name
+        .chars()
+        .map(|it| {
+            if it.is_ascii_alphanumeric() {
+                it.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if prefix
+        .chars()
+        .next()
+        .is_none_or(|it| !it.is_ascii_alphabetic())
+    {
+        prefix.insert_str(0, "E_");
+    }
+    prefix
+}
+
+/// A value in single quotes for a POSIX shell, so nothing in it is
+/// expanded or split.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The `env` rendering: for every row with a `base_url`, three
+/// `export` lines a consumer reading `<NAME>_BASE_URL` / `_MODEL` /
+/// `_API_KEY` can `eval`. **The key is a reference**, `"$<api_key_env>"`,
+/// expanded by the consumer's shell from the operator's own
+/// environment; this tool never had the value to write. A row with no
+/// key exports an empty one, and a row with no `base_url` (a pod no
+/// forward reaches) is a comment rather than a half-triple.
+fn render_env(inventory: &inventory::Endpoints) -> String {
+    let mut out = String::new();
+    for row in &inventory.rows {
+        let prefix = env_prefix(&row.name);
+        match &row.base_url {
+            Some(base_url) => {
+                out.push_str(&format!(
+                    "export {prefix}_BASE_URL={}\n",
+                    shell_quote(base_url)
+                ));
+                out.push_str(&format!(
+                    "export {prefix}_MODEL={}\n",
+                    shell_quote(row.model.as_deref().unwrap_or(""))
+                ));
+                match &row.api_key_env {
+                    Some(name) => {
+                        out.push_str(&format!("export {prefix}_API_KEY=\"${{{name}:-}}\"\n"))
+                    }
+                    None => out.push_str(&format!("export {prefix}_API_KEY=''\n")),
+                }
+            }
+            None => out.push_str(&format!(
+                "# {}: {:?} {}/{} has no endpoint to export (no forward reaches it)\n",
+                row.name,
+                row.kind,
+                row.provider.as_deref().unwrap_or("-"),
+                row.id.as_deref().unwrap_or("-")
+            )),
+        }
+    }
+    out
+}
+
+/// The `litellm` rendering: a `model_list` for the LiteLLM proxy, one
+/// entry per row with a `base_url`, the key as `os.environ/<NAME>`
+/// [documented: docs.litellm.ai/docs/proxy/configs]. A row with no key
+/// is served through the `hosted_vllm/` prefix, which takes none; one
+/// with a key through `openai/`. Rows with no `base_url` are left out
+/// with a comment.
+fn render_litellm(inventory: &inventory::Endpoints) -> String {
+    let mut out = String::from("model_list:\n");
+    for row in &inventory.rows {
+        let Some(base_url) = &row.base_url else {
+            out.push_str(&format!(
+                "  # {}: no endpoint (no forward reaches {}/{})\n",
+                row.name,
+                row.provider.as_deref().unwrap_or("-"),
+                row.id.as_deref().unwrap_or("-")
+            ));
+            continue;
+        };
+        let model = row.model.as_deref().unwrap_or(&row.name);
+        out.push_str(&format!("  - model_name: {}\n", yaml_quote(&row.name)));
+        out.push_str("    litellm_params:\n");
+        match &row.api_key_env {
+            Some(name) => {
+                out.push_str(&format!(
+                    "      model: {}\n",
+                    yaml_quote(&format!("openai/{model}"))
+                ));
+                out.push_str(&format!("      api_base: {}\n", yaml_quote(base_url)));
+                out.push_str(&format!("      api_key: os.environ/{name}\n"));
+            }
+            None => {
+                out.push_str(&format!(
+                    "      model: {}\n",
+                    yaml_quote(&format!("hosted_vllm/{model}"))
+                ));
+                out.push_str(&format!("      api_base: {}\n", yaml_quote(base_url)));
+            }
+        }
+    }
+    out
+}
+
+/// A YAML double-quoted scalar — JSON's string form is one.
+fn yaml_quote(value: &str) -> String {
+    serde_json::Value::String(value.to_string()).to_string()
+}
+
 /// Where the acquisitions record lives when nothing says otherwise —
 /// beside the ledger, and falling back the same way, because the two
 /// files are read together (a sweep judges a row from the record
@@ -2609,6 +2899,7 @@ fn correction_row(
             profile_hash: profile_hash.to_string(),
             release: release.to_vec(),
             released_at: Some(released_at),
+            service: None,
         },
     }
 }
@@ -3178,6 +3469,7 @@ mod tests {
                 "{id}".to_string(),
             ],
             released_at: None,
+            service: None,
         }
     }
 
@@ -3718,5 +4010,116 @@ mod tests {
         assert!(acquisitions.file_name().is_some_and(
             |it| it == "acquisitions.jsonl" || it == "lm-provision-acquisitions.jsonl"
         ));
+    }
+
+    /// **The `env` rendering references the key and never carries it**,
+    /// and a row with nothing to point at is a comment rather than a
+    /// half-triple. Names become prefixes a shell accepts.
+    #[test]
+    fn the_env_rendering_references_the_key_by_name() {
+        use lm_provision_driver::inventory::{Endpoint, EndpointKind, Endpoints};
+        let inventory = Endpoints {
+            rows: vec![
+                Endpoint {
+                    name: "vllm-qwen".to_string(),
+                    kind: EndpointKind::Deployment,
+                    provider: Some("together".to_string()),
+                    id: Some("ep_1".to_string()),
+                    base_url: Some("https://api-inference.together.ai/v1".to_string()),
+                    model: Some("slug/lmp-exp-x".to_string()),
+                    api_key_env: Some("TOGETHER_API_KEY".to_string()),
+                    expires_at: None,
+                    source: "acquisitions".to_string(),
+                },
+                Endpoint {
+                    name: "8b".to_string(),
+                    kind: EndpointKind::Tunnel,
+                    provider: None,
+                    id: None,
+                    base_url: Some("http://127.0.0.1:18000/v1".to_string()),
+                    model: None,
+                    api_key_env: None,
+                    expires_at: None,
+                    source: "forwards".to_string(),
+                },
+                Endpoint {
+                    name: "idle".to_string(),
+                    kind: EndpointKind::Pod,
+                    provider: Some("runpod".to_string()),
+                    id: Some("pod-1".to_string()),
+                    base_url: None,
+                    model: None,
+                    api_key_env: None,
+                    expires_at: None,
+                    source: "acquisitions".to_string(),
+                },
+            ],
+            failed: Vec::new(),
+            said: Vec::new(),
+        };
+        let env = super::render_env(&inventory);
+        assert!(
+            env.contains("export VLLM_QWEN_BASE_URL='https://api-inference.together.ai/v1'\n"),
+            "{env}"
+        );
+        assert!(
+            env.contains("export VLLM_QWEN_MODEL='slug/lmp-exp-x'\n"),
+            "{env}"
+        );
+        assert!(
+            env.contains("export VLLM_QWEN_API_KEY=\"${TOGETHER_API_KEY:-}\"\n"),
+            "{env}"
+        );
+        assert!(
+            env.contains("export E_8B_BASE_URL='http://127.0.0.1:18000/v1'\n"),
+            "{env}"
+        );
+        assert!(env.contains("export E_8B_API_KEY=''\n"), "{env}");
+        assert!(
+            env.contains("# idle: Pod runpod/pod-1 has no endpoint"),
+            "{env}"
+        );
+        assert!(!env.contains("sk-"), "{env}");
+
+        let litellm = super::render_litellm(&inventory);
+        assert!(litellm.starts_with("model_list:\n"));
+        assert!(litellm.contains("  - model_name: \"vllm-qwen\"\n    litellm_params:\n      model: \"openai/slug/lmp-exp-x\"\n      api_base: \"https://api-inference.together.ai/v1\"\n      api_key: os.environ/TOGETHER_API_KEY\n"), "{litellm}");
+        assert!(
+            litellm.contains("model: \"hosted_vllm/8b\""),
+            "a row with no key is served without one: {litellm}"
+        );
+        assert!(litellm.contains("# idle: no endpoint"), "{litellm}");
+
+        assert_eq!(super::env_prefix("vllm-qwen"), "VLLM_QWEN");
+        assert_eq!(super::env_prefix("8b"), "E_8B");
+        assert_eq!(super::env_prefix("a.b/c"), "A_B_C");
+        assert_eq!(super::shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// **The record keeps only live forwards.** A dead row is dropped
+    /// on the next write, and the new row lands after whatever survived.
+    #[test]
+    fn recording_a_forward_prunes_the_dead_ones() {
+        use lm_provision_driver::forward::{self, ForwardPair, ForwardRow};
+        let dir = scratch("forwards-record-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("forwards.jsonl");
+        let row = |pid: u32, local: u16| ForwardRow {
+            pid,
+            started_at: lm_provision_driver::inventory::process_start_time(pid),
+            opened_at: "2026-09-23T00:00:00Z".to_string(),
+            address: "127.0.0.1".to_string(),
+            forwards: vec![ForwardPair {
+                local,
+                remote: 8000,
+            }],
+            pod: None,
+        };
+        forward::append(&path, &row(0, 1)).unwrap(); // pid 0: never live
+        super::record_forward(&path, row(std::process::id(), 2)).unwrap();
+        let rows = forward::list(&path).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].forwards[0].local, 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -361,6 +361,82 @@ what have I not given back":
 - Append failures are the ledger's error class with a sharper cost —
   see §Error surface.
 
+### Forwards record (append-only, pruned)
+
+`port-forward --detach` leaves an `ssh` running and prints its pid; the
+terminal that printed it closes, and the tunnel is a process nobody can
+name. The forwards record is the host's answer to "which tunnels did I
+open and which still exist":
+
+```
+{
+  pid          = int,      -- the detached ssh, as printed
+  started_at?  = int,      -- the kernel's start time for that pid
+                           -- (Linux: /proc/<pid>/stat field 22); absent
+                           -- where the writer could not read one
+  opened_at    = string,   -- RFC 3339 UTC, driver clock
+  address      = string,   -- the local bind address
+  forwards     = [ { local = int, remote = int }, ... ],
+  pod?         = { provider = string, id = string },  -- when the pod
+                           -- was named by platform and id
+}
+```
+
+- **A pid alone does not name a process.** Pids are reused, and a row
+  read after a reboot would point at whatever holds the number now. A
+  row is *live* when the pid exists **and**, where one was recorded,
+  its start time is the one recorded — the check every pidfile
+  convention that survives a reboot makes. A row with no start time is
+  judged on the pid alone, the weaker answer its writer declared.
+- **Pruned on write.** Each `--detach` drops the rows whose process is
+  gone before appending its own, so the file is the list of tunnels
+  that exist, not of every tunnel ever opened. A record that cannot be
+  read is not rewritten: nothing is dropped from a file nobody could
+  read.
+- Same encoding, same error class, same neutral home as the
+  acquisitions record, and for the same reason: written by the operator
+  CLI today, read by the inventory and the control plane later.
+
+### Endpoint inventory (a reading, not a record)
+
+`machine endpoints` (chapter 08) and `lm_endpoint_list` (chapter 10)
+read three sources into one document — the acquisitions record,
+the forwards record, and the operator's static rows — and write
+nothing. One row per endpoint:
+
+```
+{
+  name         = string,   -- the profile's service.start name for an
+                           -- acquired machine (the platform id when the
+                           -- row predates `service`), the operator's
+                           -- name for a static row
+  kind         = "deployment" | "tunnel" | "pod" | "serverless",
+  provider?    = string,   id? = string,
+  base_url?    = string,   -- absent on a `pod` no forward reaches
+  model?       = string,
+  api_key_env? = string,   -- the variable's NAME, never its value
+  expires_at?  = string,   -- the lease, for an acquired machine
+  source       = string,   -- "acquisitions" | "forwards" | <static path>
+}
+```
+
+- **The key is a name.** No row, rendering, or record written here
+  carries a key's value (chapter 06). A consumer that needs the value
+  reads it from its own environment under that name — which is what
+  the `env` rendering's `"$NAME"` and the `litellm` rendering's
+  `os.environ/NAME` say.
+- **The acquisitions row carries `service`** (additive to the frozen
+  schema): the one `service.start` name the profile declared, so an
+  endpoint is reached by the name the profile gave it. A row written
+  before the field reads back without it and is named by its id.
+- **A tunnel's model is read off the pod** (`/v1/models` on the local
+  port, the one question an OpenAI-compatible server answers without a
+  key); absent when the pod does not answer.
+- The static file is a JSON array of `{name, base_url, model?,
+  api_key_env?}`; a field outside those four is refused by name rather
+  than dropped, since a mistyped `api_key_env` silently dropped would
+  be a row with no key that looked complete.
+
 ## Error surface
 
 - Ledger append failures (disk / transport): driver-side, retryable;

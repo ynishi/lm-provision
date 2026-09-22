@@ -63,6 +63,23 @@ pub struct MachineListParams {
     pub provider: String,
 }
 
+/// `lm_endpoint_list(acquisitions?, forwards?, endpoints_file?)` request
+/// shape (10 §Tool set): every path optional, defaulting as the CLI's
+/// `machine endpoints` does.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
+pub struct EndpointListParams {
+    /// The acquisitions record; default `~/.lm-provision/acquisitions.jsonl`.
+    #[serde(default)]
+    pub acquisitions: Option<String>,
+    /// The forwards record; default `~/.lm-provision/forwards.jsonl`.
+    #[serde(default)]
+    pub forwards: Option<String>,
+    /// The operator's static rows; default
+    /// `~/.config/lm-provision/endpoints.json` when it exists.
+    #[serde(default)]
+    pub endpoints_file: Option<String>,
+}
+
 /// `lm_ledger_list(pod_id?, profile_hash?, limit?)` request shape (10
 /// §Tool set).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -325,6 +342,65 @@ impl LmProvisionServer {
     /// which is the only thing that makes dropping it acceptable. The
     /// CLI's own `machine list` prints those reasons in full, and
     /// rightly: its reader is the operator whose account it is.
+    #[tool(
+        description = "List every OpenAI-compatible endpoint this host knows (09 §Endpoint \
+                        inventory): acquired machines asked about through their platforms, \
+                        detached forwards whose ssh still runs, and the operator's static rows. \
+                        Keys by name, never by value. Read-only; a source that could not be read \
+                        is in the result's `failed`, not an error."
+    )]
+    async fn lm_endpoint_list(
+        &self,
+        Parameters(params): Parameters<EndpointListParams>,
+    ) -> Result<String, McpError> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let under_home = |rel: &str, fallback: &str| -> PathBuf {
+            home.as_ref()
+                .map(|it| it.join(rel))
+                .unwrap_or_else(|| PathBuf::from(fallback))
+        };
+        let acquisitions = params.acquisitions.map(PathBuf::from).unwrap_or_else(|| {
+            under_home(
+                ".lm-provision/acquisitions.jsonl",
+                "lm-provision-acquisitions.jsonl",
+            )
+        });
+        let forwards = params.forwards.map(PathBuf::from).unwrap_or_else(|| {
+            under_home(
+                ".lm-provision/forwards.jsonl",
+                "lm-provision-forwards.jsonl",
+            )
+        });
+        let statics = match params.endpoints_file {
+            Some(path) => Some(PathBuf::from(path)),
+            None => Some(under_home(
+                ".config/lm-provision/endpoints.json",
+                "lm-provision-endpoints.json",
+            ))
+            .filter(|it| it.exists()),
+        };
+        let inventory = tokio::task::spawn_blocking(move || {
+            lm_provision_driver::inventory::endpoints(
+                &lm_provision_driver::inventory::EndpointSources {
+                    acquisitions: &acquisitions,
+                    forwards: &forwards,
+                    statics: statics.as_deref(),
+                },
+            )
+        })
+        .await
+        .map_err(join_error)?;
+        for (program, said) in &inventory.said {
+            if !said.is_empty() {
+                tracing::debug!(program, said = %String::from_utf8_lossy(said).trim(), "platform cli output while listing endpoints");
+            }
+        }
+        for (source, reason) in &inventory.failed {
+            tracing::error!(source, reason, "lm_endpoint_list could not read a source");
+        }
+        Ok(inventory.artifact().to_string())
+    }
+
     #[tool(
         description = "List the machines a platform is running, with the lease read off each \
                         machine's own name (08 §Acquisitions and sweep). Read-only: nothing is \
@@ -787,6 +863,7 @@ mod tests {
             names,
             vec![
                 "lm_apply",
+                "lm_endpoint_list",
                 "lm_hash",
                 "lm_ledger_get",
                 "lm_ledger_list",

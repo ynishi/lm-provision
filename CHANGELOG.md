@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lm-provision machine endpoints [--format json|env|litellm]` and
+  the MCP tool `lm_endpoint_list`** — the inventory of what the fleet
+  *serves*, where `machine list` is what it *runs*. Three sources read
+  into one document of `{name, kind, base_url, model, api_key_env,
+  expires_at, source}` rows: every outstanding acquisition, asked about
+  through its platform (an inference endpoint is a `deployment`,
+  anything else a `pod` with no `base_url`); every detached
+  `port-forward` whose `ssh` is still the process recorded, a `tunnel`
+  on this host's loopback with the model read off the pod's own
+  `/v1/models`; and the operator's static rows from
+  `~/.config/lm-provision/endpoints.json` (`serverless`), any unknown
+  field refused by name. **The key travels by name**: `env` renders
+  `export <NAME>_API_KEY="$<api_key_env>"` for the consumer's shell to
+  expand, `litellm` renders `api_key: os.environ/<api_key_env>` — no
+  value is written anywhere. Rows are named by the profile's
+  `service.start` (the acquisitions row gains an additive `service`),
+  so a consumer reaches an endpoint by the name the profile gave it.
+- **A forwards record** (`~/.lm-provision/forwards.jsonl`, 09 §Forwards
+  record): `port-forward --detach` now writes the `ssh` it left running
+  — pid **and** the kernel's start time, since pids are reused and a
+  row read after a reboot would otherwise point at whatever holds the
+  number — with the address, the pairs, and the pod named by platform
+  and id. Dead rows are pruned on each write. The handle on stdout is
+  unchanged.
 - **`lm-provision port-forward <target> <LOCAL:REMOTE>… [--address
   <addr>] [--detach]`** — the fourth operator pod verb, and the reach a
   platform's own endpoints do not have: a service bound to the pod's

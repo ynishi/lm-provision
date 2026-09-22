@@ -31,6 +31,7 @@ By wrapping `ProfileNode` in `DslMcpHandler`, the server automatically exposes t
 | `lm_plan` | `profile_path` string | 07 `plan` |
 | `lm_apply` | `profile_path` string; `pod_id` string; `dry_run` bool | 08 upload / invoke / collect |
 | `lm_machine_list` | `provider` string | 08 §Acquisitions and sweep, the listing half (read-only) |
+| `lm_endpoint_list` | `acquisitions?` string; `forwards?` string; `endpoints_file?` string | 09 §Endpoint inventory (read-only; the same reading as `machine endpoints`) |
 | `lm_ledger_list` | `pod_id?` string; `profile_hash?` string; `limit?` int | 09 ledger rows |
 | `lm_ledger_get` | row locator | 09 single row |
 
