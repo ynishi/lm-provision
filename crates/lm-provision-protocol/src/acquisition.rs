@@ -85,6 +85,14 @@ pub struct AcquisitionRow {
     /// key's presence rather than by a sentinel value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<String>,
+    /// The name of the one `service.start` the profile declared, when
+    /// it declared one — what an endpoint inventory names the machine's
+    /// endpoint by, so a consumer reaches it by the name the profile
+    /// gave it rather than by a platform id. Additive: a row written
+    /// before this field existed reads back as `None`, and a row for a
+    /// profile declaring no service is written without the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
 }
 
 /// Errors raised while appending to or reading an acquisitions file.
@@ -207,6 +215,7 @@ mod tests {
                 "{id}".to_string(),
             ],
             released_at: None,
+            service: None,
         }
     }
 

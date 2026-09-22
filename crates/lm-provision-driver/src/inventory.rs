@@ -13,6 +13,8 @@
 //! it buys: this module has no release path, and a machine carrying no
 //! lease stamp is reported exactly like one that does.
 
+use std::path::Path;
+
 use crate::credentials;
 use crate::infra::{self, Fleet, Machine};
 
@@ -192,6 +194,326 @@ fn listed(machine: &Machine, provider: &str) -> serde_json::Value {
     })
 }
 
+// ---- The endpoint inventory ----
+
+/// One OpenAI-compatible endpoint this tool knows about, or a machine
+/// that could carry one — a row of the endpoint inventory (09
+/// §Endpoint inventory).
+///
+/// **The key travels by name.** `api_key_env` is the variable the
+/// consumer reads the key from; the value is in no row, as it is in no
+/// artifact this crate writes. A consumer rendering this into its own
+/// configuration writes the same name (`api_key: os.environ/NAME`,
+/// `export X_API_KEY="$NAME"`), and the value stays where the operator
+/// put it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Endpoint {
+    /// What a consumer calls it: the profile's `service.start` name for
+    /// a machine this tool acquired (falling back to the platform id),
+    /// the operator's own name for a static row.
+    pub name: String,
+    /// `deployment` (a served model on a managed platform), `tunnel` (a
+    /// detached forward to a pod, reachable on this host's loopback),
+    /// `pod` (a machine this tool acquired that no forward reaches —
+    /// `base_url` is absent), or `serverless` (a static row).
+    pub kind: EndpointKind,
+    /// The platform, for rows that came from one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The machine's id on that platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Where an OpenAI client is pointed, when there is somewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// What to send as `model`, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The environment variable holding the key, by name; absent when
+    /// the endpoint takes none (a tunnel to a pod's own vLLM).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// The lease, for a machine this tool acquired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Where the row came from: `acquisitions`, `forwards`, or the
+    /// static file's path.
+    pub source: String,
+}
+
+/// The kinds of row the inventory carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointKind {
+    /// A served model on a managed platform.
+    Deployment,
+    /// A detached forward to a pod, on this host's loopback.
+    Tunnel,
+    /// An acquired machine no forward reaches.
+    Pod,
+    /// A static row the operator wrote.
+    Serverless,
+}
+
+/// Where the inventory's rows are read from.
+#[derive(Debug, Clone)]
+pub struct EndpointSources<'a> {
+    /// The acquisitions record (09 §Acquisitions record).
+    pub acquisitions: &'a Path,
+    /// The forwards record (09 §Forwards record).
+    pub forwards: &'a Path,
+    /// The operator's static rows, when they keep any: a JSON array of
+    /// `{name, base_url, model?, api_key_env?}`.
+    pub statics: Option<&'a Path>,
+}
+
+/// The inventory: every row that could be read, and every source or
+/// machine that could not — typed, as [`Listing`] is, so a caller
+/// deciding an exit code reads a field rather than a document.
+#[derive(Debug, Clone)]
+pub struct Endpoints {
+    /// The rows, deployments and tunnels first.
+    pub rows: Vec<Endpoint>,
+    /// What could not be read, as `(what, reason)`: a platform that
+    /// could not be asked about a recorded machine, a record that
+    /// could not be parsed, a static file that is not the shape above.
+    pub failed: Vec<(String, String)>,
+    /// Each platform CLI's stderr under the program that said it.
+    pub said: Vec<(String, Vec<u8>)>,
+}
+
+impl Endpoints {
+    /// The one machine-readable document (07 §Stream split).
+    pub fn artifact(&self) -> serde_json::Value {
+        serde_json::json!({
+            "endpoints": self.rows,
+            "failed": self
+                .failed
+                .iter()
+                .map(|(what, reason)| serde_json::json!({ "source": what, "reason": reason }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Whether every source and every recorded machine answered.
+    pub fn complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// Read the inventory.
+///
+/// Three sources, each read on its own so one that cannot be read does
+/// not hide the others:
+///
+/// - **The acquisitions record**, every outstanding row: the machine is
+///   asked about through its platform ([`connection`]), and what it
+///   projects decides the row — an inference endpoint is a
+///   `deployment`, an SSH endpoint (or nothing yet) is a `pod`. The
+///   platform's credential is needed for the question, and a machine
+///   whose platform cannot be asked lands in `failed` under its id.
+/// - **The forwards record**, every row whose `ssh` is still the
+///   process the row named ([`forward_is_live`]): a `tunnel` on this
+///   host's loopback, its model read off the pod's own `/v1/models`
+///   when it answers. A row whose process is gone is left out, and
+///   said in `failed` so the next `port-forward` can prune it.
+/// - **The static file**, when named: the operator's own rows, verbatim.
+pub fn endpoints(sources: &EndpointSources<'_>) -> Endpoints {
+    let mut out = Endpoints {
+        rows: Vec::new(),
+        failed: Vec::new(),
+        said: Vec::new(),
+    };
+
+    match lm_provision_protocol::acquisition::outstanding(sources.acquisitions) {
+        Ok(rows) => {
+            for row in rows {
+                match connection(&row.provider, &row.id) {
+                    Ok(projected) => out.rows.push(endpoint_of_acquired(&row, &projected)),
+                    Err(reason) => out
+                        .failed
+                        .push((format!("{}/{}", row.provider, row.id), reason)),
+                }
+            }
+        }
+        Err(err) => out
+            .failed
+            .push((sources.acquisitions.display().to_string(), err.to_string())),
+    }
+
+    match lm_provision_protocol::forward::list(sources.forwards) {
+        Ok(rows) => {
+            for row in rows {
+                if !forward_is_live(&row) {
+                    out.failed.push((
+                        format!("forward pid {}", row.pid),
+                        "the ssh that carried it is gone; the next port-forward prunes the row"
+                            .to_string(),
+                    ));
+                    continue;
+                }
+                for pair in &row.forwards {
+                    let base_url = format!("http://{}:{}/v1", row.address, pair.local);
+                    out.rows.push(Endpoint {
+                        name: row
+                            .pod
+                            .as_ref()
+                            .map(|it| format!("{}-{}-{}", it.provider, it.id, pair.remote))
+                            .unwrap_or_else(|| format!("tunnel-{}-{}", row.address, pair.local)),
+                        kind: EndpointKind::Tunnel,
+                        provider: row.pod.as_ref().map(|it| it.provider.clone()),
+                        id: row.pod.as_ref().map(|it| it.id.clone()),
+                        model: served_model_at(&base_url),
+                        base_url: Some(base_url),
+                        api_key_env: None,
+                        expires_at: None,
+                        source: "forwards".to_string(),
+                    });
+                }
+            }
+        }
+        Err(err) => out
+            .failed
+            .push((sources.forwards.display().to_string(), err.to_string())),
+    }
+
+    if let Some(path) = sources.statics {
+        match static_rows(path) {
+            Ok(rows) => out.rows.extend(rows),
+            Err(reason) => out.failed.push((path.display().to_string(), reason)),
+        }
+    }
+
+    out
+}
+
+/// The row an acquired machine makes, from its record and what its
+/// platform says about it now.
+fn endpoint_of_acquired(
+    row: &lm_provision_protocol::acquisition::AcquisitionRow,
+    projected: &infra::Connection,
+) -> Endpoint {
+    let name = row.service.clone().unwrap_or_else(|| row.id.clone());
+    match &projected.endpoint {
+        Some(served) => Endpoint {
+            name,
+            kind: EndpointKind::Deployment,
+            provider: Some(row.provider.clone()),
+            id: Some(row.id.clone()),
+            base_url: Some(served.base_url.clone()),
+            model: Some(served.model.clone()),
+            api_key_env: Some(served.api_key_env.clone()),
+            expires_at: Some(row.expires_at.clone()),
+            source: "acquisitions".to_string(),
+        },
+        None => Endpoint {
+            name,
+            kind: EndpointKind::Pod,
+            provider: Some(row.provider.clone()),
+            id: Some(row.id.clone()),
+            base_url: None,
+            model: None,
+            api_key_env: None,
+            expires_at: Some(row.expires_at.clone()),
+            source: "acquisitions".to_string(),
+        },
+    }
+}
+
+/// Whether the process a forward row names is still the `ssh` that was
+/// detached: the pid exists **and**, where the row recorded one, its
+/// start time is the one recorded. Pids are reused; a start time is
+/// not [documented: proc_pid_stat(5)]. A row with no recorded start
+/// time is judged on the pid alone, which is the weaker answer the
+/// writer already declared by leaving the field out.
+pub fn forward_is_live(row: &lm_provision_protocol::forward::ForwardRow) -> bool {
+    match (process_start_time(row.pid), row.started_at) {
+        (None, _) => false,
+        (Some(now), Some(then)) => now == then,
+        (Some(_), None) => true,
+    }
+}
+
+/// The kernel's start time for `pid`, or `None` when there is no such
+/// process (or no `/proc` to ask).
+///
+/// Linux only: field 22 of `/proc/<pid>/stat`, read after the last `)`
+/// so a command name containing spaces or parentheses cannot shift the
+/// fields [documented: proc_pid_stat(5)].
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    // `after_comm` starts at field 3 (state); field 22 is therefore the
+    // 20th whitespace-separated word from here.
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// The first model a tunnel's pod serves, read off `/v1/models` — the
+/// one question an OpenAI-compatible server answers without a key.
+/// `None` when it does not answer within a couple of seconds: a pod
+/// still starting, or a port that carries something else.
+fn served_model_at(base_url: &str) -> Option<String> {
+    let output = std::process::Command::new("curl")
+        .args(["-sS", "-f", "-m", "3", &format!("{base_url}/models")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    body.get("data")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The operator's static rows: a JSON array of objects with `name` and
+/// `base_url` (required) and `model` / `api_key_env` (optional).
+/// Anything else in an object is refused by name rather than dropped.
+fn static_rows(path: &Path) -> Result<Vec<Endpoint>, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| err.to_string())?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| "the static endpoints file is not a JSON array".to_string())?;
+    let mut rows = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let object = item
+            .as_object()
+            .ok_or_else(|| format!("entry {index} is not an object"))?;
+        let text_field = |key: &str| {
+            object
+                .get(key)
+                .and_then(|it| it.as_str())
+                .map(str::to_string)
+        };
+        for key in object.keys() {
+            if !["name", "base_url", "model", "api_key_env"].contains(&key.as_str()) {
+                return Err(format!(
+                    "entry {index} carries `{key}`, which is not a field of a static row \
+                     (name, base_url, model, api_key_env)"
+                ));
+            }
+        }
+        rows.push(Endpoint {
+            name: text_field("name").ok_or_else(|| format!("entry {index} has no name"))?,
+            kind: EndpointKind::Serverless,
+            provider: None,
+            id: None,
+            base_url: Some(
+                text_field("base_url").ok_or_else(|| format!("entry {index} has no base_url"))?,
+            ),
+            model: text_field("model"),
+            api_key_env: text_field("api_key_env"),
+            expires_at: None,
+            source: path.display().to_string(),
+        });
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +650,175 @@ mod tests {
             serde_json::json!({ "machines": [], "failed": [] }),
             "the one document is emitted with every field present"
         );
+    }
+
+    /// **A forward is live only while the pid is the process the row
+    /// named.** The test's own process is such a pid; a start time
+    /// that disagrees is a reused number, and a pid nothing holds is
+    /// gone. On a platform with no `/proc` the answer is "not live",
+    /// which is the safe way to be wrong about a tunnel.
+    #[test]
+    fn a_forward_is_live_only_while_its_pid_is_the_recorded_process() {
+        use lm_provision_protocol::forward::{ForwardPair, ForwardRow};
+        let me = std::process::id();
+        let now = process_start_time(me);
+        let row = |pid: u32, started_at: Option<u64>| ForwardRow {
+            pid,
+            started_at,
+            opened_at: "2026-09-23T00:00:00Z".to_string(),
+            address: "127.0.0.1".to_string(),
+            forwards: vec![ForwardPair {
+                local: 18000,
+                remote: 8000,
+            }],
+            pod: None,
+        };
+        if let Some(now) = now {
+            assert!(forward_is_live(&row(me, Some(now))));
+            assert!(
+                !forward_is_live(&row(me, Some(now.wrapping_add(1)))),
+                "a different start time is a different process holding the same number"
+            );
+            assert!(
+                forward_is_live(&row(me, None)),
+                "with no recorded start time the pid alone decides"
+            );
+        }
+        // Pid 0 is never a user process a forward could be.
+        assert!(!forward_is_live(&row(0, None)));
+        assert!(!forward_is_live(&row(0, Some(1))));
+    }
+
+    /// **The rows the record makes**: a machine whose platform projects
+    /// an inference endpoint is a deployment, carrying the endpoint and
+    /// the lease; one that projects none is a pod with no `base_url`;
+    /// both are named by the profile's service when the record has one.
+    #[test]
+    fn an_acquired_machine_is_a_deployment_or_a_pod_by_what_it_projects() {
+        use lm_provision_protocol::acquisition::AcquisitionRow;
+        let row = AcquisitionRow {
+            id: "dep-1".to_string(),
+            provider: "deepinfra-deploy".to_string(),
+            acquired_at: "2026-09-23T00:00:00Z".to_string(),
+            expires_at: "2026-09-24T00:00:00Z".to_string(),
+            profile_hash: "0".repeat(64),
+            release: vec!["true".to_string()],
+            released_at: None,
+            service: Some("qwen".to_string()),
+        };
+        let served = infra::Connection {
+            ssh: None,
+            endpoint: Some(infra::InferenceEndpoint {
+                base_url: "https://api.deepinfra.com/v1/openai".to_string(),
+                model: "deploy_id:dep-1".to_string(),
+                api_key_env: "DEEPINFRA_API_KEY".to_string(),
+            }),
+            endpoints: Default::default(),
+            read: Vec::new(),
+        };
+        let deployment = endpoint_of_acquired(&row, &served);
+        assert_eq!(deployment.kind, EndpointKind::Deployment);
+        assert_eq!(deployment.name, "qwen");
+        assert_eq!(
+            deployment.base_url.as_deref(),
+            Some("https://api.deepinfra.com/v1/openai")
+        );
+        assert_eq!(deployment.model.as_deref(), Some("deploy_id:dep-1"));
+        assert_eq!(deployment.api_key_env.as_deref(), Some("DEEPINFRA_API_KEY"));
+        assert_eq!(
+            deployment.expires_at.as_deref(),
+            Some("2026-09-24T00:00:00Z")
+        );
+        let artifact = serde_json::to_value(&deployment).unwrap();
+        assert_eq!(artifact["kind"], "deployment");
+        assert!(
+            !artifact.to_string().contains("sk-"),
+            "no key value anywhere: {artifact}"
+        );
+
+        let mut unnamed = row.clone();
+        unnamed.service = None;
+        let pod = endpoint_of_acquired(&unnamed, &infra::Connection::default());
+        assert_eq!(pod.kind, EndpointKind::Pod);
+        assert_eq!(pod.name, "dep-1", "no service, so the platform id names it");
+        assert!(pod.base_url.is_none() && pod.model.is_none() && pod.api_key_env.is_none());
+        let artifact = serde_json::to_value(&pod).unwrap();
+        assert!(
+            artifact.get("base_url").is_none(),
+            "absent, not null: {artifact}"
+        );
+    }
+
+    /// **Static rows are the operator's, verbatim, and a field this
+    /// tool does not know is refused by name** — a typo in `api_key_env`
+    /// silently dropped would be a row with no key that looked complete.
+    #[test]
+    fn static_rows_are_read_verbatim_and_unknown_fields_are_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-inventory-static-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.json");
+        std::fs::write(
+            &path,
+            r#"[{"name": "deepinfra-ds", "base_url": "https://api.deepinfra.com/v1/openai",
+                 "model": "deepseek-ai/DeepSeek-V4-Flash", "api_key_env": "DEEPINFRA_API_KEY"},
+                {"name": "bare", "base_url": "http://127.0.0.1:8000/v1"}]"#,
+        )
+        .unwrap();
+        let rows = static_rows(&path).expect("two well-formed rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, EndpointKind::Serverless);
+        assert_eq!(rows[0].name, "deepinfra-ds");
+        assert_eq!(rows[0].api_key_env.as_deref(), Some("DEEPINFRA_API_KEY"));
+        assert_eq!(rows[1].model, None);
+        assert_eq!(rows[1].source, path.display().to_string());
+
+        std::fs::write(
+            &path,
+            r#"[{"name": "x", "base_url": "u", "api_key": "sk-live"}]"#,
+        )
+        .unwrap();
+        let refusal = static_rows(&path).expect_err("a key value is not a field of a row");
+        assert!(
+            refusal.contains("`api_key`") && refusal.contains("api_key_env"),
+            "{refusal}"
+        );
+
+        std::fs::write(&path, r#"{"name": "x"}"#).unwrap();
+        assert!(static_rows(&path).unwrap_err().contains("not a JSON array"));
+
+        // The whole inventory, from these sources: no record, no
+        // forwards, the static file — reads as the static rows alone,
+        // complete.
+        let none = dir.join("absent.jsonl");
+        std::fs::write(
+            &path,
+            r#"[{"name": "only", "base_url": "http://127.0.0.1:1/v1"}]"#,
+        )
+        .unwrap();
+        let inventory = endpoints(&EndpointSources {
+            acquisitions: &none,
+            forwards: &none,
+            statics: Some(&path),
+        });
+        assert!(inventory.complete(), "{:?}", inventory.failed);
+        assert_eq!(inventory.rows.len(), 1);
+        assert_eq!(
+            inventory.artifact()["endpoints"][0]["name"],
+            serde_json::json!("only")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The kernel's start time is readable for a live process and absent
+    /// for a pid nothing holds.
+    #[test]
+    fn a_start_time_is_read_for_a_live_process_and_absent_otherwise() {
+        if std::path::Path::new("/proc/self/stat").exists() {
+            assert!(process_start_time(std::process::id()).is_some());
+        }
+        assert_eq!(process_start_time(0), None);
     }
 }

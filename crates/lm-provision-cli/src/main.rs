@@ -1265,6 +1265,10 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         profile_hash,
         release: release_template,
         released_at: None,
+        // The profile's own name for the service this machine was
+        // bought to run — what the endpoint inventory names its
+        // endpoint by (09 §Endpoint inventory).
+        service: required.serving.as_ref().map(|it| it.name.clone()),
     };
     if let Err(err) = record_acquisition(&acquisitions_path, &row) {
         // Not an exit code, and not a failure: the machine exists and
@@ -2609,6 +2613,7 @@ fn correction_row(
             profile_hash: profile_hash.to_string(),
             release: release.to_vec(),
             released_at: Some(released_at),
+            service: None,
         },
     }
 }
@@ -3178,6 +3183,7 @@ mod tests {
                 "{id}".to_string(),
             ],
             released_at: None,
+            service: None,
         }
     }
 

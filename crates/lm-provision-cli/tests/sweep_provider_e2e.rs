@@ -108,6 +108,7 @@ fn acquired(id: &str, expires_at: &str) -> AcquisitionRow {
             "{id}".to_string(),
         ],
         released_at: None,
+        service: None,
     }
 }
 
