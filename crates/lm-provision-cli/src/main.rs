@@ -1497,9 +1497,17 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     // [measured: 2026-09-23].
     let no_address = connection.ssh.is_none() && connection.endpoint.is_none();
     let never_came_up = no_address && address_is_the_platforms_own(adapter);
+    // The platform's own reason, when it gives one — the one value out
+    // of the description that is relayed, since presence alone told an
+    // operator nothing about a deployment the platform could not
+    // schedule [measured: 2026-09-22 / 23].
+    let why = adapter
+        .failure(&acquired.inspected)
+        .map(|reason| format!("; the platform says: {reason}"))
+        .unwrap_or_default();
     if no_address {
         eprintln!(
-            "{}: {} projects no address; read from the platform: {}",
+            "{}: {} projects no address; read from the platform: {}{why}",
             if never_came_up { "error" } else { "note" },
             acquired.id,
             connection.read.join("; ")
@@ -1529,7 +1537,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     if gave_up_materializing {
         eprintln!(
             "error: {} was still materializing when the wait ran out; it is recorded and \
-             running, and is the operator's or the sweep's to release",
+             running, and is the operator's or the sweep's to release{why}",
             acquired.id
         );
         return ExitCode::FAILURE;
@@ -1537,7 +1545,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     if never_came_up {
         eprintln!(
             "error: {} never came up; it is recorded, and is the operator's or the sweep's \
-             to release",
+             to release{why}",
             acquired.id
         );
         return ExitCode::FAILURE;

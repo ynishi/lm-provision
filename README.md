@@ -189,9 +189,16 @@ lm-provision apply --provider deepinfra --pod-id <id> --remote-dir /home/ubuntu 
 # requires_ports, no requires_disk, no other phase — anything this
 # platform cannot run is refused by name rather than dropped. Same
 # DEEPINFRA_API_KEY as the instances above.
+# The account needs a display name first (dashboard → Settings): the
+# service prefixes every deployment's model_name with it and answers
+# 409 "missing display name" without one. The replica range can be
+# said once for every managed platform as deploy.min_replicas /
+# deploy.max_replicas; a platform's own key (below) wins over it.
 #   "provider": {
-#     "deepinfra-deploy.settings.min_instances": "0",
-#     "deepinfra-deploy.settings.max_instances": "1",
+#     "deploy.min_replicas": "0",
+#     "deploy.max_replicas": "1",
+#     "deepinfra-deploy.settings.min_instances": "0",   # same thing, this
+#     "deepinfra-deploy.settings.max_instances": "1",   #   platform's spelling
 #     "deepinfra-deploy.hf.revision": "main",
 #     "deepinfra-deploy.hf.token_env": "HF_TOKEN",   # a private repo:
 #            # the name, imported inside curl; the value is on no argv
@@ -223,6 +230,8 @@ lm-provision machine acquire --provider deepinfra-deploy \
 # "together.config" (a cr_… id from `tg beta models configs <model>`)
 # otherwise. Any other together.* key is refused rather than dropped.
 #   "provider": {
+#     "deploy.min_replicas": "1",          # shared with deepinfra-deploy;
+#     "deploy.max_replicas": "1",          #   together.* wins when both given
 #     "together.min_replicas": "1",        # 0/0 (created stopped) is refused
 #     "together.max_replicas": "1",
 #     "together.inactive_timeout": "60"    # minutes, 30-1440

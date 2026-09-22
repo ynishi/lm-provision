@@ -409,6 +409,17 @@ scrollback and a machine that billed until someone noticed.
   The endpoint is reachable once its deployment is `READY` **and** on
   the traffic split; the inference `model` is the endpoint's name on a
   different host from the management API.
+
+  Targets that run the model share one provider-slot namespace,
+  `deploy` — `deploy.min_replicas` / `deploy.max_replicas`, the replica
+  range in the words the managed platforms already agree on — which
+  each renders into its own field, a target's own key winning over the
+  shared one. And `acquire` relays the platform's **own reason** when a
+  machine will not come up and the platform states one (`fail_reason`,
+  a deployment's `status.message`): the one value out of a description
+  that is relayed, because it is the platform's text about the machine
+  and identifies nothing (2026-09-23; presence alone had told the
+  operator nothing about a deployment the platform could not schedule).
 - A continuously running host daemon that enforces leases without
   being invoked is the control plane's job (chapter 09's record is
   the shared vocabulary for exactly that); `sweep` is the operator's
