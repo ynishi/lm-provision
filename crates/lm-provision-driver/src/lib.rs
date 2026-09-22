@@ -76,6 +76,10 @@
 //!   [`infra`] and rendered as the one JSON document both the operator
 //!   CLI's `machine list` and the MCP `lm_machine_list` tool return. A
 //!   read: it has no release path at all.
+//! - [`prices`] — the price record's writer (09 §Price record): ask a
+//!   platform what its models cost and append what changed, so the
+//!   inventory's join has something to stand on. It writes that one
+//!   file and reaches no machine.
 //! - [`credentials`] — where a target's credential is resolved from,
 //!   and what is reported when it is not there.
 //! - [`image`] — whether the image a profile names exists in its
@@ -95,6 +99,7 @@ pub mod infra;
 pub mod inventory;
 pub use lm_provision_protocol::ledger;
 pub mod local_exec;
+pub mod prices;
 pub mod provisioner;
 pub mod session;
 pub mod ssh;

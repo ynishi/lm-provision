@@ -86,6 +86,7 @@ use lm_provision_driver::credentials;
 use lm_provision_driver::forward::{self as forwards_record, ForwardPair, ForwardPod, ForwardRow};
 use lm_provision_driver::infra;
 use lm_provision_driver::inventory;
+use lm_provision_driver::prices;
 use lm_provision_driver::provisioner;
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
 use lm_provision_driver::ssh::{
@@ -199,6 +200,32 @@ enum MachineCommand {
     /// named and never valued, rendered for the consumer named by
     /// `--format` (09 §Endpoint inventory).
     Endpoints(EndpointsArgs),
+    /// Keep the price record (09 §Price record).
+    Prices(PricesArgs),
+}
+
+#[derive(Args)]
+struct PricesArgs {
+    /// What to do with the record.
+    #[command(subcommand)]
+    command: PricesCommand,
+}
+
+#[derive(Subcommand)]
+enum PricesCommand {
+    /// Ask a platform what its models cost, and append what changed.
+    Sync(PricesSyncArgs),
+}
+
+#[derive(Args)]
+struct PricesSyncArgs {
+    /// The platform to ask (`deepinfra`).
+    #[arg(long = "provider")]
+    provider: String,
+    /// The price record to append to; defaults to
+    /// `~/.lm-provision/prices.jsonl`.
+    #[arg(long = "prices")]
+    prices: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -692,6 +719,9 @@ fn main() -> ExitCode {
             MachineCommand::Release(args) => run_release(args),
             MachineCommand::Sweep(args) => run_sweep(args),
             MachineCommand::Endpoints(args) => run_endpoints(args),
+            MachineCommand::Prices(args) => match args.command {
+                PricesCommand::Sync(args) => run_prices_sync(args),
+            },
         },
         Command::Mcp => run_mcp(),
     }
@@ -2691,6 +2721,36 @@ fn default_prices_path() -> PathBuf {
     }
 }
 
+/// `machine prices sync` — ask a platform what its models cost and
+/// append what changed (09 §Price record).
+///
+/// **The record is the only thing this touches.** Nothing is acquired,
+/// nothing is released, and the platform is asked a question its own
+/// pricing page answers without a key.
+fn run_prices_sync(args: PricesSyncArgs) -> ExitCode {
+    let path = args.prices.unwrap_or_else(default_prices_path);
+    // The instant every appended row carries, in the shape the record
+    // accepts — `prices::now_utc` and not `Timestamp::now().to_string()`,
+    // whose sub-second digits the record's writer refuses.
+    let now = prices::now_utc();
+    match prices::sync(&args.provider, &path, &now) {
+        Ok(synced) => match serde_json::to_string(&synced) {
+            Ok(artifact) => {
+                println!("{artifact}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: could not render what was synced: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Where the operator's static rows live by default: with the
 /// credential file, since both are things the operator writes by hand
 /// about services outside this tool's reach.
@@ -2933,8 +2993,9 @@ fn correction_row(
 mod tests {
     use super::{
         attributed, credentials, exit_status, forward_failure_code, parse_forwards,
-        parse_ssh_target, record, resolve_target, ssh_help, AcquisitionRow, Cli, Command, Forward,
-        MachineCommand, Path, PathBuf, TargetArgs,
+        parse_ssh_target, record, resolve_target, run_prices_sync, ssh_help, AcquisitionRow, Cli,
+        Command, ExitCode, Forward, MachineCommand, Path, PathBuf, PricesArgs, PricesCommand,
+        TargetArgs,
     };
     use clap::Parser as _;
     use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
@@ -3331,6 +3392,42 @@ mod tests {
             .is_empty());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// **A platform with no price list to read writes no record.** The
+    /// refusal is the whole run: the file the operator named is still
+    /// not there afterwards, so a sync that could not ask is told apart
+    /// from one that asked and found nothing.
+    #[test]
+    fn prices_sync_refuses_a_platform_with_no_token_prices() {
+        let path = scratch("prices-refused");
+        let cli = Cli::parse_from([
+            "lm-provision",
+            "machine",
+            "prices",
+            "sync",
+            "--provider",
+            "together",
+            "--prices",
+            path.to_str().expect("the scratch path is utf-8"),
+        ]);
+        let Command::Machine {
+            command: MachineCommand::Prices(PricesArgs { command: args }),
+        } = cli.command
+        else {
+            panic!("the parsed subcommand is `machine prices sync`");
+        };
+        let PricesCommand::Sync(args) = args;
+        assert_eq!(args.provider, "together");
+
+        let code = run_prices_sync(args);
+
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::FAILURE),
+            "a platform this tool reads no prices from is a failed run"
+        );
+        assert!(!path.exists(), "a refusal writes no record");
     }
 
     /// A scratch path nothing else is using, in the shape the ledger's

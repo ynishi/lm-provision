@@ -446,6 +446,14 @@ model, as of when":
   from last month is re-priced at last month's rate rather than at
   today's — which is the only way a cost said about the past stays true
   after the platform moves its prices.
+- **A sync appends the change, not the snapshot.**
+  `machine prices sync --provider <p>` reads the platform's own price
+  list and appends a row only for a model whose newest row states
+  different amounts (or none), so the record grows by what moved and
+  `as_of` on a row is when the amounts were first seen, not the last
+  time anybody looked. What the platform states in a shape this tool
+  does not read (a model priced per second, an amount that is not a
+  number) is reported in the artifact's `skipped`, by name.
 - **The join is (`provider`, `model`)**, by the same words the endpoint
   row carries (§Endpoint inventory). Nothing translates between the
   two: the record names a model exactly as the platform that bills for

@@ -83,6 +83,17 @@ pub struct EndpointListParams {
     pub prices: Option<String>,
 }
 
+/// `lm_price_sync(provider, prices?)` request shape (10 §Tool set).
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PriceSyncParams {
+    /// The platform to ask (`deepinfra`).
+    pub provider: String,
+    /// The price record to append to; default
+    /// `~/.lm-provision/prices.jsonl`.
+    #[serde(default)]
+    pub prices: Option<String>,
+}
+
 /// `lm_ledger_list(pod_id?, profile_hash?, limit?)` request shape (10
 /// §Tool set).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -408,6 +419,42 @@ impl LmProvisionServer {
             tracing::error!(source, reason, "lm_endpoint_list could not read a source");
         }
         Ok(inventory.artifact().to_string())
+    }
+
+    /// `lm_price_sync` (10 §Tool set: `provider`, `prices?`; backing
+    /// surface `lm_provision_driver::prices::sync`).
+    ///
+    /// **The one tool here that writes the price record**, and the only
+    /// file it touches: a sync asks the platform's own published price
+    /// list — the question that needs no key — and appends a row per
+    /// model whose amounts moved. No machine is acquired and none is
+    /// released.
+    #[tool(
+        description = "Ask a platform what its models cost and append what changed to the price \
+                        record (09 §Price record). Writes the record; nothing is bought or \
+                        released. `deepinfra` today."
+    )]
+    async fn lm_price_sync(
+        &self,
+        Parameters(PriceSyncParams { provider, prices }): Parameters<PriceSyncParams>,
+    ) -> Result<String, McpError> {
+        let prices = prices
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(".lm-provision/prices.jsonl"),
+                None => PathBuf::from("lm-provision-prices.jsonl"),
+            });
+        // The shape the record's own writer accepts, from the one place
+        // it is written (`prices::now_utc`), as the CLI takes it.
+        let now = lm_provision_driver::prices::now_utc();
+        let synced = tokio::task::spawn_blocking(move || {
+            lm_provision_driver::prices::sync(&provider, &prices, &now)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(precondition_error)?;
+        serde_json::to_string(&synced)
+            .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
     #[tool(
@@ -878,6 +925,7 @@ mod tests {
                 "lm_ledger_list",
                 "lm_machine_list",
                 "lm_plan",
+                "lm_price_sync",
                 "lm_validate",
             ]
         );
