@@ -155,9 +155,19 @@ pub fn runpod_balance(document: &serde_json::Value, now: &str) -> Result<Balance
 /// `credit` → `amount`.
 ///
 /// **Not `balance`.** The document carries both, and `credit` is the
-/// prepaid amount the platform's own CLI prints as money [documented:
-/// `vast-cli` `user_fields`: `("credit","Credit","{:0.2f}")`]. A
-/// document without a numeric `credit` is refused by name.
+/// prepaid amount: the platform's own Claude plugin reads
+/// `vastai show user --raw` and says to report "`credit` (current
+/// balance)" [documented: github.com/vast-ai/vast-claude-plugin,
+/// `commands/cost.md`, read 2026-09-23], and its CLI prints only
+/// `credit` as money [documented: `vast-cli` `vast.py` `user_fields`:
+/// `("credit","Credit","{:0.2f}")`]. `balance` has one sentence in the
+/// platform's OpenAPI ("The current balance of the user") and `credit`
+/// is not in that schema at all, so the two are not the same number
+/// and the documented one is not the money [read 2026-09-23:
+/// `credit` 9.98 beside `balance` 0 on a signup-credit account].
+/// `balance_threshold` is the auto-billing trigger the operator set,
+/// not a balance. A document without a numeric `credit` is refused by
+/// name.
 pub fn vast_balance(document: &serde_json::Value, now: &str) -> Result<Balance, String> {
     let Some(amount) = document
         .get("credit")
