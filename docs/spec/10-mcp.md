@@ -33,6 +33,7 @@ By wrapping `ProfileNode` in `DslMcpHandler`, the server automatically exposes t
 | `lm_machine_list` | `provider` string | 08 §Acquisitions and sweep, the listing half (read-only) |
 | `lm_endpoint_list` | `acquisitions?` string; `forwards?` string; `endpoints_file?` string; `prices?` string | 09 §Endpoint inventory (read-only; the same reading as `machine endpoints`) |
 | `lm_price_sync` | `provider` string; `prices?` string | 09 §Price record (writes the record) |
+| `lm_cost` | `provider` string; `model` string; `usage` object; `usage_format?` string; `at?` string; `prices?` string | 09 §Cost (read-only) |
 | `lm_ledger_list` | `pod_id?` string; `profile_hash?` string; `limit?` int | 09 ledger rows |
 | `lm_ledger_get` | row locator | 09 single row |
 

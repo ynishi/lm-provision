@@ -94,6 +94,37 @@ pub struct PriceSyncParams {
     pub prices: Option<String>,
 }
 
+/// `lm_cost(provider, model, usage, usage_format?, at?, prices?)`
+/// request shape (10 §Tool set).
+///
+/// **`usage_format` is a string, not an enum.** The driver's
+/// `cost::UsageFormat` would be the type to take here, but deriving
+/// `JsonSchema` on it would put `schemars` in the driver's
+/// dependencies, and the driver has none of this crate's — so the four
+/// spellings are parsed in the tool and anything else is refused by
+/// name.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct CostParams {
+    /// The platform the run ran on — the word the price record's rows
+    /// carry (`deepinfra`, `together`, …).
+    pub provider: String,
+    /// The model, as that platform names it.
+    pub model: String,
+    /// What the run used, in the shape `usage_format` names.
+    pub usage: serde_json::Value,
+    /// `plain` (the five buckets as this tool writes them, the
+    /// default), `openai`, `deepseek`, or `anthropic`.
+    #[serde(default)]
+    pub usage_format: Option<String>,
+    /// Price it at the rate in force at this instant (RFC 3339 UTC, `Z`
+    /// form); the record's newest row by default.
+    #[serde(default)]
+    pub at: Option<String>,
+    /// The price record to read; default `~/.lm-provision/prices.jsonl`.
+    #[serde(default)]
+    pub prices: Option<String>,
+}
+
 /// `lm_ledger_list(pod_id?, profile_hash?, limit?)` request shape (10
 /// §Tool set).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -454,6 +485,63 @@ impl LmProvisionServer {
         .map_err(join_error)?
         .map_err(precondition_error)?;
         serde_json::to_string(&synced)
+            .map_err(|err| McpError::internal_error(err.to_string(), None))
+    }
+
+    /// `lm_cost` (10 §Tool set: `provider`, `model`, `usage`,
+    /// `usage_format?`, `at?`, `prices?`; backing surface
+    /// `lm_provision_driver::cost::cost`).
+    ///
+    /// **A reading.** The price record is read, the arithmetic is done,
+    /// and nothing is written — not the usage, not the answer. What
+    /// comes back is an estimate from a published rate; the platform's
+    /// own bill is the authority and this is not it.
+    #[tool(
+        description = "Price a run: the usage object (in the platform's own shape, \
+                        `usage_format`) at what the price record says a token costs on \
+                        (`provider`, `model`), at `at` or now. Read-only; an estimate from the \
+                        published rate."
+    )]
+    async fn lm_cost(
+        &self,
+        Parameters(CostParams {
+            provider,
+            model,
+            usage,
+            usage_format,
+            at,
+            prices,
+        }): Parameters<CostParams>,
+    ) -> Result<String, McpError> {
+        let format = match usage_format.as_deref().unwrap_or("plain") {
+            "plain" => lm_provision_driver::cost::UsageFormat::Plain,
+            "openai" => lm_provision_driver::cost::UsageFormat::Openai,
+            "deepseek" => lm_provision_driver::cost::UsageFormat::Deepseek,
+            "anthropic" => lm_provision_driver::cost::UsageFormat::Anthropic,
+            other => {
+                return Err(precondition_error(format!(
+                    "usage_format `{other}` is not one of plain, openai, deepseek, anthropic"
+                )))
+            }
+        };
+        // Before anything is read: a usage this reader cannot translate
+        // is refused here rather than priced as whatever survived the
+        // translation.
+        let usage =
+            lm_provision_driver::cost::usage_from(format, &usage).map_err(precondition_error)?;
+        let prices = prices
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(".lm-provision/prices.jsonl"),
+                None => PathBuf::from("lm-provision-prices.jsonl"),
+            });
+        let costed = tokio::task::spawn_blocking(move || {
+            lm_provision_driver::cost::cost(&prices, &provider, &model, at.as_deref(), &usage)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(precondition_error)?;
+        serde_json::to_string(&costed)
             .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
@@ -919,6 +1007,7 @@ mod tests {
             names,
             vec![
                 "lm_apply",
+                "lm_cost",
                 "lm_endpoint_list",
                 "lm_hash",
                 "lm_ledger_get",

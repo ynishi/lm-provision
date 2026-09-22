@@ -518,6 +518,54 @@ nothing. One row per endpoint:
   by name rather than dropped, since a mistyped `api_key_env`
   silently dropped would be a row with no key that looked complete.
 
+### Cost (a reading, not a record)
+
+`machine cost` (chapter 08) and `lm_cost` (chapter 10) answer one
+question — what did this run cost, at what a token costs where it ran —
+by reading the price record and doing the arithmetic. Nothing is
+written: the usage stays with whoever holds it (§Price record keeps the
+rates; the runs are somebody else's file).
+
+What a run used is stated in five buckets:
+
+```
+{ input, output, cache_read?, cache_write?, reasoning? }   -- token counts
+```
+
+- **`input` is uncached input only.** Tokens served from the platform's
+  cache are `cache_read`, not part of `input`. That is Anthropic's
+  convention; the OpenAI and DeepSeek `usage` objects count cache hits
+  inside `prompt_tokens`, and `--usage-format openai|deepseek|anthropic`
+  translates them at the door — once, here, rather than in every caller,
+  because getting it wrong is a double count nothing downstream can see.
+- **Absent optional rates fall back by what their absence means**
+  (§Price record: absent is not zero): `cache_read` tokens at
+  `price.cache_read`, else at `price.input` — a cached input token is
+  still an input token, and a platform that does not price it apart
+  charges the input rate; `cache_write` tokens at `price.cache_write`,
+  else **nothing** — a platform that states no write charge does not
+  charge one, the write being a surcharge on tokens already counted in
+  `input`; `reasoning` tokens at `price.reasoning`, else at
+  `price.output`.
+- **`cache_known: false` makes the amount an upper bound.** A usage
+  object with no cache field did not say how much was cached, which is
+  not the same as having cached nothing, so every input token is charged
+  at the uncached rate and the answer says so.
+- **`--at <instant>` re-prices at the rate in force then** — the newest
+  row at or before it (§Price record), so a run from last month costs
+  what it cost rather than what it would cost today.
+
+The answer:
+
+```
+{ provider, model, price_as_of, price_source, usage, cache_known,
+  cost = { amount, currency, source } }
+```
+
+`amount` is USD as decimal text, `currency` is `USD`, and `cost.source`
+is always `estimate`: this is computed from a published rate, and the
+platform's bill is the authority — this is not it.
+
 ## Error surface
 
 - Ledger append failures (disk / transport): driver-side, retryable;

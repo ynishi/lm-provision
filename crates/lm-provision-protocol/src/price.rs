@@ -80,6 +80,45 @@ pub struct Micros {
     pub reasoning: Option<u64>,
 }
 
+/// What one request (or one run) consumed, in the five buckets the
+/// amounts are priced by. **`input` is uncached input only** — the
+/// tokens served from the platform's cache are `cache_read`, not a
+/// part of `input`. That is the Anthropic convention; the OpenAI and
+/// DeepSeek `usage` objects count cache hits inside `prompt_tokens`
+/// and are translated before they get here (the driver's
+/// `cost::usage_from`). Getting this wrong is a double count, and it
+/// is stated once, here, rather than at every caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Usage {
+    /// Uncached input tokens.
+    pub input: u64,
+    /// Output tokens (including reasoning tokens when `reasoning` is `None`).
+    pub output: u64,
+    /// Input tokens served from the cache; `None` when the caller does
+    /// not know (a usage object with no cache field), which is not the
+    /// same as `Some(0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    /// Input tokens written into the cache, where the platform reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
+    /// Reasoning tokens, when reported apart from `output` (and then
+    /// **not** also counted in `output`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<u64>,
+}
+
+/// What a [`Usage`] costs at a [`Micros`] price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Charge {
+    /// Micro-USD, rounded to nearest once, after summing.
+    pub micros: u64,
+    /// Whether the usage said how much of its input was cached. When
+    /// it did not, every input token was charged at the uncached rate
+    /// and this is an upper bound.
+    pub cache_known: bool,
+}
+
 /// Errors raised while appending to or reading a price record, or
 /// reading an amount out of one.
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +216,46 @@ pub fn format_usd(micros: u64) -> String {
     }
     let fraction = format!("{fraction:06}");
     format!("{whole}.{}", fraction.trim_end_matches('0'))
+}
+
+/// `usage × price`, in integers.
+///
+/// Each bucket is `tokens × micro-USD-per-million-tokens`; the buckets
+/// are summed as `u128` and divided by one million once, rounding to
+/// nearest — so no bucket is rounded on its own. The rates for the
+/// optional buckets fall back by what their absence means (09 §Cost):
+/// - `cache_read` tokens at `price.cache_read`, else at `price.input`
+///   (a cached input token is still an input token; a platform that
+///   does not price it apart charges the input rate);
+/// - `cache_write` tokens at `price.cache_write`, else **nothing** (a
+///   platform that does not state a write charge does not charge one —
+///   the write is a surcharge on tokens already counted in `input`);
+/// - `reasoning` tokens at `price.reasoning`, else at `price.output`.
+pub fn charge(usage: &Usage, price: &Micros) -> Charge {
+    let bucket = |tokens: u64, rate: u64| u128::from(tokens) * u128::from(rate);
+    // An absent optional count is no tokens in that bucket, which is
+    // not the same statement as `cache_known`: the unknown cache is
+    // reported, and its tokens are already inside `input`.
+    let total = bucket(usage.input, price.input)
+        + bucket(usage.output, price.output)
+        + bucket(
+            usage.cache_read.unwrap_or(0),
+            price.cache_read.unwrap_or(price.input),
+        )
+        + bucket(
+            usage.cache_write.unwrap_or(0),
+            price.cache_write.unwrap_or(0),
+        )
+        + bucket(
+            usage.reasoning.unwrap_or(0),
+            price.reasoning.unwrap_or(price.output),
+        );
+    // One rounding, at the end: half a micro-dollar up.
+    let micros = (total + 500_000) / 1_000_000;
+    Charge {
+        micros: u64::try_from(micros).unwrap_or(u64::MAX),
+        cache_known: usage.cache_read.is_some(),
+    }
 }
 
 /// The shape [`PriceRow::as_of`] is written in, checked as text.
@@ -460,5 +539,116 @@ mod tests {
             "{error}"
         );
         assert!(!path.exists(), "nothing was written");
+    }
+
+    /// The five rates test 1-3 price against: cache reads priced apart,
+    /// writes and reasoning not.
+    fn rates() -> Micros {
+        Micros {
+            input: 1_300_000,
+            output: 2_600_000,
+            cache_read: Some(100_000),
+            cache_write: None,
+            reasoning: None,
+        }
+    }
+
+    /// **Nothing is rounded twice.** Each bucket is summed in
+    /// token-micro-dollars and the sum is divided by a million once, so
+    /// a charge is what the amounts say rather than the total of five
+    /// separate roundings.
+    #[test]
+    fn a_charge_sums_every_bucket_and_rounds_once() {
+        let priced = charge(
+            &Usage {
+                input: 1_000_000,
+                output: 100_000,
+                cache_read: Some(2_000_000),
+                cache_write: Some(500),
+                reasoning: None,
+            },
+            &rates(),
+        );
+        assert_eq!(
+            priced.micros, 1_760_000,
+            "1.3 for the input, 0.26 for the output, 0.2 for the cached \
+             input, and nothing for a write this platform does not charge for"
+        );
+        assert!(priced.cache_known);
+
+        let one_token_at = |input| {
+            charge(
+                &Usage {
+                    input: 1,
+                    ..Usage::default()
+                },
+                &Micros { input, ..rates() },
+            )
+            .micros
+        };
+        assert_eq!(one_token_at(1_500_000), 2, "half a micro-dollar rounds up");
+        assert_eq!(one_token_at(1_400_000), 1);
+    }
+
+    /// **An upper bound is said to be one.** A usage object with no
+    /// cache field is not a usage object that cached nothing, so every
+    /// input token is charged at the uncached rate and the answer
+    /// carries `cache_known: false` rather than reading as exact.
+    #[test]
+    fn an_unknown_cache_is_charged_as_uncached_input_and_said_so() {
+        let priced = charge(
+            &Usage {
+                input: 3_000_000,
+                output: 0,
+                cache_read: None,
+                ..Usage::default()
+            },
+            &rates(),
+        );
+        assert_eq!(priced.micros, 3_900_000);
+        assert!(
+            !priced.cache_known,
+            "nothing here knows how much of that input was served from a cache"
+        );
+    }
+
+    /// Absent is not zero, and what it does mean differs by bucket: an
+    /// unpriced cache read is an input token, unpriced reasoning is an
+    /// output token, and an unstated write charge is no charge.
+    #[test]
+    fn absent_optional_rates_fall_back_by_what_absence_means() {
+        let price = Micros {
+            input: 1_300_000,
+            output: 2_600_000,
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+        };
+        let million = |usage: Usage| charge(&usage, &price).micros;
+
+        assert_eq!(
+            million(Usage {
+                cache_read: Some(1_000_000),
+                ..Usage::default()
+            }),
+            1_300_000,
+            "a cached input token is still an input token"
+        );
+        assert_eq!(
+            million(Usage {
+                reasoning: Some(1_000_000),
+                ..Usage::default()
+            }),
+            2_600_000,
+            "reasoning not priced apart is priced as output"
+        );
+        assert_eq!(
+            million(Usage {
+                cache_write: Some(1_000_000),
+                ..Usage::default()
+            }),
+            0,
+            "a platform that states no write charge does not charge one"
+        );
     }
 }

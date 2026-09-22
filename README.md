@@ -168,6 +168,8 @@ lm-provision machine sweep --provider runpod --dry-run false
 # `price` from ~/.lm-provision/prices.jsonl when a row there prices its model.
 # The record itself is filled by asking a platform what it charges:
 lm-provision machine prices sync --provider deepinfra  # append what DeepInfra's price list says has changed
+lm-provision machine cost --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash \
+  --usage '{"input":1550000,"output":11000}'     # {"cost":{"amount":"...","currency":"USD","source":"estimate"},"cache_known":false,...}
 lm-provision machine endpoints                        # the JSON artifact
 eval "$(lm-provision machine endpoints --format env)" # DEEPINFRA_DS_BASE_URL / _MODEL / _API_KEY="$DEEPINFRA_API_KEY"
 lm-provision machine endpoints --format litellm > litellm.yaml   # a model_list for the LiteLLM proxy

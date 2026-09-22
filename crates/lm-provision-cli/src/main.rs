@@ -82,6 +82,7 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 use lm_provision_driver::acquisition::{self as record, AcquisitionRow};
+use lm_provision_driver::cost;
 use lm_provision_driver::credentials;
 use lm_provision_driver::forward::{self as forwards_record, ForwardPair, ForwardPod, ForwardRow};
 use lm_provision_driver::infra;
@@ -202,6 +203,73 @@ enum MachineCommand {
     Endpoints(EndpointsArgs),
     /// Keep the price record (09 §Price record).
     Prices(PricesArgs),
+    /// Price a run: what it used, at what the record says a token cost
+    /// where it ran (09 §Cost). Read-only.
+    Cost(CostArgs),
+}
+
+#[derive(Args)]
+struct CostArgs {
+    /// The platform the run ran on (`deepinfra`, `together`, …) — the
+    /// word the price record's rows carry.
+    #[arg(long = "provider")]
+    provider: String,
+
+    /// The model, as that platform names it.
+    #[arg(long = "model")]
+    model: String,
+
+    /// What the run used: a JSON object, or `@path` to a file holding one.
+    #[arg(long = "usage")]
+    usage: String,
+
+    /// Which platform's `usage` shape it is written in.
+    ///
+    /// The five buckets are the Anthropic convention — `input` is
+    /// uncached input — and the shapes that count cache hits inside the
+    /// prompt total are translated here rather than by whoever holds
+    /// the usage (09 §Cost).
+    #[arg(long = "usage-format", value_enum, default_value_t = CostUsageFormat::Plain)]
+    usage_format: CostUsageFormat,
+
+    /// Price it at the rate in force at this instant (RFC 3339 UTC, `Z`
+    /// form); the record's newest row by default.
+    #[arg(long = "at")]
+    at: Option<String>,
+
+    /// The price record to read (09 §Price record); defaults to
+    /// `~/.lm-provision/prices.jsonl`.
+    #[arg(long = "prices")]
+    prices: Option<PathBuf>,
+}
+
+/// The `usage` shapes `machine cost` reads, as flag values.
+///
+/// A repeat of `lm_provision_driver::cost::UsageFormat` because the
+/// driver has no `clap` to derive [`ValueEnum`] with — deliberately (it
+/// is a library and the argument surface left with the binary), so the
+/// flag's vocabulary is spelled here and converted at the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CostUsageFormat {
+    /// The five buckets as this tool writes them.
+    Plain,
+    /// OpenAI Chat Completions / Responses.
+    Openai,
+    /// DeepSeek.
+    Deepseek,
+    /// Anthropic Messages.
+    Anthropic,
+}
+
+impl From<CostUsageFormat> for cost::UsageFormat {
+    fn from(format: CostUsageFormat) -> Self {
+        match format {
+            CostUsageFormat::Plain => cost::UsageFormat::Plain,
+            CostUsageFormat::Openai => cost::UsageFormat::Openai,
+            CostUsageFormat::Deepseek => cost::UsageFormat::Deepseek,
+            CostUsageFormat::Anthropic => cost::UsageFormat::Anthropic,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -722,6 +790,7 @@ fn main() -> ExitCode {
             MachineCommand::Prices(args) => match args.command {
                 PricesCommand::Sync(args) => run_prices_sync(args),
             },
+            MachineCommand::Cost(args) => run_cost(args),
         },
         Command::Mcp => run_mcp(),
     }
@@ -2751,6 +2820,53 @@ fn run_prices_sync(args: PricesSyncArgs) -> ExitCode {
     }
 }
 
+/// `machine cost` — what a run cost, from what it used and what the
+/// record says a token cost where it ran (09 §Cost).
+///
+/// **A reading.** Nothing is bought, nothing is released, and no record
+/// is written: the price record is read and the arithmetic is done
+/// here. The answer is an estimate from a published rate — the
+/// platform's own bill is the authority and this is not it.
+fn run_cost(args: CostArgs) -> ExitCode {
+    match priced(args) {
+        Ok(artifact) => {
+            println!("{artifact}");
+            ExitCode::SUCCESS
+        }
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// [`run_cost`] without the exit code: the usage text, the translation
+/// into the five buckets, the record row, and the artifact — each step
+/// failing with the line the operator is shown.
+fn priced(args: CostArgs) -> Result<String, String> {
+    let path = args.prices.unwrap_or_else(default_prices_path);
+    // `@path` reads the usage from a file, the spelling `curl --data`
+    // and `gh --body-file`-era tools use for "this argument is over
+    // there": a run's usage object is routinely longer than a command
+    // line holds.
+    let text = match args.usage.strip_prefix('@') {
+        Some(file) => std::fs::read_to_string(file)
+            .map_err(|err| format!("could not read the usage from {file}: {err}"))?,
+        None => args.usage.clone(),
+    };
+    let document: serde_json::Value =
+        serde_json::from_str(&text).map_err(|err| format!("the usage is not JSON: {err}"))?;
+    let usage = cost::usage_from(args.usage_format.into(), &document)?;
+    let costed = cost::cost(
+        &path,
+        &args.provider,
+        &args.model,
+        args.at.as_deref(),
+        &usage,
+    )?;
+    serde_json::to_string(&costed).map_err(|err| format!("could not render the cost: {err}"))
+}
+
 /// Where the operator's static rows live by default: with the
 /// credential file, since both are things the operator writes by hand
 /// about services outside this tool's reach.
@@ -2993,9 +3109,9 @@ fn correction_row(
 mod tests {
     use super::{
         attributed, credentials, exit_status, forward_failure_code, parse_forwards,
-        parse_ssh_target, record, resolve_target, run_prices_sync, ssh_help, AcquisitionRow, Cli,
-        Command, ExitCode, Forward, MachineCommand, Path, PathBuf, PricesArgs, PricesCommand,
-        TargetArgs,
+        parse_ssh_target, record, resolve_target, run_cost, run_prices_sync, ssh_help,
+        AcquisitionRow, Cli, Command, ExitCode, Forward, MachineCommand, Path, PathBuf, PricesArgs,
+        PricesCommand, TargetArgs,
     };
     use clap::Parser as _;
     use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
@@ -3428,6 +3544,64 @@ mod tests {
             "a platform this tool reads no prices from is a failed run"
         );
         assert!(!path.exists(), "a refusal writes no record");
+    }
+
+    /// **A price the record does not carry is a failed run, not a cost
+    /// of nothing.** The priced call prints the artifact an operator
+    /// reads — amount, currency, and the `estimate` that says where it
+    /// came from — and the unpriced model exits non-zero rather than
+    /// answering with a zero nobody could tell from a free model.
+    #[test]
+    fn cost_prints_the_priced_artifact_and_refuses_an_unpriced_model() {
+        let path = scratch("cost-record");
+        let row = serde_json::json!({
+            "provider": "deepinfra",
+            "model": "m",
+            "price": { "input": "1.3", "output": "2.6" },
+            "unit": "usd_per_mtok",
+            "as_of": "2026-09-22T00:00:00Z",
+            "source": "https://deepinfra.com/pricing"
+        });
+        std::fs::write(&path, format!("{row}\n")).expect("the scratch record is writable");
+
+        let parse = |model: &str| {
+            let cli = Cli::parse_from([
+                "lm-provision",
+                "machine",
+                "cost",
+                "--provider",
+                "deepinfra",
+                "--model",
+                model,
+                "--usage",
+                r#"{"input":1000000,"output":100000}"#,
+                "--prices",
+                path.to_str().expect("the scratch path is utf-8"),
+            ]);
+            let Command::Machine {
+                command: MachineCommand::Cost(args),
+            } = cli.command
+            else {
+                panic!("the parsed subcommand is `machine cost`");
+            };
+            args
+        };
+
+        let priced = parse("m");
+        assert_eq!(priced.provider, "deepinfra");
+        assert_eq!(
+            format!("{:?}", run_cost(priced)),
+            format!("{:?}", ExitCode::SUCCESS),
+            "the record prices that model"
+        );
+
+        assert_eq!(
+            format!("{:?}", run_cost(parse("not-in-the-record"))),
+            format!("{:?}", ExitCode::FAILURE),
+            "a model the record says nothing about is a failed run"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// A scratch path nothing else is using, in the shape the ledger's

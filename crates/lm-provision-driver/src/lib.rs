@@ -82,6 +82,10 @@
 //!   file and reaches no machine.
 //! - [`credentials`] — where a target's credential is resolved from,
 //!   and what is reported when it is not there.
+//! - [`cost`] — what a run cost: one `usage` document (in the shape the
+//!   platform states it, translated at the door) priced by the record's
+//!   row for its (provider, model) at an instant. A reading, like
+//!   [`inventory`]: it writes nothing and reaches no machine.
 //! - [`image`] — whether the image a profile names exists in its
 //!   registry, asked before a machine exists to pull it and fail.
 //! - [`provisioner`] — where the provisioner comes from: the CI-built,
@@ -92,6 +96,7 @@
 
 pub use lm_provision_protocol::acquisition;
 pub use lm_provision_protocol::forward;
+pub mod cost;
 pub mod credentials;
 pub mod driver;
 pub mod image;
