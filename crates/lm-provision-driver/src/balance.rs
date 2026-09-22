@@ -256,19 +256,20 @@ fn usd_text(amount: f64) -> Option<String> {
 /// The key reaches curl **by name only** ([`crate::infra::curl_bearer`]
 /// imports the variable inside curl), `-m 20` bounds the wait, and a
 /// body — which carries no key — makes it a `POST` with a JSON content
-/// type. JSON on stdout goes to `document_says`.
+/// type. JSON on stdout is the answer.
 ///
 /// Anything else is an `Err` built from curl's status and **its stderr
 /// only**: the body of a refusal is never relayed, because on one of
 /// these platforms the document the key opens carries the account's
 /// billing address and card digits.
-fn asked(
+///
+/// [`crate::cost`] asks the same platform its billing question through
+/// this, so one key travels one way.
+pub(crate) fn fetch_json(
     key_var: &str,
     url: &str,
     body: Option<&str>,
-    document_says: fn(&serde_json::Value, &str) -> Result<Balance, String>,
-    now: &str,
-) -> Result<Balance, String> {
+) -> Result<serde_json::Value, String> {
     let mut argv = crate::infra::curl_bearer(key_var, url);
     for argument in ["-m", TIMEOUT_SEC] {
         argv.push(argument.to_string());
@@ -299,9 +300,19 @@ fn asked(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("{url} did not answer with JSON: {err}"))?;
-    document_says(&document, now)
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("{url} did not answer with JSON: {err}"))
+}
+
+/// One question, and what one of the readers above makes of the answer.
+fn asked(
+    key_var: &str,
+    url: &str,
+    body: Option<&str>,
+    document_says: fn(&serde_json::Value, &str) -> Result<Balance, String>,
+    now: &str,
+) -> Result<Balance, String> {
+    document_says(&fetch_json(key_var, url, body)?, now)
 }
 
 #[cfg(test)]

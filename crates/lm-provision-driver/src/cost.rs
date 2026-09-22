@@ -5,6 +5,8 @@ use std::path::Path;
 
 use lm_provision_protocol::price::{self, Usage};
 
+use crate::{balance, credentials};
+
 /// The shapes a `usage` document arrives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -193,8 +195,9 @@ pub struct Cost {
     pub amount: String,
     /// Always `USD`.
     pub currency: String,
-    /// Always `estimate`: computed from a published rate, not read
-    /// from the platform's bill.
+    /// `estimate` — computed from a published rate ([`cost`]) — or
+    /// `platform`: read from the platform's own bill ([`billed`]), the
+    /// authority an estimate is not.
     pub source: String,
 }
 
@@ -235,6 +238,243 @@ pub fn cost(
             source: "estimate".to_string(),
         },
     })
+}
+
+// ---- The platform's own bill ----
+
+/// What the platform itself says one period cost — its bill, not this
+/// tool's estimate (09 §Cost). `cost.source` is `platform`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Billed {
+    /// The platform whose bill this is.
+    pub provider: String,
+    /// `YYYY.MM`, as the platform names the period.
+    pub period: String,
+    /// One per (model, bucket) the platform listed, in its order, or
+    /// only those of `model` when one was asked for.
+    pub items: Vec<BilledItem>,
+    /// The sum of `items`.
+    pub cost: Cost,
+    /// The URL it was read from.
+    pub source: String,
+}
+
+/// One line of the bill: what a model cost in one of the platform's
+/// own buckets.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BilledItem {
+    /// The model, as the platform names it — or, for an `uptime` line,
+    /// the machine this tool acquired.
+    pub model: String,
+    /// The platform's own bucket word: `input_tokens` / `output_tokens` /
+    /// `cached_tokens` / `uptime` / ….
+    pub bucket: String,
+    /// How many of them: tokens, or minutes for `uptime`.
+    pub units: u64,
+    /// USD per **million** units, decimal text — the price record's own
+    /// unit for a token bucket (`1.3` here is `1.3` there), and exact
+    /// where USD per unit is not: a per-token rate sits below the
+    /// micro-dollar. DeepInfra states cents per unit; converted.
+    pub rate_per_million_units: String,
+    /// USD, decimal text (DeepInfra states cents; converted).
+    pub amount: String,
+}
+
+/// Where DeepInfra states what a month cost: `?from=YYYY.MM` (the dot
+/// is the platform's own separator — `2026-09` is refused "separator
+/// should be .") and the account's key as a bearer.
+pub const DEEPINFRA_USAGE: &str = "https://api.deepinfra.com/payment/usage";
+
+/// Read `provider`'s bill for `period` (`YYYY.MM`), optionally only
+/// `model`'s lines. `deepinfra` today; every other name is refused:
+/// "`{p}` publishes no bill this tool reads (deepinfra)". The period
+/// shape is checked before anything is sent (7 chars, `YYYY.MM`, digits
+/// and one dot at index 4) and refused by name otherwise.
+pub fn billed(provider: &str, period: &str, model: Option<&str>) -> Result<Billed, String> {
+    // Before the key is looked for and before anything is sent: the
+    // platform answers a period of another shape with a complaint about
+    // its separator, and that is a question this tool should not have
+    // asked rather than an answer to relay.
+    if !is_period(period) {
+        return Err(format!(
+            "`{period}` is not a period this tool reads: a month is `YYYY.MM`"
+        ));
+    }
+    match provider {
+        "deepinfra" => {
+            credentials::require("deepinfra", &[balance::DEEPINFRA_API_KEY])
+                .map_err(|it| it.to_string())?;
+            let document = balance::fetch_json(
+                balance::DEEPINFRA_API_KEY,
+                &format!("{DEEPINFRA_USAGE}?from={period}"),
+                None,
+            )?;
+            deepinfra_billed(&document, period, model)
+        }
+        other => Err(format!(
+            "`{other}` publishes no bill this tool reads (deepinfra)"
+        )),
+    }
+}
+
+/// `YYYY.MM`: seven characters, digits, and the platform's own dot at
+/// index 4.
+fn is_period(period: &str) -> bool {
+    let bytes = period.as_bytes();
+    bytes.len() == 7
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if index == 4 {
+                *byte == b'.'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+}
+
+/// The DeepInfra document → the bill. Pure; tested.
+///
+/// The month whose `period` is the one asked for is the only one read
+/// (a document without it is refused, naming the period); every item
+/// states `model.model_name`, `pricing_type`, `units`, `rate` and
+/// `cost`, and one missing any of them is refused by that field rather
+/// than counted as a zero.
+///
+/// **The amounts are cents.** The platform's `payment/usage` states
+/// `total_cost` in cents [documented: docs.deepinfra.com], and a cent
+/// is 10⁴ micro-dollars — the unit the price record holds — so each
+/// amount is converted once, at the reader, and the answer is USD like
+/// every other amount this tool prints.
+///
+/// **`total_cost` is not read.** It is null until the month is
+/// invoiced, and a bill that said nothing for the current month would
+/// be the one question this is for. The items are summed instead.
+pub fn deepinfra_billed(
+    document: &serde_json::Value,
+    period: &str,
+    model: Option<&str>,
+) -> Result<Billed, String> {
+    let months = document
+        .get("months")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let month = months
+        .iter()
+        .find(|it| it.get("period").and_then(serde_json::Value::as_str) == Some(period))
+        .ok_or_else(|| format!("{DEEPINFRA_USAGE} states no month `{period}`"))?;
+    let entries = month
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    let mut items: Vec<(u64, BilledItem)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let missing = |field: &str| format!("item {index} of `{period}` states no {field}");
+        let name = entry
+            .pointer("/model/model_name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| missing("model.model_name"))?;
+        let bucket = entry
+            .get("pricing_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| missing("pricing_type"))?;
+        let units = entry
+            .get("units")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| missing("units"))?;
+        // cents per unit × 10⁴ is micro-dollars per unit; × 10⁶ more is
+        // per million units, the resolution a per-token rate needs.
+        let rate = entry
+            .get("rate")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(|cents| micro_usd(cents * 1_000_000.0))
+            .ok_or_else(|| missing("rate"))?;
+        let amount = entry
+            .get("cost")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(micro_usd)
+            .ok_or_else(|| missing("cost"))?;
+        items.push((
+            amount,
+            BilledItem {
+                model: name.to_string(),
+                bucket: bucket.to_string(),
+                units,
+                rate_per_million_units: price::format_usd(rate),
+                amount: price::format_usd(amount),
+            },
+        ));
+    }
+
+    if let Some(model) = model {
+        items.retain(|(_, item)| item.model == model);
+    }
+    let mut total: u64 = 0;
+    for (amount, _) in &items {
+        total = total.checked_add(*amount).ok_or_else(|| {
+            format!("the items of `{period}` sum to more than micro-dollars hold")
+        })?;
+    }
+
+    Ok(Billed {
+        provider: "deepinfra".to_string(),
+        period: period.to_string(),
+        items: items.into_iter().map(|(_, item)| item).collect(),
+        cost: Cost {
+            amount: price::format_usd(total),
+            currency: "USD".to_string(),
+            source: "platform".to_string(),
+        },
+        source: DEEPINFRA_USAGE.to_string(),
+    })
+}
+
+/// Cents as micro-dollars: a cent is 10⁴ of them, rounded to the
+/// nearest. `None` for what no amount can be made of — not a finite
+/// number, below zero, or larger than micro-dollars hold — so the
+/// caller refuses it by the field it came from.
+fn micro_usd(cents: f64) -> Option<u64> {
+    if !cents.is_finite() || cents < 0.0 {
+        return None;
+    }
+    let micros = (cents * 10_000.0).round();
+    (micros < u64::MAX as f64).then_some(micros as u64)
+}
+
+/// The (provider, model) of the inventory row called `name`, read
+/// from the same sources `machine endpoints` reads (network: an
+/// acquisition is asked about through its platform).
+///
+/// Refuses a name no row carries, a row that names no provider or no
+/// model — the join a price is made on has to stand on both — and,
+/// when the inventory could not be fully read and the name was not
+/// found, says so with what could not be read: a row that is missing
+/// because its source failed is not a row that does not exist.
+pub fn endpoint_named(
+    sources: &crate::inventory::EndpointSources<'_>,
+    name: &str,
+) -> Result<(String, String), String> {
+    let inventory = crate::inventory::endpoints(sources);
+    let Some(row) = inventory.rows.iter().find(|row| row.name == name) else {
+        let mut refusal = format!("no endpoint named `{name}` in the inventory");
+        if !inventory.complete() {
+            let unread = inventory
+                .failed
+                .iter()
+                .map(|(what, reason)| format!("{what}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            refusal.push_str(&format!(", which could not be fully read ({unread})"));
+        }
+        return Err(refusal);
+    };
+    let (Some(provider), Some(model)) = (row.provider.as_deref(), row.model.as_deref()) else {
+        return Err(format!(
+            "endpoint `{name}` names no provider/model to price by"
+        ));
+    };
+    Ok((provider.to_string(), model.to_string()))
 }
 
 #[cfg(test)]
@@ -416,5 +656,157 @@ mod tests {
         assert!(refused.contains('x') && refused.contains('m'), "{refused}");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The month the platform stated, in the shape it stated it
+    /// [live read 2026-09-23, this host's key].
+    fn a_month() -> serde_json::Value {
+        let line = |model: &str, units: u64, rate: f64, cost: u64, bucket: &str| {
+            serde_json::json!({
+                "model": { "provider": "di", "model_name": model,
+                           "task": "text-generation", "private": false },
+                "units": units, "rate": rate, "cost": cost,
+                "pricing_type": bucket,
+            })
+        };
+        serde_json::json!({ "months": [{
+            "period": "2026.09",
+            "interval": { "fr": 1788246000000u64, "to": 1790837999999u64 },
+            "items": [
+                line("deepseek-ai/DeepSeek-V4-Pro", 2286051, 0.00013, 297, "input_tokens"),
+                line("deepseek-ai/DeepSeek-V4-Pro", 175592, 0.00026, 46, "output_tokens"),
+                line("deepseek-ai/DeepSeek-V4-Pro", 12126464, 1.00000004e-05, 121, "cached_tokens"),
+                line("ynishi/lmp-exp-20260923T022040Z", 15, 0.06111111, 1, "uptime"),
+            ],
+            "total_cost": serde_json::Value::Null,
+            "invoice_id": serde_json::Value::Null,
+        }]})
+    }
+
+    /// **The bill is the month's own lines, summed from cents.** The
+    /// platform states each (model, bucket) apart — tokens in three
+    /// buckets, a machine's minutes in a fourth — in cents, and leaves
+    /// `total_cost` null until the month is invoiced, so the sum is the
+    /// items and not the field. A month the document does not carry is
+    /// refused by the period asked for rather than answered with
+    /// whatever month it did carry, and a line missing an amount is
+    /// refused by that field rather than counted as nothing.
+    #[test]
+    fn a_deepinfra_bill_is_the_months_items_summed_from_cents() {
+        let document = a_month();
+        let bill = deepinfra_billed(&document, "2026.09", None).expect("the month is in there");
+        assert_eq!(bill.items.len(), 4);
+        assert_eq!(bill.items[0].bucket, "input_tokens");
+        assert_eq!(bill.items[0].model, "deepseek-ai/DeepSeek-V4-Pro");
+        assert_eq!(bill.items[0].units, 2286051);
+        assert_eq!(
+            bill.items[0].rate_per_million_units, "1.3",
+            "0.00013 cents per token is 1.30 USD per million tokens — the record's own number"
+        );
+        assert_eq!(bill.items[0].amount, "2.97", "297 cents");
+        assert_eq!(
+            bill.cost.amount, "4.65",
+            "297 + 46 + 121 + 1 cents, summed in micro-dollars"
+        );
+        assert_eq!(bill.cost.currency, "USD");
+        assert_eq!(
+            bill.cost.source, "platform",
+            "the platform's own bill is the authority the estimate is not"
+        );
+        assert_eq!(bill.period, "2026.09");
+        assert_eq!(bill.provider, "deepinfra");
+        assert_eq!(bill.source, DEEPINFRA_USAGE);
+
+        let one_model = deepinfra_billed(&document, "2026.09", Some("deepseek-ai/DeepSeek-V4-Pro"))
+            .expect("the month is in there");
+        assert_eq!(
+            one_model.items.len(),
+            3,
+            "the machine's uptime is another model's line"
+        );
+        assert_eq!(one_model.cost.amount, "4.64");
+
+        let refused = deepinfra_billed(&document, "2026.08", None)
+            .expect_err("the document carries no such month");
+        assert!(refused.contains("2026.08"), "{refused}");
+
+        let mut silent = a_month();
+        silent["months"][0]["items"][2]
+            .as_object_mut()
+            .expect("an item is an object")
+            .remove("cost");
+        let refused =
+            deepinfra_billed(&silent, "2026.09", None).expect_err("that line states no amount");
+        assert!(
+            refused.contains("cost"),
+            "the field that was missing is named: {refused}"
+        );
+    }
+
+    /// **A period of the wrong shape is not sent.** The platform names
+    /// a month `YYYY.MM` and answers anything else with a complaint
+    /// about its separator; the shape is checked here, before the key
+    /// is looked for and before anything is sent. A platform that
+    /// publishes no bill this tool reads is refused by its own name,
+    /// whether it is one this tool spends through or one nobody serves.
+    #[test]
+    fn a_bill_period_is_the_platforms_own_shape_and_others_are_refused_by_name() {
+        let refused =
+            billed("deepinfra", "2026-09", None).expect_err("a dash is not the separator");
+        assert!(refused.contains("YYYY.MM"), "{refused}");
+
+        let refused = billed("together", "2026.09", None)
+            .expect_err("the platform publishes no bill this tool reads");
+        assert!(refused.contains("together"), "{refused}");
+
+        let refused = billed("nope", "2026.09", None).expect_err("nor does a name nobody serves");
+        assert!(refused.contains("nope"), "{refused}");
+    }
+
+    /// **An endpoint prices by the row's own words.** A run that
+    /// reached an endpoint by the name the profile or the operator gave
+    /// it is priced without re-typing where it ran — the row names the
+    /// platform and the model, and those are the two words the price
+    /// record joins on. A row that names neither gives the join nothing
+    /// to stand on, and a name no row carries is refused by that name.
+    #[test]
+    fn an_endpoint_is_priced_by_the_provider_and_model_its_row_names() {
+        let dir = scratch("endpoint-named");
+        std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+        let statics = dir.join("endpoints.json");
+        std::fs::write(
+            &statics,
+            r#"[{"name": "flash", "provider": "deepinfra",
+                 "model": "deepseek-ai/DeepSeek-V4-Flash", "base_url": "u"},
+                {"name": "bare", "base_url": "u"}]"#,
+        )
+        .expect("the static file is writable");
+        // Absent: no machine is asked about through its platform, and
+        // no record prices anything — the lookup is the rows' own
+        // words and nothing else.
+        let absent = dir.join("absent.jsonl");
+        let sources = crate::inventory::EndpointSources {
+            acquisitions: &absent,
+            forwards: &absent,
+            statics: Some(&statics),
+            prices: &absent,
+        };
+
+        assert_eq!(
+            endpoint_named(&sources, "flash"),
+            Ok((
+                "deepinfra".to_string(),
+                "deepseek-ai/DeepSeek-V4-Flash".to_string()
+            ))
+        );
+
+        let refused =
+            endpoint_named(&sources, "bare").expect_err("that row names nothing to price by");
+        assert!(refused.contains("no provider"), "{refused}");
+
+        let refused = endpoint_named(&sources, "nope").expect_err("no row carries that name");
+        assert!(refused.contains("nope"), "{refused}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

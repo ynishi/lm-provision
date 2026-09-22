@@ -204,7 +204,8 @@ enum MachineCommand {
     /// Keep the price record (09 §Price record).
     Prices(PricesArgs),
     /// Price a run: what it used, at what the record says a token cost
-    /// where it ran (09 §Cost). Read-only.
+    /// where it ran — or, with `--period`, what the platform itself
+    /// billed for that month (09 §Cost). Read-only.
     Cost(CostArgs),
 }
 
@@ -213,24 +214,56 @@ struct CostArgs {
     /// The platform the run ran on (`deepinfra`, `together`, …) — the
     /// word the price record's rows carry.
     #[arg(long = "provider")]
-    provider: String,
+    provider: Option<String>,
 
     /// The model, as that platform names it.
     #[arg(long = "model")]
-    model: String,
+    model: Option<String>,
+
+    /// Price by the provider and model of this inventory row instead of
+    /// `--provider` / `--model` (09 §Endpoint inventory); reads the same
+    /// sources as `machine endpoints`.
+    #[arg(long = "endpoint")]
+    endpoint: Option<String>,
+
+    /// The operator's static rows, for `--endpoint` — a JSON array of
+    /// `{name, base_url, model?, api_key_env?, provider?, price?}`, as
+    /// `machine endpoints` reads. Defaults to
+    /// `~/.config/lm-provision/endpoints.json` when that file exists;
+    /// named explicitly, it has to.
+    #[arg(long = "endpoints-file")]
+    endpoints_file: Option<PathBuf>,
+
+    /// The acquisitions record `--endpoint` is looked up in; defaults
+    /// to `~/.lm-provision/acquisitions.jsonl`.
+    #[arg(long = "acquisitions")]
+    acquisitions: Option<PathBuf>,
+
+    /// The forwards record `--endpoint` is looked up in (09 §Forwards
+    /// record); defaults to `~/.lm-provision/forwards.jsonl`.
+    #[arg(long = "forwards")]
+    forwards: Option<PathBuf>,
 
     /// What the run used: a JSON object, or `@path` to a file holding one.
     #[arg(long = "usage")]
-    usage: String,
+    usage: Option<String>,
 
-    /// Which platform's `usage` shape it is written in.
+    /// Read the platform's own bill for this period (`YYYY.MM`) instead
+    /// of pricing a usage — `cost.source` is `platform`, the authority.
+    /// `deepinfra` today; with `--model` (or `--endpoint`) only that
+    /// model's lines.
+    #[arg(long = "period")]
+    period: Option<String>,
+
+    /// Which platform's `usage` shape it is written in; `plain` by
+    /// default.
     ///
     /// The five buckets are the Anthropic convention — `input` is
     /// uncached input — and the shapes that count cache hits inside the
     /// prompt total are translated here rather than by whoever holds
     /// the usage (09 §Cost).
-    #[arg(long = "usage-format", value_enum, default_value_t = CostUsageFormat::Plain)]
-    usage_format: CostUsageFormat,
+    #[arg(long = "usage-format", value_enum)]
+    usage_format: Option<CostUsageFormat>,
 
     /// Price it at the rate in force at this instant (RFC 3339 UTC, `Z`
     /// form); the record's newest row by default.
@@ -2853,7 +2886,8 @@ fn run_prices_sync(args: PricesSyncArgs) -> ExitCode {
 /// **A reading.** Nothing is bought, nothing is released, and no record
 /// is written: the price record is read and the arithmetic is done
 /// here. The answer is an estimate from a published rate — the
-/// platform's own bill is the authority and this is not it.
+/// platform's own bill is the authority and this is not it, which is
+/// what `--period` asks the platform for instead.
 fn run_cost(args: CostArgs) -> ExitCode {
     match priced(args) {
         Ok(artifact) => {
@@ -2867,30 +2901,124 @@ fn run_cost(args: CostArgs) -> ExitCode {
     }
 }
 
-/// [`run_cost`] without the exit code: the usage text, the translation
-/// into the five buckets, the record row, and the artifact — each step
-/// failing with the line the operator is shown.
+/// [`run_cost`] without the exit code: the arguments checked against
+/// each other, the endpoint resolved when one was named, then either
+/// the usage priced from the record or the platform's bill read — each
+/// step failing with the line the operator is shown.
 fn priced(args: CostArgs) -> Result<String, String> {
-    let path = args.prices.unwrap_or_else(default_prices_path);
+    let path = args.prices.clone().unwrap_or_else(default_prices_path);
+    // Which question this is, decided before anything is read: a usage
+    // priced from the record, or the month the platform itself billed.
+    // They are different answers with different authorities behind
+    // them, so one of them is asked for and not both.
+    match (&args.usage, &args.period) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "one of --usage or --period: --usage is priced from the record, \
+                        --period is the platform's own bill"
+                    .to_string(),
+            )
+        }
+        (None, None) => {
+            return Err(
+                "one of --usage or --period is required: a usage to price, or a \
+                        period to read the bill for"
+                    .to_string(),
+            )
+        }
+        _ => {}
+    }
+    if args.endpoint.is_some() && (args.provider.is_some() || args.model.is_some()) {
+        return Err(
+            "--endpoint names the provider and the model; --provider / --model are \
+                    not given with it"
+                .to_string(),
+        );
+    }
+    if args.period.is_some() {
+        if args.at.is_some() || args.usage_format.is_some() {
+            return Err("--at / --usage-format price a usage, not a bill".to_string());
+        }
+        if args.endpoint.is_none() && args.provider.is_none() {
+            return Err("--period needs --provider or --endpoint: whose bill to read".to_string());
+        }
+    } else if args.endpoint.is_none() && (args.provider.is_none() || args.model.is_none()) {
+        return Err("--provider and --model are required without --endpoint".to_string());
+    }
+
+    // The row's own words, when a row was named: the same reading
+    // `machine endpoints` does, so an endpoint is priced by the name it
+    // was reached under rather than by re-typing where it ran.
+    let named = match args.endpoint.as_deref() {
+        Some(name) => {
+            let acquisitions = args
+                .acquisitions
+                .clone()
+                .unwrap_or_else(default_acquisitions_path);
+            let forwards = args.forwards.clone().unwrap_or_else(default_forwards_path);
+            let statics = match args.endpoints_file.clone() {
+                Some(path) => Some(path),
+                None => Some(default_endpoints_file()).filter(|it| it.exists()),
+            };
+            Some(cost::endpoint_named(
+                &inventory::EndpointSources {
+                    acquisitions: &acquisitions,
+                    forwards: &forwards,
+                    statics: statics.as_deref(),
+                    prices: &path,
+                },
+                name,
+            )?)
+        }
+        None => None,
+    };
+    let (provider, endpoint_model) = match named {
+        Some((provider, model)) => (provider, Some(model)),
+        None => (
+            args.provider
+                .clone()
+                .ok_or_else(|| "--provider is required".to_string())?,
+            None,
+        ),
+    };
+
+    // The platform's own bill: nothing of the record is read, and the
+    // model — the endpoint's, or the one asked for — only narrows the
+    // lines to those of one model.
+    if let Some(period) = args.period.as_deref() {
+        let model = endpoint_model.as_deref().or(args.model.as_deref());
+        let bill = cost::billed(&provider, period, model)?;
+        return serde_json::to_string(&bill)
+            .map_err(|err| format!("could not render the bill: {err}"));
+    }
+
+    let model = match endpoint_model {
+        Some(model) => model,
+        None => args
+            .model
+            .clone()
+            .ok_or_else(|| "--model is required".to_string())?,
+    };
+    let usage_text = args
+        .usage
+        .clone()
+        .ok_or_else(|| "--usage is required".to_string())?;
     // `@path` reads the usage from a file, the spelling `curl --data`
     // and `gh --body-file`-era tools use for "this argument is over
     // there": a run's usage object is routinely longer than a command
     // line holds.
-    let text = match args.usage.strip_prefix('@') {
+    let text = match usage_text.strip_prefix('@') {
         Some(file) => std::fs::read_to_string(file)
             .map_err(|err| format!("could not read the usage from {file}: {err}"))?,
-        None => args.usage.clone(),
+        None => usage_text.clone(),
     };
     let document: serde_json::Value =
         serde_json::from_str(&text).map_err(|err| format!("the usage is not JSON: {err}"))?;
-    let usage = cost::usage_from(args.usage_format.into(), &document)?;
-    let costed = cost::cost(
-        &path,
-        &args.provider,
-        &args.model,
-        args.at.as_deref(),
-        &usage,
+    let usage = cost::usage_from(
+        args.usage_format.unwrap_or(CostUsageFormat::Plain).into(),
+        &document,
     )?;
+    let costed = cost::cost(&path, &provider, &model, args.at.as_deref(), &usage)?;
     serde_json::to_string(&costed).map_err(|err| format!("could not render the cost: {err}"))
 }
 
@@ -3136,7 +3264,7 @@ fn correction_row(
 mod tests {
     use super::{
         attributed, credentials, exit_status, forward_failure_code, parse_forwards,
-        parse_ssh_target, record, resolve_target, run_cost, run_prices_sync, ssh_help,
+        parse_ssh_target, priced, record, resolve_target, run_cost, run_prices_sync, ssh_help,
         AcquisitionRow, Cli, Command, ExitCode, Forward, MachineCommand, Path, PathBuf, PricesArgs,
         PricesCommand, TargetArgs,
     };
@@ -3650,7 +3778,7 @@ mod tests {
         };
 
         let priced = parse("m");
-        assert_eq!(priced.provider, "deepinfra");
+        assert_eq!(priced.provider.as_deref(), Some("deepinfra"));
         assert_eq!(
             format!("{:?}", run_cost(priced)),
             format!("{:?}", ExitCode::SUCCESS),
@@ -3664,6 +3792,106 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// **The two questions `machine cost` answers are asked for
+    /// separately.** A usage is priced from the record; a period is the
+    /// platform's own bill, and `cost.source` says which. Asking for
+    /// both in one call is refused before anything is read — there is
+    /// no answer that is both — and an endpoint's name stands in for
+    /// the provider and the model, read from the same rows
+    /// `machine endpoints` lists.
+    #[test]
+    fn cost_by_endpoint_name_and_by_period_parse_and_refuse() {
+        let parse = |extra: Vec<&str>| {
+            let mut argv = vec!["lm-provision", "machine", "cost"];
+            argv.extend(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Machine {
+                command: MachineCommand::Cost(args),
+            } = cli.command
+            else {
+                panic!("the parsed subcommand is `machine cost`");
+            };
+            args
+        };
+
+        let by_endpoint = parse(vec![
+            "--endpoint",
+            "flash",
+            "--usage",
+            r#"{"input":1,"output":1}"#,
+        ]);
+        assert_eq!(by_endpoint.endpoint.as_deref(), Some("flash"));
+        assert_eq!(
+            by_endpoint.provider, None,
+            "the row names the platform, so the flag does not"
+        );
+
+        let by_period = parse(vec!["--period", "2026.09", "--provider", "deepinfra"]);
+        assert_eq!(by_period.period.as_deref(), Some("2026.09"));
+        assert_eq!(by_period.usage, None);
+
+        let both = vec!["--period", "2026.09", "--usage", "x"];
+        let refused =
+            priced(parse(both.clone())).expect_err("a bill and an estimate are not one answer");
+        assert!(refused.contains("one of --usage or --period"), "{refused}");
+        assert_eq!(
+            format!("{:?}", run_cost(parse(both))),
+            format!("{:?}", ExitCode::FAILURE),
+            "and nothing is asked of any platform to find that out"
+        );
+
+        // The endpoint resolved and priced: a static row naming the
+        // platform and the model, a record pricing that pair, and no
+        // acquisitions or forwards — so no machine is asked about
+        // through its platform.
+        let dir = scratch("cost-endpoint");
+        std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+        let record = dir.join("prices.jsonl");
+        let row = serde_json::json!({
+            "provider": "deepinfra",
+            "model": "m",
+            "price": { "input": "1.3", "output": "2.6" },
+            "unit": "usd_per_mtok",
+            "as_of": "2026-09-22T00:00:00Z",
+            "source": "https://deepinfra.com/pricing"
+        });
+        std::fs::write(&record, format!("{row}\n")).expect("the scratch record is writable");
+        let statics = dir.join("endpoints.json");
+        std::fs::write(
+            &statics,
+            r#"[{"name": "flash", "provider": "deepinfra", "model": "m",
+                 "base_url": "http://127.0.0.1:1/v1"}]"#,
+        )
+        .expect("the static file is writable");
+        let absent = dir.join("absent.jsonl");
+        let text = |path: &Path| {
+            path.to_str()
+                .expect("the scratch path is utf-8")
+                .to_string()
+        };
+        let artifact = priced(parse(vec![
+            "--endpoint",
+            "flash",
+            "--endpoints-file",
+            &text(&statics),
+            "--acquisitions",
+            &text(&absent),
+            "--forwards",
+            &text(&absent),
+            "--prices",
+            &text(&record),
+            "--usage",
+            r#"{"input":1000000,"output":100000}"#,
+        ]))
+        .expect("the row names a pair the record prices");
+        assert!(
+            artifact.contains("\"model\":\"m\"") && artifact.contains("\"amount\":\"1.56\""),
+            "the row's own provider and model priced it: {artifact}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A scratch path nothing else is using, in the shape the ledger's

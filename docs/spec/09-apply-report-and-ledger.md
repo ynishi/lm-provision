@@ -591,6 +591,18 @@ What a run used is stated in five buckets:
 - **`--at <instant>` re-prices at the rate in force then** — the newest
   row at or before it (§Price record), so a run from last month costs
   what it cost rather than what it would cost today.
+- **`--period <YYYY.MM>` reads the platform's own bill instead of
+  pricing a usage.** What the platform lists for the month — one line
+  per (model, bucket) in its own words (`input_tokens` /
+  `output_tokens` / `cached_tokens` / `uptime`), units, rate and
+  amount, summed — with `cost.source: platform`: the authority the
+  estimate is not. DeepInfra today (its `payment/usage`, cents
+  converted to USD); a platform with no such surface is refused by
+  name.
+- **`--endpoint <name>` prices by the provider and model of that
+  inventory row** (§Endpoint inventory), so a run that reached an
+  endpoint by the name the profile or the operator gave it is priced
+  without re-typing where it ran.
 
 The answer:
 
@@ -600,8 +612,16 @@ The answer:
 ```
 
 `amount` is USD as decimal text, `currency` is `USD`, and `cost.source`
-is always `estimate`: this is computed from a published rate, and the
+is `estimate`: this is computed from a published rate, and the
 platform's bill is the authority — this is not it.
+
+The billed answer's shape:
+
+```
+{ provider, period, items = [{ model, bucket, units,
+                              rate_per_million_units, amount }],
+  cost = { amount, currency, source = "platform" }, source }
+```
 
 ## Error surface
 

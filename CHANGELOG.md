@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`machine cost --period <YYYY.MM>` and `--endpoint <name>`.**
+  `--period` reads the platform's own bill for a month — DeepInfra's
+  `payment/usage`, one line per (model, bucket) with units, rate and
+  amount, cents converted to USD and summed — and answers with
+  `cost.source: platform`, the authority the estimate is not [measured:
+  2026-09-23, a month's lines summed to the cents of what the account
+  said it had spent]. `--endpoint` prices by the provider and model of
+  an inventory row instead of `--provider` / `--model`. Both on
+  `lm_cost`.
 - **`machine prices sync` applies DeepInfra's discount and reads
   Together.** DeepInfra's `cents_per_*` is the list price and `discount`
   a fraction off it; what it bills is list × (1 − discount) [measured:
