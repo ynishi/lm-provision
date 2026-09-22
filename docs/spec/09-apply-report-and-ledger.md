@@ -491,6 +491,13 @@ nothing. One row per endpoint:
                            -- the newest price-record row for
                            -- (provider, model), or the static row's
                            -- own; USD per million tokens, decimal text
+  balance?     = { amount, currency, spend_per_hour?, suspended?,
+                   suspend_reason?, as_of, source },
+                           -- what the platform this tool spends from
+                           -- says is left, when asked (--balance)
+                           -- and when it says
+  probe?       = { state, http?, said?, usage? },
+                           -- what one token got, when asked (--probe)
   source       = string,   -- "acquisitions" | "forwards" | <static path>
 }
 ```
@@ -513,6 +520,29 @@ nothing. One row per endpoint:
   carry its own `price` (the operator's word, which beats the record
   for that row). No row prices it → no `price` key. A record that
   cannot be read is one entry in `failed` and prices nothing.
+- **A balance is the account this tool spends from, as the platform
+  states it — asked once per platform and put beside every row of it.**
+  RunPod (`myself.clientBalance`, with the account's spend per hour),
+  Vast (`credit`, the prepaid amount its CLI prints as money) and
+  DeepInfra (`checklist.stripe_balance`, whose sign the platform
+  documents as "negative = funds ready to spend" and which is flipped
+  here so positive is funds everywhere; with `suspended` /
+  `suspend_reason`) say; Together publishes none and its rows carry no
+  `balance` — absent is "the platform does not say", never zero. A name
+  this tool has no adapter for is not asked: there is no account of this
+  tool's there. The DeepInfra document also carries the billing address
+  and card digits; the reader takes the three named fields and nothing
+  else. A platform that could not be asked (no key, no answer) is one
+  entry in `failed`. Nothing here is a gate: the row says what was read
+  and when, and what to do about it is the operator's.
+- **A probe is one token, now.** `--probe` sends every row with a
+  `base_url` and a `model` a one-token completion and reports the answer
+  by state (`ok` / `unauthorized` / `payment_required` / `not_found` /
+  `failed` / `unreachable` / `no_key`), with the platform's own words
+  when it refused and its `usage` object when it did not — the place a
+  platform states what the request cost it. It spends money and runs
+  only when asked; a refusal is a warning on stderr and a state in the
+  row, not an exit code.
 - The static file is a JSON array of `{name, base_url, model?,
   api_key_env?, provider?, price?}`; a field outside those is refused
   by name rather than dropped, since a mistyped `api_key_env`

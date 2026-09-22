@@ -2286,7 +2286,7 @@ impl Infra for DeepInfraAdapter {
 /// an argv that named only the variable; curl ≥ 8.3.0]. `-sS` keeps
 /// errors and drops the progress meter; `--fail-with-body` makes an HTTP
 /// error a non-zero exit while keeping the service's own explanation.
-fn curl_bearer(var: &str, url: &str) -> Vec<String> {
+pub(crate) fn curl_bearer(var: &str, url: &str) -> Vec<String> {
     vec![
         "curl".to_string(),
         "-sS".to_string(),

@@ -439,6 +439,21 @@ scrollback and a machine that billed until someone noticed.
   cannot be read is reported in the document's `failed` and costs the
   zero exit, as a platform that cannot be listed does.
 
+- **What the fleet's tokens cost is read beside what it serves.** The
+  inventory joins chapter 09's price record onto each row as `price`;
+  `machine prices sync --provider <p>` is that record's writer, asking a
+  platform's own price list and appending what changed; and `machine
+  cost --provider <p> --model <m> --usage <json> [--usage-format …]
+  [--at <instant>]` prices one run's usage at the rate in force then
+  (chapter 09 §Cost) — a reading, and an estimate: the platform's bill
+  is the authority. Two more questions the inventory answers when told
+  to: `--balance`, what a platform this tool spends from says is left on
+  the account (RunPod, Vast and DeepInfra say; Together does not; absent
+  is not zero), and `--probe`, one token to every endpoint, so an
+  exhausted account or a dead key is found now and not by the next run —
+  this one spends money and runs only when asked. Neither is a gate: the
+  row states what was read and the operator decides.
+
 ## Operator pod verbs
 
 An apply leaves a pod running something. Everything an operator does

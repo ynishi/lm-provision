@@ -449,6 +449,19 @@ struct EndpointsArgs {
     /// LiteLLM proxy, the key as `os.environ/<api_key_env>`.
     #[arg(long = "format", value_enum, default_value_t = EndpointFormat::Json)]
     format: EndpointFormat,
+    /// Also ask each platform this tool spends from what is left on
+    /// the account — RunPod, Vast and DeepInfra say; Together does
+    /// not — and put the answer beside every row of that platform as
+    /// `balance`. Read-only.
+    #[arg(long = "balance")]
+    balance: bool,
+    /// Also send every endpoint a one-token completion and report what
+    /// came back as `probe` — the one question that finds an exhausted
+    /// account (402) or a dead key (401) now rather than in the next
+    /// run. **Spends money**: a few tokens per endpoint. Off unless
+    /// asked for.
+    #[arg(long = "probe")]
+    probe: bool,
 }
 
 /// The renderings `machine endpoints` offers.
@@ -2744,12 +2757,26 @@ fn run_endpoints(args: EndpointsArgs) -> ExitCode {
         Some(path) => Some(path),
         None => Some(default_endpoints_file()).filter(|it| it.exists()),
     };
-    let inventory = inventory::endpoints(&inventory::EndpointSources {
+    let mut inventory = inventory::endpoints(&inventory::EndpointSources {
         acquisitions: &acquisitions,
         forwards: &forwards,
         statics: statics.as_deref(),
         prices: &prices,
     });
+    if args.balance {
+        inventory.balanced(&prices::now_utc());
+    }
+    if args.probe {
+        inventory.probed();
+        // A refusal is news, not an exit code: the state is in the row,
+        // and this is the line that says so while the operator watches.
+        for (name, state, said) in inventory.probe_refusals() {
+            eprintln!(
+                "warning: {name}: probe {state:?}{}",
+                said.map(|it| format!(" — {it}")).unwrap_or_default()
+            );
+        }
+    }
     for (program, said) in &inventory.said {
         relay(program, said);
     }
@@ -3508,6 +3535,41 @@ mod tests {
             .is_empty());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// **Both extra questions are asked for, never on by default.** A
+    /// probe spends money and a balance reaches a platform, so the
+    /// bare `machine endpoints` asks neither — and the flags that do
+    /// ask are parsed here, where a rename would otherwise change what
+    /// a run costs without failing anything.
+    #[test]
+    fn endpoints_flags_balance_and_probe_parse() {
+        let parsed = |argv: &[&str]| {
+            let cli = Cli::parse_from(argv);
+            let Command::Machine {
+                command: MachineCommand::Endpoints(args),
+            } = cli.command
+            else {
+                panic!("the parsed subcommand is `machine endpoints`");
+            };
+            (args.balance, args.probe)
+        };
+
+        assert_eq!(
+            parsed(&[
+                "lm-provision",
+                "machine",
+                "endpoints",
+                "--balance",
+                "--probe"
+            ]),
+            (true, true)
+        );
+        assert_eq!(
+            parsed(&["lm-provision", "machine", "endpoints"]),
+            (false, false),
+            "nothing is spent, and no platform is reached, unless asked for"
+        );
     }
 
     /// **A platform with no price list to read writes no record.** The
@@ -4326,6 +4388,8 @@ mod tests {
                     api_key_env: Some("TOGETHER_API_KEY".to_string()),
                     expires_at: None,
                     price: None,
+                    balance: None,
+                    probe: None,
                     source: "acquisitions".to_string(),
                 },
                 Endpoint {
@@ -4338,6 +4402,8 @@ mod tests {
                     api_key_env: None,
                     expires_at: None,
                     price: None,
+                    balance: None,
+                    probe: None,
                     source: "forwards".to_string(),
                 },
                 Endpoint {
@@ -4350,6 +4416,8 @@ mod tests {
                     api_key_env: None,
                     expires_at: None,
                     price: None,
+                    balance: None,
+                    probe: None,
                     source: "acquisitions".to_string(),
                 },
             ],

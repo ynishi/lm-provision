@@ -168,6 +168,8 @@ lm-provision machine sweep --provider runpod --dry-run false
 # `price` from ~/.lm-provision/prices.jsonl when a row there prices its model.
 # The record itself is filled by asking a platform what it charges:
 lm-provision machine prices sync --provider deepinfra  # append what DeepInfra's price list says has changed
+lm-provision machine endpoints --probe    # one token to each endpoint: finds a 402 / dead key now, not in the next run (spends a few tokens)
+lm-provision machine endpoints --balance  # what RunPod / Vast / DeepInfra say is left on the account; Together publishes no balance
 lm-provision machine cost --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash \
   --usage '{"input":1550000,"output":11000}'     # {"cost":{"amount":"...","currency":"USD","source":"estimate"},"cache_known":false,...}
 lm-provision machine endpoints                        # the JSON artifact

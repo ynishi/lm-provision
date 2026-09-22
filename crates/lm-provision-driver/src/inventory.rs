@@ -245,6 +245,13 @@ pub struct Endpoint {
     /// row names, a model the record has not been synced for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<EndpointPrice>,
+    /// What the platform says is left on the account, when asked
+    /// (`--balance`) and when the platform says (09 §Endpoint inventory).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<crate::balance::Balance>,
+    /// What one token got, when asked (`--probe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<crate::probe::Probe>,
     /// Where the row came from: `acquisitions`, `forwards`, or the
     /// static file's path.
     pub source: String,
@@ -329,6 +336,89 @@ impl Endpoints {
     /// Whether every source and every recorded machine answered.
     pub fn complete(&self) -> bool {
         self.failed.is_empty()
+    }
+
+    /// Ask each platform named by a row what is left, once per platform,
+    /// and put the answer beside every row of that platform. A platform
+    /// that publishes no balance leaves its rows as they were; one that
+    /// could not be asked is one entry in `failed` under `balance <p>`.
+    pub fn balanced(&mut self, now: &str) {
+        self.balanced_with(|provider| crate::balance::read(provider, now))
+    }
+
+    /// [`Endpoints::balanced`] with the reader handed in — the seam the
+    /// tests ask through, so what this does with an answer is checked
+    /// without a platform to ask.
+    pub fn balanced_with(
+        &mut self,
+        mut read: impl FnMut(&str) -> Result<Option<crate::balance::Balance>, String>,
+    ) {
+        // The distinct platforms in the order the rows name them: the
+        // artifact's order is the rows', and a set would answer in
+        // whatever order it hashed them into.
+        let mut providers: Vec<String> = Vec::new();
+        for row in &self.rows {
+            if let Some(provider) = &row.provider {
+                if !providers.contains(provider) {
+                    providers.push(provider.clone());
+                }
+            }
+        }
+        for provider in providers {
+            match read(&provider) {
+                Ok(Some(balance)) => {
+                    for row in &mut self.rows {
+                        if row.provider.as_deref() == Some(provider.as_str()) {
+                            row.balance = Some(balance.clone());
+                        }
+                    }
+                }
+                // The platform publishes none: its rows carry no
+                // balance, which is not the same statement as a
+                // platform nobody could ask.
+                Ok(None) => {}
+                Err(reason) => self.failed.push((format!("balance {provider}"), reason)),
+            }
+        }
+    }
+
+    /// Send one token to every row that has somewhere to send it
+    /// (`base_url` and `model`) and put what came back beside it. A row
+    /// with no `base_url`, or no `model` to name, is left as it was.
+    pub fn probed(&mut self) {
+        self.probed_with(crate::probe::probe)
+    }
+
+    /// [`Endpoints::probed`] with the sender handed in — the seam the
+    /// tests ask through, so nothing is sent to check what is done with
+    /// the answers.
+    pub fn probed_with(
+        &mut self,
+        mut probe: impl FnMut(&str, &str, Option<&str>) -> crate::probe::Probe,
+    ) {
+        for row in &mut self.rows {
+            let (Some(base_url), Some(model)) = (row.base_url.clone(), row.model.clone()) else {
+                continue;
+            };
+            let api_key_env = row.api_key_env.clone();
+            row.probe = Some(probe(&base_url, &model, api_key_env.as_deref()));
+        }
+    }
+
+    /// The rows whose probe did not come back `Ok`, as `(name, state,
+    /// said)` — what the CLI warns about.
+    pub fn probe_refusals(&self) -> Vec<(&str, crate::probe::State, Option<&str>)> {
+        self.rows
+            .iter()
+            .filter_map(|row| {
+                let probe = row.probe.as_ref()?;
+                (probe.state != crate::probe::State::Ok).then_some((
+                    row.name.as_str(),
+                    probe.state,
+                    probe.said.as_deref(),
+                ))
+            })
+            .collect()
     }
 }
 
@@ -415,6 +505,8 @@ pub fn endpoints(sources: &EndpointSources<'_>) -> Endpoints {
                         api_key_env: None,
                         expires_at: None,
                         price: None,
+                        balance: None,
+                        probe: None,
                         source: "forwards".to_string(),
                     });
                 }
@@ -483,6 +575,8 @@ fn endpoint_of_acquired(
             api_key_env: Some(served.api_key_env.clone()),
             expires_at: Some(row.expires_at.clone()),
             price: None,
+            balance: None,
+            probe: None,
             source: "acquisitions".to_string(),
         },
         None => Endpoint {
@@ -495,6 +589,8 @@ fn endpoint_of_acquired(
             api_key_env: None,
             expires_at: Some(row.expires_at.clone()),
             price: None,
+            balance: None,
+            probe: None,
             source: "acquisitions".to_string(),
         },
     }
@@ -611,6 +707,8 @@ fn static_rows(path: &Path) -> Result<Vec<Endpoint>, String> {
             api_key_env: text_field("api_key_env"),
             expires_at: None,
             price,
+            balance: None,
+            probe: None,
             source: path.display().to_string(),
         });
     }
@@ -1190,6 +1288,192 @@ mod tests {
         assert!(!inventory.complete());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A row of the inventory, spelled out where a test needs one that
+    /// no source has to produce.
+    fn endpoint_row(
+        name: &str,
+        provider: Option<&str>,
+        base_url: Option<&str>,
+        model: Option<&str>,
+        api_key_env: Option<&str>,
+    ) -> Endpoint {
+        Endpoint {
+            name: name.to_string(),
+            kind: EndpointKind::Serverless,
+            provider: provider.map(str::to_string),
+            id: None,
+            base_url: base_url.map(str::to_string),
+            model: model.map(str::to_string),
+            api_key_env: api_key_env.map(str::to_string),
+            expires_at: None,
+            price: None,
+            balance: None,
+            probe: None,
+            source: "test".to_string(),
+        }
+    }
+
+    /// The inventory those rows make, read from no source.
+    fn inventory_of(rows: Vec<Endpoint>) -> Endpoints {
+        Endpoints {
+            rows,
+            failed: Vec::new(),
+            said: Vec::new(),
+        }
+    }
+
+    /// **A balance is the account's, not the row's**: it is asked once
+    /// per platform however many rows that platform has, and the answer
+    /// goes beside every one of them. A platform that publishes none
+    /// leaves its rows exactly as they were — absent is "the platform
+    /// does not say", never zero.
+    #[test]
+    fn a_balance_is_asked_once_per_platform_and_put_beside_every_row_of_it() {
+        let mut inventory = inventory_of(vec![
+            endpoint_row("tg-a", Some("together"), Some("u"), Some("m"), None),
+            endpoint_row("tg-b", Some("together"), Some("u"), Some("m"), None),
+            endpoint_row("rp", Some("runpod"), Some("u"), Some("m"), None),
+        ]);
+
+        let mut asked: std::collections::BTreeMap<String, usize> = Default::default();
+        inventory.balanced_with(|provider| {
+            *asked.entry(provider.to_string()).or_default() += 1;
+            match provider {
+                "runpod" => Ok(Some(crate::balance::Balance {
+                    amount: "15.40".to_string(),
+                    currency: "USD".to_string(),
+                    spend_per_hour: Some("0.79".to_string()),
+                    suspended: None,
+                    suspend_reason: None,
+                    as_of: "2026-09-22T00:00:00Z".to_string(),
+                    source: crate::balance::RUNPOD_GRAPHQL.to_string(),
+                })),
+                _ => Ok(None),
+            }
+        });
+
+        assert_eq!(asked.get("together"), Some(&1), "two rows, one question");
+        assert_eq!(asked.get("runpod"), Some(&1));
+        assert!(
+            inventory.rows[0].balance.is_none() && inventory.rows[1].balance.is_none(),
+            "a platform that publishes no balance leaves its rows as they were"
+        );
+        let balance = inventory.rows[2]
+            .balance
+            .as_ref()
+            .expect("the platform stated one");
+        assert_eq!(balance.amount, "15.40");
+        assert!(inventory.complete(), "{:?}", inventory.failed);
+    }
+
+    /// **A platform that could not be asked is reported, not fatal.**
+    /// The rows are still the inventory — where the endpoints are does
+    /// not depend on what is left on the account — and the run is
+    /// incomplete, under the platform's own name.
+    #[test]
+    fn a_platform_that_could_not_be_asked_lands_in_failed_under_its_name() {
+        let mut inventory = inventory_of(vec![endpoint_row(
+            "rp",
+            Some("runpod"),
+            Some("u"),
+            Some("m"),
+            None,
+        )]);
+        inventory.balanced_with(|_| Err("no key".to_string()));
+
+        assert_eq!(inventory.rows.len(), 1, "the row is still listed");
+        assert!(inventory.rows[0].balance.is_none());
+        assert_eq!(
+            inventory.failed,
+            vec![("balance runpod".to_string(), "no key".to_string())]
+        );
+        assert!(!inventory.complete());
+    }
+
+    /// **A probe goes where there is somewhere to send it**: a row with
+    /// a `base_url` and a `model`, key or no key. A pod no forward
+    /// reaches has no address to ask, and is left as it was rather than
+    /// reported as unreachable. What did not come back `Ok` is what the
+    /// caller warns about, and the one that did is not in that list.
+    #[test]
+    fn a_probe_is_sent_to_every_row_that_has_somewhere_to_send_it() {
+        let mut inventory = inventory_of(vec![
+            endpoint_row(
+                "managed",
+                Some("deepinfra"),
+                Some("https://api.deepinfra.com/v1/openai"),
+                Some("m"),
+                Some("DEEPINFRA_API_KEY"),
+            ),
+            endpoint_row(
+                "tunnel",
+                None,
+                Some("http://127.0.0.1:18000/v1"),
+                Some("local"),
+                None,
+            ),
+            endpoint_row("pod", Some("runpod"), None, None, None),
+        ]);
+
+        let mut sent: Vec<(String, String, Option<String>)> = Vec::new();
+        inventory.probed_with(|base_url, model, api_key_env| {
+            sent.push((
+                base_url.to_string(),
+                model.to_string(),
+                api_key_env.map(str::to_string),
+            ));
+            if api_key_env.is_some() {
+                crate::probe::Probe {
+                    state: crate::probe::State::PaymentRequired,
+                    http: Some(402),
+                    said: Some("You need positive balance".to_string()),
+                    usage: None,
+                }
+            } else {
+                crate::probe::Probe {
+                    state: crate::probe::State::Ok,
+                    http: Some(200),
+                    said: None,
+                    usage: Some(serde_json::json!({ "total_tokens": 6 })),
+                }
+            }
+        });
+
+        assert_eq!(sent.len(), 2, "the pod has nowhere to send one: {sent:?}");
+        assert_eq!(
+            sent[0],
+            (
+                "https://api.deepinfra.com/v1/openai".to_string(),
+                "m".to_string(),
+                Some("DEEPINFRA_API_KEY".to_string()),
+            ),
+            "the key travels by name, as the row carries it"
+        );
+        assert_eq!(sent[1].2, None, "a tunnel to a pod's own server takes none");
+        assert!(
+            inventory.rows[2].probe.is_none(),
+            "a row with no base_url is left as it was"
+        );
+
+        let refusals = inventory.probe_refusals();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(refusals[0].0, "managed");
+        assert_eq!(refusals[0].1, crate::probe::State::PaymentRequired);
+        assert_eq!(refusals[0].2, Some("You need positive balance"));
+
+        let probed = serde_json::to_value(&inventory.rows[1]).expect("a row renders");
+        assert_eq!(probed["probe"]["state"], serde_json::json!("ok"));
+        assert!(
+            probed["probe"].get("said").is_none(),
+            "nothing was refused, so nothing is said: {probed}"
+        );
+        let neither = serde_json::to_value(&inventory.rows[2]).expect("a row renders");
+        assert!(
+            neither.get("balance").is_none() && neither.get("probe").is_none(),
+            "absent, not null: {neither}"
+        );
     }
 
     /// The kernel's start time is readable for a live process and absent

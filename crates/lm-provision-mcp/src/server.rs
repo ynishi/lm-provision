@@ -63,9 +63,9 @@ pub struct MachineListParams {
     pub provider: String,
 }
 
-/// `lm_endpoint_list(acquisitions?, forwards?, endpoints_file?, prices?)`
-/// request shape (10 §Tool set): every path optional, defaulting as the
-/// CLI's `machine endpoints` does.
+/// `lm_endpoint_list(acquisitions?, forwards?, endpoints_file?, prices?,
+/// balance?, probe?)` request shape (10 §Tool set): every path optional,
+/// defaulting as the CLI's `machine endpoints` does.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
 pub struct EndpointListParams {
     /// The acquisitions record; default `~/.lm-provision/acquisitions.jsonl`.
@@ -81,6 +81,15 @@ pub struct EndpointListParams {
     /// The price record; default `~/.lm-provision/prices.jsonl`.
     #[serde(default)]
     pub prices: Option<String>,
+    /// Also ask each platform this tool spends from what is left on
+    /// the account (RunPod, Vast, DeepInfra say; Together does not);
+    /// read-only.
+    #[serde(default)]
+    pub balance: Option<bool>,
+    /// Also send every endpoint a one-token completion and report what
+    /// came back; **spends money**, off unless asked for.
+    #[serde(default)]
+    pub probe: Option<bool>,
 }
 
 /// `lm_price_sync(provider, prices?)` request shape (10 §Tool set).
@@ -394,7 +403,10 @@ impl LmProvisionServer {
                         Keys by name, never by value. Each row carries `price` (USD per million \
                         tokens, decimal text) when the price record has a row for its provider \
                         and model. Read-only; a source that could not be read is in the result's \
-                        `failed`, not an error."
+                        `failed`, not an error. `balance` asks the platforms this tool \
+                        spends from (RunPod, Vast, DeepInfra) what is left; `probe` sends every \
+                        endpoint one token and reports the answer (spends money; off by \
+                        default)."
     )]
     async fn lm_endpoint_list(
         &self,
@@ -429,18 +441,41 @@ impl LmProvisionServer {
             ))
             .filter(|it| it.exists()),
         };
+        let ask_balance = params.balance.unwrap_or(false);
+        let ask_probe = params.probe.unwrap_or(false);
+        // The instant the balances are stamped with, in the one shape
+        // the record's timestamps take — taken here rather than inside
+        // the closure so the reading and the stamp are the same run's.
+        let now = lm_provision_driver::prices::now_utc();
         let inventory = tokio::task::spawn_blocking(move || {
-            lm_provision_driver::inventory::endpoints(
+            let mut inventory = lm_provision_driver::inventory::endpoints(
                 &lm_provision_driver::inventory::EndpointSources {
                     acquisitions: &acquisitions,
                     forwards: &forwards,
                     statics: statics.as_deref(),
                     prices: &prices,
                 },
-            )
+            );
+            if ask_balance {
+                inventory.balanced(&now);
+            }
+            if ask_probe {
+                inventory.probed();
+            }
+            inventory
         })
         .await
         .map_err(join_error)?;
+        // A refusal is news the operator's own log carries; the state
+        // is in the row either way, and the result is not an error.
+        for (name, state, said) in inventory.probe_refusals() {
+            tracing::warn!(
+                endpoint = name,
+                state = ?state,
+                said = said.unwrap_or_default(),
+                "a probe did not come back ok"
+            );
+        }
         for (program, said) in &inventory.said {
             if !said.is_empty() {
                 tracing::debug!(program, said = %String::from_utf8_lossy(said).trim(), "platform cli output while listing endpoints");
