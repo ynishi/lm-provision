@@ -91,7 +91,7 @@ impl Transport for LocalExecTransport {
         args: &[String],
         env: &BTreeMap<String, String>,
     ) -> Result<ExecOutput, TransportError> {
-        let output = Command::new(&paths.binary).args(args).envs(env).output()?;
+        let output = run_waiting_out_a_busy_file(&paths.binary, args, env)?;
         Ok(ExecOutput {
             stdout: String::from_utf8(output.stdout)?,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -135,6 +135,59 @@ fn mark_executable(path: &Path) -> Result<(), TransportError> {
     perms.set_mode(perms.mode() | 0o111);
     std::fs::set_permissions(path, perms)?;
     Ok(())
+}
+
+/// How long to keep trying a binary the kernel calls busy, and how
+/// often: about a tenth of a second, in 5 ms steps.
+///
+/// The window being waited out is the microseconds between another
+/// thread's `fork` and its `exec`, so the first retry almost always
+/// wins; a file something genuinely holds open for writing still fails,
+/// and fails quickly enough that nobody is left wondering.
+const BUSY_STEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How many times [`BUSY_STEP`] is waited before the busy file is
+/// reported as the error it is.
+const BUSY_ATTEMPTS: u32 = 20;
+
+/// Run `binary`, waiting out an `ETXTBSY` that says nothing about this
+/// file.
+///
+/// **The kernel refuses to exec a file some process has open for
+/// writing, and a forked child holds its parent's descriptors until it
+/// execs.** This transport stages a binary and then runs it; anything
+/// else in the process that spawns in the window between that write and
+/// this exec leaves its child holding the descriptor, and the exec
+/// fails with `Text file busy` for exactly as long as that child takes
+/// to exec its own program. Nothing about the staged file is wrong, and
+/// a run that reports it as a failure is reporting somebody else's
+/// fork.
+///
+/// A long-lived `lm-provision mcp` serving two applies at once is the
+/// shape that meets this in production: one call stages its binary
+/// while the other spawns. The end-to-end suites meet it too, and hold
+/// it off with a lock instead ([documented at length:
+/// `lm-provision-cli/tests/common/mod.rs`]) — a lock works there
+/// because those know every spawner in the process, and nothing here
+/// does [measured: 2026-09-23, this crate's own unit suite lost 4 of
+/// 120 parallel runs to it and none of 40 serial ones].
+fn run_waiting_out_a_busy_file(
+    binary: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> std::io::Result<std::process::Output> {
+    for _ in 0..BUSY_ATTEMPTS {
+        match Command::new(binary).args(args).envs(env).output() {
+            Err(busy) if busy.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(BUSY_STEP);
+            }
+            other => return other,
+        }
+    }
+    // One last attempt, so what a caller is told about a file that is
+    // busy for good is the kernel's own error rather than this
+    // function's account of having given up.
+    Command::new(binary).args(args).envs(env).output()
 }
 
 #[cfg(not(unix))]
@@ -273,6 +326,52 @@ mod tests {
         assert_eq!(output.stdout, "out:hello\n");
         assert_eq!(output.stderr, "err:secret-value\n");
         assert_eq!(output.exit_code, Some(7));
+
+        std::fs::remove_dir_all(&staging).ok();
+    }
+
+    /// **A binary something else still holds open for writing is waited
+    /// out, not reported as a failure.** The hold here is deliberate and
+    /// in this process; the one this guards against is another thread's
+    /// forked child holding a descriptor it never asked for, which is
+    /// the same refusal from the kernel and cannot be staged on purpose.
+    #[cfg(unix)]
+    #[test]
+    fn exec_waits_out_a_binary_something_else_holds_open_for_writing() {
+        let staging = tmp_dir("busy");
+        std::fs::create_dir_all(&staging).expect("create staging dir");
+        let script = staging.join("script.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho ran\n").expect("write script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        // Held open for writing for a fraction of the retry budget, then
+        // closed: an exec that does not wait fails outright here.
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("hold the script open for writing");
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(held);
+        });
+
+        let transport = LocalExecTransport::new(&staging);
+        let paths = PodPaths {
+            binary: script.clone(),
+            profile: staging.join("unused-profile.lua"),
+        };
+        let output = transport
+            .exec(&paths, &[], &BTreeMap::new())
+            .expect("a file held open for writing is waited out, not failed on");
+
+        holder.join().expect("the holder thread");
+        assert_eq!(output.stdout, "ran\n");
+        assert_eq!(output.exit_code, Some(0));
 
         std::fs::remove_dir_all(&staging).ok();
     }
