@@ -114,9 +114,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may project instead of an SSH one, and whether a platform returns
   its stamp field under an account namespace, which the fleet reader
   steps over.
+- **A fifth platform: Together AI dedicated endpoints (`--provider
+  together`), driven by the service's own CLI.** The v1 REST create is
+  closed (403 `endpoints_v1_create_access_disabled` [measured:
+  2026-09-22]) and v2 takes three calls to create an endpoint and five
+  steps to release one, so this adapter drives `tg` (python package
+  `together`) as the pod adapters drive theirs: `tg beta endpoints
+  deploy <model> --endpoint <lease> --min-replicas … --json` creates
+  endpoint, deployment and traffic split in one verb, `tg beta endpoints
+  get` / `ls` read them back with the deployment summary inline, and
+  `tg beta endpoints rm --force` tears them down — converging over
+  repeated calls, since the first scales the deployment to zero and is
+  refused while it stops [measured: 2026-09-22, two calls 30 s apart].
+  The lease is the endpoint's **name**: a v2 endpoint has no
+  `display_name` or labels, the service lists the name under the
+  project slug (stepped over by the fleet reader), and the inference
+  `model` is that name on `https://api-inference.together.ai/v1`. The
+  hardware is the certified config (`cr_…`) the CLI picks when the
+  model has exactly one, or `provider."together.config"`; the profile's
+  other knobs (`min_replicas` / `max_replicas` / `inactive_timeout` /
+  `deployment_name`) become flags, and any other `together.*` key is
+  refused rather than dropped. Also refused by name: engine arguments,
+  other phases, a disk, ports at admission, and `min 0 / max 0` (a
+  deployment created stopped is nothing to judge). Credentials:
+  `TOGETHER_API_KEY` and `TOGETHER_PROJECT_ID`, read by the CLI itself.
+  The CLI path was verified by hand [measured: 2026-09-22,
+  Qwen/Qwen2.5-7B-Instruct on 1x H100: PROVISIONING → SCALING → READY in
+  ~2.5 min, one chat reply, teardown after two release calls]; the
+  adapter's own first run [2026-09-23] created an endpoint whose
+  deployment sat in `PROVISIONING` for the whole 20-minute cap and was
+  later stopped by the platform itself, and found two defects fixed
+  here: a rendering without a lease was refused (so `machine release`
+  could not reach the release template), and `acquire` exited 0 on a
+  machine that never came up; a second run found the adapter reading
+  the creation-time deployment over the read-back. With those fixed,
+  the adapter's own run went end to end [measured: 2026-09-23,
+  Qwen/Qwen2.5-7B-Instruct on 1x H100: `acquire` waited through
+  SCALING and reported the endpoint, `machine list` read the lease
+  under the project slug, `exec` refused the machine by what it is, one
+  chat reply through `<slug>/<name>`, and `release` deleted the endpoint
+  on its third call, 30 s after the first scaled it to zero].
+- **Driver library: `Discovery` / `Wait`, `Fleet::stamp_from_inspect`,
+  `curl_bearer`.** The pre-create step an acquisition may carry is now
+  a `Discovery` — the argv, an optional body, a dotted path to the id
+  in what it prints, the placeholder that id fills in the create argv
+  **and** body, and an optional `Wait` that polls a read-back until a
+  status word says ready (or fails, or a cap is reached) — so a
+  platform that has to import a model before it can be referred to is
+  the same mechanism as the marketplace's offer query (`Acquisition
+  ::discover` was a bare argv whose first row's `id` filled
+  `{offer_id}`). A fleet whose listing omits the stamp field reads it
+  off each machine's own description. Every REST platform's `curl`
+  argv comes from one builder, bound to the platform's key name.
 
 ### Changed
 
+- **`machine acquire` exits 1 when the wait ran out while the platform
+  still called the machine materializing**, whatever the description
+  already satisfies. A machine that never finished coming up in the
+  window is not one that came up; it stays recorded and running, and
+  is the operator's or the sweep's to release [measured: 2026-09-23, a
+  dedicated endpoint reported `Satisfied` at exit 0 with no endpoint].
+  And on a target whose address is the platform's own (one declaring no
+  exposure — the container service and both managed-deployment
+  services), a machine that projects neither `ssh` nor `endpoint` after
+  the wait is reported at exit 1 as one that never came up: there is no
+  declared port whose answer could stand in for the address [measured:
+  2026-09-23, a deployment the platform stopped at once for a billing
+  reason was judged by its GPU alone].
+- **The Together adapter reads a machine's read-back before what its
+  creation said.** `Acquired::inspect` fills a read-back's blanks from
+  the creation-time document, so after the first inspection both the
+  create response's `deployment` and the read-back's `deployments[0]`
+  are present — and the creation-time one says `PROVISIONING` forever.
+  Preferring it kept `acquire` waiting on a deployment the platform had
+  already stopped [measured: 2026-09-23].
 - **A platform's own explanation of a refused call now reaches the
   operator.** The `curl`-driven adapters ask for `--fail-with-body`
   instead of `-f`, and a failed command's error carries what it printed

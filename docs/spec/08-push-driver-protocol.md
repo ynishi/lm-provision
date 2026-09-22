@@ -396,6 +396,19 @@ scrollback and a machine that billed until someone noticed.
   returns it under the account's namespace, so the stamp is read past
   the last slash; the endpoint names the deployment by `deploy_id:`
   rather than by that name, so the stamp never reaches a request.
+  Second: `--provider together`, a dedicated endpoint on a model the
+  service already serves. Its v2 API takes three calls to create and
+  five steps to release, so the adapter drives the service's own CLI
+  (`tg`), which folds each into one verb — the same judgement the pod
+  adapters make, with the same consequence for release: it converges
+  over repeated calls (the first scales the deployment to zero and is
+  refused while it stops), which §Idempotency already allows for. The
+  lease is the endpoint's **name** — a v2 endpoint has no other
+  operator-written field — listed under the project slug, so the fleet
+  reader steps over the namespace as it does on the container service.
+  The endpoint is reachable once its deployment is `READY` **and** on
+  the traffic split; the inference `model` is the endpoint's name on a
+  different host from the management API.
 - A continuously running host daemon that enforces leases without
   being invoked is the control plane's job (chapter 09's record is
   the shared vocabulary for exactly that); `sweep` is the operator's

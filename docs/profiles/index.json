@@ -27,6 +27,13 @@
       "path": "deepinfra-deploy-qwen-0.1.0.json",
       "profile_hash": "11ad8cf0c8d9cc678b43cbb4f99f293b996a6ef844936ac21c776fe933001638",
       "summary": "A Qwen-family model you declare, deployed onto DeepInfra Deployments (the platform runs the engine; what comes back is an OpenAI-compatible endpoint)."
+    },
+    {
+      "name": "together-dedicated",
+      "version": "0.1.0",
+      "path": "together-dedicated-0.1.0.json",
+      "profile_hash": "bc82e189bf95756bfff4aca286018b3414e99c9751fb3040a30d8a7a315b8e1e",
+      "summary": "A model Together AI already serves, on a dedicated endpoint created through the service's own CLI (the platform runs the engine; what comes back is an OpenAI-compatible endpoint)."
     }
   ]
 }

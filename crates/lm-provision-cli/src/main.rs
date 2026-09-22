@@ -193,7 +193,7 @@ enum MachineCommand {
 #[derive(Args)]
 struct ListArgs {
     /// Ask this platform what it is running (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`). Repeatable, and **required**.
+    /// `deepinfra`, `deepinfra-deploy`, `together`). Repeatable, and **required**.
     ///
     /// There is no "all platforms" default and no empty run: a listing
     /// of nothing is indistinguishable from an account with nothing on
@@ -241,7 +241,7 @@ struct AcquireArgs {
     dry_run: bool,
 
     /// Which platform to buy from (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`).
+    /// `deepinfra-deploy`, `together`).
     ///
     /// The operator's choice, not the profile's: the profile says what
     /// the machine must be, and where to buy one meeting it is decided
@@ -273,7 +273,7 @@ struct AcquireArgs {
 struct SweepArgs {
     /// Ask this platform what it is running, and judge those machines
     /// by the lease stamped on each one (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`). Repeatable.
+    /// `deepinfra-deploy`, `together`). Repeatable.
     ///
     /// **This is the inventory when it is given.** A machine whose
     /// acquisitions row was never written, was written on another host,
@@ -320,7 +320,7 @@ struct ReleaseArgs {
     id: String,
 
     /// The platform the machine was acquired from (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`).
+    /// `deepinfra`, `deepinfra-deploy`, `together`).
     #[arg(long = "provider", default_value = "runpod")]
     provider: String,
 
@@ -371,7 +371,7 @@ struct TargetArgs {
     ssh: Option<String>,
 
     /// Ask this platform (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`) where `--pod-id` is, instead of naming an
+    /// `deepinfra-deploy`, `together`) where `--pod-id` is, instead of naming an
     /// address.
     ///
     /// The address and port come from the platform's own description
@@ -1319,6 +1319,15 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     let deadline = started + ACQUIRE_REACHABILITY_TIMEOUT;
     let cap = started + ACQUIRE_MATERIALIZING_CAP;
     let mut extended = false;
+    // Whether the wait ran out while the platform still called the
+    // machine materializing: a machine that never finished coming up
+    // in the window is not one that came up, whatever its description
+    // already satisfies — a deployment reported `Satisfied` at exit 0
+    // with no endpoint, because its GPU was readable from the create
+    // response while it sat in `PROVISIONING` for the whole cap
+    // [measured: 2026-09-23, a dedicated endpoint the platform later
+    // stopped by itself].
+    let mut gave_up_materializing = false;
     //
     // And not while the platform itself still calls the machine
     // materializing: a container service that maps no port has nothing
@@ -1352,6 +1361,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
                     );
                 }
             } else {
+                gave_up_materializing = adapter.still_materializing(&acquired.inspected);
                 eprintln!(
                     "warning: {} is still not up after {}s (ports unanswered, or the \
                      platform still calls it materializing); reporting what is known",
@@ -1382,9 +1392,19 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     // (`Connection::read` is `#[serde(skip)]`). Said here so that a
     // deployment the platform gave up on — `failed`, with the reason in
     // the read-back — is not reported as silence.
-    if connection.ssh.is_none() && connection.endpoint.is_none() {
+    //
+    // And on a target that maps nothing, said as an error: the address
+    // is the platform's own, there is no port wait standing in for it,
+    // and a machine without one never came up. A dedicated endpoint
+    // the platform stopped at once for a billing reason was otherwise
+    // judged by its GPU alone and reported `Satisfied` at exit 0
+    // [measured: 2026-09-23].
+    let no_address = connection.ssh.is_none() && connection.endpoint.is_none();
+    let never_came_up = no_address && address_is_the_platforms_own(adapter);
+    if no_address {
         eprintln!(
-            "note: {} projects no address; read from the platform: {}",
+            "{}: {} projects no address; read from the platform: {}",
+            if never_came_up { "error" } else { "note" },
             acquired.id,
             connection.read.join("; ")
         );
@@ -1410,10 +1430,37 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         })
     );
 
+    if gave_up_materializing {
+        eprintln!(
+            "error: {} was still materializing when the wait ran out; it is recorded and \
+             running, and is the operator's or the sweep's to release",
+            acquired.id
+        );
+        return ExitCode::FAILURE;
+    }
+    if never_came_up {
+        eprintln!(
+            "error: {} never came up; it is recorded, and is the operator's or the sweep's \
+             to release",
+            acquired.id
+        );
+        return ExitCode::FAILURE;
+    }
     match verdict {
         lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     }
+}
+
+/// Whether a target's address is the platform's own rather than a port
+/// it mapped: such a target declares no exposure, and a machine on it
+/// that projects neither `ssh` nor `endpoint` after the wait never came
+/// up — there is no declared port whose answer could stand in for the
+/// address. On a target that maps ports, a profile declaring none may
+/// legitimately project no address, and the wait already judged what it
+/// declared.
+fn address_is_the_platforms_own(adapter: &dyn infra::Infra) -> bool {
+    adapter.capability().exposures.is_empty()
 }
 
 /// How long `acquire` waits for the machine to answer for its declared

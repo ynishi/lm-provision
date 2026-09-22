@@ -49,7 +49,7 @@ pub struct AcquisitionRow {
     /// for a session driven against it.
     pub id: String,
     /// Which platform it was bought from (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`), as the operator named it. What
+    /// `deepinfra`, `deepinfra-deploy`, `together`), as the operator named it. What
     /// a sweep looks the adapter up by, since the credential to release
     /// it is the platform's.
     pub provider: String,

@@ -59,7 +59,7 @@ pub struct ApplyParams {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MachineListParams {
     /// The platform to ask what it is running (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`).
+    /// `deepinfra`, `deepinfra-deploy`, `together`).
     pub provider: String,
 }
 
@@ -341,7 +341,7 @@ impl LmProvisionServer {
         if provider.trim().is_empty() {
             return Err(precondition_error(
                 "provider is required: name a platform to list \
-                 (runpod, vast, deepinfra, deepinfra-deploy)",
+                 (runpod, vast, deepinfra, deepinfra-deploy, together)",
             ));
         }
         lm_provision_driver::infra::adapter_named(&provider).map_err(precondition_error)?;
