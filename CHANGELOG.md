@@ -87,6 +87,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The local-exec transport waits out a `Text file busy` instead of
+  failing on it.** The kernel refuses to exec a file some process has
+  open for writing, and a forked child holds its parent's descriptors
+  until it execs — so anything else in the process that spawns between
+  this transport's staging write and its exec makes the exec fail for
+  as long as that child takes to start, which says nothing about the
+  staged binary. It is now retried for about a tenth of a second, and a
+  file that is busy for good still fails with the kernel's own error.
+  The shape that meets this in production is a long-lived
+  `lm-provision mcp` serving two applies at once [measured: 2026-09-23,
+  the driver's unit suite lost 4 of 120 parallel runs to it and none of
+  40 serial ones].
+
 ### Security
 
 ## [0.12.0] - 2026-09-22
