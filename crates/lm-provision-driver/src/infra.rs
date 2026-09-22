@@ -2428,9 +2428,6 @@ const DEEPINFRA_DEPLOY_CATALOGUE: &[Gpu] = &[
 /// reference, `num_gpus` 1..8].
 const DEEPINFRA_DEPLOY_MAX_GPUS: u32 = 8;
 
-/// The endpoints collection on the managed-inference service
-/// [documented: docs.together.ai/reference/createendpoint, read 2026-09-22].
-const TOGETHER_ENDPOINTS: &str = "https://api.together.ai/v1/endpoints";
 /// Where a dedicated endpoint answers OpenAI-compatible requests — a
 /// different host from the management API [documented:
 /// docs.together.ai/docs/dedicated-endpoints/requests, read 2026-09-22].
@@ -2440,6 +2437,15 @@ const TOGETHER_INFERENCE: &str = "https://api-inference.together.ai/v1";
 /// (`TOGETHERAI_API_KEY`); the platform's spelling wins here, as for every
 /// other target.
 const TOGETHER_API_KEY: &str = "TOGETHER_API_KEY";
+/// The second variable the CLI reads: v2 scopes every resource under a
+/// project, and in `--json --non-interactive` mode its mutating verbs
+/// require the project explicitly [documented: `tg --help`, "mutating
+/// commands may prompt for confirmation or require an explicit project
+/// in JSON or non-interactive mode"; `tg whoami --json` prints it as
+/// `project_id`].
+const TOGETHER_PROJECT_ID: &str = "TOGETHER_PROJECT_ID";
+/// The program: the service's own CLI (python package `together`).
+const TOGETHER_CLI: &str = "tg";
 const TOGETHER_NS: &str = "together";
 
 /// A managed LLM deployment: the machine is a **served model**, not a
@@ -2714,26 +2720,26 @@ fn deepinfra_deploy_release() -> Vec<String> {
 /// the machine is a **served model**, not a host. The platform takes a
 /// model id from its own catalogue, a hardware configuration, and
 /// autoscaling settings, and answers OpenAI-compatible requests at its
-/// own address — nothing of this tool's ever runs on it
-/// [documented: docs.together.ai/reference/createendpoint, read
-/// 2026-09-22].
+/// own address — nothing of this tool's ever runs on it.
 ///
-/// **Model upload is out of scope.** The v1 upload job has no
-/// documented status endpoint to wait on (see design.md), so this
-/// adapter does not offer a discovery step. The profile's
-/// `service.start` names a model Together already serves: a catalogue
-/// id, or a previously uploaded one as `GET /v1/models` lists it.
+/// **v2 (dedicated endpoints), driven through the service's own CLI.**
+/// The v1 REST create is closed (403
+/// `endpoints_v1_create_access_disabled`) [measured: 2026-09-22]. The
+/// platform's `tg` CLI (python package `together` ≥ 2.24) folds the
+/// three create calls and the five release steps into one verb each, so
+/// this adapter drives `tg` as the RunPod and Vast adapters drive
+/// theirs. `tg` reads `TOGETHER_API_KEY` and `TOGETHER_PROJECT_ID` from
+/// the environment; in `--json --non-interactive` mode mutating verbs
+/// require the project, so both are this adapter's credentials.
 ///
-/// **The lease is in `display_name`, and the listing cannot carry it.**
-/// The service's listing endpoint returns `id`, `name`, and `state` but
-/// not `display_name` — the field where the create call writes the
-/// operator's stamp. So [`Fleet::stamp_from_inspect`] is true, and a
-/// sweep reads each endpoint's `display_name` off its own read-back
-/// ([`Fleet::inspect`]) rather than off the listing. The inference host
-/// differs from the management host (`api-inference.together.ai` vs.
-/// `api.together.ai`), and the endpoint is projected by `name` rather
-/// than by id because the platform does not accept an id-based model
-/// reference.
+/// **The lease is in the endpoint `name`, and the listing carries it.**
+/// The endpoint name is the one operator-written field; the service
+/// prefixes it with the project slug in every read-back, so
+/// [`Fleet::stamp_namespaced`] is true. The listing prints the name
+/// and the deployment summary, so nothing is read back per endpoint
+/// (`stamp_from_inspect: false`). A `STOPPED` or `FAILED` deployment
+/// still belongs to an endpoint that exists and bills nothing, and is
+/// the operator's or the sweep's to delete, so nothing is `ended`.
 ///
 /// **No exposure.** The service answers at its own address and maps
 /// nothing of the deployment's. A `requires_ports` profile is refused
@@ -2762,19 +2768,21 @@ impl Infra for TogetherAdapter {
     }
 
     fn credentials(&self) -> &'static [&'static str] {
-        &[TOGETHER_API_KEY]
+        &[TOGETHER_API_KEY, TOGETHER_PROJECT_ID]
     }
 
-    /// The configuration is named by the profile
-    /// (`provider."together.hardware"`) because the service publishes no
-    /// complete list to select from [documented: listhardware shows
-    /// examples only]; a memory floor is judged **after** the fact by
-    /// `read_state` from the configuration's own name.
+    /// The configuration is the platform's certified pairing of model
+    /// and hardware (`cr_…`), selected by the CLI when exactly one exists
+    /// for the model and named by the profile (`provider."together.config"`)
+    /// otherwise; the count and memory are judged after the fact by
+    /// `read_state` from the deployment's `hardware`
+    /// [measured: 2026-09-22, the CLI's deploy output carries `hardware`
+    /// as `1xnvidia-h100-80gb`].
     fn gpu_answer(&self, required: &GpuRequirement) -> Answer {
         if required.count == 0 {
             Answer::unmet(
-                "this service deploys a model onto a hardware configuration; a profile \
-                 asking for no GPU has nothing to deploy onto",
+                "this service deploys a model onto a certified hardware configuration; \
+                 a profile asking for no GPU has nothing to deploy onto",
             )
         } else {
             Answer::met()
@@ -2794,37 +2802,36 @@ impl Infra for TogetherAdapter {
         provider: &BTreeMap<String, String>,
         expires_at: Option<jiff::Timestamp>,
     ) -> Result<Acquisition, AcquisitionError> {
-        let body = together_body(
+        let create = together_create(
             required,
             provider,
             required.gpu.as_ref().map(|it| self.gpu_answer(it)),
             required.disk.as_ref().map(|it| self.disk_answer(it)),
             expires_at,
         )?;
-        let mut create = curl_bearer(TOGETHER_API_KEY, TOGETHER_ENDPOINTS);
-        create.push("--json".to_string());
         Ok(Acquisition {
             discover: None,
             create,
-            body: Some(body),
-            created_id_key: "id",
+            body: None,
+            created_id_key: "endpoint.id",
             inspect: together_inspect(),
             release: together_release(),
         })
     }
 
-    /// `STOPPED` and `ERROR` endpoints still exist and are the
-    /// operator's to release, so nothing is `ended`.
+    /// The listing carries the `name` and the deployment summary, so
+    /// nothing is read back per endpoint; a `STOPPED` or `FAILED`
+    /// deployment still belongs to an endpoint that exists and bills
+    /// nothing, and is the operator's or the sweep's to delete, so
+    /// nothing is `ended` [measured: 2026-09-22, `tg beta endpoints ls
+    /// --json` prints `deployments` with `state`, `hardware`, etc.].
     fn fleet(&self) -> Option<Fleet> {
         Some(Fleet {
-            list: curl_bearer(
-                TOGETHER_API_KEY,
-                &format!("{TOGETHER_ENDPOINTS}?type=dedicated&mine=true"),
-            ),
+            list: together_cli(&["beta", "endpoints", "ls", "--json"]),
             id: "id",
-            stamp: "display_name",
-            stamp_namespaced: false,
-            stamp_from_inspect: true,
+            stamp: "name",
+            stamp_namespaced: true,
+            stamp_from_inspect: false,
             ended: None,
             release: together_release(),
             inspect: together_inspect(),
@@ -2837,14 +2844,16 @@ impl Infra for TogetherAdapter {
 
     fn still_materializing(&self, inspected: &serde_json::Value) -> bool {
         matches!(
-            inspected.get("state").and_then(|it| it.as_str()),
-            Some("PENDING") | Some("STARTING")
+            together_deployment(inspected)
+                .and_then(|d| d.get("state"))
+                .and_then(|it| it.as_str()),
+            Some("DEPLOYMENT_STATE_PROVISIONING") | Some("DEPLOYMENT_STATE_SCALING")
         )
     }
 
     fn read_state(&self, inspected: &serde_json::Value) -> MachineState {
-        let parsed = inspected
-            .get("hardware")
+        let parsed = together_deployment(inspected)
+            .and_then(|d| d.get("hardware"))
             .and_then(|it| it.as_str())
             .and_then(together_hardware);
         MachineState {
@@ -2859,17 +2868,17 @@ impl Infra for TogetherAdapter {
     }
 
     fn connection(&self, inspected: &serde_json::Value) -> Connection {
-        let state = inspected.get("state").and_then(|it| it.as_str());
-        let name = inspected
-            .get("name")
-            .and_then(|it| it.as_str())
-            .filter(|it| !it.is_empty());
-        let endpoint = match (state, name) {
-            (Some("STARTED"), Some(name)) => Some(InferenceEndpoint {
-                base_url: TOGETHER_INFERENCE.to_string(),
-                model: name.to_string(),
-                api_key_env: TOGETHER_API_KEY.to_string(),
-            }),
+        let (name, state, split) = together_view(inspected);
+        let endpoint = match (state, split, name) {
+            (Some("DEPLOYMENT_STATE_READY"), Some(s), Some(name))
+                if !s.is_empty() && !name.is_empty() =>
+            {
+                Some(InferenceEndpoint {
+                    base_url: TOGETHER_INFERENCE.to_string(),
+                    model: name.to_string(),
+                    api_key_env: TOGETHER_API_KEY.to_string(),
+                })
+            }
             _ => None,
         };
         Connection {
@@ -2878,37 +2887,237 @@ impl Infra for TogetherAdapter {
             endpoints: BTreeMap::new(),
             read: vec![
                 read_text(inspected, "id"),
-                format!("state: {}", state.unwrap_or("absent")),
+                format!("deployment state: {}", state.unwrap_or("absent")),
+                format!(
+                    "trafficSplit: {}",
+                    match split {
+                        Some(s) if s.is_empty() => "empty",
+                        Some(_) => "present",
+                        None => "absent",
+                    }
+                ),
                 read_text(inspected, "name"),
             ],
         }
     }
 }
 
+/// The first deployment in a read-back document, handling both the
+/// create-response shape (`deployment`) and the listing/inspect shape
+/// (`deployments[0]`) [measured: 2026-09-22, `tg beta endpoints deploy`
+/// nests the deployment under `deployment`; `tg beta endpoints get` and
+/// `ls` nest it under `deployments`].
+fn together_deployment(inspected: &serde_json::Value) -> Option<&serde_json::Value> {
+    inspected
+        .get("deployment")
+        .or_else(|| inspected.get("deployments").and_then(|d| d.get(0)))
+}
+
+/// Read the `name`, deployment `state`, and `trafficSplit` from either
+/// document shape: the create response (top-level `endpoint` /
+/// `deployment`) or the listing/inspect shape (top-level fields).
+fn together_view(
+    inspected: &serde_json::Value,
+) -> (Option<&str>, Option<&str>, Option<&Vec<serde_json::Value>>) {
+    // The create response nests the endpoint under "endpoint".
+    let endpoint = inspected.get("endpoint").unwrap_or(inspected);
+    let name = endpoint.get("name").and_then(|it| it.as_str());
+    let state = together_deployment(inspected)
+        .and_then(|d| d.get("state"))
+        .or_else(|| {
+            // Also try status.state (create response shape).
+            inspected
+                .get("deployment")
+                .and_then(|d| d.get("status"))
+                .and_then(|s| s.get("state"))
+        })
+        .and_then(|it| it.as_str());
+    let split = endpoint.get("trafficSplit").and_then(|it| it.as_array());
+    (name, state, split)
+}
+
 /// What reads one endpoint back, `{id}` unsubstituted — one spelling
 /// for the record and for the listing.
 fn together_inspect() -> Vec<String> {
-    curl_bearer(TOGETHER_API_KEY, &format!("{TOGETHER_ENDPOINTS}/{{id}}"))
+    together_cli(&["beta", "endpoints", "get", "{id}", "--json"])
 }
 
 /// What destroys one endpoint, `{id}` unsubstituted — one spelling for
-/// the record and for the listing. `DELETE` answers 204 with an empty
-/// body; nothing is read from it.
+/// the record and for the listing. Release converges over repeated
+/// calls: the first scales the deployment to zero, and while it is
+/// `STOPPING` the verb answers non-zero; repeated once the deployment
+/// is `STOPPED` it deletes the endpoint
+/// [measured: 2026-09-22, `tg beta endpoints rm ep_… --force --json
+/// --non-interactive`].
 fn together_release() -> Vec<String> {
-    let mut argv = curl_bearer(TOGETHER_API_KEY, &format!("{TOGETHER_ENDPOINTS}/{{id}}"));
-    argv.push("-X".to_string());
-    argv.push("DELETE".to_string());
+    together_cli(&["beta", "endpoints", "rm", "{id}", "--force", "--json"])
+}
+
+/// The program `tg` with `args`, plus `--non-interactive` — the key and
+/// the project travel by name through the environment, read by the CLI
+/// itself [documented: `tg` reads `TOGETHER_API_KEY` and
+/// `TOGETHER_PROJECT_ID` from the environment; `--json --non-interactive`
+/// mutating verbs require the project].
+fn together_cli(args: &[&str]) -> Vec<String> {
+    let mut argv: Vec<String> = vec![TOGETHER_CLI.to_string()];
+    argv.extend(args.iter().map(|&s| s.to_string()));
+    argv.push("--non-interactive".to_string());
     argv
 }
 
-/// The count and VRAM in a hardware configuration string
-/// (`2x_nvidia_h100_80gb_sxm` → `(2, 80)`), or `None` when either the
-/// leading count or the `<M>gb` segment is missing.
+/// Build the deploy argv for [`TogetherAdapter::acquisition`].
+///
+/// Refusals exactly as the old `together_body` had them (no serving / no
+/// model → `Incomplete`; `others` non-empty, `dtype` or `extra_args`
+/// present → `Unmet`). The `together.hardware` requirement and the
+/// tensor-parallel check are dropped (hardware is the config's, judged
+/// after the fact).
+fn together_create(
+    required: &Requirements,
+    provider: &BTreeMap<String, String>,
+    gpu_answer: Option<Answer>,
+    disk_answer: Option<Answer>,
+    expires_at: Option<jiff::Timestamp>,
+) -> Result<Vec<String>, AcquisitionError> {
+    let serving = required
+        .serving
+        .as_ref()
+        .ok_or(AcquisitionError::Incomplete {
+            target: TOGETHER_NS,
+            missing: "a service.start phase naming the model to deploy",
+        })?;
+    let unmet = |reason: String| AcquisitionError::Unmet {
+        target: TOGETHER_NS,
+        reason,
+    };
+
+    let model = serving.model.as_ref().ok_or(AcquisitionError::Incomplete {
+        target: TOGETHER_NS,
+        missing: "service.start's model (the model id the service lists)",
+    })?;
+
+    if !serving.others.is_empty() {
+        return Err(unmet(format!(
+            "this target runs the declared service and nothing else; the profile also \
+             declares: {}",
+            serving.others.join(", ")
+        )));
+    }
+
+    if serving.dtype.is_some() || !serving.extra_args.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        if serving.dtype.is_some() {
+            parts.push(format!(
+                "dtype `{}`",
+                serving.dtype.as_deref().unwrap_or("")
+            ));
+        }
+        if !serving.extra_args.is_empty() {
+            parts.push(format!("extra_args: [{}]", serving.extra_args.join(", ")));
+        }
+        return Err(unmet(format!(
+            "this service takes no engine arguments; the profile's service `{}` declares \
+             {}, which would be dropped",
+            serving.name,
+            parts.join(" and ")
+        )));
+    }
+
+    if let Some(answer) = gpu_answer {
+        admitted(TOGETHER_NS, answer)?;
+    }
+    if let Some(answer) = disk_answer {
+        admitted(TOGETHER_NS, answer)?;
+    }
+
+    let expires_at = expires_at.ok_or(AcquisitionError::Incomplete {
+        target: TOGETHER_NS,
+        missing: "a lease: the endpoint's name is where the lease rides, and the service requires a name",
+    })?;
+
+    // Read provider slots.
+    let config = provider.get("together.config");
+    let min_replicas = provider
+        .get("together.min_replicas")
+        .map(|v| v.as_str())
+        .unwrap_or("1");
+    let max_replicas = provider
+        .get("together.max_replicas")
+        .map(|v| v.as_str())
+        .unwrap_or("1");
+    let inactive_timeout = provider.get("together.inactive_timeout");
+    let deployment_name = provider.get("together.deployment_name");
+
+    // min 0 max 0 is refused.
+    if min_replicas == "0" && max_replicas == "0" {
+        return Err(AcquisitionError::Unmet {
+            target: TOGETHER_NS,
+            reason: "a deployment created stopped is one nothing can be judged against; \
+                      scale it down after acquiring"
+                .to_string(),
+        });
+    }
+
+    // Any other together.* key is refused.
+    for key in provider.keys() {
+        if let Some(field) = key.strip_prefix("together.") {
+            match field {
+                "config" | "min_replicas" | "max_replicas" | "inactive_timeout"
+                | "deployment_name" => {}
+                other => {
+                    return Err(AcquisitionError::Unmet {
+                        target: TOGETHER_NS,
+                        reason: format!(
+                            "provider key `{other}` is not one this target takes \
+                             (config, min_replicas, max_replicas, inactive_timeout, \
+                             deployment_name)"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut argv = together_cli(&[
+        "beta",
+        "endpoints",
+        "deploy",
+        model,
+        "--endpoint",
+        &expiry_stamp(expires_at),
+        "--min-replicas",
+        min_replicas,
+        "--max-replicas",
+        max_replicas,
+    ]);
+
+    if let Some(c) = config {
+        argv.push("--config".to_string());
+        argv.push(c.clone());
+    }
+    if let Some(t) = inactive_timeout {
+        argv.push("--inactive-timeout".to_string());
+        argv.push(t.clone());
+    }
+    if let Some(n) = deployment_name {
+        argv.push("--deployment-name".to_string());
+        argv.push(n.clone());
+    }
+
+    argv.push("--json".to_string());
+
+    Ok(argv)
+}
+
+/// The count and VRAM in a hardware configuration string printed by the
+/// CLI (`1xnvidia-h100-80gb` → `(1, 80)`), or `None` when either the
+/// leading count or the `<M>gb` segment is missing
+/// [measured: 2026-09-22, `tg beta endpoints deploy` output].
 fn together_hardware(config: &str) -> Option<(u32, u32)> {
-    let (count_str, rest) = config.split_once("x_")?;
+    let (count_str, rest) = config.split_once('x')?;
     let count: u32 = count_str.parse().ok()?;
     let vram_gb = rest
-        .split('_')
+        .split('-')
         .find(|segment| segment.ends_with("gb"))
         .and_then(|segment| segment.strip_suffix("gb")?.parse().ok())?;
     Some((count, vram_gb))
@@ -2922,12 +3131,12 @@ fn deepinfra_gpu_vram_gb(config: &str) -> Option<u32> {
 
 /// A provider-slot value as the JSON scalar it spells.
 ///
-/// Shared by the typed REST targets (`deepinfra-deploy`, `together`):
-/// those APIs take typed fields (`num_gpus`,
-/// `settings.min_instances`, `min_replicas`) while the profile's
-/// provider slot is strings, so a passthrough here reads each value as
-/// the scalar it spells rather than quoting it: `"0"` becomes `0`,
-/// `"true"` becomes `true`, and anything else stays the string it is.
+/// Shared by the typed REST target (`deepinfra-deploy`): its API takes
+/// typed fields (`num_gpus`, `settings.min_instances`) while the
+/// profile's provider slot is strings, so a passthrough here reads each
+/// value as the scalar it spells rather than quoting it: `"0"` becomes
+/// `0`, `"true"` becomes `true`, and anything else stays the string it
+/// is.
 fn deepinfra_scalar(value: &str) -> serde_json::Value {
     if let Ok(number) = value.parse::<i64>() {
         return serde_json::json!(number);
@@ -3087,132 +3296,6 @@ fn deepinfra_deploy_body(
     }
 
     Ok((serde_json::Value::Object(body).to_string(), token_env))
-}
-
-/// The request body for [`TogetherAdapter::acquisition`], built from
-/// the profile's service *and the adapter's answers* — the same gate
-/// `runpod_body` stands behind.
-///
-/// **Refused by name, not dropped:** a missing service or model, extra
-/// phases, engine arguments the service does not take, a missing or
-/// mismatched hardware configuration, a disk. Each is something the
-/// profile said and this target cannot do.
-fn together_body(
-    required: &Requirements,
-    provider: &BTreeMap<String, String>,
-    gpu_answer: Option<Answer>,
-    disk_answer: Option<Answer>,
-    expires_at: Option<jiff::Timestamp>,
-) -> Result<String, AcquisitionError> {
-    let serving = required
-        .serving
-        .as_ref()
-        .ok_or(AcquisitionError::Incomplete {
-            target: TOGETHER_NS,
-            missing: "a service.start phase naming the model to deploy",
-        })?;
-    let unmet = |reason: String| AcquisitionError::Unmet {
-        target: TOGETHER_NS,
-        reason,
-    };
-
-    let model = serving.model.as_ref().ok_or(AcquisitionError::Incomplete {
-        target: TOGETHER_NS,
-        missing: "service.start's model (the model id the service lists)",
-    })?;
-
-    if !serving.others.is_empty() {
-        return Err(unmet(format!(
-            "this target runs the declared service and nothing else; the profile also \
-             declares: {}",
-            serving.others.join(", ")
-        )));
-    }
-
-    if serving.dtype.is_some() || !serving.extra_args.is_empty() {
-        let mut parts: Vec<String> = Vec::new();
-        if serving.dtype.is_some() {
-            parts.push(format!(
-                "dtype `{}`",
-                serving.dtype.as_deref().unwrap_or("")
-            ));
-        }
-        if !serving.extra_args.is_empty() {
-            parts.push(format!("extra_args: [{}]", serving.extra_args.join(", ")));
-        }
-        return Err(unmet(format!(
-            "this service takes no engine arguments; the profile's service `{}` declares \
-             {}, which would be dropped",
-            serving.name,
-            parts.join(" and ")
-        )));
-    }
-
-    let hardware = provider
-        .get("together.hardware")
-        .ok_or(AcquisitionError::Incomplete {
-            target: TOGETHER_NS,
-            missing: "provider.together.hardware (a configuration id from \
-                      GET /v1/hardware, e.g. 1x_nvidia_h100_80gb_sxm)",
-        })?;
-
-    if let Some(answer) = gpu_answer {
-        admitted(TOGETHER_NS, answer)?;
-    }
-    if let Some(answer) = disk_answer {
-        admitted(TOGETHER_NS, answer)?;
-    }
-
-    if let Some(p) = serving.tensor_parallel_size {
-        if let Some((count, _)) = together_hardware(hardware) {
-            if u32::from(p) != count {
-                return Err(unmet(format!(
-                    "the service declares tensor_parallel_size {p} but the hardware \
-                     configuration `{hardware}` carries {count} devices; the two have \
-                     to agree",
-                )));
-            }
-        }
-    }
-
-    let mut body = serde_json::Map::new();
-    body.insert("model".into(), serde_json::json!(model));
-    body.insert("hardware".into(), serde_json::json!(hardware));
-    body.insert(
-        "autoscaling".into(),
-        serde_json::json!({"min_replicas": 1, "max_replicas": 1}),
-    );
-
-    // together.autoscaling.<k> overrides autoscaling; everything else
-    // lands at the top level. together.hardware is consumed above.
-    for (key, value) in provider {
-        let Some(field) = key.strip_prefix("together.") else {
-            continue;
-        };
-        if field == "hardware" {
-            continue;
-        }
-        if let Some(inner) = field.strip_prefix("autoscaling.") {
-            if let Some(autoscaling) = body.get_mut("autoscaling").and_then(|v| v.as_object_mut()) {
-                autoscaling.insert(inner.to_string(), deepinfra_scalar(value));
-            }
-        } else {
-            body.insert(field.to_string(), deepinfra_scalar(value));
-        }
-    }
-
-    // The lease, last, for the reason `runpod_body` gives — the one
-    // field the profile does not get the last word on. `display_name`
-    // is where a sweep reads the expiry off each endpoint's own
-    // read-back.
-    if let Some(expires_at) = expires_at {
-        body.insert(
-            "display_name".into(),
-            serde_json::json!(expiry_stamp(expires_at)),
-        );
-    }
-
-    Ok(serde_json::Value::Object(body).to_string())
 }
 
 /// A machine that exists because [`acquire`] made it.
