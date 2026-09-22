@@ -3033,11 +3033,6 @@ fn together_create(
         admitted(TOGETHER_NS, answer)?;
     }
 
-    let expires_at = expires_at.ok_or(AcquisitionError::Incomplete {
-        target: TOGETHER_NS,
-        missing: "a lease: the endpoint's name is where the lease rides, and the service requires a name",
-    })?;
-
     // Read provider slots.
     let config = provider.get("together.config");
     let min_replicas = provider
@@ -3084,19 +3079,27 @@ fn together_create(
     // Every argument the verb takes, assembled before the program and
     // the trailing `--non-interactive` are put around it, so the argv
     // ends the way every other verb's does (`--json --non-interactive`).
-    let stamp = expiry_stamp(expires_at);
-    let mut args: Vec<&str> = vec![
-        "beta",
-        "endpoints",
-        "deploy",
-        model,
-        "--endpoint",
-        &stamp,
+    //
+    // The lease is the endpoint's name, so a rendering with no lease
+    // carries no `--endpoint` at all — a create the CLI would refuse,
+    // and one nothing sends: such a rendering is asked for its release
+    // and inspect templates (the trait's `expires_at: None` contract),
+    // which is how `machine release` reaches a machine it did not just
+    // buy. Refusing it here left every endpoint this adapter created
+    // unreleasable through the CLI [measured: 2026-09-23, fourteen
+    // release attempts refused for want of a lease while the endpoint
+    // sat in the account].
+    let stamp = expires_at.map(expiry_stamp);
+    let mut args: Vec<&str> = vec!["beta", "endpoints", "deploy", model];
+    if let Some(stamp) = &stamp {
+        args.extend(["--endpoint", stamp.as_str()]);
+    }
+    args.extend([
         "--min-replicas",
         min_replicas,
         "--max-replicas",
         max_replicas,
-    ];
+    ]);
     if let Some(c) = config {
         args.extend(["--config", c.as_str()]);
     }
@@ -6284,11 +6287,20 @@ mod tests {
             refusal(together_requirements().with_serving(Some(with_args))).contains("extra_args")
         );
 
+        // No lease is not a refusal: `machine release` renders the
+        // acquisition without one to reach the release template, and a
+        // rendering that refused left endpoints unreleasable
+        // [measured: 2026-09-23]. The create it carries names no
+        // endpoint and is never sent.
         let unleased = TogetherAdapter
             .acquisition(&together_requirements(), &together_provider(), None)
-            .expect_err("the name is the lease, and the CLI requires a name")
-            .to_string();
-        assert!(unleased.contains("lease"), "{unleased}");
+            .expect("a rendering wanted for its templates");
+        assert!(
+            !unleased.create.contains(&"--endpoint".to_string()),
+            "{:?}",
+            unleased.create
+        );
+        assert!(unleased.release.contains(&"--force".to_string()));
 
         let with_disk = Requirements::from_slots(
             &BTreeMap::new(),

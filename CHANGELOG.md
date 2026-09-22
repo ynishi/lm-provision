@@ -138,9 +138,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other phases, a disk, ports at admission, and `min 0 / max 0` (a
   deployment created stopped is nothing to judge). Credentials:
   `TOGETHER_API_KEY` and `TOGETHER_PROJECT_ID`, read by the CLI itself.
-  Verified end to end [measured: 2026-09-22, Qwen/Qwen2.5-7B-Instruct on
-  1x H100: PROVISIONING → SCALING → READY in ~2.5 min, one chat reply,
-  teardown after two release calls].
+  The CLI path was verified by hand [measured: 2026-09-22,
+  Qwen/Qwen2.5-7B-Instruct on 1x H100: PROVISIONING → SCALING → READY in
+  ~2.5 min, one chat reply, teardown after two release calls]; the
+  adapter's own first run [2026-09-23] created an endpoint whose
+  deployment sat in `PROVISIONING` for the whole 20-minute cap and was
+  later stopped by the platform itself, and found two defects fixed
+  here: a rendering without a lease was refused (so `machine release`
+  could not reach the release template), and `acquire` exited 0 on a
+  machine that never came up. A run that reaches a reply through the
+  adapter is still owed.
 - **Driver library: `Discovery` / `Wait`, `Fleet::stamp_from_inspect`,
   `curl_bearer`.** The pre-create step an acquisition may carry is now
   a `Discovery` — the argv, an optional body, a dotted path to the id
@@ -156,6 +163,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`machine acquire` exits 1 when the wait ran out while the platform
+  still called the machine materializing**, whatever the description
+  already satisfies. A machine that never finished coming up in the
+  window is not one that came up; it stays recorded and running, and
+  is the operator's or the sweep's to release [measured: 2026-09-23, a
+  dedicated endpoint reported `Satisfied` at exit 0 with no endpoint].
 - **A platform's own explanation of a refused call now reaches the
   operator.** The `curl`-driven adapters ask for `--fail-with-body`
   instead of `-f`, and a failed command's error carries what it printed

@@ -1319,6 +1319,15 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     let deadline = started + ACQUIRE_REACHABILITY_TIMEOUT;
     let cap = started + ACQUIRE_MATERIALIZING_CAP;
     let mut extended = false;
+    // Whether the wait ran out while the platform still called the
+    // machine materializing: a machine that never finished coming up
+    // in the window is not one that came up, whatever its description
+    // already satisfies — a deployment reported `Satisfied` at exit 0
+    // with no endpoint, because its GPU was readable from the create
+    // response while it sat in `PROVISIONING` for the whole cap
+    // [measured: 2026-09-23, a dedicated endpoint the platform later
+    // stopped by itself].
+    let mut gave_up_materializing = false;
     //
     // And not while the platform itself still calls the machine
     // materializing: a container service that maps no port has nothing
@@ -1352,6 +1361,7 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
                     );
                 }
             } else {
+                gave_up_materializing = adapter.still_materializing(&acquired.inspected);
                 eprintln!(
                     "warning: {} is still not up after {}s (ports unanswered, or the \
                      platform still calls it materializing); reporting what is known",
@@ -1410,6 +1420,14 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         })
     );
 
+    if gave_up_materializing {
+        eprintln!(
+            "error: {} was still materializing when the wait ran out; it is recorded and \
+             running, and is the operator's or the sweep's to release",
+            acquired.id
+        );
+        return ExitCode::FAILURE;
+    }
     match verdict {
         lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
