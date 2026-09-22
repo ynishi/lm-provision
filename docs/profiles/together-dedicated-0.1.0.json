@@ -2,7 +2,7 @@
   "type": "Spec",
   "name": "together-dedicated",
   "version": "0.1.0",
-  "description": "Deploy a model Together AI already serves onto a dedicated endpoint: `machine acquire --provider together` renders the one service.start below into the service's endpoint request, and what comes back is an OpenAI-compatible endpoint on https://api-inference.together.ai/v1 rather than a host. The model is yours to declare: replace the SET-ME placeholder with a catalogue model id, or the id GET /v1/models lists for a model you uploaded with `tg` (uploading is not the acquisition's job). The hardware configuration is named outright in \"together.hardware\" (an id from GET /v1/hardware); the service publishes no complete list to select from, so requires_gpu.min_vram_gb is judged after the fact from that id. No requires_ports, no requires_disk, no engine arguments: the engine is the platform's, and a profile declaring any of these is refused by name. The lease rides in the endpoint's display_name; the pod verbs (apply, logs, exec, cp, port-forward) do not apply to such a machine and say so.",
+  "description": "Deploy a model Together AI already serves onto a dedicated endpoint (v2): `machine acquire --provider together` drives the service's own CLI (`tg beta endpoints deploy`), and what comes back is an OpenAI-compatible endpoint on https://api-inference.together.ai/v1 rather than a host. The model is yours to declare: replace the SET-ME placeholder with a model `tg beta models public --product dedicated` lists. The hardware is the certified config the CLI picks when the model has exactly one; name it with \"together.config\" (a cr_ id from `tg beta models configs <model>`) otherwise. No requires_ports, no requires_disk, no engine arguments: the engine is the platform's, and a profile declaring any of these is refused by name. The lease is the endpoint's name; the pod verbs (apply, logs, exec, cp, port-forward) do not apply to such a machine and say so. Needs TOGETHER_API_KEY and TOGETHER_PROJECT_ID.",
   "capabilities": [
     "sh.exec",
     "net.http_get"
@@ -17,9 +17,8 @@
     "min_vram_gb": "80"
   },
   "provider": {
-    "together.hardware": "1x_nvidia_h100_80gb_sxm",
-    "together.autoscaling.min_replicas": "1",
-    "together.autoscaling.max_replicas": "1"
+    "together.min_replicas": "1",
+    "together.max_replicas": "1"
   },
   "phases": [
     {

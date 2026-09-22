@@ -115,26 +115,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its stamp field under an account namespace, which the fleet reader
   steps over.
 - **A fifth platform: Together AI dedicated endpoints (`--provider
-  together`).** A dedicated endpoint on a model the service already
-  serves — a catalogue id, or one uploaded out of band with `tg` — on a
-  hardware configuration the profile names
-  (`provider."together.hardware"`, an id from `GET /v1/hardware`; the
-  service publishes no complete list to select from, so a memory floor
-  is judged after the fact from the configuration's own spelling). One
-  `curl` to `POST /v1/endpoints` [documented:
-  docs.together.ai/reference/createendpoint, read 2026-09-22]. The
-  lease rides in `display_name`, which the listing **omits** (`id /
-  name / state` only), so the fleet reader asks each listed endpoint
-  for its own description — `Fleet::stamp_from_inspect` — and a
-  read-back it cannot get ends the sweep rather than passing as
-  unstamped. The projected endpoint is the service's own `name` on
-  `https://api-inference.together.ai/v1`, a different host from the
-  management API. Refused by name: engine arguments (`dtype`,
-  `extra_args` — the engine is the platform's), a `tensor_parallel_size`
-  disagreeing with the configuration's device count, other phases, a
-  disk, and `requires_ports` at admission. Model upload is not the
-  acquisition's job: the v1 upload job publishes no status the driver
-  could wait on. Not yet run against the service.
+  together`), driven by the service's own CLI.** The v1 REST create is
+  closed (403 `endpoints_v1_create_access_disabled` [measured:
+  2026-09-22]) and v2 takes three calls to create an endpoint and five
+  steps to release one, so this adapter drives `tg` (python package
+  `together`) as the pod adapters drive theirs: `tg beta endpoints
+  deploy <model> --endpoint <lease> --min-replicas … --json` creates
+  endpoint, deployment and traffic split in one verb, `tg beta endpoints
+  get` / `ls` read them back with the deployment summary inline, and
+  `tg beta endpoints rm --force` tears them down — converging over
+  repeated calls, since the first scales the deployment to zero and is
+  refused while it stops [measured: 2026-09-22, two calls 30 s apart].
+  The lease is the endpoint's **name**: a v2 endpoint has no
+  `display_name` or labels, the service lists the name under the
+  project slug (stepped over by the fleet reader), and the inference
+  `model` is that name on `https://api-inference.together.ai/v1`. The
+  hardware is the certified config (`cr_…`) the CLI picks when the
+  model has exactly one, or `provider."together.config"`; the profile's
+  other knobs (`min_replicas` / `max_replicas` / `inactive_timeout` /
+  `deployment_name`) become flags, and any other `together.*` key is
+  refused rather than dropped. Also refused by name: engine arguments,
+  other phases, a disk, ports at admission, and `min 0 / max 0` (a
+  deployment created stopped is nothing to judge). Credentials:
+  `TOGETHER_API_KEY` and `TOGETHER_PROJECT_ID`, read by the CLI itself.
+  Verified end to end [measured: 2026-09-22, Qwen/Qwen2.5-7B-Instruct on
+  1x H100: PROVISIONING → SCALING → READY in ~2.5 min, one chat reply,
+  teardown after two release calls].
 - **Driver library: `Discovery` / `Wait`, `Fleet::stamp_from_inspect`,
   `curl_bearer`.** The pre-create step an acquisition may carry is now
   a `Discovery` — the argv, an optional body, a dotted path to the id

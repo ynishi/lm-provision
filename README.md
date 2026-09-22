@@ -200,24 +200,30 @@ lm-provision machine acquire --provider deepinfra-deploy \
 # on any other platform; apply / logs / exec / cp / port-forward do not
 # apply and say so — there is no session to open.
 
-# A fifth: Together AI dedicated endpoints — a model the service already
-# serves (a catalogue id, or one uploaded with `tg` and listed by
-# GET /v1/models), on a hardware configuration you name. The profile
-# declares requires_gpu, exactly one ServiceStart whose "model" is that
-# id, no engine arguments (the engine is the platform's), no ports, no
-# disk. TOGETHER_API_KEY in the .env.
+# A fifth: Together AI dedicated endpoints (v2), driven by the service's
+# own CLI `tg` (python package `together`, on PATH) — the v2 API takes
+# three calls to create and five steps to release, and `tg` folds each
+# into one verb. Keys: TOGETHER_API_KEY and TOGETHER_PROJECT_ID (from
+# `tg whoami`) in the .env. The profile declares requires_gpu, exactly
+# one ServiceStart whose "model" is a model the service serves (`tg beta
+# models public --product dedicated`), no engine arguments (the engine
+# is the platform's), no ports, no disk. The hardware is the certified
+# config the CLI picks when the model has exactly one; name it with
+# "together.config" (a cr_… id from `tg beta models configs <model>`)
+# otherwise. Any other together.* key is refused rather than dropped.
 #   "provider": {
-#     "together.hardware": "1x_nvidia_h100_80gb_sxm",   # GET /v1/hardware
-#     "together.autoscaling.min_replicas": "1",         # 0 + max > 0 is refused
-#     "together.autoscaling.max_replicas": "1",         #   by the service
-#     "together.inactive_timeout": "60"                 # minutes, 30-1440
+#     "together.min_replicas": "1",        # 0/0 (created stopped) is refused
+#     "together.max_replicas": "1",
+#     "together.inactive_timeout": "60"    # minutes, 30-1440
 #   }
 lm-provision machine acquire --provider together \
   --profile docs/profiles/together-dedicated-0.1.0.json --dry-run false
 # {"connection":{"endpoint":{"base_url":"https://api-inference.together.ai/v1",
-#   "model":"<account>/<model>-<hash>","api_key_env":"TOGETHER_API_KEY"}}}
-# The lease is the endpoint's display_name, which the listing omits, so
-# `machine list` / `sweep` read it back per endpoint (one GET each).
+#   "model":"<project-slug>/lmp-exp-…","api_key_env":"TOGETHER_API_KEY"}}}
+# The lease is the endpoint's name (a v2 endpoint has no other operator-
+# written field), listed under the project slug; `model` is that name.
+# `release` converges: the first call scales the deployment to zero and
+# is refused while it stops; call it again (or let the sweep) to delete.
 
 # The MCP server, on stdio (see below for what it reads):
 lm-provision mcp
