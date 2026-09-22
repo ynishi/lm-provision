@@ -397,6 +397,68 @@ open and which still exist":
   acquisitions record, and for the same reason: written by the operator
   CLI today, read by the inventory and the control plane later.
 
+### Price record (append-only)
+
+The records above say what was bought and what is still open; none of
+them says what the work itself is billed at. The price record is the
+host's answer to "what does a token cost on this platform for this
+model, as of when":
+
+```
+{
+  provider = string,   -- the platform, as the operator named it
+                       -- (`deepinfra`, `together`, `openrouter`) — the
+                       -- same word the endpoint row's `provider` carries
+  model    = string,   -- the model, as that platform names it — the
+                       -- same word the endpoint row's `model` carries
+  price    = { input         = string,   -- uncached input tokens
+               output        = string,   -- output tokens
+               cache_read?   = string,   -- input served from the
+                                         -- platform's prompt cache
+               cache_write?  = string,   -- input written into it, where
+                                         -- the write is charged for
+               reasoning?    = string }, -- reasoning tokens, where
+                                         -- priced apart from output
+  unit     = "usd_per_mtok",  -- written into every row
+  as_of    = string,   -- RFC 3339 UTC: the instant the amounts were
+                       -- read — the writer's clock for a sync, the
+                       -- operator's word for a hand row
+  source   = string,   -- the URL a sync read, or `operator`
+}
+```
+
+- **Amounts are decimal text in USD per million tokens.** That is the
+  unit every platform's own pricing page states, so a row can be
+  checked against the page it came from by reading it. Text rather
+  than a number because the platforms that return money over an API
+  return it as text, and a reader that needs arithmetic parses to
+  integer micro-dollars (10⁻⁶ USD) and stays in integers until it
+  prints — money rounded silently is the failure this shape exists to
+  prevent.
+- **Absent is not zero.** A platform that does not price cache reads
+  leaves `cache_read` out; a platform that prices them at nothing
+  writes `"0"`. Both are true statements about that platform and a
+  reader must be able to tell them apart, so an unpriced amount is
+  written without its key rather than as a sentinel.
+- **Append-only, and `as_of` is the version.** A price that changes is
+  a new row, never an edit to the row that stated the old one. What a
+  reader asks for is the newest row at or before some instant, so a run
+  from last month is re-priced at last month's rate rather than at
+  today's — which is the only way a cost said about the past stays true
+  after the platform moves its prices.
+- **The join is (`provider`, `model`)**, by the same words the endpoint
+  row carries (§Endpoint inventory). Nothing translates between the
+  two: the record names a model exactly as the platform that bills for
+  it does.
+- **The unit is written into every row.** A reader that meets a row
+  carrying any other unit refuses it by name; it does not convert and
+  does not guess. A row silently read as per-token when it was written
+  per-million-tokens is wrong by a factor of a million, and a refusal
+  by name is the one outcome that says so.
+- Same encoding, same error class, same neutral home
+  (`~/.lm-provision/prices.jsonl`) as the acquisitions record; written
+  by `machine prices sync` and by the operator, read by the inventory.
+
 ### Endpoint inventory (a reading, not a record)
 
 `machine endpoints` (chapter 08) and `lm_endpoint_list` (chapter 10)
