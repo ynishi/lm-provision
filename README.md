@@ -171,6 +171,35 @@ lm-provision machine acquire --provider deepinfra --profile profile.json --dry-r
 lm-provision apply --provider deepinfra --pod-id <id> --remote-dir /home/ubuntu \
   --profile profile.json
 
+# A fourth: DeepInfra Deployments — the platform runs the model, so
+# what is acquired is an endpoint and not a host. The profile declares
+# requires_gpu and exactly one ServiceStart ("platform_kind": "vllm",
+# "model" = the Hugging Face repo id) and nothing else: no
+# requires_ports, no requires_disk, no other phase — anything this
+# platform cannot run is refused by name rather than dropped. Same
+# DEEPINFRA_TOKEN as the instances above.
+#   "provider": {
+#     "deepinfra-deploy.settings.min_instances": "0",
+#     "deepinfra-deploy.settings.max_instances": "1",
+#     "deepinfra-deploy.hf.revision": "main",
+#     "deepinfra-deploy.hf.token_env": "HF_TOKEN",   # a private repo:
+#            # the name, imported inside curl; the value is on no argv
+#     "deepinfra-deploy.container_image": "vllm/vllm-openai:v0.8.4",
+#     "deepinfra-deploy.gpu": "H100-80GB"            # or let
+#            # requires_gpu.min_vram_gb pick the cheapest that fits
+#   }
+lm-provision machine acquire --provider deepinfra-deploy \
+  --profile docs/profiles/deepinfra-deploy-qwen-0.1.0.json   # shows the exact body
+lm-provision machine acquire --provider deepinfra-deploy \
+  --profile docs/profiles/deepinfra-deploy-qwen-0.1.0.json --dry-run false
+# The artifact's connection is an endpoint rather than an ssh address:
+# {"connection":{"endpoint":{"base_url":"https://api.deepinfra.com/v1/openai",
+#   "model":"deploy_id:<id>","api_key_env":"DEEPINFRA_TOKEN"}}}
+# `model` names the deployment by id, so the lease stamped into
+# model_name never travels in a request. list / release / sweep work as
+# on any other platform; apply / logs / exec / cp / port-forward do not
+# apply and say so — there is no session to open.
+
 # The MCP server, on stdio (see below for what it reads):
 lm-provision mcp
 ```

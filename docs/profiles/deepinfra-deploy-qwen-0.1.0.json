@@ -1,0 +1,40 @@
+{
+  "type": "Spec",
+  "name": "deepinfra-deploy-qwen",
+  "version": "0.1.0",
+  "description": "Deploy a Qwen-family model onto DeepInfra Deployments, where the platform runs the engine: `machine acquire --provider deepinfra-deploy` renders the one service.start below into the platform's deploy request, and what comes back is an OpenAI-compatible endpoint rather than a host. The model is yours to declare: replace the SET-ME placeholder with the Hugging Face repo id you intend to serve (a private repo adds \"deepinfra-deploy.hf.token_env\", the name of the variable holding the read token — the value never reaches an argv). No requires_ports and no requires_disk: the deployment exposes nothing of its own and the platform holds the weights, so a profile declaring either is refused at admission. The GPU is chosen from min_vram_gb as the cheapest catalogued configuration that clears it, or named outright with \"deepinfra-deploy.gpu\". min_instances 0 lets the deployment scale to nothing between requests; the pod verbs (apply, logs, exec, cp, port-forward) do not apply to such a machine and say so.",
+  "capabilities": [
+    "sh.exec",
+    "net.http_get"
+  ],
+  "paths": [],
+  "http_allowlist": [
+    "https://api.deepinfra.com"
+  ],
+  "requires_gpu": {
+    "count": "1",
+    "min_vram_gb": "80"
+  },
+  "provider": {
+    "deepinfra-deploy.settings.min_instances": "0",
+    "deepinfra-deploy.settings.max_instances": "1"
+  },
+  "phases": [
+    {
+      "type": "ServiceStart",
+      "name": "qwen",
+      "platform_kind": "vllm",
+      "model": "SET-ME/your-model-repo-id",
+      "extra_args": [
+        "--max-model-len",
+        "32768"
+      ]
+    },
+    {
+      "type": "ServiceReady",
+      "name": "qwen",
+      "check_url": "https://api.deepinfra.com/v1/openai/models",
+      "timeout_sec": 1800
+    }
+  ]
+}

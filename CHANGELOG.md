@@ -60,6 +60,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   here at all. An apply against it wants `--remote-dir /home/ubuntu`,
   and phases needing root on the machine fail there as on any
   non-root session.
+- **A fourth platform: DeepInfra Deployments (`--provider
+  deepinfra-deploy`) — the first target that runs the model itself.**
+  What is acquired is a served model rather than a host: the profile's
+  one `service.start` (`platform_kind: vllm`, `model` = a Hugging Face
+  repository id) becomes the create body's `hf.repo`, its `dtype` and
+  `extra_args` become the engine's arguments, `requires_gpu` becomes
+  the `gpu` configuration and `num_gpus`, and everything addressed to
+  `provider."deepinfra-deploy.*"` lands after those — `settings.*`
+  and `hf.*` nested under their objects, each value read as the JSON
+  scalar it spells, since this API is typed where the profile's slot
+  is strings. One `curl` call from repository to deployment
+  [documented: docs.deepinfra.com/api-reference/dedicated-models,
+  read 2026-09-22]. The lease rides in `model_name`, the one
+  operator-written field a deployment has, and the listing returns it
+  under the account's namespace, so the stamp is read past the last
+  slash; the endpoint names the deployment `deploy_id:<id>` instead,
+  so the stamp never travels in a request. A private repository's
+  token is named, not passed: `provider."deepinfra-deploy.hf.token_env"`
+  puts `{{NAME:json}}` in the body and `--variable %NAME
+  --expand-json` in the argv, and the value is in no argv, dry-run or
+  record [measured: 2026-09-21, a local listener received the expanded
+  value from an argv naming only the variable]. Refused **by name**,
+  not dropped: a service on another engine, a phase besides the
+  service, a `tensor_parallel_size` disagreeing with the GPU count, a
+  disk, and — at admission, since the adapter declares no exposure —
+  `requires_ports`. The acquire artifact's connection is an inference
+  endpoint (`base_url`, `model`, `api_key_env` — the key's name) and
+  never an ssh address, projected once the service calls the
+  deployment `running`. `list` / `release` / `sweep` work as on any
+  other platform; `apply` / `logs` / `exec` / `cp` / `port-forward`
+  refuse such a machine by what it is, because no retry grows a shell
+  onto a served model. Same `DEEPINFRA_TOKEN` as the instances above.
+  Example profile: `docs/profiles/deepinfra-deploy-qwen-0.1.0.json`.
+- **Driver library: `Requirements::serving`, `Connection::endpoint`,
+  `Fleet::stamp_namespaced`** — the profile's one service carried
+  beside the machine requirements (`Serving::from_phases`, which
+  refuses a profile declaring two), the inference endpoint a machine
+  may project instead of an SSH one, and whether a platform returns
+  its stamp field under an account namespace, which the fleet reader
+  steps over.
 
 ### Changed
 

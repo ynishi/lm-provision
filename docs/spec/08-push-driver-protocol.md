@@ -375,6 +375,27 @@ scrollback and a machine that billed until someone noticed.
   machine (fail closed) but as a `failed` entry, not a refusal, because
   a corrupt ledger read as a refusal would keep every expired machine
   billing behind a zero exit forever.
+- **A managed deployment is acquired, listed, released and swept with
+  the same verbs and the same record**, because it is the same thing:
+  a billable object with the lease stamped on it, enumerated from the
+  platform's own list. What differs is what the acquisition *renders*
+  and what the machine *projects*. The request is built from the
+  profile's one `service.start` — carried alongside the machine
+  requirements as `Requirements::serving` — into the platform's deploy
+  request rather than a machine request, so the platform runs the model
+  itself; everything else the profile declared is refused by name,
+  since a deployment that quietly dropped a phase would be running
+  something the profile did not describe. The connection is an
+  **inference endpoint** — `base_url`, `model`, and `api_key_env`, the
+  key's *name* and never its value — instead of an SSH endpoint. Such a
+  machine has no session at all: the pod verbs (§Operator pod verbs)
+  refuse it by what it is rather than by what it lacks, because no
+  retry will grow a shell onto a served model. First platform:
+  `--provider deepinfra-deploy`, where the lease rides in `model_name`
+  (the one operator-written field the deployment has) and the listing
+  returns it under the account's namespace, so the stamp is read past
+  the last slash; the endpoint names the deployment by `deploy_id:`
+  rather than by that name, so the stamp never reaches a request.
 - A continuously running host daemon that enforces leases without
   being invoked is the control plane's job (chapter 09's record is
   the shared vocabulary for exactly that); `sweep` is the operator's
@@ -567,6 +588,14 @@ lm-provision port-forward <target> <LOCAL:REMOTE>... [--address <addr>] [--detac
   the driver already paid to learn (first artifacts verification did
   exactly that by hand). The projection is part of the adapter
   seam; the wait bound is the driver's own (**internal**).
+
+  Revised (2026-09-22): the connection data may be an **inference
+  endpoint** rather than an SSH endpoint — on a platform that runs the
+  model itself, the machine answers OpenAI-compatible requests at its
+  own address and has no host to dial (§Acquisitions and sweep). Which
+  of the two an adapter projects is the adapter seam; that a machine
+  projecting neither is reported with what the projection read, rather
+  than in silence, is the same rule the pod verbs' refusal follows.
 - The acquisition lease and the sweep (2026-09-01): the **recording**
   is chapter 09's stable tier — a row written today is read by the
   control plane later, which is the whole reason the schema sits on

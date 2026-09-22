@@ -63,6 +63,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::profile_ast::ProfileNode;
+
 /// How a port must be reachable.
 ///
 /// **This is what the workload needs, not what a platform offers.** A
@@ -249,6 +251,11 @@ pub struct Requirements {
     pub gpu: Option<GpuRequirement>,
     /// Storage, when the profile asks for any.
     pub disk: Option<DiskRequirement>,
+    /// The one service the profile declares, when a target that runs
+    /// the model itself needs to know it — see [`Serving`]. `None` from
+    /// the slot readers; a caller that has the phases attaches it with
+    /// [`Requirements::with_serving`].
+    pub serving: Option<Serving>,
 }
 
 impl Requirements {
@@ -268,6 +275,16 @@ impl Requirements {
             disk: Self::disk_from_slot(disk)?,
             ..Self::from_slot(ports)?
         })
+    }
+
+    /// The same requirements, carrying the profile's one service.
+    ///
+    /// Separate from the slot readers because the service is not in a
+    /// slot: it is a phase, and a caller that has the phases is the
+    /// one that can read it ([`Serving::from_phases`]).
+    pub fn with_serving(mut self, serving: Option<Serving>) -> Self {
+        self.serving = serving;
+        self
     }
 
     /// Read a profile's `requires_disk` slot.
@@ -364,12 +381,117 @@ impl Requirements {
             ports,
             gpu: None,
             disk: None,
+            serving: None,
         })
     }
 
     /// Whether anything is required at all.
     pub fn is_empty(&self) -> bool {
         self.ports.is_empty() && self.gpu.is_none()
+    }
+}
+
+/// The one service a profile declares — what a target that **runs the
+/// model itself** deploys, read out of the phases.
+///
+/// Not a requirement in the sense the rest of this module means: no
+/// target is judged on it by [`observe`], and a target that hands the
+/// machine to the provisioner never reads it (the provisioner reads the
+/// same `service.start` on the machine). It rides with the
+/// [`Requirements`] because a managed deployment platform has no other
+/// way to learn what to deploy — nothing of this tool's ever runs on
+/// such a platform — and because it comes out of the same profile the
+/// requirements do, so a caller holding one holds the other.
+///
+/// **One service, and nothing else.** A deployment platform runs the
+/// model and no other phase, so what the profile declares *besides* the
+/// service is carried here too ([`Serving::others`]) for the adapter to
+/// refuse by name — the alternative is a `system.apt` that was declared,
+/// never ran, and was never mentioned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Serving {
+    /// The service's declared name.
+    pub name: String,
+    /// The serving engine (`service.start`'s `platform.kind`: `vllm`,
+    /// `ollama`, `llamacpp`).
+    pub engine: String,
+    /// The model to serve, as `service.start` names it — a Hugging Face
+    /// repository id on the engines that take one.
+    pub model: Option<String>,
+    /// `vllm` `--dtype`, when declared.
+    pub dtype: Option<String>,
+    /// `vllm` `--tensor-parallel-size`, when declared.
+    pub tensor_parallel_size: Option<u16>,
+    /// Extra launch arguments, declaration order preserved.
+    pub extra_args: Vec<String>,
+    /// The catalog kinds of every other phase the profile declares,
+    /// except the `service.ready` that belongs to this service — in
+    /// profile order, one entry per phase.
+    pub others: Vec<String>,
+}
+
+/// A profile whose services cannot be read as one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ServingError {
+    /// More than one `service.start`: a deployment is one model, and
+    /// picking one of several would be deploying something the profile
+    /// did not single out.
+    #[error(
+        "the profile declares {} services ({}); a deployment serves one",
+        names.len(),
+        names.join(", ")
+    )]
+    SeveralServices {
+        /// The services, in profile order.
+        names: Vec<String>,
+    },
+}
+
+impl Serving {
+    /// The one `service.start` in `phases`, or `None` when there is
+    /// none — a profile without a service is not an error here, it is a
+    /// profile a deployment platform will refuse as incomplete and a pod
+    /// will run as declared.
+    pub fn from_phases(phases: &[ProfileNode]) -> Result<Option<Self>, ServingError> {
+        let mut starts = phases.iter().filter_map(|phase| match phase {
+            ProfileNode::ServiceStart {
+                name,
+                platform_kind,
+                model,
+                dtype,
+                tensor_parallel_size,
+                extra_args,
+                ..
+            } => Some(Serving {
+                name: name.clone(),
+                engine: platform_kind.clone(),
+                model: model.clone(),
+                dtype: dtype.clone(),
+                tensor_parallel_size: *tensor_parallel_size,
+                extra_args: extra_args.clone(),
+                others: Vec::new(),
+            }),
+            _ => None,
+        });
+        let Some(mut serving) = starts.next() else {
+            return Ok(None);
+        };
+        let rest: Vec<Serving> = starts.collect();
+        if !rest.is_empty() {
+            let mut names = vec![serving.name];
+            names.extend(rest.into_iter().map(|it| it.name));
+            return Err(ServingError::SeveralServices { names });
+        }
+        serving.others = phases
+            .iter()
+            .filter(|phase| match phase {
+                ProfileNode::ServiceStart { .. } => false,
+                ProfileNode::ServiceReady { name, .. } => *name != serving.name,
+                _ => true,
+            })
+            .map(|phase| crate::plan::kind_of(phase).to_string())
+            .collect();
+        Ok(Some(serving))
     }
 }
 
@@ -1187,6 +1309,101 @@ mod tests {
         assert!(
             rendered.contains("it provides raw_tcp"),
             "the refusal says what the target can do: {rendered}"
+        );
+    }
+
+    /// **One service, read out of the phases; the rest named.** A
+    /// deployment platform runs the model and nothing else, so what the
+    /// profile declared besides it has to be carried out to be refused
+    /// by name — and its own readiness poll is not "something else".
+    #[test]
+    fn the_one_service_is_read_and_everything_else_is_named() {
+        let ids = dsl_kit::IdGen::new();
+        let phases = vec![
+            ProfileNode::SystemApt {
+                id: ids.node(),
+                packages: vec!["git".to_string()],
+            },
+            ProfileNode::ServiceStart {
+                id: ids.node(),
+                name: "llm".to_string(),
+                platform_kind: "vllm".to_string(),
+                model: Some("Qwen/Qwen3-8B".to_string()),
+                port: Some(8000),
+                dtype: Some("bfloat16".to_string()),
+                tensor_parallel_size: Some(2),
+                extra_args: vec!["--max-model-len".to_string(), "32768".to_string()],
+            },
+            ProfileNode::ServiceReady {
+                id: ids.node(),
+                name: "llm".to_string(),
+                check_url: "http://127.0.0.1:8000/v1/models".to_string(),
+                timeout_sec: None,
+            },
+            ProfileNode::ServiceReady {
+                id: ids.node(),
+                name: "other".to_string(),
+                check_url: "http://127.0.0.1:9000/".to_string(),
+                timeout_sec: None,
+            },
+        ];
+        let serving = Serving::from_phases(&phases)
+            .expect("one service")
+            .expect("declared");
+        assert_eq!(serving.name, "llm");
+        assert_eq!(serving.engine, "vllm");
+        assert_eq!(serving.model.as_deref(), Some("Qwen/Qwen3-8B"));
+        assert_eq!(serving.dtype.as_deref(), Some("bfloat16"));
+        assert_eq!(serving.tensor_parallel_size, Some(2));
+        assert_eq!(serving.extra_args, vec!["--max-model-len", "32768"]);
+        assert_eq!(
+            serving.others,
+            vec!["system.apt".to_string(), "service.ready".to_string()],
+            "the package phase and the other service's poll are named; this service's own poll is not"
+        );
+
+        assert_eq!(
+            Serving::from_phases(&[]).expect("no service is not an error"),
+            None
+        );
+
+        let two = vec![
+            ProfileNode::ServiceStart {
+                id: ids.node(),
+                name: "a".to_string(),
+                platform_kind: "vllm".to_string(),
+                model: None,
+                port: None,
+                dtype: None,
+                tensor_parallel_size: None,
+                extra_args: Vec::new(),
+            },
+            ProfileNode::ServiceStart {
+                id: ids.node(),
+                name: "b".to_string(),
+                platform_kind: "ollama".to_string(),
+                model: None,
+                port: None,
+                dtype: None,
+                tensor_parallel_size: None,
+                extra_args: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            Serving::from_phases(&two),
+            Err(ServingError::SeveralServices {
+                names: vec!["a".to_string(), "b".to_string()]
+            })
+        );
+
+        let required = Requirements::default().with_serving(Some(serving.clone()));
+        assert_eq!(required.serving, Some(serving));
+        assert!(
+            Requirements::from_slots(&slot(&[]), &slot(&[]), &slot(&[]))
+                .unwrap()
+                .serving
+                .is_none(),
+            "the slot readers never attach one"
         );
     }
 }

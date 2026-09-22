@@ -20,6 +20,13 @@
       "path": "qwen-vllm-serve-0.2.0.json",
       "profile_hash": "6bf10f6c04d6622f3a70bfe2122f3964cd38e893e4c9f275216f2153d9f927ba",
       "summary": "vLLM OpenAI-compatible serving for a Qwen-family model you declare (48GB GPU, tool calling on, CUDA-driver-aware install)."
+    },
+    {
+      "name": "deepinfra-deploy-qwen",
+      "version": "0.1.0",
+      "path": "deepinfra-deploy-qwen-0.1.0.json",
+      "profile_hash": "11ad8cf0c8d9cc678b43cbb4f99f293b996a6ef844936ac21c776fe933001638",
+      "summary": "A Qwen-family model you declare, deployed onto DeepInfra Deployments (the platform runs the engine; what comes back is an OpenAI-compatible endpoint)."
     }
   ]
 }
