@@ -4277,7 +4277,13 @@ mod tests {
     #[test]
     fn an_empty_discovery_is_out_of_stock_not_a_machine() {
         let err = acquire(Acquisition {
-            discover: Some(vec!["echo".into(), "[]".into()]),
+            discover: Some(Discovery {
+                argv: vec!["echo".into(), "[]".into()],
+                body: None,
+                id_key: "id",
+                placeholder: "{offer_id}",
+                wait: None,
+            }),
             create: vec!["true".into()],
             body: None,
             created_id_key: "new_contract",
@@ -5612,5 +5618,194 @@ mod tests {
             deepinfra_curl("https://example.invalid").contains(&"--fail-with-body".to_string()),
             "and the curl argv asks for the body to be kept"
         );
+    }
+
+    /// **json_path walks dotted keys and reads the first row of an array.**
+    /// `a.b` walks into nested objects; when the document is an array the
+    /// path is read from its first element; a missing key or an empty array
+    /// answers `None`.
+    #[test]
+    fn json_path_walks_dotted_keys_and_the_first_row_of_an_array() {
+        assert_eq!(
+            json_path(&serde_json::json!({"a": {"b": 7}}), "a.b"),
+            Some(&serde_json::json!(7))
+        );
+        assert_eq!(
+            json_path(&serde_json::json!([{"id": "x"}]), "id"),
+            Some(&serde_json::json!("x"))
+        );
+        assert_eq!(json_path(&serde_json::json!({"a": 1}), "a.b"), None);
+        assert_eq!(json_path(&serde_json::json!([]), "id"), None);
+    }
+
+    /// **The discovered id is read by dotted path and lands in the body.**
+    /// The id at `data.model_id` is substituted into both the create argv
+    /// and the create body before the create call runs.
+    #[test]
+    fn the_discovered_id_is_read_by_dotted_path_and_lands_in_the_body() {
+        let acquired = acquire(Acquisition {
+            discover: Some(Discovery {
+                argv: vec![
+                    "printf".into(),
+                    r#"{"data":{"model_id":"m-42","job_id":"j-1"}}"#.into(),
+                ],
+                body: None,
+                id_key: "data.model_id",
+                placeholder: "{model_id}",
+                wait: None,
+            }),
+            create: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '{\"id\":\"%s\"}' \"$1\"".into(),
+                "argv0".into(),
+            ],
+            body: Some("{model_id}".into()),
+            created_id_key: "id",
+            inspect: vec!["echo".into(), "{}".into()],
+            release: vec!["true".into()],
+        })
+        .expect("the discovery found a model");
+        assert_eq!(
+            acquired.id, "m-42",
+            "the body substitution put the discovered id as the last argument"
+        );
+    }
+
+    /// **A wait polls until ready and the create follows.** The wait
+    /// command runs repeatedly; once it reports a ready status the create
+    /// call proceeds and succeeds.
+    #[test]
+    fn a_wait_polls_until_ready_and_the_create_follows() {
+        let dir = std::env::temp_dir().join("lm-prov-wait-poll-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter = dir.join("count");
+        std::fs::remove_file(&counter).ok();
+        let wait_script = format!(
+            "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {}; \
+             if [ $n -ge 3 ]; then echo '{{\"status\":\"Complete\"}}'; \
+             else echo '{{\"status\":\"Running\"}}'; fi",
+            counter.display(),
+            counter.display()
+        );
+        let acquired = acquire(Acquisition {
+            discover: Some(Discovery {
+                argv: vec!["echo".into(), r#"[{"id":"offer-1"}]"#.into()],
+                body: None,
+                id_key: "id",
+                placeholder: "{offer_id}",
+                wait: Some(Wait {
+                    argv: vec!["sh".into(), "-c".into(), wait_script],
+                    status_key: "status",
+                    ready: &["Complete"],
+                    failed: &["Failed"],
+                    poll_secs: 0,
+                    cap_secs: 60,
+                }),
+            }),
+            create: vec!["echo".into(), r#"{"new_contract":"created"}"#.into()],
+            body: None,
+            created_id_key: "new_contract",
+            inspect: vec!["echo".into(), "{}".into()],
+            release: vec!["true".into()],
+        })
+        .expect("the wait reported ready and create followed");
+        assert_eq!(acquired.id, "created");
+        let n: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            n, 3,
+            "the wait polled until the third attempt said Complete"
+        );
+    }
+
+    /// **A wait that says failed stops before creating.** The create
+    /// command would leave a marker file if run; the marker must not
+    /// exist.
+    #[test]
+    fn a_wait_that_says_failed_stops_before_creating() {
+        let dir = std::env::temp_dir().join("lm-prov-wait-failed-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker");
+        std::fs::remove_file(&marker).ok();
+        let err = acquire(Acquisition {
+            discover: Some(Discovery {
+                argv: vec!["echo".into(), r#"[{"id":"offer-1"}]"#.into()],
+                body: None,
+                id_key: "id",
+                placeholder: "{offer_id}",
+                wait: Some(Wait {
+                    argv: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "echo '{\"status\":\"Failed\"}'".into(),
+                    ],
+                    status_key: "status",
+                    ready: &["Complete"],
+                    failed: &["Failed"],
+                    poll_secs: 0,
+                    cap_secs: 60,
+                }),
+            }),
+            create: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("touch {}; echo '{{}}'", marker.display()),
+            ],
+            body: None,
+            created_id_key: "id",
+            inspect: vec!["true".into()],
+            release: vec!["true".into()],
+        })
+        .expect_err("the wait reported Failed");
+        match &err {
+            ExecuteError::DiscoveryFailed { status, .. } => {
+                assert_eq!(status, "Failed");
+            }
+            other => panic!("expected DiscoveryFailed, got {other:?}"),
+        }
+        assert!(!marker.exists(), "the create command must not have run");
+    }
+
+    /// **A wait past its cap is a timeout, not a hang.** With
+    /// `poll_secs: 0` and `cap_secs: 0` the first poll runs and the
+    /// deadline is already reached.
+    #[test]
+    fn a_wait_past_its_cap_is_a_timeout_not_a_hang() {
+        let err = acquire(Acquisition {
+            discover: Some(Discovery {
+                argv: vec!["echo".into(), r#"[{"id":"offer-1"}]"#.into()],
+                body: None,
+                id_key: "id",
+                placeholder: "{offer_id}",
+                wait: Some(Wait {
+                    argv: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "echo '{\"status\":\"Running\"}'".into(),
+                    ],
+                    status_key: "status",
+                    ready: &["Complete"],
+                    failed: &["Failed"],
+                    poll_secs: 0,
+                    cap_secs: 0,
+                }),
+            }),
+            create: vec!["true".into()],
+            body: None,
+            created_id_key: "id",
+            inspect: vec!["true".into()],
+            release: vec!["true".into()],
+        })
+        .expect_err("the cap was zero so the first poll times out");
+        match &err {
+            ExecuteError::DiscoveryTimeout { last_status, .. } => {
+                assert_eq!(last_status.as_deref(), Some("Running"));
+            }
+            other => panic!("expected DiscoveryTimeout, got {other:?}"),
+        }
     }
 }
