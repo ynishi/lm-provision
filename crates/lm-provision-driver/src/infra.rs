@@ -2842,11 +2842,14 @@ impl Infra for TogetherAdapter {
         None
     }
 
+    /// `PROVISIONING` and `SCALING` are the service's words for a
+    /// deployment on its way up [measured: 2026-09-22, PROVISIONING →
+    /// SCALING → READY over ~2.5 minutes]; read through the same view
+    /// as the connection, so the create response (`deployment.status
+    /// .state`) and a read-back (`deployments[0].state`) agree.
     fn still_materializing(&self, inspected: &serde_json::Value) -> bool {
         matches!(
-            together_deployment(inspected)
-                .and_then(|d| d.get("state"))
-                .and_then(|it| it.as_str()),
+            together_view(inspected).1,
             Some("DEPLOYMENT_STATE_PROVISIONING") | Some("DEPLOYMENT_STATE_SCALING")
         )
     }
@@ -3078,35 +3081,34 @@ fn together_create(
         }
     }
 
-    let mut argv = together_cli(&[
+    // Every argument the verb takes, assembled before the program and
+    // the trailing `--non-interactive` are put around it, so the argv
+    // ends the way every other verb's does (`--json --non-interactive`).
+    let stamp = expiry_stamp(expires_at);
+    let mut args: Vec<&str> = vec![
         "beta",
         "endpoints",
         "deploy",
         model,
         "--endpoint",
-        &expiry_stamp(expires_at),
+        &stamp,
         "--min-replicas",
         min_replicas,
         "--max-replicas",
         max_replicas,
-    ]);
-
+    ];
     if let Some(c) = config {
-        argv.push("--config".to_string());
-        argv.push(c.clone());
+        args.extend(["--config", c.as_str()]);
     }
     if let Some(t) = inactive_timeout {
-        argv.push("--inactive-timeout".to_string());
-        argv.push(t.clone());
+        args.extend(["--inactive-timeout", t.as_str()]);
     }
     if let Some(n) = deployment_name {
-        argv.push("--deployment-name".to_string());
-        argv.push(n.clone());
+        args.extend(["--deployment-name", n.as_str()]);
     }
+    args.push("--json");
 
-    argv.push("--json".to_string());
-
-    Ok(argv)
+    Ok(together_cli(&args))
 }
 
 /// The count and VRAM in a hardware configuration string printed by the
@@ -4897,25 +4899,26 @@ mod tests {
         }
     }
 
-    // ---- The managed endpoint ----
+    // ---- The managed endpoint (Together, v2, `tg`-driven) ----
 
     fn together_serving() -> lm_provision::machine::Serving {
         lm_provision::machine::Serving {
             name: "llm".to_string(),
             engine: "vllm".to_string(),
-            model: Some("meta-llama/Meta-Llama-3.1-8B-Instruct".to_string()),
+            model: Some("Qwen/Qwen2.5-7B-Instruct".to_string()),
             dtype: None,
-            tensor_parallel_size: Some(2),
+            tensor_parallel_size: None,
             extra_args: Vec::new(),
             others: Vec::new(),
         }
     }
 
-    /// A profile for the managed endpoint: two GPUs, no ports, no disk, one service.
+    /// A profile for the managed endpoint: one GPU of at least 80 GB, no
+    /// ports, no disk, one service.
     fn together_requirements() -> Requirements {
         Requirements::from_slots(
             &BTreeMap::new(),
-            &[("count", "2")]
+            &[("count", "1"), ("min_vram_gb", "80")]
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
@@ -4926,10 +4929,48 @@ mod tests {
     }
 
     fn together_provider() -> BTreeMap<String, String> {
-        [("together.hardware", "2x_nvidia_h100_80gb_sxm")]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+        BTreeMap::new()
+    }
+
+    /// What `tg beta endpoints deploy … --json` printed [measured:
+    /// 2026-09-22], with the stamp the fixtures share.
+    fn together_created() -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": {
+                "id": "ep_CfJ2Wd6XBFiNqNMDRzkss",
+                "name": "ytknishimura-b6db/lmp-exp-20260902T063000Z",
+                "deployments": [], "trafficSplit": [], "etag": "1",
+                "endpointType": "ENDPOINT_TYPE_DEDICATED", "projectId": "proj_x",
+                "visibility": "VISIBILITY_PRIVATE"
+            },
+            "deployment": {
+                "id": "dep_CfJ2WeFDbgDb47gX4cTG5", "endpointId": "ep_CfJ2Wd6XBFiNqNMDRzkss",
+                "name": "ytknishimura-b6db/lmp-exp-20260902T063000Z/Qwen-Qwen2.5-7B-Instruct-BF16-a2ac14fa",
+                "hardware": "1xnvidia-h100-80gb", "configId": "cr_x", "modelId": "ml_x",
+                "autoscaling": { "minReplicas": 1, "maxReplicas": 1 },
+                "status": { "message": "Scheduling replicas", "state": "DEPLOYMENT_STATE_PROVISIONING" },
+                "trafficMode": "TRAFFIC_MODE_LIVE", "desiredReplicas": 1, "etag": "1"
+            }
+        })
+    }
+
+    /// What `tg beta endpoints get ep_… --json` (and each `ls` row)
+    /// printed once the deployment was serving [measured: 2026-09-22].
+    fn together_ready() -> serde_json::Value {
+        serde_json::json!({
+            "id": "ep_CfJ2Wd6XBFiNqNMDRzkss",
+            "name": "ytknishimura-b6db/lmp-exp-20260902T063000Z",
+            "etag": "3", "endpointType": "ENDPOINT_TYPE_DEDICATED", "projectId": "proj_x",
+            "visibility": "VISIBILITY_PRIVATE",
+            "deployments": [{
+                "id": "dep_CfJ2WeFDbgDb47gX4cTG5",
+                "name": "ytknishimura-b6db/lmp-exp-20260902T063000Z/Qwen-Qwen2.5-7B-Instruct-BF16-a2ac14fa",
+                "state": "DEPLOYMENT_STATE_READY", "hardware": "1xnvidia-h100-80gb",
+                "modelId": "ml_x", "autoscaling": { "minReplicas": 1, "maxReplicas": 1 },
+                "trafficMode": "TRAFFIC_MODE_LIVE", "estimatedEffectiveTrafficShare": 1
+            }],
+            "trafficSplit": [{ "deploymentId": "dep_CfJ2WeFDbgDb47gX4cTG5", "weight": 1 }]
+        })
     }
 
     /// The lease reaches the machine in each platform's own field: a
@@ -5001,16 +5042,22 @@ mod tests {
             serde_json::from_str(unstamped.body.as_deref().unwrap()).unwrap();
         assert_eq!(body.get("name"), None);
 
+        // The managed endpoint carries it as the endpoint's own name —
+        // the argument after `--endpoint` — because a v2 endpoint has no
+        // other operator-written field.
         let endpoint = TogetherAdapter
             .acquisition(
                 &together_requirements(),
                 &together_provider(),
                 Some(expires_at),
             )
-            .expect("a service and hardware were declared");
-        let body: serde_json::Value =
-            serde_json::from_str(endpoint.body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["display_name"], serde_json::json!(stamp));
+            .expect("a service was declared");
+        let at_endpoint = endpoint
+            .create
+            .iter()
+            .position(|it| it == "--endpoint")
+            .expect("the CLI takes the endpoint name");
+        assert_eq!(endpoint.create.get(at_endpoint + 1), Some(&stamp));
     }
 
     /// **The profile does not get the last word on this one field.**
@@ -5071,8 +5118,12 @@ mod tests {
         assert_eq!(deployments.inspect, deployment.inspect);
 
         let endpoint = TogetherAdapter
-            .acquisition(&together_requirements(), &together_provider(), None)
-            .expect("a service and hardware were declared");
+            .acquisition(
+                &together_requirements(),
+                &together_provider(),
+                Some(at("2026-09-02T06:30:00Z")),
+            )
+            .expect("a service and a lease were declared");
         let endpoints = TogetherAdapter.fleet().expect("this target can be asked");
         assert_eq!(endpoints.release, endpoint.release);
         assert_eq!(endpoints.inspect, endpoint.inspect);
@@ -5741,652 +5792,6 @@ mod tests {
         .collect()
     }
 
-    /// **The profile's service becomes the service's own request.** The
-    /// model is `hf.repo`, dtype and extra args are the engine's
-    /// arguments, the GPU answer and count are `gpu` / `num_gpus`, the
-    /// slot's `settings.*` land nested and typed, and the lease is
-    /// `model_name`.
-    #[test]
-    fn the_deployment_request_is_built_from_the_service_and_the_answers() {
-        let expires_at = at("2026-09-02T06:30:00Z");
-        let acquisition = DeepInfraDeployAdapter
-            .acquisition(
-                &deployment_requirements(),
-                &deployment_provider(),
-                Some(expires_at),
-            )
-            .expect("a service and a GPU were declared");
-        let body: serde_json::Value = serde_json::from_str(
-            acquisition
-                .body
-                .as_deref()
-                .expect("this target takes a body"),
-        )
-        .unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({
-                "gpu": "A100-80GB",
-                "num_gpus": 2,
-                "extra_args": ["--dtype", "bfloat16", "--max-model-len", "32768"],
-                "hf": { "repo": "Qwen/Qwen3-8B" },
-                "settings": { "min_instances": 0, "max_instances": 1 },
-                "model_name": expiry_stamp(expires_at),
-            })
-        );
-        assert_eq!(acquisition.created_id_key, "deploy_id");
-        assert_eq!(
-            acquisition.create.last().map(String::as_str),
-            Some("--json")
-        );
-        assert!(
-            acquisition
-                .create
-                .contains(&format!("{DEEPINFRA_DEPLOY}/llm")),
-            "{:?}",
-            acquisition.create
-        );
-        assert!(acquisition.discover.is_none());
-    }
-
-    /// **The repository token travels by name.** Naming the variable
-    /// puts a placeholder in the body and the import in the argv; the
-    /// value is in neither.
-    #[test]
-    fn a_repository_token_is_a_placeholder_in_the_body_and_a_name_in_the_argv() {
-        let mut provider = deployment_provider();
-        provider.insert(
-            "deepinfra-deploy.hf.token_env".to_string(),
-            "HF_TOKEN".to_string(),
-        );
-        provider.insert(
-            "deepinfra-deploy.hf.revision".to_string(),
-            "main".to_string(),
-        );
-        let acquisition = DeepInfraDeployAdapter
-            .acquisition(&deployment_requirements(), &provider, None)
-            .expect("a service and a GPU were declared");
-        let body: serde_json::Value =
-            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            body["hf"],
-            serde_json::json!({ "repo": "Qwen/Qwen3-8B", "revision": "main", "token": "{{HF_TOKEN:json}}" })
-        );
-        assert!(
-            body.get("hf.token_env").is_none(),
-            "consumed, not forwarded: {body}"
-        );
-        assert!(
-            acquisition
-                .create
-                .windows(2)
-                .any(|it| it == ["--variable", "%HF_TOKEN"]),
-            "{:?}",
-            acquisition.create
-        );
-        assert_eq!(
-            acquisition.create.last().map(String::as_str),
-            Some("--expand-json")
-        );
-        assert!(
-            !acquisition.create.iter().any(|it| it.contains("hf_")),
-            "no argument carries a token value: {:?}",
-            acquisition.create
-        );
-        assert_eq!(
-            body.get("model_name"),
-            None,
-            "no lease, no name: the service refuses it"
-        );
-    }
-
-    /// **Refused by name, not dropped.** Each thing the profile said
-    /// that this target cannot do stops the request and says which.
-    #[test]
-    fn a_deployment_refuses_what_it_cannot_run_by_name() {
-        let refusal = |required: Requirements| {
-            DeepInfraDeployAdapter
-                .acquisition(&required, &deployment_provider(), None)
-                .expect_err("something the target cannot do")
-                .to_string()
-        };
-
-        let no_service = deployment_requirements().with_serving(None);
-        assert!(refusal(no_service).contains("service.start"));
-
-        let mut other_engine = serving();
-        other_engine.engine = "ollama".to_string();
-        let rendered = refusal(deployment_requirements().with_serving(Some(other_engine)));
-        assert!(
-            rendered.contains("vLLM") && rendered.contains("ollama"),
-            "{rendered}"
-        );
-
-        let mut with_others = serving();
-        with_others.others = vec!["system.apt".to_string(), "sh.exec".to_string()];
-        let rendered = refusal(deployment_requirements().with_serving(Some(with_others)));
-        assert!(rendered.contains("system.apt, sh.exec"), "{rendered}");
-
-        let mut no_model = serving();
-        no_model.model = None;
-        assert!(refusal(deployment_requirements().with_serving(Some(no_model))).contains("model"));
-
-        let mut disagreeing = serving();
-        disagreeing.tensor_parallel_size = Some(4);
-        let rendered = refusal(deployment_requirements().with_serving(Some(disagreeing)));
-        assert!(
-            rendered.contains("tensor_parallel_size 4") && rendered.contains("2 devices"),
-            "{rendered}"
-        );
-
-        let with_disk = Requirements::from_slots(
-            &BTreeMap::new(),
-            &[("count", "2")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            &[("ephemeral_gb", "60")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        )
-        .unwrap()
-        .with_serving(Some(serving()));
-        assert!(refusal(with_disk).contains("no disk"));
-
-        let capability = DeepInfraDeployAdapter.capability();
-        assert!(capability.exposures.is_empty());
-        assert!(
-            lm_provision::machine::admit(&required(&[("8000", "raw_tcp")]), &capability).is_err(),
-            "a port declaration is refused at admission"
-        );
-    }
-
-    /// The count is bounded by the API, the floor selects the cheapest
-    /// configuration, and the way out names the slot key.
-    #[test]
-    fn a_deployment_selects_one_configuration_within_the_apis_bounds() {
-        assert_eq!(
-            DeepInfraDeployAdapter.gpu_answer(&GpuRequirement {
-                count: 1,
-                min_vram_gb: Some(100),
-            }),
-            Answer::Met {
-                using: vec!["H200-141GB".to_string()]
-            }
-        );
-        assert!(DeepInfraDeployAdapter
-            .gpu_answer(&GpuRequirement {
-                count: 9,
-                min_vram_gb: None
-            })
-            .blocks());
-        match DeepInfraDeployAdapter.gpu_answer(&GpuRequirement {
-            count: 1,
-            min_vram_gb: Some(300),
-        }) {
-            Answer::Unmet { reason } => {
-                assert!(reason.contains("provider.deepinfra-deploy.gpu"), "{reason}")
-            }
-            other => panic!("nothing catalogued carries 300 GB: {other:?}"),
-        }
-        let mut provider = deployment_provider();
-        provider.insert(
-            "deepinfra-deploy.gpu".to_string(),
-            "RTXPRO6000-96GB".to_string(),
-        );
-        let acquisition = DeepInfraDeployAdapter
-            .acquisition(&deployment_requirements(), &provider, None)
-            .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            body["gpu"], "RTXPRO6000-96GB",
-            "the profile gets the last word"
-        );
-    }
-
-    /// **The endpoint is projected only once the service calls the
-    /// deployment up, and it names the deployment by id** — so the
-    /// lease in `model_name` never reaches a request.
-    #[test]
-    fn the_deployment_projects_an_endpoint_and_no_ssh() {
-        let deploying = serde_json::json!({
-            "deploy_id": "dep-1", "model_name": "me/lmp-exp-20260902T063000Z",
-            "status": "deploying", "fail_reason": null,
-            "config": { "gpu": "H100-80GB", "num_gpus": 2 }
-        });
-        let connection = DeepInfraDeployAdapter.connection(&deploying);
-        assert!(connection.ssh.is_none() && connection.endpoint.is_none());
-        assert!(
-            connection.read.contains(&"status: deploying".to_string()),
-            "{:?}",
-            connection.read
-        );
-        assert!(DeepInfraDeployAdapter.still_materializing(&deploying));
-
-        let mut running = deploying.clone();
-        running["status"] = serde_json::json!("running");
-        let connection = DeepInfraDeployAdapter.connection(&running);
-        let endpoint = connection.endpoint.as_ref().expect("running");
-        assert_eq!(endpoint.base_url, "https://api.deepinfra.com/v1/openai");
-        assert_eq!(endpoint.model, "deploy_id:dep-1");
-        assert_eq!(endpoint.api_key_env, "DEEPINFRA_API_KEY");
-        assert!(connection.ssh.is_none(), "there is no host");
-        assert!(!DeepInfraDeployAdapter.still_materializing(&running));
-        let artifact = serde_json::to_value(&connection).unwrap();
-        assert_eq!(
-            artifact,
-            serde_json::json!({ "endpoint": {
-                "base_url": "https://api.deepinfra.com/v1/openai",
-                "model": "deploy_id:dep-1",
-                "api_key_env": "DEEPINFRA_API_KEY",
-            }}),
-            "what a caller reads: the endpoint, and nothing that is not there"
-        );
-
-        let mut failed = deploying.clone();
-        failed["status"] = serde_json::json!("failed");
-        failed["fail_reason"] = serde_json::json!("out of quota");
-        let connection = DeepInfraDeployAdapter.connection(&failed);
-        assert!(connection.endpoint.is_none());
-        assert!(!DeepInfraDeployAdapter.still_materializing(&failed));
-        assert!(
-            connection
-                .read
-                .contains(&"fail_reason: present".to_string()),
-            "{:?}",
-            connection.read
-        );
-
-        let state = DeepInfraDeployAdapter.read_state(&running);
-        assert_eq!(state.gpu_count, Some(2));
-        assert_eq!(state.gpu_vram_mib, Some(gb_to_mib(80)));
-        assert!(!state.ports_observed);
-        let findings = lm_provision::machine::observe(&deployment_requirements(), &state);
-        assert_eq!(
-            lm_provision::machine::verdict(&findings),
-            lm_provision::machine::Outcome::Satisfied,
-            "{findings:#?}"
-        );
-        let uncatalogued = DeepInfraDeployAdapter.read_state(&serde_json::json!({
-            "config": { "gpu": "RTXPRO6000-96GB", "num_gpus": 1 }
-        }));
-        assert_eq!(
-            uncatalogued.gpu_vram_mib,
-            Some(gb_to_mib(96)),
-            "the memory is read off the configuration's own spelling"
-        );
-        assert_eq!(deepinfra_gpu_vram_gb("other"), None);
-    }
-
-    /// **The stamp is read past the account's namespace.** The listing
-    /// says `<username>/<model_name>`; the lease is what the create
-    /// call wrote, which is the part after the slash.
-    #[test]
-    fn the_deployment_listing_reads_the_stamp_past_the_namespace() {
-        let fleet = DeepInfraDeployAdapter
-            .fleet()
-            .expect("this target can be asked");
-        assert!(fleet.stamp_namespaced);
-        let listed = serde_json::json!([
-            { "deploy_id": "dep-a", "model_name": "me/lmp-exp-20260902T063000Z", "status": "running" },
-            { "deploy_id": "dep-b", "model_name": "me/scratch", "status": "stopped" },
-            { "deploy_id": "dep-c", "model_name": "lmp-exp-20260902T063000Z", "status": "running" },
-        ]);
-        let listed = machines(&listed, &fleet).expect("a bare array is the rows");
-        assert_eq!(
-            listed
-                .iter()
-                .map(|it| (it.id.as_str(), it.name.as_deref()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("dep-a", Some("lmp-exp-20260902T063000Z")),
-                ("dep-b", Some("scratch")),
-                ("dep-c", Some("lmp-exp-20260902T063000Z")),
-            ]
-        );
-        assert!(expiry_of(listed[0].name.as_deref().unwrap()).is_some());
-
-        // The pod service's names are read whole: a slash in one of
-        // them is the operator's, not a namespace.
-        let pods = RunPodAdapter.fleet().unwrap();
-        assert!(!pods.stamp_namespaced);
-        let listed = serde_json::json!({ "pods": [{ "id": "p", "name": "team/box" }] });
-        assert_eq!(
-            machines(&listed, &pods).unwrap()[0].name.as_deref(),
-            Some("team/box")
-        );
-
-        assert_eq!(fleet.id, "deploy_id");
-        assert!(
-            fleet.list.contains(&format!("{DEEPINFRA_DEPLOY}/list/")),
-            "{:?}",
-            fleet.list
-        );
-        assert!(fleet.release.windows(2).any(|it| it == ["-X", "DELETE"]));
-        assert_eq!(DeepInfraDeployAdapter.credentials(), &["DEEPINFRA_API_KEY"]);
-        assert_eq!(
-            DeepInfraDeployAdapter.image_key(),
-            Some("deepinfra-deploy.container_image")
-        );
-        assert!(adapter_named("deepinfra-deploy").is_ok());
-    }
-
-    /// **A row the platform has already ended is not a machine.** The
-    /// deployment service lists `failed` and `deleted` deployments
-    /// beside the live ones; reading them as the fleet would have a
-    /// sweep releasing each of them every tick. An account whose rows
-    /// are all ended is an empty fleet, not an unreadable one.
-    #[test]
-    fn ended_rows_are_left_out_of_the_fleet() {
-        let fleet = DeepInfraDeployAdapter
-            .fleet()
-            .expect("this target can be asked");
-        let listed = serde_json::json!([
-            { "deploy_id": "live", "model_name": "me/lmp-exp-20260902T063000Z", "status": "running" },
-            { "deploy_id": "coming", "model_name": "me/lmp-exp-20260902T063000Z", "status": "deploying" },
-            { "deploy_id": "gone", "model_name": "me/lmp-exp-20260902T063000Z", "status": "deleted" },
-            { "deploy_id": "broke", "model_name": "me/lmp-exp-20260902T063000Z", "status": "failed" },
-        ]);
-        let ids: Vec<String> = machines(&listed, &fleet)
-            .expect("live rows are the fleet")
-            .into_iter()
-            .map(|it| it.id)
-            .collect();
-        assert_eq!(ids, vec!["live", "coming"]);
-
-        let all_ended = serde_json::json!([
-            { "deploy_id": "gone", "model_name": "me/x", "status": "deleted" },
-        ]);
-        assert_eq!(machines(&all_ended, &fleet), Ok(Vec::new()));
-
-        // A platform declaring no ended rows reads every row, as before.
-        let pods = RunPodAdapter.fleet().unwrap();
-        assert!(pods.ended.is_none());
-        let listed =
-            serde_json::json!({ "pods": [{ "id": "p", "name": "x", "status": "failed" }] });
-        assert_eq!(machines(&listed, &pods).unwrap().len(), 1);
-    }
-
-    // ---- The managed endpoint ----
-
-    /// **The profile's service becomes the service's own request.** The
-    /// model is `model`, the hardware is the provider slot's
-    /// `together.hardware`, autoscaling defaults to one replica, and
-    /// the lease is `display_name`.
-    #[test]
-    fn the_endpoint_request_is_the_service_and_the_hardware_and_the_lease() {
-        let expires_at = at("2026-09-02T06:30:00Z");
-        let acquisition = TogetherAdapter
-            .acquisition(
-                &together_requirements(),
-                &together_provider(),
-                Some(expires_at),
-            )
-            .expect("a service and hardware were declared");
-        let body: serde_json::Value = serde_json::from_str(
-            acquisition
-                .body
-                .as_deref()
-                .expect("this target takes a body"),
-        )
-        .unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({
-                "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
-                "hardware": "2x_nvidia_h100_80gb_sxm",
-                "autoscaling": { "min_replicas": 1, "max_replicas": 1 },
-                "display_name": expiry_stamp(expires_at),
-            })
-        );
-        assert_eq!(acquisition.created_id_key, "id");
-        assert_eq!(
-            acquisition.create.last().map(String::as_str),
-            Some("--json")
-        );
-        assert!(
-            acquisition.create.contains(&TOGETHER_ENDPOINTS.to_string()),
-            "{:?}",
-            acquisition.create
-        );
-        assert!(acquisition.discover.is_none());
-
-        // No lease: the body has no display_name.
-        let unstamped = TogetherAdapter
-            .acquisition(&together_requirements(), &together_provider(), None)
-            .expect("a service and hardware were declared");
-        let unstamped_body: serde_json::Value =
-            serde_json::from_str(unstamped.body.as_deref().unwrap()).unwrap();
-        assert!(
-            unstamped_body.get("display_name").is_none(),
-            "no lease, no display_name: {unstamped_body}"
-        );
-    }
-
-    /// **The profile's provider keys land typed**, overriding the
-    /// defaults — except for `display_name`, which the lease always
-    /// wins.
-    #[test]
-    fn a_profiles_scaling_and_other_fields_land_typed_and_the_lease_still_wins() {
-        let expires_at = at("2026-09-02T06:30:00Z");
-        let mut provider = together_provider();
-        provider.insert(
-            "together.autoscaling.min_replicas".to_string(),
-            "0".to_string(),
-        );
-        provider.insert(
-            "together.autoscaling.max_replicas".to_string(),
-            "2".to_string(),
-        );
-        provider.insert("together.inactive_timeout".to_string(), "60".to_string());
-        provider.insert("together.display_name".to_string(), "mine".to_string());
-        let acquisition = TogetherAdapter
-            .acquisition(&together_requirements(), &provider, Some(expires_at))
-            .expect("a service and hardware were declared");
-        let body: serde_json::Value =
-            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            body["autoscaling"],
-            serde_json::json!({"min_replicas": 0, "max_replicas": 2})
-        );
-        assert_eq!(body["inactive_timeout"], serde_json::json!(60));
-        assert_eq!(
-            body["display_name"],
-            serde_json::json!(expiry_stamp(expires_at)),
-            "the lease always wins over the profile's display_name"
-        );
-    }
-
-    /// **Refused by name, not dropped.** Each thing the profile said
-    /// that this target cannot do stops the request and says which.
-    #[test]
-    fn the_endpoint_refuses_what_it_cannot_run_by_name() {
-        let refusal = |required: Requirements| {
-            TogetherAdapter
-                .acquisition(&required, &together_provider(), None)
-                .expect_err("something the target cannot do")
-                .to_string()
-        };
-
-        let no_service = together_requirements().with_serving(None);
-        assert!(refusal(no_service).contains("service.start"));
-
-        let mut no_model = together_serving();
-        no_model.model = None;
-        let rendered = refusal(together_requirements().with_serving(Some(no_model)));
-        assert!(rendered.contains("model"), "{rendered}");
-
-        let mut with_others = together_serving();
-        with_others.others = vec!["system.apt".to_string()];
-        let rendered = refusal(together_requirements().with_serving(Some(with_others)));
-        assert!(rendered.contains("system.apt"), "{rendered}");
-
-        let mut with_dtype = together_serving();
-        with_dtype.dtype = Some("bfloat16".to_string());
-        let rendered = refusal(together_requirements().with_serving(Some(with_dtype)));
-        assert!(
-            rendered.contains("engine arguments") && rendered.contains("dtype"),
-            "{rendered}"
-        );
-
-        let mut with_extra_args = together_serving();
-        with_extra_args.extra_args = vec!["--x".to_string()];
-        let rendered = refusal(together_requirements().with_serving(Some(with_extra_args)));
-        assert!(rendered.contains("extra_args"), "{rendered}");
-
-        let no_hardware = TogetherAdapter
-            .acquisition(&together_requirements(), &BTreeMap::new(), None)
-            .expect_err("hardware is required");
-        let rendered = no_hardware.to_string();
-        assert!(
-            rendered.contains("provider.together.hardware"),
-            "{rendered}"
-        );
-
-        let mut disagreeing = together_serving();
-        disagreeing.tensor_parallel_size = Some(4);
-        let rendered = refusal(together_requirements().with_serving(Some(disagreeing)));
-        assert!(
-            rendered.contains("tensor_parallel_size 4") && rendered.contains("2 devices"),
-            "{rendered}"
-        );
-
-        let with_disk = Requirements::from_slots(
-            &BTreeMap::new(),
-            &[("count", "2")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            &[("ephemeral_gb", "60")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        )
-        .unwrap()
-        .with_serving(Some(together_serving()));
-        assert!(refusal(with_disk).contains("no disk"));
-
-        let capability = TogetherAdapter.capability();
-        assert!(capability.exposures.is_empty());
-        assert!(
-            lm_provision::machine::admit(&required(&[("8000", "raw_tcp")]), &capability).is_err(),
-            "a port declaration is refused at admission"
-        );
-    }
-
-    /// **The endpoint is projected only once the service calls the
-    /// endpoint up, and it names it by `name`.** No SSH: there is no
-    /// host.
-    #[test]
-    fn the_endpoint_projects_the_inference_host_and_no_ssh() {
-        let starting = serde_json::json!({
-            "id": "endpoint-1",
-            "name": "acct/Qwen-abc123",
-            "state": "STARTING",
-            "hardware": "2x_nvidia_h100_80gb_sxm",
-            "display_name": "lmp-exp-20260902T063000Z"
-        });
-        let connection = TogetherAdapter.connection(&starting);
-        assert!(connection.endpoint.is_none(), "not reachable until STARTED");
-        assert!(TogetherAdapter.still_materializing(&starting));
-        assert!(
-            connection.read.contains(&"state: STARTING".to_string()),
-            "{:?}",
-            connection.read
-        );
-
-        let mut started = starting.clone();
-        started["state"] = serde_json::json!("STARTED");
-        let connection = TogetherAdapter.connection(&started);
-        let endpoint = connection.endpoint.as_ref().expect("STARTED");
-        assert_eq!(endpoint.base_url, "https://api-inference.together.ai/v1");
-        assert_eq!(endpoint.model, "acct/Qwen-abc123");
-        assert_eq!(endpoint.api_key_env, "TOGETHER_API_KEY");
-        assert!(connection.ssh.is_none(), "there is no host");
-        assert!(!TogetherAdapter.still_materializing(&started));
-
-        let mut error = starting.clone();
-        error["state"] = serde_json::json!("ERROR");
-        let connection = TogetherAdapter.connection(&error);
-        assert!(connection.endpoint.is_none());
-        assert!(!TogetherAdapter.still_materializing(&error));
-
-        // read_state
-        let state = TogetherAdapter.read_state(&started);
-        assert_eq!(state.gpu_count, Some(2));
-        assert_eq!(state.gpu_vram_mib, Some(gb_to_mib(80)));
-        assert!(!state.ports_observed);
-        let findings = lm_provision::machine::observe(&together_requirements(), &state);
-        assert_eq!(
-            lm_provision::machine::verdict(&findings),
-            lm_provision::machine::Outcome::Satisfied,
-            "{findings:#?}"
-        );
-
-        // together_hardware parsing
-        assert_eq!(
-            together_hardware("8x_nvidia_h200_140gb_sxm"),
-            Some((8, 140))
-        );
-        assert_eq!(together_hardware("1x_nvidia_a100_80gb_sxm"), Some((1, 80)));
-        assert_eq!(together_hardware("gpu"), None);
-    }
-
-    /// **The listing omits the stamp, so every machine's lease is read
-    /// off its own read-back.** The fleet carries the same release and
-    /// inspect as the acquisition.
-    #[test]
-    fn the_endpoint_fleet_reads_the_lease_off_each_read_back() {
-        let fleet = TogetherAdapter.fleet().expect("this target can be asked");
-        assert_eq!(fleet.id, "id");
-        assert_eq!(fleet.stamp, "display_name");
-        assert!(!fleet.stamp_namespaced);
-        assert!(fleet.stamp_from_inspect);
-        assert!(fleet.ended.is_none());
-        assert!(
-            fleet
-                .list
-                .contains(&format!("{TOGETHER_ENDPOINTS}?type=dedicated&mine=true")),
-            "{:?}",
-            fleet.list
-        );
-        assert!(
-            fleet.release.windows(2).any(|it| it == ["-X", "DELETE"]),
-            "{:?}",
-            fleet.release
-        );
-        assert!(
-            fleet.inspect.iter().any(|it| it.contains("{id}")),
-            "{:?}",
-            fleet.inspect
-        );
-
-        // The acquisition and the fleet carry the same release and inspect.
-        let acquisition = TogetherAdapter
-            .acquisition(&together_requirements(), &together_provider(), None)
-            .expect("a service and hardware were declared");
-        assert_eq!(fleet.release, acquisition.release);
-        assert_eq!(fleet.inspect, acquisition.inspect);
-
-        assert_eq!(TogetherAdapter.credentials(), &["TOGETHER_API_KEY"]);
-        assert_eq!(TogetherAdapter.image_key(), None);
-        assert!(adapter_named("together").is_ok());
-
-        // The listing alone carries no lease: stamp_from_inspect means
-        // every name comes back None until each endpoint is read back.
-        let listed = serde_json::json!({
-            "object": "list",
-            "data": [
-                { "id": "endpoint-1", "state": "STARTED" }
-            ]
-        });
-        let machines = machines(&listed, &fleet).expect("the listing parses");
-        assert_eq!(machines.len(), 1);
-        assert_eq!(machines[0].name, None, "the listing alone carries no stamp");
-    }
-
     /// **A failure explains itself from whichever stream carried the
     /// explanation.** `curl --fail-with-body` leaves the service's
     /// reason on stdout and says only the status on stderr; an error
@@ -6725,5 +6130,300 @@ mod tests {
                 .any(|it| it.starts_with("Authorization: Bearer ") && !it.contains("{{")),
             "no argument carries a literal bearer value: {argv:?}"
         );
+    }
+
+    /// **The endpoint is deployed by the platform's own CLI**, which
+    /// folds the v2 API's three create calls into one verb; the lease is
+    /// the endpoint's name, and what the verb prints names the endpoint
+    /// under `endpoint.id`.
+    #[test]
+    fn the_endpoint_is_deployed_by_the_platforms_own_cli() {
+        let acquisition = TogetherAdapter
+            .acquisition(
+                &together_requirements(),
+                &together_provider(),
+                Some(at("2026-09-02T06:30:00Z")),
+            )
+            .expect("a service and a lease were declared");
+        assert_eq!(
+            acquisition.create,
+            [
+                "tg",
+                "beta",
+                "endpoints",
+                "deploy",
+                "Qwen/Qwen2.5-7B-Instruct",
+                "--endpoint",
+                "lmp-exp-20260902T063000Z",
+                "--min-replicas",
+                "1",
+                "--max-replicas",
+                "1",
+                "--json",
+                "--non-interactive",
+            ]
+            .map(String::from)
+        );
+        assert!(
+            acquisition.body.is_none(),
+            "the CLI takes arguments, not a body"
+        );
+        assert_eq!(acquisition.created_id_key, "endpoint.id");
+        assert!(acquisition.discover.is_none());
+        assert!(acquisition.inspect.iter().any(|it| it.contains("{id}")));
+        assert_eq!(
+            &acquisition.inspect[acquisition.inspect.len() - 2..],
+            ["--json", "--non-interactive"].map(String::from)
+        );
+        assert!(acquisition.release.contains(&"--force".to_string()));
+        assert_eq!(
+            TogetherAdapter.credentials(),
+            &["TOGETHER_API_KEY", "TOGETHER_PROJECT_ID"]
+        );
+        assert_eq!(
+            json_id(&together_created(), "endpoint.id").as_deref(),
+            Some("ep_CfJ2Wd6XBFiNqNMDRzkss")
+        );
+    }
+
+    /// **The profile's knobs become flags, and a key this target does
+    /// not take is refused** rather than dropped — a request the profile
+    /// did not describe is not a request to send.
+    #[test]
+    fn the_profiles_knobs_become_flags_and_unknown_keys_are_refused() {
+        let mut provider = together_provider();
+        for (k, v) in [
+            ("together.config", "cr_abc"),
+            ("together.min_replicas", "0"),
+            ("together.max_replicas", "2"),
+            ("together.inactive_timeout", "60"),
+            ("together.deployment_name", "d1"),
+        ] {
+            provider.insert(k.to_string(), v.to_string());
+        }
+        let argv = TogetherAdapter
+            .acquisition(
+                &together_requirements(),
+                &provider,
+                Some(at("2026-09-02T06:30:00Z")),
+            )
+            .expect("every key is one the target takes")
+            .create;
+        for pair in [
+            ["--config", "cr_abc"],
+            ["--min-replicas", "0"],
+            ["--max-replicas", "2"],
+            ["--inactive-timeout", "60"],
+            ["--deployment-name", "d1"],
+        ] {
+            assert!(
+                argv.windows(2).any(|it| it == pair.map(String::from)),
+                "{pair:?} in {argv:?}"
+            );
+        }
+
+        let mut unknown = together_provider();
+        unknown.insert("together.hardware".to_string(), "x".to_string());
+        let refusal = TogetherAdapter
+            .acquisition(
+                &together_requirements(),
+                &unknown,
+                Some(at("2026-09-02T06:30:00Z")),
+            )
+            .expect_err("v1's hardware id is not a v2 knob")
+            .to_string();
+        assert!(
+            refusal.contains("hardware") && refusal.contains("not one this target takes"),
+            "{refusal}"
+        );
+
+        let mut stopped = together_provider();
+        stopped.insert("together.min_replicas".to_string(), "0".to_string());
+        stopped.insert("together.max_replicas".to_string(), "0".to_string());
+        let refusal = TogetherAdapter
+            .acquisition(
+                &together_requirements(),
+                &stopped,
+                Some(at("2026-09-02T06:30:00Z")),
+            )
+            .expect_err("created stopped is nothing to judge")
+            .to_string();
+        assert!(refusal.contains("created stopped"), "{refusal}");
+    }
+
+    /// **Refused by name, not dropped.** Each thing the profile said that
+    /// this target cannot do stops the request and says which.
+    #[test]
+    fn the_endpoint_refuses_what_it_cannot_run_by_name() {
+        let lease = Some(at("2026-09-02T06:30:00Z"));
+        let refusal = |required: Requirements| {
+            TogetherAdapter
+                .acquisition(&required, &together_provider(), lease)
+                .expect_err("something the target cannot do")
+                .to_string()
+        };
+        assert!(refusal(together_requirements().with_serving(None)).contains("service.start"));
+        let mut no_model = together_serving();
+        no_model.model = None;
+        assert!(refusal(together_requirements().with_serving(Some(no_model))).contains("model"));
+        let mut with_others = together_serving();
+        with_others.others = vec!["system.apt".to_string()];
+        assert!(
+            refusal(together_requirements().with_serving(Some(with_others))).contains("system.apt")
+        );
+        let mut with_dtype = together_serving();
+        with_dtype.dtype = Some("bfloat16".to_string());
+        let rendered = refusal(together_requirements().with_serving(Some(with_dtype)));
+        assert!(
+            rendered.contains("engine arguments") && rendered.contains("dtype"),
+            "{rendered}"
+        );
+        let mut with_args = together_serving();
+        with_args.extra_args = vec!["--x".to_string()];
+        assert!(
+            refusal(together_requirements().with_serving(Some(with_args))).contains("extra_args")
+        );
+
+        let unleased = TogetherAdapter
+            .acquisition(&together_requirements(), &together_provider(), None)
+            .expect_err("the name is the lease, and the CLI requires a name")
+            .to_string();
+        assert!(unleased.contains("lease"), "{unleased}");
+
+        let with_disk = Requirements::from_slots(
+            &BTreeMap::new(),
+            &[("count", "1")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &[("ephemeral_gb", "60")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+        .unwrap()
+        .with_serving(Some(together_serving()));
+        assert!(refusal(with_disk).contains("no disk"));
+
+        assert!(lm_provision::machine::admit(
+            &required(&[("8000", "raw_tcp")]),
+            &TogetherAdapter.capability()
+        )
+        .is_err());
+        assert!(TogetherAdapter
+            .gpu_answer(&GpuRequirement {
+                count: 0,
+                min_vram_gb: None
+            })
+            .blocks());
+    }
+
+    /// **The endpoint is reachable only when its deployment is READY and
+    /// on the traffic split** — a READY deployment off the split receives
+    /// nothing, and a scaling one is still coming up.
+    #[test]
+    fn the_endpoint_is_reachable_only_when_ready_and_routed() {
+        let created = together_created();
+        let connection = TogetherAdapter.connection(&created);
+        assert!(connection.endpoint.is_none() && connection.ssh.is_none());
+        assert!(TogetherAdapter.still_materializing(&created));
+        assert!(
+            connection
+                .read
+                .contains(&"deployment state: DEPLOYMENT_STATE_PROVISIONING".to_string()),
+            "{:?}",
+            connection.read
+        );
+        assert!(
+            connection.read.contains(&"trafficSplit: empty".to_string()),
+            "{:?}",
+            connection.read
+        );
+
+        let ready = together_ready();
+        let connection = TogetherAdapter.connection(&ready);
+        assert_eq!(
+            connection.endpoint,
+            Some(InferenceEndpoint {
+                base_url: "https://api-inference.together.ai/v1".to_string(),
+                model: "ytknishimura-b6db/lmp-exp-20260902T063000Z".to_string(),
+                api_key_env: "TOGETHER_API_KEY".to_string(),
+            })
+        );
+        assert!(connection.ssh.is_none());
+        assert!(!TogetherAdapter.still_materializing(&ready));
+
+        let mut off_split = ready.clone();
+        off_split["trafficSplit"] = serde_json::json!([]);
+        assert!(TogetherAdapter.connection(&off_split).endpoint.is_none());
+
+        let mut scaling = ready.clone();
+        scaling["deployments"][0]["state"] = serde_json::json!("DEPLOYMENT_STATE_SCALING");
+        assert!(TogetherAdapter.still_materializing(&scaling));
+        assert!(TogetherAdapter.connection(&scaling).endpoint.is_none());
+
+        let mut stopped = ready.clone();
+        stopped["deployments"][0]["state"] = serde_json::json!("DEPLOYMENT_STATE_STOPPED");
+        assert!(!TogetherAdapter.still_materializing(&stopped));
+        assert!(TogetherAdapter.connection(&stopped).endpoint.is_none());
+
+        let state = TogetherAdapter.read_state(&ready);
+        assert_eq!(state.gpu_count, Some(1));
+        assert_eq!(state.gpu_vram_mib, Some(gb_to_mib(80)));
+        assert!(!state.ports_observed);
+        let findings = lm_provision::machine::observe(&together_requirements(), &state);
+        assert_eq!(
+            lm_provision::machine::verdict(&findings),
+            lm_provision::machine::Outcome::Satisfied,
+            "{findings:#?}"
+        );
+        assert_eq!(together_hardware("2xnvidia-h200-141gb"), Some((2, 141)));
+        assert_eq!(together_hardware("nvidia-h100"), None);
+    }
+
+    /// **The listing carries the lease under the project slug**, so no
+    /// read-back per endpoint is needed, and the slug is stepped over.
+    #[test]
+    fn the_endpoint_listing_carries_the_lease_under_the_project_slug() {
+        let fleet = TogetherAdapter.fleet().expect("this target can be asked");
+        assert_eq!(fleet.stamp, "name");
+        assert!(fleet.stamp_namespaced && !fleet.stamp_from_inspect);
+        assert!(fleet.ended.is_none());
+        assert_eq!(
+            fleet.list,
+            [
+                "tg",
+                "beta",
+                "endpoints",
+                "ls",
+                "--json",
+                "--non-interactive"
+            ]
+            .map(String::from)
+        );
+        let listed = serde_json::json!({
+            "object": "list",
+            "data": [
+                together_ready(),
+                { "id": "ep_2", "name": "ytknishimura-b6db/scratch", "deployments": [], "trafficSplit": [] },
+            ]
+        });
+        let read = machines(&listed, &fleet).expect("the wrapper's rows are the fleet");
+        assert_eq!(
+            read.iter()
+                .map(|it| (it.id.as_str(), it.name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ep_CfJ2Wd6XBFiNqNMDRzkss", Some("lmp-exp-20260902T063000Z")),
+                ("ep_2", Some("scratch")),
+            ]
+        );
+        assert!(expiry_of(read[0].name.as_deref().unwrap()).is_some());
+        assert_eq!(
+            machines(&serde_json::json!({ "object": "list", "data": [] }), &fleet),
+            Ok(Vec::new())
+        );
+        assert!(adapter_named("together").is_ok());
+        assert_eq!(TogetherAdapter.image_key(), None);
     }
 }
