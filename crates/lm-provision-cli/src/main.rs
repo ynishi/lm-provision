@@ -1392,9 +1392,19 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
     // (`Connection::read` is `#[serde(skip)]`). Said here so that a
     // deployment the platform gave up on — `failed`, with the reason in
     // the read-back — is not reported as silence.
-    if connection.ssh.is_none() && connection.endpoint.is_none() {
+    //
+    // And on a target that maps nothing, said as an error: the address
+    // is the platform's own, there is no port wait standing in for it,
+    // and a machine without one never came up. A dedicated endpoint
+    // the platform stopped at once for a billing reason was otherwise
+    // judged by its GPU alone and reported `Satisfied` at exit 0
+    // [measured: 2026-09-23].
+    let no_address = connection.ssh.is_none() && connection.endpoint.is_none();
+    let never_came_up = no_address && address_is_the_platforms_own(adapter);
+    if no_address {
         eprintln!(
-            "note: {} projects no address; read from the platform: {}",
+            "{}: {} projects no address; read from the platform: {}",
+            if never_came_up { "error" } else { "note" },
             acquired.id,
             connection.read.join("; ")
         );
@@ -1428,10 +1438,29 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    if never_came_up {
+        eprintln!(
+            "error: {} never came up; it is recorded, and is the operator's or the sweep's \
+             to release",
+            acquired.id
+        );
+        return ExitCode::FAILURE;
+    }
     match verdict {
         lm_provision::machine::Outcome::Satisfied => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     }
+}
+
+/// Whether a target's address is the platform's own rather than a port
+/// it mapped: such a target declares no exposure, and a machine on it
+/// that projects neither `ssh` nor `endpoint` after the wait never came
+/// up — there is no declared port whose answer could stand in for the
+/// address. On a target that maps ports, a profile declaring none may
+/// legitimately project no address, and the wait already judged what it
+/// declared.
+fn address_is_the_platforms_own(adapter: &dyn infra::Infra) -> bool {
+    adapter.capability().exposures.is_empty()
 }
 
 /// How long `acquire` waits for the machine to answer for its declared

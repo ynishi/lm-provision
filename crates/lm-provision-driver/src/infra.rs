@@ -2911,9 +2911,18 @@ impl Infra for TogetherAdapter {
 /// nests the deployment under `deployment`; `tg beta endpoints get` and
 /// `ls` nest it under `deployments`].
 fn together_deployment(inspected: &serde_json::Value) -> Option<&serde_json::Value> {
+    // The read-back shape first, the create shape only when there is
+    // no read-back: `Acquired::inspect` fills a read-back's blanks from
+    // the creation-time document, so after the first inspection both
+    // shapes are present in one document — and the create-time
+    // `deployment` says `PROVISIONING` forever. Preferring it kept
+    // `acquire` waiting on a deployment the platform had already
+    // stopped [measured: 2026-09-23, a deployment stopped for a
+    // billing reason, waited on for the whole cap].
     inspected
-        .get("deployment")
-        .or_else(|| inspected.get("deployments").and_then(|d| d.get(0)))
+        .get("deployments")
+        .and_then(|d| d.get(0))
+        .or_else(|| inspected.get("deployment"))
 }
 
 /// Read the `name`, deployment `state`, and `trafficSplit` from either
@@ -2922,15 +2931,22 @@ fn together_deployment(inspected: &serde_json::Value) -> Option<&serde_json::Val
 fn together_view(
     inspected: &serde_json::Value,
 ) -> (Option<&str>, Option<&str>, Option<&Vec<serde_json::Value>>) {
-    // The create response nests the endpoint under "endpoint".
-    let endpoint = inspected.get("endpoint").unwrap_or(inspected);
+    // The read-back's top-level fields first; the create response's
+    // nested `endpoint` only when the document has no top-level `name`
+    // (see `together_deployment` for why both can be present).
+    let endpoint = if inspected.get("name").is_some() {
+        inspected
+    } else {
+        inspected.get("endpoint").unwrap_or(inspected)
+    };
     let name = endpoint.get("name").and_then(|it| it.as_str());
-    let state = together_deployment(inspected)
+    let deployment = together_deployment(inspected);
+    // A summary row says `state`; the create response's deployment says
+    // `status.state`.
+    let state = deployment
         .and_then(|d| d.get("state"))
         .or_else(|| {
-            // Also try status.state (create response shape).
-            inspected
-                .get("deployment")
+            deployment
                 .and_then(|d| d.get("status"))
                 .and_then(|s| s.get("state"))
         })
@@ -6437,5 +6453,41 @@ mod tests {
         );
         assert!(adapter_named("together").is_ok());
         assert_eq!(TogetherAdapter.image_key(), None);
+    }
+
+    /// **The read-back wins over what creation said.** `Acquired::inspect`
+    /// fills a read-back's blanks from the creation-time document, so
+    /// both shapes end up in one document — and the creation-time
+    /// deployment says `PROVISIONING` forever. Read from the creation
+    /// shape, a stopped deployment was waited on for the whole cap
+    /// [measured: 2026-09-23].
+    #[test]
+    fn the_read_back_wins_over_what_creation_said() {
+        let mut merged = together_ready();
+        merged["deployments"][0]["state"] = serde_json::json!("DEPLOYMENT_STATE_STOPPED");
+        let created = together_created();
+        merged["endpoint"] = created["endpoint"].clone();
+        merged["deployment"] = created["deployment"].clone();
+        assert!(
+            !TogetherAdapter.still_materializing(&merged),
+            "the read-back says STOPPED; the creation-time PROVISIONING is stale"
+        );
+        assert!(TogetherAdapter.connection(&merged).endpoint.is_none());
+        assert!(TogetherAdapter
+            .connection(&merged)
+            .read
+            .contains(&"deployment state: DEPLOYMENT_STATE_STOPPED".to_string()));
+
+        let mut serving = together_ready();
+        serving["endpoint"] = created["endpoint"].clone();
+        serving["deployment"] = created["deployment"].clone();
+        assert!(
+            TogetherAdapter.connection(&serving).endpoint.is_some(),
+            "READY on the read-back is READY, whatever creation said"
+        );
+        assert_eq!(
+            TogetherAdapter.connection(&serving).endpoint.unwrap().model,
+            "ytknishimura-b6db/lmp-exp-20260902T063000Z"
+        );
     }
 }

@@ -169,6 +169,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window is not one that came up; it stays recorded and running, and
   is the operator's or the sweep's to release [measured: 2026-09-23, a
   dedicated endpoint reported `Satisfied` at exit 0 with no endpoint].
+  And on a target whose address is the platform's own (one declaring no
+  exposure — the container service and both managed-deployment
+  services), a machine that projects neither `ssh` nor `endpoint` after
+  the wait is reported at exit 1 as one that never came up: there is no
+  declared port whose answer could stand in for the address [measured:
+  2026-09-23, a deployment the platform stopped at once for a billing
+  reason was judged by its GPU alone].
+- **The Together adapter reads a machine's read-back before what its
+  creation said.** `Acquired::inspect` fills a read-back's blanks from
+  the creation-time document, so after the first inspection both the
+  create response's `deployment` and the read-back's `deployments[0]`
+  are present — and the creation-time one says `PROVISIONING` forever.
+  Preferring it kept `acquire` waiting on a deployment the platform had
+  already stopped [measured: 2026-09-23].
 - **A platform's own explanation of a refused call now reaches the
   operator.** The `curl`-driven adapters ask for `--fail-with-body`
   instead of `-f`, and a failed command's error carries what it printed
