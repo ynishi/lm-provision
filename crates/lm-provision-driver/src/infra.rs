@@ -404,6 +404,16 @@ pub struct Fleet {
     /// returns the field as written: a slash in one of those names is
     /// the operator's own, and reading past it would misread a name.
     pub stamp_namespaced: bool,
+    /// Whether the listing **omits** the stamp field, so that the lease
+    /// has to be read off each machine's own read-back
+    /// ([`Fleet::inspect`]) instead. A managed-endpoint service lists
+    /// its endpoints with `id / name / state` and leaves the
+    /// operator-set `display_name` to the per-endpoint read
+    /// [documented: docs.together.ai/reference/listendpoints, read
+    /// 2026-09-22]; a sweep that read the listing alone would see every
+    /// one of them as unstamped and never release any. `false` on a
+    /// platform whose listing carries the field.
+    pub stamp_from_inspect: bool,
     /// Rows the platform still lists but has already ended — a field
     /// name and the values of it that mean "this is over" — which the
     /// reader leaves out. `None` on a platform whose list is its live
@@ -529,6 +539,26 @@ pub fn expiry_of(name: &str) -> Option<jiff::Timestamp> {
     .ok()
 }
 
+/// The operator-set text in a listed row, as [`machines`] reads it.
+///
+/// One rule, so the listing and the per-machine read-back cannot
+/// disagree: read the [`Fleet::stamp`] field as a string, step over the
+/// platform's namespace when [`Fleet::stamp_namespaced`], and treat an
+/// empty string as `None`.
+fn stamp_of(row: &serde_json::Value, fleet: &Fleet) -> Option<String> {
+    row.get(fleet.stamp)
+        .and_then(|it| it.as_str())
+        .map(|it| {
+            if fleet.stamp_namespaced {
+                it.rsplit('/').next().unwrap_or(it)
+            } else {
+                it
+            }
+        })
+        .filter(|it| !it.is_empty())
+        .map(str::to_string)
+}
+
 /// The machines in what a [`Fleet::list`] printed — or why the
 /// document cannot be read as a fleet.
 ///
@@ -590,18 +620,7 @@ pub fn machines(listed: &serde_json::Value, fleet: &Fleet) -> Result<Vec<Machine
         .filter_map(|row| {
             Some(Machine {
                 id: json_id(row, fleet.id)?,
-                name: row
-                    .get(fleet.stamp)
-                    .and_then(|it| it.as_str())
-                    .map(|it| {
-                        if fleet.stamp_namespaced {
-                            it.rsplit('/').next().unwrap_or(it)
-                        } else {
-                            it
-                        }
-                    })
-                    .filter(|it| !it.is_empty())
-                    .map(str::to_string),
+                name: stamp_of(row, fleet),
             })
         })
         .collect();
@@ -630,13 +649,28 @@ pub struct Listing {
 /// A read, and the only one here that needs the account's credential
 /// without spending anything: the key buys the question, not an
 /// answer that costs money.
+///
+/// **When the listing omits the stamp field,** each machine's lease is
+/// read off its own read-back ([`Fleet::inspect`]) and an inspect that
+/// fails ends `list` with that error — a sweep that cannot read a lease
+/// must not proceed as though the machine were unstamped (unstamped is
+/// "never released", and an unreadable lease is not evidence of that).
 pub fn list(fleet: &Fleet) -> Result<Listing, ExecuteError> {
     let output = run_output(&fleet.list, None)?;
     let command = fleet.list.join(" ");
     let listed = payload(&String::from_utf8_lossy(&output.stdout), &command)?;
+    let mut machines = machines(&listed, fleet).map_err(|detail| ExecuteError::Unreadable {
+        command: command.clone(),
+        detail,
+    })?;
+    if fleet.stamp_from_inspect {
+        for machine in &mut machines {
+            let doc = inspect(fleet, &machine.id)?;
+            machine.name = stamp_of(&doc, fleet);
+        }
+    }
     Ok(Listing {
-        machines: machines(&listed, fleet)
-            .map_err(|detail| ExecuteError::Unreadable { command, detail })?,
+        machines,
         said: output.stderr,
     })
 }
@@ -992,6 +1026,7 @@ impl Infra for RunPodAdapter {
             id: "id",
             stamp: "name",
             stamp_namespaced: false,
+            stamp_from_inspect: false,
             ended: None,
             release: runpod_release(),
             inspect: runpod_inspect(),
@@ -1581,6 +1616,7 @@ impl Infra for VastAdapter {
             id: "id",
             stamp: "label",
             stamp_namespaced: false,
+            stamp_from_inspect: false,
             ended: None,
             release: vast_release(),
             inspect: vast_inspect(),
@@ -2075,6 +2111,7 @@ impl Infra for DeepInfraAdapter {
             id: "id",
             stamp: "name",
             stamp_namespaced: false,
+            stamp_from_inspect: false,
             ended: None,
             release: deepinfra_release(),
             inspect: deepinfra_inspect(),
@@ -2176,31 +2213,30 @@ impl Infra for DeepInfraAdapter {
     }
 }
 
-/// `curl` against `url`, authenticated by the token's **name**.
-///
-/// `-sS`: no progress meter on stderr, errors still spoken there. `-f`:
-/// an HTTP error is a non-zero exit with the status on stderr, rather
-/// than an error document on stdout that the next step would try to
-/// read as a machine. `--variable %NAME` imports the environment
-/// variable inside curl and `--expand-header` substitutes it there — the
-/// value never appears in this argv, which is what the dry-run prints
-/// and what a process listing shows.
-fn deepinfra_curl(url: &str) -> Vec<String> {
+/// `curl` against `url`, authenticated by a bearer token read from the
+/// environment **by name**: `--variable %NAME` imports the variable
+/// inside curl and `--expand-header` substitutes it there, so the value
+/// is in no argv, no dry-run and no process listing [measured:
+/// 2026-09-21, a local listener saw `Authorization: Bearer <value>` from
+/// an argv that named only the variable; curl ≥ 8.3.0]. `-sS` keeps
+/// errors and drops the progress meter; `--fail-with-body` makes an HTTP
+/// error a non-zero exit while keeping the service's own explanation.
+fn curl_bearer(var: &str, url: &str) -> Vec<String> {
     vec![
         "curl".to_string(),
         "-sS".to_string(),
-        // Fail on an HTTP error, keeping the body: the service says
-        // *why* in the body (`{"detail":{"error":"missing display
-        // name"}}` on a 409), and `-f` threw that away, leaving the
-        // operator a status code [measured: 2026-09-22, a create
-        // refused for an account setting, reported as "error: 409"].
         "--fail-with-body".to_string(),
         "--variable".to_string(),
-        format!("%{DEEPINFRA_API_KEY}"),
+        format!("%{var}"),
         "--expand-header".to_string(),
-        format!("Authorization: Bearer {{{{{DEEPINFRA_API_KEY}}}}}"),
+        format!("Authorization: Bearer {{{{{var}}}}}"),
         url.to_string(),
     ]
+}
+
+/// `curl_bearer` bound to this service's credential variable.
+fn deepinfra_curl(url: &str) -> Vec<String> {
+    curl_bearer(DEEPINFRA_API_KEY, url)
 }
 
 /// What reads one container back, `{id}` unsubstituted — one spelling
@@ -2560,6 +2596,7 @@ impl Infra for DeepInfraDeployAdapter {
             id: "deploy_id",
             stamp: "model_name",
             stamp_namespaced: true,
+            stamp_from_inspect: false,
             ended: Some(("status", &["failed", "deleted"])),
             release: deepinfra_deploy_release(),
             inspect: deepinfra_deploy_inspect(),
@@ -4591,6 +4628,7 @@ mod tests {
                 id: "id",
                 stamp: "name",
                 stamp_namespaced: false,
+                stamp_from_inspect: false,
                 ended: None,
                 release: vec!["true".into()],
                 inspect: vec![
@@ -4728,6 +4766,7 @@ mod tests {
             id: "id",
             stamp: "label",
             stamp_namespaced: false,
+            stamp_from_inspect: false,
             ended: None,
             release: vec!["true".into()],
             inspect: vec!["true".into()],
@@ -5807,5 +5846,122 @@ mod tests {
             }
             other => panic!("expected DiscoveryTimeout, got {other:?}"),
         }
+    }
+
+    /// **The lease is read off each machine's own read-back when the
+    /// listing omits it.**
+    #[test]
+    fn the_lease_is_read_off_each_machine_when_the_listing_omits_it() {
+        let fleet = Fleet {
+            list: vec![
+                "echo".into(),
+                r#"{"object":"list","data":[{"id":"e-1","state":"STARTED"},{"id":"e-2","state":"STOPPED"}]}"#.into(),
+            ],
+            id: "id",
+            stamp: "display_name",
+            stamp_namespaced: false,
+            stamp_from_inspect: true,
+            ended: None,
+            release: vec!["true".into()],
+            inspect: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"case "$1" in e-1) echo '{"id":"e-1","display_name":"lmp-exp-20260902T063000Z"}';; *) echo '{"id":"e-2","display_name":""}';; esac"#.into(),
+                "sh".into(),
+                "{id}".into(),
+            ],
+        };
+        let listing = list(&fleet).expect("the listing parses and inspects succeed");
+        assert_eq!(
+            listing.machines,
+            vec![
+                Machine {
+                    id: "e-1".to_string(),
+                    name: Some("lmp-exp-20260902T063000Z".to_string()),
+                },
+                Machine {
+                    id: "e-2".to_string(),
+                    name: None,
+                },
+            ]
+        );
+
+        // With stamp_from_inspect: false the listing alone says nothing.
+        let mut without = fleet.clone();
+        without.stamp_from_inspect = false;
+        let listing = list(&without).expect("the listing parses");
+        assert_eq!(
+            listing
+                .machines
+                .iter()
+                .map(|it| it.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, None]
+        );
+
+        // An inspect that fails ends list with that error.
+        let mut failing = fleet;
+        failing.inspect = vec!["false".into()];
+        assert!(
+            list(&failing).is_err(),
+            "an unreadable lease is not evidence of unstamped"
+        );
+    }
+
+    /// **The namespace rule applies to a stamp read off the read-back,
+    /// the same way it does to one read off the listing.**
+    #[test]
+    fn the_namespace_rule_applies_to_a_stamp_read_off_the_read_back() {
+        let fleet = Fleet {
+            list: vec![
+                "echo".into(),
+                r#"{"object":"list","data":[{"id":"e-1","state":"STARTED"}]}"#.into(),
+            ],
+            id: "id",
+            stamp: "display_name",
+            stamp_namespaced: true,
+            stamp_from_inspect: true,
+            ended: None,
+            release: vec!["true".into()],
+            inspect: vec![
+                "echo".into(),
+                r#"{"id":"e-1","display_name":"acct/lmp-exp-20260902T063000Z"}"#.into(),
+            ],
+        };
+        let listing = list(&fleet).expect("the inspect succeeds");
+        assert_eq!(
+            listing.machines[0].name.as_deref(),
+            Some("lmp-exp-20260902T063000Z"),
+            "the namespace is stepped over when reading off the read-back"
+        );
+    }
+
+    /// **Every REST platform shares one `curl` shape** — a variable,
+    /// a bearer header, and never a value.
+    #[test]
+    fn every_rest_platform_shares_one_curl_shape() {
+        assert_eq!(
+            deepinfra_curl("https://x/y"),
+            curl_bearer("DEEPINFRA_API_KEY", "https://x/y")
+        );
+        let argv = curl_bearer("TOGETHER_API_KEY", "https://x");
+        assert!(
+            argv.contains(&"%TOGETHER_API_KEY".to_string()),
+            "the variable is imported by name: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"Authorization: Bearer {{TOGETHER_API_KEY}}".to_string()),
+            "the header is expanded inside curl: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"--fail-with-body".to_string()),
+            "an HTTP error keeps the body: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|it| it.starts_with("Authorization: Bearer ") && !it.contains("{{")),
+            "no argument carries a literal bearer value: {argv:?}"
+        );
     }
 }
