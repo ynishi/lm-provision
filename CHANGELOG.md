@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nobody mapped; anything past sshd is `port-forward`'s job. The
   service has no CLI for its machines, so the adapter drives `curl`
   against its REST surface (`/v1/containers`), with the token
-  imported **by name** inside curl (`--variable %DEEPINFRA_TOKEN`,
+  imported **by name** inside curl (`--variable %DEEPINFRA_API_KEY`,
   `--expand-header`, curl ≥ 8.3.0) — the value is in no argv, no
   dry-run, no process listing. The create call takes a cloud-init
   document, so the profile names the public key
@@ -91,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deployment `running`. `list` / `release` / `sweep` work as on any
   other platform; `apply` / `logs` / `exec` / `cp` / `port-forward`
   refuse such a machine by what it is, because no retry grows a shell
-  onto a served model. Same `DEEPINFRA_TOKEN` as the instances above.
+  onto a served model. Same `DEEPINFRA_API_KEY` as the instances above.
   Example profile: `docs/profiles/deepinfra-deploy-qwen-0.1.0.json`.
 - **Driver library: `Requirements::serving`, `Connection::endpoint`,
   `Fleet::stamp_namespaced`** — the profile's one service carried

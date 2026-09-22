@@ -1782,8 +1782,16 @@ fn vast_release() -> Vec<String> {
 /// read 2026-09-21].
 const DEEPINFRA_CONTAINERS: &str = "https://api.deepinfra.com/v1/containers";
 
-/// The variable the service's own examples read the bearer token from.
-const DEEPINFRA_TOKEN: &str = "DEEPINFRA_TOKEN";
+/// The variable the service's key is read from.
+///
+/// `_API_KEY`, as every other platform's is here (`RUNPOD_API_KEY`) and
+/// as the service's own dashboard names the thing ("API Keys"), rather
+/// than the `DEEPINFRA_API_KEY` its curl examples happen to spell — one
+/// shape for the operator's credential file, and the name the routers
+/// that consume the resulting endpoint already read (LiteLLM's
+/// `deepinfra/` provider takes `DEEPINFRA_API_KEY`) [documented:
+/// docs.litellm.ai/docs/providers/deepinfra, read 2026-09-22].
+const DEEPINFRA_API_KEY: &str = "DEEPINFRA_API_KEY";
 
 /// The user the service's image creates and its documentation connects
 /// as (`ssh ubuntu@<container-ip>`) — not root, which is why the
@@ -1828,7 +1836,7 @@ const DEEPINFRA_CATALOGUE: &[Gpu] = &[Gpu {
 /// the REST surface through `curl`: the same judgment [`crate::image`]
 /// makes, for the same reason — a program already on the host over a
 /// second HTTP client tracking somebody else's schema. The credential
-/// travels **by name**: `--variable %DEEPINFRA_TOKEN` imports the
+/// travels **by name**: `--variable %DEEPINFRA_API_KEY` imports the
 /// variable inside curl and `--expand-header` writes it into the header
 /// there, so the value is in no argv, no dry-run artifact, and no
 /// process listing [measured: 2026-09-21, a local listener saw
@@ -1876,13 +1884,13 @@ impl Infra for DeepInfraAdapter {
         "deepinfra"
     }
 
-    /// The token, by the name the service's own examples use. Required
+    /// The key, by name. Required
     /// out here because there is no CLI holding its own key: `curl`
     /// reads it from the environment at the adapter's instruction, and
     /// a missing one is found before anything is spent rather than as
     /// a 401 in the middle of a create.
     fn credentials(&self) -> &'static [&'static str] {
-        &[DEEPINFRA_TOKEN]
+        &[DEEPINFRA_API_KEY]
     }
 
     /// The cheapest catalogued model that clears the floor, in the
@@ -2105,9 +2113,9 @@ fn deepinfra_curl(url: &str) -> Vec<String> {
         "-sS".to_string(),
         "-f".to_string(),
         "--variable".to_string(),
-        format!("%{DEEPINFRA_TOKEN}"),
+        format!("%{DEEPINFRA_API_KEY}"),
         "--expand-header".to_string(),
-        format!("Authorization: Bearer {{{{{DEEPINFRA_TOKEN}}}}}"),
+        format!("Authorization: Bearer {{{{{DEEPINFRA_API_KEY}}}}}"),
         url.to_string(),
     ]
 }
@@ -2367,7 +2375,7 @@ impl Infra for DeepInfraDeployAdapter {
     /// The same token as the container half of this service, read by
     /// the same name — one credential file entry covers both.
     fn credentials(&self) -> &'static [&'static str] {
-        &[DEEPINFRA_TOKEN]
+        &[DEEPINFRA_API_KEY]
     }
 
     /// The cheapest catalogued configuration that clears the floor, in
@@ -2532,7 +2540,7 @@ impl Infra for DeepInfraDeployAdapter {
             (Some("running") | Some("deployed"), Some(id)) => Some(InferenceEndpoint {
                 base_url: DEEPINFRA_OPENAI.to_string(),
                 model: format!("deploy_id:{id}"),
-                api_key_env: DEEPINFRA_TOKEN.to_string(),
+                api_key_env: DEEPINFRA_API_KEY.to_string(),
             }),
             _ => None,
         };
@@ -4633,12 +4641,12 @@ mod tests {
     /// same name so it is required before anything is spent.
     #[test]
     fn the_container_service_is_authenticated_without_a_value_in_the_argv() {
-        assert_eq!(DeepInfraAdapter.credentials(), &["DEEPINFRA_TOKEN"]);
+        assert_eq!(DeepInfraAdapter.credentials(), &["DEEPINFRA_API_KEY"]);
         let fleet = DeepInfraAdapter.fleet().expect("this target can be asked");
         for argv in [&fleet.list, &fleet.inspect, &fleet.release] {
-            assert!(argv.contains(&"%DEEPINFRA_TOKEN".to_string()), "{argv:?}");
+            assert!(argv.contains(&"%DEEPINFRA_API_KEY".to_string()), "{argv:?}");
             assert!(
-                argv.contains(&"Authorization: Bearer {{DEEPINFRA_TOKEN}}".to_string()),
+                argv.contains(&"Authorization: Bearer {{DEEPINFRA_API_KEY}}".to_string()),
                 "{argv:?}"
             );
             assert!(
@@ -5242,7 +5250,7 @@ mod tests {
         let endpoint = connection.endpoint.as_ref().expect("running");
         assert_eq!(endpoint.base_url, "https://api.deepinfra.com/v1/openai");
         assert_eq!(endpoint.model, "deploy_id:dep-1");
-        assert_eq!(endpoint.api_key_env, "DEEPINFRA_TOKEN");
+        assert_eq!(endpoint.api_key_env, "DEEPINFRA_API_KEY");
         assert!(connection.ssh.is_none(), "there is no host");
         assert!(!DeepInfraDeployAdapter.still_materializing(&running));
         let artifact = serde_json::to_value(&connection).unwrap();
@@ -5251,7 +5259,7 @@ mod tests {
             serde_json::json!({ "endpoint": {
                 "base_url": "https://api.deepinfra.com/v1/openai",
                 "model": "deploy_id:dep-1",
-                "api_key_env": "DEEPINFRA_TOKEN",
+                "api_key_env": "DEEPINFRA_API_KEY",
             }}),
             "what a caller reads: the endpoint, and nothing that is not there"
         );
@@ -5336,7 +5344,7 @@ mod tests {
             fleet.list
         );
         assert!(fleet.release.windows(2).any(|it| it == ["-X", "DELETE"]));
-        assert_eq!(DeepInfraDeployAdapter.credentials(), &["DEEPINFRA_TOKEN"]);
+        assert_eq!(DeepInfraDeployAdapter.credentials(), &["DEEPINFRA_API_KEY"]);
         assert_eq!(
             DeepInfraDeployAdapter.image_key(),
             Some("deepinfra-deploy.container_image")

@@ -159,7 +159,7 @@ lm-provision machine sweep --provider runpod --dry-run false
 
 # A third platform: DeepInfra GPU Instances — a container with an
 # address, reached over ssh as `ubuntu`. The token goes in the .env as
-# DEEPINFRA_TOKEN (curl >= 8.3.0 reads it by name; the value is never
+# DEEPINFRA_API_KEY (curl >= 8.3.0 reads it by name; the value is never
 # on an argv). The profile names the image and your public key under
 # the platform's own keys and declares no ports: the service maps
 # none, so anything past sshd is reached with port-forward.
@@ -177,7 +177,7 @@ lm-provision apply --provider deepinfra --pod-id <id> --remote-dir /home/ubuntu 
 # "model" = the Hugging Face repo id) and nothing else: no
 # requires_ports, no requires_disk, no other phase — anything this
 # platform cannot run is refused by name rather than dropped. Same
-# DEEPINFRA_TOKEN as the instances above.
+# DEEPINFRA_API_KEY as the instances above.
 #   "provider": {
 #     "deepinfra-deploy.settings.min_instances": "0",
 #     "deepinfra-deploy.settings.max_instances": "1",
@@ -194,7 +194,7 @@ lm-provision machine acquire --provider deepinfra-deploy \
   --profile docs/profiles/deepinfra-deploy-qwen-0.1.0.json --dry-run false
 # The artifact's connection is an endpoint rather than an ssh address:
 # {"connection":{"endpoint":{"base_url":"https://api.deepinfra.com/v1/openai",
-#   "model":"deploy_id:<id>","api_key_env":"DEEPINFRA_TOKEN"}}}
+#   "model":"deploy_id:<id>","api_key_env":"DEEPINFRA_API_KEY"}}}
 # `model` names the deployment by id, so the lease stamped into
 # model_name never travels in a request. list / release / sweep work as
 # on any other platform; apply / logs / exec / cp / port-forward do not
