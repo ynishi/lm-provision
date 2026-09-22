@@ -93,6 +93,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuse such a machine by what it is, because no retry grows a shell
   onto a served model. Same `DEEPINFRA_API_KEY` as the instances above.
   Example profile: `docs/profiles/deepinfra-deploy-qwen-0.1.0.json`.
+  Verified end to end [measured: 2026-09-22, Qwen/Qwen3-8B on one
+  H100-80GB: acquire waited through `deploying`, judged `Satisfied`
+  once `running` carried `config`, one chat request answered through
+  `deploy_id:`, release answered 200 and the deployment read `deleted`].
+  Two things the service does that the adapter now allows for: it keeps
+  `failed` and `deleted` deployments in its default listing and answers
+  200 to deleting them again (the fleet reader leaves such rows out —
+  `Fleet::ended` — so a sweep does not release each of them every tick),
+  and its `A100-80GB` was reported available while allocation failed
+  twice with `no-gpu-available` (the availability endpoint is a hint;
+  a `failed` deployment is reported at exit 1 with what the read-back
+  said, and is the operator's to release). An account needs a display
+  name before it can deploy at all — the service answers 409 `missing
+  display name` — which is set in the dashboard, not with the API key.
 - **Driver library: `Requirements::serving`, `Connection::endpoint`,
   `Fleet::stamp_namespaced`** — the profile's one service carried
   beside the machine requirements (`Serving::from_phases`, which
@@ -103,6 +117,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A platform's own explanation of a refused call now reaches the
+  operator.** The `curl`-driven adapters ask for `--fail-with-body`
+  instead of `-f`, and a failed command's error carries what it printed
+  on either stream — a 409 from the deployment service used to be
+  reported as the status alone, with the reason (`missing display
+  name`) thrown away with the body [measured: 2026-09-22].
 - **`machine acquire` keeps waiting while the platform itself still
   calls the machine materializing**, not only while a declared port
   is unanswered. A container service that maps no port left the port

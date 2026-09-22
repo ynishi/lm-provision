@@ -354,6 +354,17 @@ pub struct Fleet {
     /// returns the field as written: a slash in one of those names is
     /// the operator's own, and reading past it would misread a name.
     pub stamp_namespaced: bool,
+    /// Rows the platform still lists but has already ended — a field
+    /// name and the values of it that mean "this is over" — which the
+    /// reader leaves out. `None` on a platform whose list is its live
+    /// machines. A managed deployment service keeps `failed` and
+    /// `deleted` deployments in its default listing and answers 200 to
+    /// deleting them again [measured: 2026-09-22, two deployments the
+    /// service failed for want of a GPU and one it had deleted, all
+    /// listed afterwards], so without this a sweep would release each
+    /// of them on every tick, once their lease was reached, and write a
+    /// correction row every time.
+    pub ended: Option<(&'static str, &'static [&'static str])>,
     /// How to destroy one, `{id}` unsubstituted — the same template
     /// [`Acquisition::release`] carries, from the same source, so a
     /// machine released off the record and one released off the list
@@ -516,7 +527,15 @@ pub fn machines(listed: &serde_json::Value, fleet: &Fleet) -> Result<Vec<Machine
         }
         _ => return Err("the listing is neither an array nor an object".to_string()),
     };
-    let read: Vec<Machine> = rows
+    let ended = |row: &serde_json::Value| {
+        fleet.ended.is_some_and(|(key, values)| {
+            row.get(key)
+                .and_then(|it| it.as_str())
+                .is_some_and(|it| values.contains(&it))
+        })
+    };
+    let live: Vec<&serde_json::Value> = rows.iter().filter(|row| !ended(row)).collect();
+    let read: Vec<Machine> = live
         .iter()
         .filter_map(|row| {
             Some(Machine {
@@ -536,10 +555,10 @@ pub fn machines(listed: &serde_json::Value, fleet: &Fleet) -> Result<Vec<Machine
             })
         })
         .collect();
-    if read.is_empty() && !rows.is_empty() {
+    if read.is_empty() && !live.is_empty() {
         return Err(format!(
             "none of the {} listed rows carries a readable {:?}",
-            rows.len(),
+            live.len(),
             fleet.id
         ));
     }
@@ -923,6 +942,7 @@ impl Infra for RunPodAdapter {
             id: "id",
             stamp: "name",
             stamp_namespaced: false,
+            ended: None,
             release: runpod_release(),
             inspect: runpod_inspect(),
         })
@@ -1511,6 +1531,7 @@ impl Infra for VastAdapter {
             id: "id",
             stamp: "label",
             stamp_namespaced: false,
+            ended: None,
             release: vast_release(),
             inspect: vast_inspect(),
         })
@@ -1998,6 +2019,7 @@ impl Infra for DeepInfraAdapter {
             id: "id",
             stamp: "name",
             stamp_namespaced: false,
+            ended: None,
             release: deepinfra_release(),
             inspect: deepinfra_inspect(),
         })
@@ -2111,7 +2133,12 @@ fn deepinfra_curl(url: &str) -> Vec<String> {
     vec![
         "curl".to_string(),
         "-sS".to_string(),
-        "-f".to_string(),
+        // Fail on an HTTP error, keeping the body: the service says
+        // *why* in the body (`{"detail":{"error":"missing display
+        // name"}}` on a 409), and `-f` threw that away, leaving the
+        // operator a status code [measured: 2026-09-22, a create
+        // refused for an account setting, reported as "error: 409"].
+        "--fail-with-body".to_string(),
         "--variable".to_string(),
         format!("%{DEEPINFRA_API_KEY}"),
         "--expand-header".to_string(),
@@ -2477,6 +2504,7 @@ impl Infra for DeepInfraDeployAdapter {
             id: "deploy_id",
             stamp: "model_name",
             stamp_namespaced: true,
+            ended: Some(("status", &["failed", "deleted"])),
             release: deepinfra_deploy_release(),
             inspect: deepinfra_deploy_inspect(),
         })
@@ -2978,7 +3006,19 @@ fn run_output(argv: &[String], body: Option<&str>) -> Result<std::process::Outpu
                 .code()
                 .map(|it| it.to_string())
                 .unwrap_or_else(|| "signal".to_string()),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            stderr: {
+                // What it said, on either stream: a CLI explains itself
+                // on stderr, but `curl --fail-with-body` leaves the
+                // service's own explanation on stdout, and an error
+                // that dropped it would report a status and no reason.
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                match (stderr.is_empty(), stdout.is_empty()) {
+                    (_, true) => stderr,
+                    (true, false) => stdout,
+                    (false, false) => format!("{stderr}; {stdout}"),
+                }
+            },
         });
     }
     Ok(output)
@@ -4395,6 +4435,7 @@ mod tests {
                 id: "id",
                 stamp: "name",
                 stamp_namespaced: false,
+                ended: None,
                 release: vec!["true".into()],
                 inspect: vec![
                     "printf".into(),
@@ -4531,6 +4572,7 @@ mod tests {
             id: "id",
             stamp: "label",
             stamp_namespaced: false,
+            ended: None,
             release: vec!["true".into()],
             inspect: vec!["true".into()],
         })
@@ -5350,5 +5392,75 @@ mod tests {
             Some("deepinfra-deploy.container_image")
         );
         assert!(adapter_named("deepinfra-deploy").is_ok());
+    }
+
+    /// **A row the platform has already ended is not a machine.** The
+    /// deployment service lists `failed` and `deleted` deployments
+    /// beside the live ones; reading them as the fleet would have a
+    /// sweep releasing each of them every tick. An account whose rows
+    /// are all ended is an empty fleet, not an unreadable one.
+    #[test]
+    fn ended_rows_are_left_out_of_the_fleet() {
+        let fleet = DeepInfraDeployAdapter
+            .fleet()
+            .expect("this target can be asked");
+        let listed = serde_json::json!([
+            { "deploy_id": "live", "model_name": "me/lmp-exp-20260902T063000Z", "status": "running" },
+            { "deploy_id": "coming", "model_name": "me/lmp-exp-20260902T063000Z", "status": "deploying" },
+            { "deploy_id": "gone", "model_name": "me/lmp-exp-20260902T063000Z", "status": "deleted" },
+            { "deploy_id": "broke", "model_name": "me/lmp-exp-20260902T063000Z", "status": "failed" },
+        ]);
+        let ids: Vec<String> = machines(&listed, &fleet)
+            .expect("live rows are the fleet")
+            .into_iter()
+            .map(|it| it.id)
+            .collect();
+        assert_eq!(ids, vec!["live", "coming"]);
+
+        let all_ended = serde_json::json!([
+            { "deploy_id": "gone", "model_name": "me/x", "status": "deleted" },
+        ]);
+        assert_eq!(machines(&all_ended, &fleet), Ok(Vec::new()));
+
+        // A platform declaring no ended rows reads every row, as before.
+        let pods = RunPodAdapter.fleet().unwrap();
+        assert!(pods.ended.is_none());
+        let listed =
+            serde_json::json!({ "pods": [{ "id": "p", "name": "x", "status": "failed" }] });
+        assert_eq!(machines(&listed, &pods).unwrap().len(), 1);
+    }
+
+    /// **A failure explains itself from whichever stream carried the
+    /// explanation.** `curl --fail-with-body` leaves the service's
+    /// reason on stdout and says only the status on stderr; an error
+    /// built from stderr alone reported "error: 409".
+    #[test]
+    fn a_failed_command_reports_what_it_printed_on_either_stream() {
+        let failed = run(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "echo '{\"detail\":{\"error\":\"missing display name\"}}'; \
+                 echo 'curl: (22) The requested URL returned error: 409' >&2; exit 22"
+                    .into(),
+            ],
+            None,
+        )
+        .expect_err("exit 22");
+        let rendered = failed.to_string();
+        assert!(rendered.contains("returned error: 409"), "{rendered}");
+        assert!(rendered.contains("missing display name"), "{rendered}");
+
+        let quiet = run(
+            &["sh".into(), "-c".into(), "echo only-out; exit 1".into()],
+            None,
+        )
+        .expect_err("exit 1");
+        assert!(quiet.to_string().contains("only-out"), "{quiet}");
+
+        assert!(
+            deepinfra_curl("https://example.invalid").contains(&"--fail-with-body".to_string()),
+            "and the curl argv asks for the body to be kept"
+        );
     }
 }
