@@ -82,10 +82,12 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 use lm_provision_driver::acquisition::{self as record, AcquisitionRow};
+use lm_provision_driver::cost;
 use lm_provision_driver::credentials;
 use lm_provision_driver::forward::{self as forwards_record, ForwardPair, ForwardPod, ForwardRow};
 use lm_provision_driver::infra;
 use lm_provision_driver::inventory;
+use lm_provision_driver::prices;
 use lm_provision_driver::provisioner;
 use lm_provision_driver::session::{self, InvokeMode, StepPlan};
 use lm_provision_driver::ssh::{
@@ -199,6 +201,99 @@ enum MachineCommand {
     /// named and never valued, rendered for the consumer named by
     /// `--format` (09 §Endpoint inventory).
     Endpoints(EndpointsArgs),
+    /// Keep the price record (09 §Price record).
+    Prices(PricesArgs),
+    /// Price a run: what it used, at what the record says a token cost
+    /// where it ran (09 §Cost). Read-only.
+    Cost(CostArgs),
+}
+
+#[derive(Args)]
+struct CostArgs {
+    /// The platform the run ran on (`deepinfra`, `together`, …) — the
+    /// word the price record's rows carry.
+    #[arg(long = "provider")]
+    provider: String,
+
+    /// The model, as that platform names it.
+    #[arg(long = "model")]
+    model: String,
+
+    /// What the run used: a JSON object, or `@path` to a file holding one.
+    #[arg(long = "usage")]
+    usage: String,
+
+    /// Which platform's `usage` shape it is written in.
+    ///
+    /// The five buckets are the Anthropic convention — `input` is
+    /// uncached input — and the shapes that count cache hits inside the
+    /// prompt total are translated here rather than by whoever holds
+    /// the usage (09 §Cost).
+    #[arg(long = "usage-format", value_enum, default_value_t = CostUsageFormat::Plain)]
+    usage_format: CostUsageFormat,
+
+    /// Price it at the rate in force at this instant (RFC 3339 UTC, `Z`
+    /// form); the record's newest row by default.
+    #[arg(long = "at")]
+    at: Option<String>,
+
+    /// The price record to read (09 §Price record); defaults to
+    /// `~/.lm-provision/prices.jsonl`.
+    #[arg(long = "prices")]
+    prices: Option<PathBuf>,
+}
+
+/// The `usage` shapes `machine cost` reads, as flag values.
+///
+/// A repeat of `lm_provision_driver::cost::UsageFormat` because the
+/// driver has no `clap` to derive [`ValueEnum`] with — deliberately (it
+/// is a library and the argument surface left with the binary), so the
+/// flag's vocabulary is spelled here and converted at the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CostUsageFormat {
+    /// The five buckets as this tool writes them.
+    Plain,
+    /// OpenAI Chat Completions / Responses.
+    Openai,
+    /// DeepSeek.
+    Deepseek,
+    /// Anthropic Messages.
+    Anthropic,
+}
+
+impl From<CostUsageFormat> for cost::UsageFormat {
+    fn from(format: CostUsageFormat) -> Self {
+        match format {
+            CostUsageFormat::Plain => cost::UsageFormat::Plain,
+            CostUsageFormat::Openai => cost::UsageFormat::Openai,
+            CostUsageFormat::Deepseek => cost::UsageFormat::Deepseek,
+            CostUsageFormat::Anthropic => cost::UsageFormat::Anthropic,
+        }
+    }
+}
+
+#[derive(Args)]
+struct PricesArgs {
+    /// What to do with the record.
+    #[command(subcommand)]
+    command: PricesCommand,
+}
+
+#[derive(Subcommand)]
+enum PricesCommand {
+    /// Ask a platform what its models cost, and append what changed.
+    Sync(PricesSyncArgs),
+}
+
+#[derive(Args)]
+struct PricesSyncArgs {
+    /// The platform to ask (`deepinfra`).
+    #[arg(long = "provider")]
+    provider: String,
+    /// The price record to append to; defaults to
+    /// `~/.lm-provision/prices.jsonl`.
+    #[arg(long = "prices")]
+    prices: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -335,11 +430,15 @@ struct EndpointsArgs {
     #[arg(long = "forwards")]
     forwards: Option<PathBuf>,
     /// The operator's static rows — a JSON array of `{name, base_url,
-    /// model?, api_key_env?}`. Defaults to
+    /// model?, api_key_env?, provider?, price?}`. Defaults to
     /// `~/.config/lm-provision/endpoints.json` when that file exists;
     /// named explicitly, it has to.
     #[arg(long = "endpoints-file")]
     endpoints_file: Option<PathBuf>,
+    /// The price record to read token prices from (09 §Price record);
+    /// defaults to `~/.lm-provision/prices.jsonl`.
+    #[arg(long = "prices")]
+    prices: Option<PathBuf>,
     /// How to render the inventory on stdout.
     ///
     /// `json` is the artifact (07 §Stream split). `env` is a shell
@@ -350,6 +449,19 @@ struct EndpointsArgs {
     /// LiteLLM proxy, the key as `os.environ/<api_key_env>`.
     #[arg(long = "format", value_enum, default_value_t = EndpointFormat::Json)]
     format: EndpointFormat,
+    /// Also ask each platform this tool spends from what is left on
+    /// the account — RunPod, Vast and DeepInfra say; Together does
+    /// not — and put the answer beside every row of that platform as
+    /// `balance`. Read-only.
+    #[arg(long = "balance")]
+    balance: bool,
+    /// Also send every endpoint a one-token completion and report what
+    /// came back as `probe` — the one question that finds an exhausted
+    /// account (402) or a dead key (401) now rather than in the next
+    /// run. **Spends money**: a few tokens per endpoint. Off unless
+    /// asked for.
+    #[arg(long = "probe")]
+    probe: bool,
 }
 
 /// The renderings `machine endpoints` offers.
@@ -688,6 +800,10 @@ fn main() -> ExitCode {
             MachineCommand::Release(args) => run_release(args),
             MachineCommand::Sweep(args) => run_sweep(args),
             MachineCommand::Endpoints(args) => run_endpoints(args),
+            MachineCommand::Prices(args) => match args.command {
+                PricesCommand::Sync(args) => run_prices_sync(args),
+            },
+            MachineCommand::Cost(args) => run_cost(args),
         },
         Command::Mcp => run_mcp(),
     }
@@ -2633,6 +2749,7 @@ fn default_ledger_path() -> PathBuf {
 fn run_endpoints(args: EndpointsArgs) -> ExitCode {
     let acquisitions = args.acquisitions.unwrap_or_else(default_acquisitions_path);
     let forwards = args.forwards.unwrap_or_else(default_forwards_path);
+    let prices = args.prices.unwrap_or_else(default_prices_path);
     // Named explicitly, the static file has to exist — a typo reported
     // as "no static rows" would be a file that quietly did not count.
     // Left to the default, it is read only when it is there.
@@ -2640,11 +2757,26 @@ fn run_endpoints(args: EndpointsArgs) -> ExitCode {
         Some(path) => Some(path),
         None => Some(default_endpoints_file()).filter(|it| it.exists()),
     };
-    let inventory = inventory::endpoints(&inventory::EndpointSources {
+    let mut inventory = inventory::endpoints(&inventory::EndpointSources {
         acquisitions: &acquisitions,
         forwards: &forwards,
         statics: statics.as_deref(),
+        prices: &prices,
     });
+    if args.balance {
+        inventory.balanced(&prices::now_utc());
+    }
+    if args.probe {
+        inventory.probed();
+        // A refusal is news, not an exit code: the state is in the row,
+        // and this is the line that says so while the operator watches.
+        for (name, state, said) in inventory.probe_refusals() {
+            eprintln!(
+                "warning: {name}: probe {state:?}{}",
+                said.map(|it| format!(" — {it}")).unwrap_or_default()
+            );
+        }
+    }
     for (program, said) in &inventory.said {
         relay(program, said);
     }
@@ -2672,6 +2804,94 @@ fn default_forwards_path() -> PathBuf {
             .join("forwards.jsonl"),
         None => PathBuf::from("lm-provision-forwards.jsonl"),
     }
+}
+
+/// The price record's default location, beside the acquisitions
+/// record and for the same reason.
+fn default_prices_path() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".lm-provision")
+            .join("prices.jsonl"),
+        None => PathBuf::from("lm-provision-prices.jsonl"),
+    }
+}
+
+/// `machine prices sync` — ask a platform what its models cost and
+/// append what changed (09 §Price record).
+///
+/// **The record is the only thing this touches.** Nothing is acquired,
+/// nothing is released, and the platform is asked a question its own
+/// pricing page answers without a key.
+fn run_prices_sync(args: PricesSyncArgs) -> ExitCode {
+    let path = args.prices.unwrap_or_else(default_prices_path);
+    // The instant every appended row carries, in the shape the record
+    // accepts — `prices::now_utc` and not `Timestamp::now().to_string()`,
+    // whose sub-second digits the record's writer refuses.
+    let now = prices::now_utc();
+    match prices::sync(&args.provider, &path, &now) {
+        Ok(synced) => match serde_json::to_string(&synced) {
+            Ok(artifact) => {
+                println!("{artifact}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: could not render what was synced: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `machine cost` — what a run cost, from what it used and what the
+/// record says a token cost where it ran (09 §Cost).
+///
+/// **A reading.** Nothing is bought, nothing is released, and no record
+/// is written: the price record is read and the arithmetic is done
+/// here. The answer is an estimate from a published rate — the
+/// platform's own bill is the authority and this is not it.
+fn run_cost(args: CostArgs) -> ExitCode {
+    match priced(args) {
+        Ok(artifact) => {
+            println!("{artifact}");
+            ExitCode::SUCCESS
+        }
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// [`run_cost`] without the exit code: the usage text, the translation
+/// into the five buckets, the record row, and the artifact — each step
+/// failing with the line the operator is shown.
+fn priced(args: CostArgs) -> Result<String, String> {
+    let path = args.prices.unwrap_or_else(default_prices_path);
+    // `@path` reads the usage from a file, the spelling `curl --data`
+    // and `gh --body-file`-era tools use for "this argument is over
+    // there": a run's usage object is routinely longer than a command
+    // line holds.
+    let text = match args.usage.strip_prefix('@') {
+        Some(file) => std::fs::read_to_string(file)
+            .map_err(|err| format!("could not read the usage from {file}: {err}"))?,
+        None => args.usage.clone(),
+    };
+    let document: serde_json::Value =
+        serde_json::from_str(&text).map_err(|err| format!("the usage is not JSON: {err}"))?;
+    let usage = cost::usage_from(args.usage_format.into(), &document)?;
+    let costed = cost::cost(
+        &path,
+        &args.provider,
+        &args.model,
+        args.at.as_deref(),
+        &usage,
+    )?;
+    serde_json::to_string(&costed).map_err(|err| format!("could not render the cost: {err}"))
 }
 
 /// Where the operator's static rows live by default: with the
@@ -2916,8 +3136,9 @@ fn correction_row(
 mod tests {
     use super::{
         attributed, credentials, exit_status, forward_failure_code, parse_forwards,
-        parse_ssh_target, record, resolve_target, ssh_help, AcquisitionRow, Cli, Command, Forward,
-        MachineCommand, Path, PathBuf, TargetArgs,
+        parse_ssh_target, record, resolve_target, run_cost, run_prices_sync, ssh_help,
+        AcquisitionRow, Cli, Command, ExitCode, Forward, MachineCommand, Path, PathBuf, PricesArgs,
+        PricesCommand, TargetArgs,
     };
     use clap::Parser as _;
     use lm_provision_driver::ssh::{DEFAULT_REMOTE_DIR, DEFAULT_SSH_USER};
@@ -3312,6 +3533,135 @@ mod tests {
         assert!(super::uncollected_artifacts(&path, "pod-a")
             .expect("gate reads the ledger")
             .is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **Both extra questions are asked for, never on by default.** A
+    /// probe spends money and a balance reaches a platform, so the
+    /// bare `machine endpoints` asks neither — and the flags that do
+    /// ask are parsed here, where a rename would otherwise change what
+    /// a run costs without failing anything.
+    #[test]
+    fn endpoints_flags_balance_and_probe_parse() {
+        let parsed = |argv: &[&str]| {
+            let cli = Cli::parse_from(argv);
+            let Command::Machine {
+                command: MachineCommand::Endpoints(args),
+            } = cli.command
+            else {
+                panic!("the parsed subcommand is `machine endpoints`");
+            };
+            (args.balance, args.probe)
+        };
+
+        assert_eq!(
+            parsed(&[
+                "lm-provision",
+                "machine",
+                "endpoints",
+                "--balance",
+                "--probe"
+            ]),
+            (true, true)
+        );
+        assert_eq!(
+            parsed(&["lm-provision", "machine", "endpoints"]),
+            (false, false),
+            "nothing is spent, and no platform is reached, unless asked for"
+        );
+    }
+
+    /// **A platform with no price list to read writes no record.** The
+    /// refusal is the whole run: the file the operator named is still
+    /// not there afterwards, so a sync that could not ask is told apart
+    /// from one that asked and found nothing.
+    #[test]
+    fn prices_sync_refuses_a_platform_with_no_token_prices() {
+        let path = scratch("prices-refused");
+        let cli = Cli::parse_from([
+            "lm-provision",
+            "machine",
+            "prices",
+            "sync",
+            "--provider",
+            "together",
+            "--prices",
+            path.to_str().expect("the scratch path is utf-8"),
+        ]);
+        let Command::Machine {
+            command: MachineCommand::Prices(PricesArgs { command: args }),
+        } = cli.command
+        else {
+            panic!("the parsed subcommand is `machine prices sync`");
+        };
+        let PricesCommand::Sync(args) = args;
+        assert_eq!(args.provider, "together");
+
+        let code = run_prices_sync(args);
+
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::FAILURE),
+            "a platform this tool reads no prices from is a failed run"
+        );
+        assert!(!path.exists(), "a refusal writes no record");
+    }
+
+    /// **A price the record does not carry is a failed run, not a cost
+    /// of nothing.** The priced call prints the artifact an operator
+    /// reads — amount, currency, and the `estimate` that says where it
+    /// came from — and the unpriced model exits non-zero rather than
+    /// answering with a zero nobody could tell from a free model.
+    #[test]
+    fn cost_prints_the_priced_artifact_and_refuses_an_unpriced_model() {
+        let path = scratch("cost-record");
+        let row = serde_json::json!({
+            "provider": "deepinfra",
+            "model": "m",
+            "price": { "input": "1.3", "output": "2.6" },
+            "unit": "usd_per_mtok",
+            "as_of": "2026-09-22T00:00:00Z",
+            "source": "https://deepinfra.com/pricing"
+        });
+        std::fs::write(&path, format!("{row}\n")).expect("the scratch record is writable");
+
+        let parse = |model: &str| {
+            let cli = Cli::parse_from([
+                "lm-provision",
+                "machine",
+                "cost",
+                "--provider",
+                "deepinfra",
+                "--model",
+                model,
+                "--usage",
+                r#"{"input":1000000,"output":100000}"#,
+                "--prices",
+                path.to_str().expect("the scratch path is utf-8"),
+            ]);
+            let Command::Machine {
+                command: MachineCommand::Cost(args),
+            } = cli.command
+            else {
+                panic!("the parsed subcommand is `machine cost`");
+            };
+            args
+        };
+
+        let priced = parse("m");
+        assert_eq!(priced.provider, "deepinfra");
+        assert_eq!(
+            format!("{:?}", run_cost(priced)),
+            format!("{:?}", ExitCode::SUCCESS),
+            "the record prices that model"
+        );
+
+        assert_eq!(
+            format!("{:?}", run_cost(parse("not-in-the-record"))),
+            format!("{:?}", ExitCode::FAILURE),
+            "a model the record says nothing about is a failed run"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -4037,6 +4387,9 @@ mod tests {
                     model: Some("slug/lmp-exp-x".to_string()),
                     api_key_env: Some("TOGETHER_API_KEY".to_string()),
                     expires_at: None,
+                    price: None,
+                    balance: None,
+                    probe: None,
                     source: "acquisitions".to_string(),
                 },
                 Endpoint {
@@ -4048,6 +4401,9 @@ mod tests {
                     model: None,
                     api_key_env: None,
                     expires_at: None,
+                    price: None,
+                    balance: None,
+                    probe: None,
                     source: "forwards".to_string(),
                 },
                 Endpoint {
@@ -4059,6 +4415,9 @@ mod tests {
                     model: None,
                     api_key_env: None,
                     expires_at: None,
+                    price: None,
+                    balance: None,
+                    probe: None,
                     source: "acquisitions".to_string(),
                 },
             ],

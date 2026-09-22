@@ -76,8 +76,26 @@
 //!   [`infra`] and rendered as the one JSON document both the operator
 //!   CLI's `machine list` and the MCP `lm_machine_list` tool return. A
 //!   read: it has no release path at all.
+//! - [`prices`] — the price record's writer (09 §Price record): ask a
+//!   platform what its models cost and append what changed, so the
+//!   inventory's join has something to stand on. It writes that one
+//!   file and reaches no machine.
 //! - [`credentials`] — where a target's credential is resolved from,
 //!   and what is reported when it is not there.
+//! - [`balance`] — what a platform this tool spends from says is left
+//!   on the account (09 §Endpoint inventory, `balance`): RunPod, Vast
+//!   and DeepInfra say, each in its own shape and sign; Together does
+//!   not, and a name this tool has no adapter for is not asked at all —
+//!   `Ok(None)` is that answer rather than a failure to ask. A read,
+//!   over the platform's own HTTP API, with the key travelling by name.
+//! - [`probe`] — one token, now: the one-token completion that finds an
+//!   exhausted account (402) or a dead key (401) before a run does.
+//!   **It spends money**, which is why nothing here runs unless asked
+//!   for.
+//! - [`cost`] — what a run cost: one `usage` document (in the shape the
+//!   platform states it, translated at the door) priced by the record's
+//!   row for its (provider, model) at an instant. A reading, like
+//!   [`inventory`]: it writes nothing and reaches no machine.
 //! - [`image`] — whether the image a profile names exists in its
 //!   registry, asked before a machine exists to pull it and fail.
 //! - [`provisioner`] — where the provisioner comes from: the CI-built,
@@ -88,6 +106,8 @@
 
 pub use lm_provision_protocol::acquisition;
 pub use lm_provision_protocol::forward;
+pub mod balance;
+pub mod cost;
 pub mod credentials;
 pub mod driver;
 pub mod image;
@@ -95,6 +115,8 @@ pub mod infra;
 pub mod inventory;
 pub use lm_provision_protocol::ledger;
 pub mod local_exec;
+pub mod prices;
+pub mod probe;
 pub mod provisioner;
 pub mod session;
 pub mod ssh;

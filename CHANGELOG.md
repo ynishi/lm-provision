@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A price record, and the inventory reads it** (09 §Price record):
+  `~/.lm-provision/prices.jsonl`, one append-only row per (platform,
+  model, instant) saying what a token costs there — `input` / `output`
+  and, where the platform prices them apart, `cache_read` /
+  `cache_write` / `reasoning` — as decimal text in USD per million
+  tokens, the unit written into every row and any other refused by name.
+  Absent is not zero. `as_of` is the version: a changed price is a new
+  row, and a reader asks for the newest row at or before an instant, so
+  a run from last month is re-priced at last month's rate. Every
+  `machine endpoints` / `lm_endpoint_list` row whose (`provider`,
+  `model`) the record prices carries it as `price`; a static row may
+  name its `provider` and its own `price`, which beats the record for
+  that row.
+- **`lm-provision machine prices sync --provider deepinfra`** and the
+  MCP tool `lm_price_sync` — the record's writer. Reads DeepInfra's
+  public price list (cents per token; cache reads as a ratio of the
+  input rate) into micro-dollars with one rounding, and appends a row
+  only for a model whose newest row states different amounts: the record
+  is a change log, not a snapshot. What the platform prices in a shape
+  this tool does not read (per second, per image) is reported in
+  `skipped` by name. The platform's `discount` and service-tier fields
+  are not applied.
+- **`lm-provision machine cost --provider <p> --model <m> --usage
+  <json|@file> [--usage-format plain|openai|deepseek|anthropic] [--at
+  <instant>]`** and the MCP tool `lm_cost` — usage × price, the
+  arithmetic in one place (09 §Cost). The usage is five buckets with
+  `input` meaning **uncached** input; OpenAI and DeepSeek `usage`
+  objects, which count cache hits inside `prompt_tokens`, are translated
+  at the door so a cache hit is never paid for twice. Absent optional
+  rates fall back by what their absence means (cache reads at the input
+  rate, cache writes at nothing, reasoning at the output rate); a usage
+  that did not say what was cached is charged as uncached and the answer
+  says `cache_known: false` — an upper bound. `cost.source` is always
+  `estimate`.
+- **`machine endpoints --balance` / `--probe`** and the same on
+  `lm_endpoint_list`. `--balance` asks the platforms this tool spends
+  from what is left on the account and puts it beside every row of that
+  platform — RunPod (`clientBalance`, with spend per hour), Vast
+  (`credit`), DeepInfra (`stripe_balance`, its sign flipped so positive
+  is funds everywhere, with `suspended` / `suspend_reason`) [measured:
+  2026-09-22]; Together publishes none [documented: docs.together.ai —
+  `billing/usage` and `whoami` only] and its rows carry no `balance`; a
+  name this tool has no adapter for is not asked. The DeepInfra reader
+  takes three named fields from a document that also carries billing
+  details, and relays nothing else. `--probe` sends every endpoint a
+  one-token completion and reports the answer by state (`ok` /
+  `unauthorized` / `payment_required` / `not_found` / `failed` /
+  `unreachable` / `no_key`) with the platform's own words when it
+  refused and its `usage` object when it did not — the one question that
+  finds an exhausted account (402) before a run spends a build on
+  finding it. It spends a few tokens and runs only when asked. Neither
+  is a gate.
+
 ### Changed
 
 ### Deprecated

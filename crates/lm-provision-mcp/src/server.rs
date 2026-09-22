@@ -63,9 +63,9 @@ pub struct MachineListParams {
     pub provider: String,
 }
 
-/// `lm_endpoint_list(acquisitions?, forwards?, endpoints_file?)` request
-/// shape (10 §Tool set): every path optional, defaulting as the CLI's
-/// `machine endpoints` does.
+/// `lm_endpoint_list(acquisitions?, forwards?, endpoints_file?, prices?,
+/// balance?, probe?)` request shape (10 §Tool set): every path optional,
+/// defaulting as the CLI's `machine endpoints` does.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
 pub struct EndpointListParams {
     /// The acquisitions record; default `~/.lm-provision/acquisitions.jsonl`.
@@ -78,6 +78,60 @@ pub struct EndpointListParams {
     /// `~/.config/lm-provision/endpoints.json` when it exists.
     #[serde(default)]
     pub endpoints_file: Option<String>,
+    /// The price record; default `~/.lm-provision/prices.jsonl`.
+    #[serde(default)]
+    pub prices: Option<String>,
+    /// Also ask each platform this tool spends from what is left on
+    /// the account (RunPod, Vast, DeepInfra say; Together does not);
+    /// read-only.
+    #[serde(default)]
+    pub balance: Option<bool>,
+    /// Also send every endpoint a one-token completion and report what
+    /// came back; **spends money**, off unless asked for.
+    #[serde(default)]
+    pub probe: Option<bool>,
+}
+
+/// `lm_price_sync(provider, prices?)` request shape (10 §Tool set).
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PriceSyncParams {
+    /// The platform to ask (`deepinfra`).
+    pub provider: String,
+    /// The price record to append to; default
+    /// `~/.lm-provision/prices.jsonl`.
+    #[serde(default)]
+    pub prices: Option<String>,
+}
+
+/// `lm_cost(provider, model, usage, usage_format?, at?, prices?)`
+/// request shape (10 §Tool set).
+///
+/// **`usage_format` is a string, not an enum.** The driver's
+/// `cost::UsageFormat` would be the type to take here, but deriving
+/// `JsonSchema` on it would put `schemars` in the driver's
+/// dependencies, and the driver has none of this crate's — so the four
+/// spellings are parsed in the tool and anything else is refused by
+/// name.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct CostParams {
+    /// The platform the run ran on — the word the price record's rows
+    /// carry (`deepinfra`, `together`, …).
+    pub provider: String,
+    /// The model, as that platform names it.
+    pub model: String,
+    /// What the run used, in the shape `usage_format` names.
+    pub usage: serde_json::Value,
+    /// `plain` (the five buckets as this tool writes them, the
+    /// default), `openai`, `deepseek`, or `anthropic`.
+    #[serde(default)]
+    pub usage_format: Option<String>,
+    /// Price it at the rate in force at this instant (RFC 3339 UTC, `Z`
+    /// form); the record's newest row by default.
+    #[serde(default)]
+    pub at: Option<String>,
+    /// The price record to read; default `~/.lm-provision/prices.jsonl`.
+    #[serde(default)]
+    pub prices: Option<String>,
 }
 
 /// `lm_ledger_list(pod_id?, profile_hash?, limit?)` request shape (10
@@ -346,8 +400,13 @@ impl LmProvisionServer {
         description = "List every OpenAI-compatible endpoint this host knows (09 §Endpoint \
                         inventory): acquired machines asked about through their platforms, \
                         detached forwards whose ssh still runs, and the operator's static rows. \
-                        Keys by name, never by value. Read-only; a source that could not be read \
-                        is in the result's `failed`, not an error."
+                        Keys by name, never by value. Each row carries `price` (USD per million \
+                        tokens, decimal text) when the price record has a row for its provider \
+                        and model. Read-only; a source that could not be read is in the result's \
+                        `failed`, not an error. `balance` asks the platforms this tool \
+                        spends from (RunPod, Vast, DeepInfra) what is left; `probe` sends every \
+                        endpoint one token and reports the answer (spends money; off by \
+                        default)."
     )]
     async fn lm_endpoint_list(
         &self,
@@ -371,6 +430,9 @@ impl LmProvisionServer {
                 "lm-provision-forwards.jsonl",
             )
         });
+        let prices = params.prices.map(PathBuf::from).unwrap_or_else(|| {
+            under_home(".lm-provision/prices.jsonl", "lm-provision-prices.jsonl")
+        });
         let statics = match params.endpoints_file {
             Some(path) => Some(PathBuf::from(path)),
             None => Some(under_home(
@@ -379,17 +441,41 @@ impl LmProvisionServer {
             ))
             .filter(|it| it.exists()),
         };
+        let ask_balance = params.balance.unwrap_or(false);
+        let ask_probe = params.probe.unwrap_or(false);
+        // The instant the balances are stamped with, in the one shape
+        // the record's timestamps take — taken here rather than inside
+        // the closure so the reading and the stamp are the same run's.
+        let now = lm_provision_driver::prices::now_utc();
         let inventory = tokio::task::spawn_blocking(move || {
-            lm_provision_driver::inventory::endpoints(
+            let mut inventory = lm_provision_driver::inventory::endpoints(
                 &lm_provision_driver::inventory::EndpointSources {
                     acquisitions: &acquisitions,
                     forwards: &forwards,
                     statics: statics.as_deref(),
+                    prices: &prices,
                 },
-            )
+            );
+            if ask_balance {
+                inventory.balanced(&now);
+            }
+            if ask_probe {
+                inventory.probed();
+            }
+            inventory
         })
         .await
         .map_err(join_error)?;
+        // A refusal is news the operator's own log carries; the state
+        // is in the row either way, and the result is not an error.
+        for (name, state, said) in inventory.probe_refusals() {
+            tracing::warn!(
+                endpoint = name,
+                state = ?state,
+                said = said.unwrap_or_default(),
+                "a probe did not come back ok"
+            );
+        }
         for (program, said) in &inventory.said {
             if !said.is_empty() {
                 tracing::debug!(program, said = %String::from_utf8_lossy(said).trim(), "platform cli output while listing endpoints");
@@ -399,6 +485,99 @@ impl LmProvisionServer {
             tracing::error!(source, reason, "lm_endpoint_list could not read a source");
         }
         Ok(inventory.artifact().to_string())
+    }
+
+    /// `lm_price_sync` (10 §Tool set: `provider`, `prices?`; backing
+    /// surface `lm_provision_driver::prices::sync`).
+    ///
+    /// **The one tool here that writes the price record**, and the only
+    /// file it touches: a sync asks the platform's own published price
+    /// list — the question that needs no key — and appends a row per
+    /// model whose amounts moved. No machine is acquired and none is
+    /// released.
+    #[tool(
+        description = "Ask a platform what its models cost and append what changed to the price \
+                        record (09 §Price record). Writes the record; nothing is bought or \
+                        released. `deepinfra` today."
+    )]
+    async fn lm_price_sync(
+        &self,
+        Parameters(PriceSyncParams { provider, prices }): Parameters<PriceSyncParams>,
+    ) -> Result<String, McpError> {
+        let prices = prices
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(".lm-provision/prices.jsonl"),
+                None => PathBuf::from("lm-provision-prices.jsonl"),
+            });
+        // The shape the record's own writer accepts, from the one place
+        // it is written (`prices::now_utc`), as the CLI takes it.
+        let now = lm_provision_driver::prices::now_utc();
+        let synced = tokio::task::spawn_blocking(move || {
+            lm_provision_driver::prices::sync(&provider, &prices, &now)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(precondition_error)?;
+        serde_json::to_string(&synced)
+            .map_err(|err| McpError::internal_error(err.to_string(), None))
+    }
+
+    /// `lm_cost` (10 §Tool set: `provider`, `model`, `usage`,
+    /// `usage_format?`, `at?`, `prices?`; backing surface
+    /// `lm_provision_driver::cost::cost`).
+    ///
+    /// **A reading.** The price record is read, the arithmetic is done,
+    /// and nothing is written — not the usage, not the answer. What
+    /// comes back is an estimate from a published rate; the platform's
+    /// own bill is the authority and this is not it.
+    #[tool(
+        description = "Price a run: the usage object (in the platform's own shape, \
+                        `usage_format`) at what the price record says a token costs on \
+                        (`provider`, `model`), at `at` or now. Read-only; an estimate from the \
+                        published rate."
+    )]
+    async fn lm_cost(
+        &self,
+        Parameters(CostParams {
+            provider,
+            model,
+            usage,
+            usage_format,
+            at,
+            prices,
+        }): Parameters<CostParams>,
+    ) -> Result<String, McpError> {
+        let format = match usage_format.as_deref().unwrap_or("plain") {
+            "plain" => lm_provision_driver::cost::UsageFormat::Plain,
+            "openai" => lm_provision_driver::cost::UsageFormat::Openai,
+            "deepseek" => lm_provision_driver::cost::UsageFormat::Deepseek,
+            "anthropic" => lm_provision_driver::cost::UsageFormat::Anthropic,
+            other => {
+                return Err(precondition_error(format!(
+                    "usage_format `{other}` is not one of plain, openai, deepseek, anthropic"
+                )))
+            }
+        };
+        // Before anything is read: a usage this reader cannot translate
+        // is refused here rather than priced as whatever survived the
+        // translation.
+        let usage =
+            lm_provision_driver::cost::usage_from(format, &usage).map_err(precondition_error)?;
+        let prices = prices
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(".lm-provision/prices.jsonl"),
+                None => PathBuf::from("lm-provision-prices.jsonl"),
+            });
+        let costed = tokio::task::spawn_blocking(move || {
+            lm_provision_driver::cost::cost(&prices, &provider, &model, at.as_deref(), &usage)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(precondition_error)?;
+        serde_json::to_string(&costed)
+            .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
     #[tool(
@@ -863,12 +1042,14 @@ mod tests {
             names,
             vec![
                 "lm_apply",
+                "lm_cost",
                 "lm_endpoint_list",
                 "lm_hash",
                 "lm_ledger_get",
                 "lm_ledger_list",
                 "lm_machine_list",
                 "lm_plan",
+                "lm_price_sync",
                 "lm_validate",
             ]
         );

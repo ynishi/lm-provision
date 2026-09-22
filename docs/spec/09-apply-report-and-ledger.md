@@ -397,6 +397,76 @@ open and which still exist":
   acquisitions record, and for the same reason: written by the operator
   CLI today, read by the inventory and the control plane later.
 
+### Price record (append-only)
+
+The records above say what was bought and what is still open; none of
+them says what the work itself is billed at. The price record is the
+host's answer to "what does a token cost on this platform for this
+model, as of when":
+
+```
+{
+  provider = string,   -- the platform, as the operator named it
+                       -- (`deepinfra`, `together`, `openrouter`) — the
+                       -- same word the endpoint row's `provider` carries
+  model    = string,   -- the model, as that platform names it — the
+                       -- same word the endpoint row's `model` carries
+  price    = { input         = string,   -- uncached input tokens
+               output        = string,   -- output tokens
+               cache_read?   = string,   -- input served from the
+                                         -- platform's prompt cache
+               cache_write?  = string,   -- input written into it, where
+                                         -- the write is charged for
+               reasoning?    = string }, -- reasoning tokens, where
+                                         -- priced apart from output
+  unit     = "usd_per_mtok",  -- written into every row
+  as_of    = string,   -- RFC 3339 UTC: the instant the amounts were
+                       -- read — the writer's clock for a sync, the
+                       -- operator's word for a hand row
+  source   = string,   -- the URL a sync read, or `operator`
+}
+```
+
+- **Amounts are decimal text in USD per million tokens.** That is the
+  unit every platform's own pricing page states, so a row can be
+  checked against the page it came from by reading it. Text rather
+  than a number because the platforms that return money over an API
+  return it as text, and a reader that needs arithmetic parses to
+  integer micro-dollars (10⁻⁶ USD) and stays in integers until it
+  prints — money rounded silently is the failure this shape exists to
+  prevent.
+- **Absent is not zero.** A platform that does not price cache reads
+  leaves `cache_read` out; a platform that prices them at nothing
+  writes `"0"`. Both are true statements about that platform and a
+  reader must be able to tell them apart, so an unpriced amount is
+  written without its key rather than as a sentinel.
+- **Append-only, and `as_of` is the version.** A price that changes is
+  a new row, never an edit to the row that stated the old one. What a
+  reader asks for is the newest row at or before some instant, so a run
+  from last month is re-priced at last month's rate rather than at
+  today's — which is the only way a cost said about the past stays true
+  after the platform moves its prices.
+- **A sync appends the change, not the snapshot.**
+  `machine prices sync --provider <p>` reads the platform's own price
+  list and appends a row only for a model whose newest row states
+  different amounts (or none), so the record grows by what moved and
+  `as_of` on a row is when the amounts were first seen, not the last
+  time anybody looked. What the platform states in a shape this tool
+  does not read (a model priced per second, an amount that is not a
+  number) is reported in the artifact's `skipped`, by name.
+- **The join is (`provider`, `model`)**, by the same words the endpoint
+  row carries (§Endpoint inventory). Nothing translates between the
+  two: the record names a model exactly as the platform that bills for
+  it does.
+- **The unit is written into every row.** A reader that meets a row
+  carrying any other unit refuses it by name; it does not convert and
+  does not guess. A row silently read as per-token when it was written
+  per-million-tokens is wrong by a factor of a million, and a refusal
+  by name is the one outcome that says so.
+- Same encoding, same error class, same neutral home
+  (`~/.lm-provision/prices.jsonl`) as the acquisitions record; written
+  by `machine prices sync` and by the operator, read by the inventory.
+
 ### Endpoint inventory (a reading, not a record)
 
 `machine endpoints` (chapter 08) and `lm_endpoint_list` (chapter 10)
@@ -416,6 +486,18 @@ nothing. One row per endpoint:
   model?       = string,
   api_key_env? = string,   -- the variable's NAME, never its value
   expires_at?  = string,   -- the lease, for an acquired machine
+  price?       = { input, output, cache_read?, cache_write?,
+                   reasoning?, unit, as_of, source },
+                           -- the newest price-record row for
+                           -- (provider, model), or the static row's
+                           -- own; USD per million tokens, decimal text
+  balance?     = { amount, currency, spend_per_hour?, suspended?,
+                   suspend_reason?, as_of, source },
+                           -- what the platform this tool spends from
+                           -- says is left, when asked (--balance)
+                           -- and when it says
+  probe?       = { state, http?, said?, usage? },
+                           -- what one token got, when asked (--probe)
   source       = string,   -- "acquisitions" | "forwards" | <static path>
 }
 ```
@@ -432,10 +514,87 @@ nothing. One row per endpoint:
 - **A tunnel's model is read off the pod** (`/v1/models` on the local
   port, the one question an OpenAI-compatible server answers without a
   key); absent when the pod does not answer.
+- **A price is a join, not a field the sources carry.** The inventory
+  reads the price record (§Price record) once and puts the newest row
+  for each endpoint's (`provider`, `model`) beside it; a static row may
+  carry its own `price` (the operator's word, which beats the record
+  for that row). No row prices it → no `price` key. A record that
+  cannot be read is one entry in `failed` and prices nothing.
+- **A balance is the account this tool spends from, as the platform
+  states it — asked once per platform and put beside every row of it.**
+  RunPod (`myself.clientBalance`, with the account's spend per hour),
+  Vast (`credit`, the prepaid amount its CLI prints as money) and
+  DeepInfra (`checklist.stripe_balance`, whose sign the platform
+  documents as "negative = funds ready to spend" and which is flipped
+  here so positive is funds everywhere; with `suspended` /
+  `suspend_reason`) say; Together publishes none and its rows carry no
+  `balance` — absent is "the platform does not say", never zero. A name
+  this tool has no adapter for is not asked: there is no account of this
+  tool's there. The DeepInfra document also carries the billing address
+  and card digits; the reader takes the three named fields and nothing
+  else. A platform that could not be asked (no key, no answer) is one
+  entry in `failed`. Nothing here is a gate: the row says what was read
+  and when, and what to do about it is the operator's.
+- **A probe is one token, now.** `--probe` sends every row with a
+  `base_url` and a `model` a one-token completion and reports the answer
+  by state (`ok` / `unauthorized` / `payment_required` / `not_found` /
+  `failed` / `unreachable` / `no_key`), with the platform's own words
+  when it refused and its `usage` object when it did not — the place a
+  platform states what the request cost it. It spends money and runs
+  only when asked; a refusal is a warning on stderr and a state in the
+  row, not an exit code.
 - The static file is a JSON array of `{name, base_url, model?,
-  api_key_env?}`; a field outside those four is refused by name rather
-  than dropped, since a mistyped `api_key_env` silently dropped would
-  be a row with no key that looked complete.
+  api_key_env?, provider?, price?}`; a field outside those is refused
+  by name rather than dropped, since a mistyped `api_key_env`
+  silently dropped would be a row with no key that looked complete.
+
+### Cost (a reading, not a record)
+
+`machine cost` (chapter 08) and `lm_cost` (chapter 10) answer one
+question — what did this run cost, at what a token costs where it ran —
+by reading the price record and doing the arithmetic. Nothing is
+written: the usage stays with whoever holds it (§Price record keeps the
+rates; the runs are somebody else's file).
+
+What a run used is stated in five buckets:
+
+```
+{ input, output, cache_read?, cache_write?, reasoning? }   -- token counts
+```
+
+- **`input` is uncached input only.** Tokens served from the platform's
+  cache are `cache_read`, not part of `input`. That is Anthropic's
+  convention; the OpenAI and DeepSeek `usage` objects count cache hits
+  inside `prompt_tokens`, and `--usage-format openai|deepseek|anthropic`
+  translates them at the door — once, here, rather than in every caller,
+  because getting it wrong is a double count nothing downstream can see.
+- **Absent optional rates fall back by what their absence means**
+  (§Price record: absent is not zero): `cache_read` tokens at
+  `price.cache_read`, else at `price.input` — a cached input token is
+  still an input token, and a platform that does not price it apart
+  charges the input rate; `cache_write` tokens at `price.cache_write`,
+  else **nothing** — a platform that states no write charge does not
+  charge one, the write being a surcharge on tokens already counted in
+  `input`; `reasoning` tokens at `price.reasoning`, else at
+  `price.output`.
+- **`cache_known: false` makes the amount an upper bound.** A usage
+  object with no cache field did not say how much was cached, which is
+  not the same as having cached nothing, so every input token is charged
+  at the uncached rate and the answer says so.
+- **`--at <instant>` re-prices at the rate in force then** — the newest
+  row at or before it (§Price record), so a run from last month costs
+  what it cost rather than what it would cost today.
+
+The answer:
+
+```
+{ provider, model, price_as_of, price_source, usage, cache_known,
+  cost = { amount, currency, source } }
+```
+
+`amount` is USD as decimal text, `currency` is `USD`, and `cost.source`
+is always `estimate`: this is computed from a published rate, and the
+platform's bill is the authority — this is not it.
 
 ## Error surface
 

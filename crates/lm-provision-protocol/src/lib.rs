@@ -20,15 +20,21 @@
 //! that has already taken outside contributions needs a CLA or DCO
 //! from every contributor.
 //!
-//! The shared vocabulary is two things, both of them rows a driver
-//! appends and the host will take custody of: the apply-ledger row
-//! schema and its JSON Lines encoding ([`ledger`]), and the
-//! acquisitions record ([`acquisition`]) — one row per machine bought,
-//! one per machine given back, which is what a TTL sweep on either
-//! side of the boundary reads to know what is still running.
+//! The shared vocabulary is rows a driver appends and the host will
+//! take custody of: the apply-ledger row schema and its JSON Lines
+//! encoding ([`ledger`]); the acquisitions record ([`acquisition`]) —
+//! one row per machine bought, one per machine given back, which is
+//! what a TTL sweep on either side of the boundary reads to know what
+//! is still running; the forwards record ([`forward`]) — the detached
+//! tunnels this host opened and which of them still exist; and the
+//! price record ([`price`]) — one row per (platform, model, instant)
+//! saying what a token costs there, appended by a sync or by hand,
+//! read by the endpoint inventory to put a price beside each endpoint
+//! it lists.
 
 #![warn(missing_docs)]
 
 pub mod acquisition;
 pub mod forward;
 pub mod ledger;
+pub mod price;
