@@ -146,8 +146,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later stopped by the platform itself, and found two defects fixed
   here: a rendering without a lease was refused (so `machine release`
   could not reach the release template), and `acquire` exited 0 on a
-  machine that never came up. A run that reaches a reply through the
-  adapter is still owed.
+  machine that never came up; a second run found the adapter reading
+  the creation-time deployment over the read-back. With those fixed,
+  the adapter's own run went end to end [measured: 2026-09-23,
+  Qwen/Qwen2.5-7B-Instruct on 1x H100: `acquire` waited through
+  SCALING and reported the endpoint, `machine list` read the lease
+  under the project slug, `exec` refused the machine by what it is, one
+  chat reply through `<slug>/<name>`, and `release` deleted the endpoint
+  on its third call, 30 s after the first scaled it to zero].
 - **Driver library: `Discovery` / `Wait`, `Fleet::stamp_from_inspect`,
   `curl_bearer`.** The pre-create step an acquisition may carry is now
   a `Discovery` — the argv, an optional body, a dotted path to the id
