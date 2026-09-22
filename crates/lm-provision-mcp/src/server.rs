@@ -95,7 +95,7 @@ pub struct EndpointListParams {
 /// `lm_price_sync(provider, prices?)` request shape (10 §Tool set).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct PriceSyncParams {
-    /// The platform to ask (`deepinfra`).
+    /// The platform to ask (`deepinfra`, `together`).
     pub provider: String,
     /// The price record to append to; default
     /// `~/.lm-provision/prices.jsonl`.
@@ -103,8 +103,8 @@ pub struct PriceSyncParams {
     pub prices: Option<String>,
 }
 
-/// `lm_cost(provider, model, usage, usage_format?, at?, prices?)`
-/// request shape (10 §Tool set).
+/// `lm_cost(provider?, model?, endpoint?, endpoints_file?, acquisitions?, forwards?, usage?,
+/// usage_format?, at?, period?, prices?)` request shape (10 §Tool set).
 ///
 /// **`usage_format` is a string, not an enum.** The driver's
 /// `cost::UsageFormat` would be the type to take here, but deriving
@@ -112,15 +112,48 @@ pub struct PriceSyncParams {
 /// dependencies, and the driver has none of this crate's — so the four
 /// spellings are parsed in the tool and anything else is refused by
 /// name.
+///
+/// **Every field is optional in the schema and the combinations are
+/// checked in the tool.** A usage is priced or a period is billed, an
+/// endpoint's name stands in for a platform and a model — the rules
+/// are the CLI's, and each is its own refusal (10 §Error surface,
+/// precondition).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CostParams {
     /// The platform the run ran on — the word the price record's rows
-    /// carry (`deepinfra`, `together`, …).
-    pub provider: String,
+    /// carry (`deepinfra`, `together`, …). Not given with `endpoint`,
+    /// which names it.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// The model, as that platform names it.
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Price by the provider and model of this inventory row instead of
+    /// `provider` / `model` (09 §Endpoint inventory); reads the same
+    /// sources as `lm_endpoint_list`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// The operator's static rows, for `endpoint`; default
+    /// `~/.config/lm-provision/endpoints.json` when it exists.
+    #[serde(default)]
+    pub endpoints_file: Option<String>,
+    /// The acquisitions record, for `endpoint`; default
+    /// `~/.lm-provision/acquisitions.jsonl`.
+    #[serde(default)]
+    pub acquisitions: Option<String>,
+    /// The forwards record, for `endpoint`; default
+    /// `~/.lm-provision/forwards.jsonl`.
+    #[serde(default)]
+    pub forwards: Option<String>,
     /// What the run used, in the shape `usage_format` names.
-    pub usage: serde_json::Value,
+    #[serde(default)]
+    pub usage: Option<serde_json::Value>,
+    /// Read the platform's own bill for this period (`YYYY.MM`) instead
+    /// of pricing a usage — `cost.source` is `platform`, the authority.
+    /// `deepinfra` today; with `model` (or `endpoint`) only that
+    /// model's lines.
+    #[serde(default)]
+    pub period: Option<String>,
     /// `plain` (the five buckets as this tool writes them, the
     /// default), `openai`, `deepseek`, or `anthropic`.
     #[serde(default)]
@@ -498,7 +531,7 @@ impl LmProvisionServer {
     #[tool(
         description = "Ask a platform what its models cost and append what changed to the price \
                         record (09 §Price record). Writes the record; nothing is bought or \
-                        released. `deepinfra` today."
+                        released. `deepinfra`, `together` today."
     )]
     async fn lm_price_sync(
         &self,
@@ -523,31 +556,160 @@ impl LmProvisionServer {
             .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
-    /// `lm_cost` (10 §Tool set: `provider`, `model`, `usage`,
-    /// `usage_format?`, `at?`, `prices?`; backing surface
-    /// `lm_provision_driver::cost::cost`).
+    /// `lm_cost` (10 §Tool set: `provider?`, `model?`, `endpoint?`,
+    /// `endpoints_file?`, `usage?`, `usage_format?`, `at?`, `period?`,
+    /// `prices?`; backing surfaces `lm_provision_driver::cost::cost`,
+    /// `::billed` and `::endpoint_named`).
     ///
     /// **A reading.** The price record is read, the arithmetic is done,
     /// and nothing is written — not the usage, not the answer. What
     /// comes back is an estimate from a published rate; the platform's
-    /// own bill is the authority and this is not it.
+    /// own bill is the authority and this is not it, which is what
+    /// `period` asks the platform for instead.
     #[tool(
         description = "Price a run: the usage object (in the platform's own shape, \
                         `usage_format`) at what the price record says a token costs on \
                         (`provider`, `model`), at `at` or now. Read-only; an estimate from the \
-                        published rate."
+                        published rate — or, with `period` (`YYYY.MM`), the platform's own bill \
+                        for that month (`cost.source: platform`; deepinfra today). `endpoint` \
+                        names an inventory row instead of `provider` + `model`."
     )]
     async fn lm_cost(
         &self,
         Parameters(CostParams {
             provider,
             model,
+            endpoint,
+            endpoints_file,
+            acquisitions,
+            forwards,
             usage,
+            period,
             usage_format,
             at,
             prices,
         }): Parameters<CostParams>,
     ) -> Result<String, McpError> {
+        // Which question this is, decided before anything is read: a
+        // usage priced from the record, or the month the platform
+        // itself billed. They are different answers with different
+        // authorities behind them, so one is asked for and not both.
+        match (&usage, &period) {
+            (Some(_), Some(_)) => {
+                return Err(precondition_error(
+                    "one of usage or period: usage is priced from the record, \
+                     period is the platform's own bill",
+                ))
+            }
+            (None, None) => {
+                return Err(precondition_error(
+                    "one of usage or period is required: a usage to price, or a \
+                     period to read the bill for",
+                ))
+            }
+            _ => {}
+        }
+        if endpoint.is_some() && (provider.is_some() || model.is_some()) {
+            return Err(precondition_error(
+                "endpoint names the provider and the model; provider / model are \
+                 not given with it",
+            ));
+        }
+        if period.is_some() {
+            if at.is_some() || usage_format.is_some() {
+                return Err(precondition_error(
+                    "at / usage_format price a usage, not a bill",
+                ));
+            }
+            if endpoint.is_none() && provider.is_none() {
+                return Err(precondition_error(
+                    "period needs provider or endpoint: whose bill to read",
+                ));
+            }
+        } else if endpoint.is_none() && (provider.is_none() || model.is_none()) {
+            return Err(precondition_error(
+                "provider and model are required without endpoint",
+            ));
+        }
+
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let under_home = |rel: &str, fallback: &str| -> PathBuf {
+            home.as_ref()
+                .map(|it| it.join(rel))
+                .unwrap_or_else(|| PathBuf::from(fallback))
+        };
+        let prices = prices.map(PathBuf::from).unwrap_or_else(|| {
+            under_home(".lm-provision/prices.jsonl", "lm-provision-prices.jsonl")
+        });
+
+        // The row's own words, when a row was named: the same reading
+        // `lm_endpoint_list` does, so an endpoint is priced by the name
+        // it was reached under rather than by repeating where it ran.
+        let named = match endpoint {
+            Some(name) => {
+                let acquisitions = acquisitions.map(PathBuf::from).unwrap_or_else(|| {
+                    under_home(
+                        ".lm-provision/acquisitions.jsonl",
+                        "lm-provision-acquisitions.jsonl",
+                    )
+                });
+                let forwards = forwards.map(PathBuf::from).unwrap_or_else(|| {
+                    under_home(
+                        ".lm-provision/forwards.jsonl",
+                        "lm-provision-forwards.jsonl",
+                    )
+                });
+                let statics = match endpoints_file {
+                    Some(path) => Some(PathBuf::from(path)),
+                    None => Some(under_home(
+                        ".config/lm-provision/endpoints.json",
+                        "lm-provision-endpoints.json",
+                    ))
+                    .filter(|it| it.exists()),
+                };
+                let record = prices.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        lm_provision_driver::cost::endpoint_named(
+                            &lm_provision_driver::inventory::EndpointSources {
+                                acquisitions: &acquisitions,
+                                forwards: &forwards,
+                                statics: statics.as_deref(),
+                                prices: &record,
+                            },
+                            &name,
+                        )
+                    })
+                    .await
+                    .map_err(join_error)?
+                    .map_err(precondition_error)?,
+                )
+            }
+            None => None,
+        };
+        let (provider, endpoint_model) = match named {
+            Some((provider, model)) => (provider, Some(model)),
+            None => (
+                provider.ok_or_else(|| precondition_error("provider is required"))?,
+                None,
+            ),
+        };
+
+        // The platform's own bill: the record is not read at all, and
+        // the model — the endpoint's, or the one asked for — only
+        // narrows the lines to those of one model.
+        if let Some(period) = period {
+            let model = endpoint_model.or(model);
+            let bill = tokio::task::spawn_blocking(move || {
+                lm_provision_driver::cost::billed(&provider, &period, model.as_deref())
+            })
+            .await
+            .map_err(join_error)?
+            .map_err(precondition_error)?;
+            return serde_json::to_string(&bill)
+                .map_err(|err| McpError::internal_error(err.to_string(), None));
+        }
+
         let format = match usage_format.as_deref().unwrap_or("plain") {
             "plain" => lm_provision_driver::cost::UsageFormat::Plain,
             "openai" => lm_provision_driver::cost::UsageFormat::Openai,
@@ -559,17 +721,16 @@ impl LmProvisionServer {
                 )))
             }
         };
+        let model = match endpoint_model {
+            Some(model) => model,
+            None => model.ok_or_else(|| precondition_error("model is required"))?,
+        };
+        let usage = usage.ok_or_else(|| precondition_error("usage is required"))?;
         // Before anything is read: a usage this reader cannot translate
         // is refused here rather than priced as whatever survived the
         // translation.
         let usage =
             lm_provision_driver::cost::usage_from(format, &usage).map_err(precondition_error)?;
-        let prices = prices
-            .map(PathBuf::from)
-            .unwrap_or_else(|| match std::env::var_os("HOME") {
-                Some(home) => PathBuf::from(home).join(".lm-provision/prices.jsonl"),
-                None => PathBuf::from("lm-provision-prices.jsonl"),
-            });
         let costed = tokio::task::spawn_blocking(move || {
             lm_provision_driver::cost::cost(&prices, &provider, &model, at.as_deref(), &usage)
         })

@@ -453,7 +453,14 @@ model, as of when":
   `as_of` on a row is when the amounts were first seen, not the last
   time anybody looked. What the platform states in a shape this tool
   does not read (a model priced per second, an amount that is not a
-  number) is reported in the artifact's `skipped`, by name.
+  number) is reported in the artifact's `skipped`, by name. DeepInfra's
+  `discount` is a fraction off its list price and what it bills is
+  list × (1 − discount) [measured 2026-09-23 against OpenRouter's
+  DeepInfra row and the page's "List price" label]; the record holds the
+  billed amount, and when a discount ends the next sync appends the
+  list-price row. Together's `/v1/models` is read the same way (USD per
+  million tokens, `cached_input` as `cache_read`); a model it prices by
+  the hour is skipped by name.
 - **The join is (`provider`, `model`)**, by the same words the endpoint
   row carries (§Endpoint inventory). Nothing translates between the
   two: the record names a model exactly as the platform that bills for
@@ -584,6 +591,18 @@ What a run used is stated in five buckets:
 - **`--at <instant>` re-prices at the rate in force then** — the newest
   row at or before it (§Price record), so a run from last month costs
   what it cost rather than what it would cost today.
+- **`--period <YYYY.MM>` reads the platform's own bill instead of
+  pricing a usage.** What the platform lists for the month — one line
+  per (model, bucket) in its own words (`input_tokens` /
+  `output_tokens` / `cached_tokens` / `uptime`), units, rate and
+  amount, summed — with `cost.source: platform`: the authority the
+  estimate is not. DeepInfra today (its `payment/usage`, cents
+  converted to USD); a platform with no such surface is refused by
+  name.
+- **`--endpoint <name>` prices by the provider and model of that
+  inventory row** (§Endpoint inventory), so a run that reached an
+  endpoint by the name the profile or the operator gave it is priced
+  without re-typing where it ran.
 
 The answer:
 
@@ -593,8 +612,16 @@ The answer:
 ```
 
 `amount` is USD as decimal text, `currency` is `USD`, and `cost.source`
-is always `estimate`: this is computed from a published rate, and the
+is `estimate`: this is computed from a published rate, and the
 platform's bill is the authority — this is not it.
+
+The billed answer's shape:
+
+```
+{ provider, period, items = [{ model, bucket, units,
+                              rate_per_million_units, amount }],
+  cost = { amount, currency, source = "platform" }, source }
+```
 
 ## Error surface
 

@@ -155,9 +155,19 @@ pub fn runpod_balance(document: &serde_json::Value, now: &str) -> Result<Balance
 /// `credit` → `amount`.
 ///
 /// **Not `balance`.** The document carries both, and `credit` is the
-/// prepaid amount the platform's own CLI prints as money [documented:
-/// `vast-cli` `user_fields`: `("credit","Credit","{:0.2f}")`]. A
-/// document without a numeric `credit` is refused by name.
+/// prepaid amount: the platform's own Claude plugin reads
+/// `vastai show user --raw` and says to report "`credit` (current
+/// balance)" [documented: github.com/vast-ai/vast-claude-plugin,
+/// `commands/cost.md`, read 2026-09-23], and its CLI prints only
+/// `credit` as money [documented: `vast-cli` `vast.py` `user_fields`:
+/// `("credit","Credit","{:0.2f}")`]. `balance` has one sentence in the
+/// platform's OpenAPI ("The current balance of the user") and `credit`
+/// is not in that schema at all, so the two are not the same number
+/// and the documented one is not the money [read 2026-09-23:
+/// `credit` 9.98 beside `balance` 0 on a signup-credit account].
+/// `balance_threshold` is the auto-billing trigger the operator set,
+/// not a balance. A document without a numeric `credit` is refused by
+/// name.
 pub fn vast_balance(document: &serde_json::Value, now: &str) -> Result<Balance, String> {
     let Some(amount) = document
         .get("credit")
@@ -246,19 +256,20 @@ fn usd_text(amount: f64) -> Option<String> {
 /// The key reaches curl **by name only** ([`crate::infra::curl_bearer`]
 /// imports the variable inside curl), `-m 20` bounds the wait, and a
 /// body — which carries no key — makes it a `POST` with a JSON content
-/// type. JSON on stdout goes to `document_says`.
+/// type. JSON on stdout is the answer.
 ///
 /// Anything else is an `Err` built from curl's status and **its stderr
 /// only**: the body of a refusal is never relayed, because on one of
 /// these platforms the document the key opens carries the account's
 /// billing address and card digits.
-fn asked(
+///
+/// [`crate::cost`] asks the same platform its billing question through
+/// this, so one key travels one way.
+pub(crate) fn fetch_json(
     key_var: &str,
     url: &str,
     body: Option<&str>,
-    document_says: fn(&serde_json::Value, &str) -> Result<Balance, String>,
-    now: &str,
-) -> Result<Balance, String> {
+) -> Result<serde_json::Value, String> {
     let mut argv = crate::infra::curl_bearer(key_var, url);
     for argument in ["-m", TIMEOUT_SEC] {
         argv.push(argument.to_string());
@@ -289,9 +300,19 @@ fn asked(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("{url} did not answer with JSON: {err}"))?;
-    document_says(&document, now)
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("{url} did not answer with JSON: {err}"))
+}
+
+/// One question, and what one of the readers above makes of the answer.
+fn asked(
+    key_var: &str,
+    url: &str,
+    body: Option<&str>,
+    document_says: fn(&serde_json::Value, &str) -> Result<Balance, String>,
+    now: &str,
+) -> Result<Balance, String> {
+    document_says(&fetch_json(key_var, url, body)?, now)
 }
 
 #[cfg(test)]
