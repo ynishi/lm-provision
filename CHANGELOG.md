@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A shared vocabulary for the targets that run the model:
+  `provider."deploy.min_replicas"` / `"deploy.max_replicas"`**, read by
+  both `deepinfra-deploy` (into `settings.min_instances` /
+  `max_instances`) and `together` (into `--min-replicas` /
+  `--max-replicas`), a target's own key winning over the shared one.
+  The words are the ones five managed platforms and SkyPilot's service
+  spec already agree on; a pod target shares no vocabulary and reports
+  the shared key as unexamined.
+- **`acquire` relays the platform's own reason when a machine will not
+  come up** and the platform states one — DeepInfra's `fail_reason`
+  (instances and deployments), a Together deployment's
+  `status.message` — on the `projects no address` line and the
+  `never came up` / `still materializing` errors. Presence alone had
+  told an operator nothing about a deployment the platform could not
+  schedule [measured: 2026-09-22, `no-gpu-available`; 2026-09-23,
+  `negative balance limit exceeded`].
 - **`lm-provision machine endpoints [--format json|env|litellm]` and
   the MCP tool `lm_endpoint_list`** — the inventory of what the fleet
   *serves*, where `machine list` is what it *runs*. Three sources read

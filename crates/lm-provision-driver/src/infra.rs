@@ -200,6 +200,56 @@ pub trait Infra {
     /// [`Infra::read_state`]: a machine still booting answers with an
     /// empty projection, not a guess.
     fn connection(&self, inspected: &serde_json::Value) -> Connection;
+
+    /// The provider-slot namespaces this target reads **besides its
+    /// own** — the vocabulary shared between targets of one kind, so a
+    /// profile can say a thing once for all of them. Today that is
+    /// [`DEPLOY_NS`] (`deploy.min_replicas` / `deploy.max_replicas`),
+    /// read by every target that runs the model itself; a target's own
+    /// key for the same setting wins over the shared one, the profile
+    /// getting the last word in its most specific voice. Empty for a
+    /// target that shares no vocabulary, which is what [`unexamined`]
+    /// reports a shared key as on such a target.
+    fn shared_namespaces(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The platform's own statement of why this machine will not come
+    /// up, when its description carries one and the machine is in a
+    /// state that warrants it (`failed`, stopped by the platform) —
+    /// the one value out of a description this crate does relay,
+    /// because it is the platform's enum-shaped text about the
+    /// machine and not anything that identifies or authenticates it.
+    /// `None` when the platform makes no such statement, or the
+    /// machine is not in such a state.
+    ///
+    /// Read by `acquire` for the line it prints when a machine
+    /// projects no address: `fail_reason: present` told an operator
+    /// nothing about a deployment the platform could not schedule
+    /// [measured: 2026-09-22, `no-gpu-available` reported as presence
+    /// only; 2026-09-23, `negative balance limit exceeded` likewise].
+    fn failure(&self, _inspected: &serde_json::Value) -> Option<String> {
+        None
+    }
+}
+
+/// The provider-slot namespace shared by every target that runs the
+/// model itself: `deploy.min_replicas` and `deploy.max_replicas`, the
+/// replica range in the words five managed platforms and SkyPilot's
+/// service spec already agree on [documented: workspace/drafts/
+/// endpoint-inventory-bp.md §A-2 and managed-deployment-backend-bp.md
+/// §含意 2]. Each target renders them into its own field
+/// (`settings.min_instances`, `--min-replicas`); a target-specific key
+/// for the same setting wins.
+pub const DEPLOY_NS: &str = "deploy";
+
+/// The shared replica range a profile declared, `(min, max)` as the
+/// strings it wrote — `None` for each it did not.
+fn deploy_replicas(provider: &BTreeMap<String, String>) -> (Option<&String>, Option<&String>) {
+    (
+        provider.get("deploy.min_replicas"),
+        provider.get("deploy.max_replicas"),
+    )
 }
 
 /// How to reach a machine, as the platform reports it — the created
@@ -2147,6 +2197,18 @@ impl Infra for DeepInfraAdapter {
         )
     }
 
+    /// `fail_reason`, once the service calls the container `failed`.
+    fn failure(&self, inspected: &serde_json::Value) -> Option<String> {
+        if inspected.get("state").and_then(|it| it.as_str()) != Some("failed") {
+            return None;
+        }
+        inspected
+            .get("fail_reason")
+            .and_then(|it| it.as_str())
+            .filter(|it| !it.is_empty())
+            .map(str::to_string)
+    }
+
     /// The description names the configuration (`gpu_config`, in the
     /// `{count}x{model}` form the create took) and nothing about disk
     /// or ports. The count is read off it; the memory is looked up in
@@ -2634,6 +2696,24 @@ impl Infra for DeepInfraDeployAdapter {
         Some("deepinfra-deploy.container_image")
     }
 
+    fn shared_namespaces(&self) -> &'static [&'static str] {
+        &[DEPLOY_NS]
+    }
+
+    /// `fail_reason`, once the service calls the deployment `failed`
+    /// [measured: 2026-09-22, `no-gpu-available: failed to allocate
+    /// GPUs, try again later`].
+    fn failure(&self, inspected: &serde_json::Value) -> Option<String> {
+        if inspected.get("status").and_then(|it| it.as_str()) != Some("failed") {
+            return None;
+        }
+        inspected
+            .get("fail_reason")
+            .and_then(|it| it.as_str())
+            .filter(|it| !it.is_empty())
+            .map(str::to_string)
+    }
+
     /// `initializing`, `downloading`, `deploying`: the service's own
     /// words for a deployment on its way up [documented: deploy-list
     /// reference, `status`]. `updating` is a running deployment being
@@ -2840,6 +2920,34 @@ impl Infra for TogetherAdapter {
 
     fn image_key(&self) -> Option<&'static str> {
         None
+    }
+
+    fn shared_namespaces(&self) -> &'static [&'static str] {
+        &[DEPLOY_NS]
+    }
+
+    /// The deployment's `status.message`, when the document carries a
+    /// `status` (the create response does; a read-back's deployment
+    /// summary carries `state` alone) and the state is one the
+    /// platform ended (`STOPPED`, `FAILED`, `DEGRADED`) [measured:
+    /// 2026-09-23, `negative balance limit exceeded` under
+    /// `DEPLOYMENT_STATE_STOPPED`].
+    fn failure(&self, inspected: &serde_json::Value) -> Option<String> {
+        let (_, state, _) = together_view(inspected);
+        if !matches!(
+            state,
+            Some("DEPLOYMENT_STATE_STOPPED")
+                | Some("DEPLOYMENT_STATE_FAILED")
+                | Some("DEPLOYMENT_STATE_DEGRADED")
+        ) {
+            return None;
+        }
+        together_deployment(inspected)
+            .and_then(|d| d.get("status"))
+            .and_then(|s| s.get("message"))
+            .and_then(|it| it.as_str())
+            .filter(|it| !it.is_empty())
+            .map(str::to_string)
     }
 
     /// `PROVISIONING` and `SCALING` are the service's words for a
@@ -3053,10 +3161,12 @@ fn together_create(
     let config = provider.get("together.config");
     let min_replicas = provider
         .get("together.min_replicas")
+        .or(deploy_replicas(provider).0)
         .map(|v| v.as_str())
         .unwrap_or("1");
     let max_replicas = provider
         .get("together.max_replicas")
+        .or(deploy_replicas(provider).1)
         .map(|v| v.as_str())
         .unwrap_or("1");
     let inactive_timeout = provider.get("together.inactive_timeout");
@@ -3240,6 +3350,16 @@ fn deepinfra_deploy_body(
     let mut hf = serde_json::Map::new();
     let mut settings = serde_json::Map::new();
     hf.insert("repo".into(), serde_json::json!(model));
+
+    // The shared replica range first, so this target's own
+    // `settings.*` keys below can override it.
+    let (min_replicas, max_replicas) = deploy_replicas(provider);
+    if let Some(min) = min_replicas {
+        settings.insert("min_instances".into(), deepinfra_scalar(min));
+    }
+    if let Some(max) = max_replicas {
+        settings.insert("max_instances".into(), deepinfra_scalar(max));
+    }
 
     if let Some(answer) = gpu_answer {
         if let Some(config) = admitted(DEEPINFRA_DEPLOY_NS, answer)?.into_iter().next() {
@@ -3705,9 +3825,13 @@ pub fn unexamined<'a>(
     provider: &'a BTreeMap<String, String>,
 ) -> Vec<&'a String> {
     let mine = adapter.provider_namespace();
+    let shared = adapter.shared_namespaces();
     provider
         .keys()
-        .filter(|key| key.split('.').next() != Some(mine))
+        .filter(|key| {
+            let namespace = key.split('.').next();
+            namespace != Some(mine) && !shared.iter().any(|it| namespace == Some(it))
+        })
         .collect()
 }
 
@@ -6488,6 +6612,157 @@ mod tests {
         assert_eq!(
             TogetherAdapter.connection(&serving).endpoint.unwrap().model,
             "ytknishimura-b6db/lmp-exp-20260902T063000Z"
+        );
+    }
+
+    /// **The shared replica range reaches both managed targets, and
+    /// each target's own key wins over it.** A pod target shares no
+    /// vocabulary, so the shared key is reported as unexamined there —
+    /// a key nobody read is not a key silently honoured.
+    #[test]
+    fn the_shared_replica_keys_reach_both_managed_targets() {
+        let mut provider = deployment_provider();
+        provider.remove("deepinfra-deploy.settings.min_instances");
+        provider.remove("deepinfra-deploy.settings.max_instances");
+        provider.insert("deploy.min_replicas".to_string(), "0".to_string());
+        provider.insert("deploy.max_replicas".to_string(), "2".to_string());
+        let body: serde_json::Value = serde_json::from_str(
+            DeepInfraDeployAdapter
+                .acquisition(&deployment_requirements(), &provider, None)
+                .unwrap()
+                .body
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["settings"],
+            serde_json::json!({ "min_instances": 0, "max_instances": 2 })
+        );
+
+        provider.insert(
+            "deepinfra-deploy.settings.max_instances".to_string(),
+            "3".to_string(),
+        );
+        let body: serde_json::Value = serde_json::from_str(
+            DeepInfraDeployAdapter
+                .acquisition(&deployment_requirements(), &provider, None)
+                .unwrap()
+                .body
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["settings"]["max_instances"], 3,
+            "the target's own key wins"
+        );
+
+        let mut together = together_provider();
+        together.insert("deploy.min_replicas".to_string(), "0".to_string());
+        together.insert("deploy.max_replicas".to_string(), "2".to_string());
+        let argv = TogetherAdapter
+            .acquisition(
+                &together_requirements(),
+                &together,
+                Some(at("2026-09-02T06:30:00Z")),
+            )
+            .unwrap()
+            .create;
+        assert!(
+            argv.windows(2)
+                .any(|it| it == ["--min-replicas", "0"].map(String::from)),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|it| it == ["--max-replicas", "2"].map(String::from)),
+            "{argv:?}"
+        );
+        together.insert("together.max_replicas".to_string(), "4".to_string());
+        let argv = TogetherAdapter
+            .acquisition(
+                &together_requirements(),
+                &together,
+                Some(at("2026-09-02T06:30:00Z")),
+            )
+            .unwrap()
+            .create;
+        assert!(
+            argv.windows(2)
+                .any(|it| it == ["--max-replicas", "4"].map(String::from)),
+            "{argv:?}"
+        );
+
+        let mixed: BTreeMap<String, String> =
+            [("deploy.min_replicas", "1"), ("runpod.imageName", "x")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        assert_eq!(
+            unexamined(&DeepInfraDeployAdapter, &mixed),
+            vec![&"runpod.imageName".to_string()],
+            "the shared key is this target's to read; the pod key is not"
+        );
+        assert_eq!(
+            unexamined(&RunPodAdapter, &mixed),
+            vec![&"deploy.min_replicas".to_string()],
+            "a pod target shares no vocabulary, so the shared key is unexamined there"
+        );
+    }
+
+    /// **The platform's own reason is read when it gives one**, and
+    /// only in a state that warrants it — a running machine's stale
+    /// `fail_reason` is not a failure.
+    #[test]
+    fn the_platforms_own_failure_reason_is_read_when_it_gives_one() {
+        let failed = serde_json::json!({
+            "deploy_id": "d", "status": "failed",
+            "fail_reason": "no-gpu-available: failed to allocate GPUs, try again later"
+        });
+        assert_eq!(
+            DeepInfraDeployAdapter.failure(&failed).as_deref(),
+            Some("no-gpu-available: failed to allocate GPUs, try again later")
+        );
+        let running =
+            serde_json::json!({ "deploy_id": "d", "status": "running", "fail_reason": "old" });
+        assert_eq!(DeepInfraDeployAdapter.failure(&running), None);
+        assert_eq!(
+            DeepInfraDeployAdapter
+                .failure(&serde_json::json!({ "status": "failed", "fail_reason": "" })),
+            None
+        );
+
+        let container =
+            serde_json::json!({ "id": "c", "state": "failed", "fail_reason": "image pull failed" });
+        assert_eq!(
+            DeepInfraAdapter.failure(&container).as_deref(),
+            Some("image pull failed")
+        );
+        assert_eq!(
+            DeepInfraAdapter
+                .failure(&serde_json::json!({ "id": "c", "state": "running", "fail_reason": "x" })),
+            None
+        );
+
+        let mut stopped = together_created();
+        stopped["deployment"]["status"] = serde_json::json!({
+            "message": "negative balance limit exceeded", "state": "DEPLOYMENT_STATE_STOPPED"
+        });
+        assert_eq!(
+            TogetherAdapter.failure(&stopped).as_deref(),
+            Some("negative balance limit exceeded")
+        );
+        assert_eq!(
+            TogetherAdapter.failure(&together_created()),
+            None,
+            "provisioning is not a failure"
+        );
+        assert_eq!(TogetherAdapter.failure(&together_ready()), None);
+        assert_eq!(
+            RunPodAdapter.failure(&serde_json::json!({})),
+            None,
+            "the default says nothing"
         );
     }
 }
