@@ -208,6 +208,12 @@ pub struct Connection {
     /// machine exposes one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshEndpoint>,
+    /// The inference endpoint the machine answers at, when the machine
+    /// *is* a served model rather than a host — a managed deployment
+    /// projects this and no `ssh`. The row an endpoint inventory or a
+    /// router's configuration is generated from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<InferenceEndpoint>,
     /// Every declared port's public address, as `machine port →
     /// "host:port"` — what a caller polls a health check against
     /// without asking the service where things landed.
@@ -253,6 +259,24 @@ fn read_keys(inspected: &serde_json::Value, key: &str) -> String {
         Some(_) => format!("{key}: not an object"),
         None => format!("{key}: absent"),
     }
+}
+
+/// One OpenAI-compatible inference endpoint, in the fields a consumer
+/// needs to send a request: where, which model, and which variable
+/// holds the key. The key's **name**, never its value — the same rule
+/// as everywhere else this crate handles a credential.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InferenceEndpoint {
+    /// The base URL an OpenAI client is pointed at (`…/v1` or the
+    /// platform's equivalent), without a path beyond it.
+    pub base_url: String,
+    /// What to send as `model` — the platform's own reference to this
+    /// deployment, which on a platform whose model name carries the
+    /// lease is the deployment's id rather than that name.
+    pub model: String,
+    /// The environment variable the platform's key is read from, by
+    /// the platform's own name for it.
+    pub api_key_env: String,
 }
 
 /// One SSH endpoint, in the fields spec 08's `ConnectionSpec` takes.
@@ -324,6 +348,23 @@ pub struct Fleet {
     /// The key each row carries its operator-set text under — `name` on
     /// one platform, `label` on another. Where [`expiry_stamp`] rides.
     pub stamp: &'static str,
+    /// Whether the platform returns that field under its own namespace
+    /// — `<account>/<what the operator wrote>` — so that the operator's
+    /// text is what follows the last slash. `false` on a platform that
+    /// returns the field as written: a slash in one of those names is
+    /// the operator's own, and reading past it would misread a name.
+    pub stamp_namespaced: bool,
+    /// Rows the platform still lists but has already ended — a field
+    /// name and the values of it that mean "this is over" — which the
+    /// reader leaves out. `None` on a platform whose list is its live
+    /// machines. A managed deployment service keeps `failed` and
+    /// `deleted` deployments in its default listing and answers 200 to
+    /// deleting them again [measured: 2026-09-22, two deployments the
+    /// service failed for want of a GPU and one it had deleted, all
+    /// listed afterwards], so without this a sweep would release each
+    /// of them on every tick, once their lease was reached, and write a
+    /// correction row every time.
+    pub ended: Option<(&'static str, &'static [&'static str])>,
     /// How to destroy one, `{id}` unsubstituted — the same template
     /// [`Acquisition::release`] carries, from the same source, so a
     /// machine released off the record and one released off the list
@@ -356,7 +397,7 @@ pub struct Machine {
 /// The adapter sold under `name`, or which names would have worked.
 ///
 /// A static reference rather than a box because the adapters are unit
-/// structs: there is nothing to construct, only one of three
+/// structs: there is nothing to construct, only one of four
 /// vocabularies to speak.
 ///
 /// Here rather than beside the caller because there are now three
@@ -368,8 +409,9 @@ pub fn adapter_named(name: &str) -> Result<&'static dyn Infra, String> {
         "runpod" => Ok(&RunPodAdapter),
         "vast" => Ok(&VastAdapter),
         "deepinfra" => Ok(&DeepInfraAdapter),
+        "deepinfra-deploy" => Ok(&DeepInfraDeployAdapter),
         other => Err(format!(
-            "unknown provider `{other}` (runpod, vast, deepinfra)"
+            "unknown provider `{other}` (runpod, vast, deepinfra, deepinfra-deploy)"
         )),
     }
 }
@@ -485,7 +527,15 @@ pub fn machines(listed: &serde_json::Value, fleet: &Fleet) -> Result<Vec<Machine
         }
         _ => return Err("the listing is neither an array nor an object".to_string()),
     };
-    let read: Vec<Machine> = rows
+    let ended = |row: &serde_json::Value| {
+        fleet.ended.is_some_and(|(key, values)| {
+            row.get(key)
+                .and_then(|it| it.as_str())
+                .is_some_and(|it| values.contains(&it))
+        })
+    };
+    let live: Vec<&serde_json::Value> = rows.iter().filter(|row| !ended(row)).collect();
+    let read: Vec<Machine> = live
         .iter()
         .filter_map(|row| {
             Some(Machine {
@@ -493,15 +543,22 @@ pub fn machines(listed: &serde_json::Value, fleet: &Fleet) -> Result<Vec<Machine
                 name: row
                     .get(fleet.stamp)
                     .and_then(|it| it.as_str())
+                    .map(|it| {
+                        if fleet.stamp_namespaced {
+                            it.rsplit('/').next().unwrap_or(it)
+                        } else {
+                            it
+                        }
+                    })
                     .filter(|it| !it.is_empty())
                     .map(str::to_string),
             })
         })
         .collect();
-    if read.is_empty() && !rows.is_empty() {
+    if read.is_empty() && !live.is_empty() {
         return Err(format!(
             "none of the {} listed rows carries a readable {:?}",
-            rows.len(),
+            live.len(),
             fleet.id
         ));
     }
@@ -884,6 +941,8 @@ impl Infra for RunPodAdapter {
             ],
             id: "id",
             stamp: "name",
+            stamp_namespaced: false,
+            ended: None,
             release: runpod_release(),
             inspect: runpod_inspect(),
         })
@@ -1024,6 +1083,7 @@ impl Infra for RunPodAdapter {
         });
         Connection {
             ssh,
+            endpoint: None,
             endpoints,
             read: vec![
                 read_text(inspected, "publicIp"),
@@ -1470,6 +1530,8 @@ impl Infra for VastAdapter {
             ],
             id: "id",
             stamp: "label",
+            stamp_namespaced: false,
+            ended: None,
             release: vast_release(),
             inspect: vast_inspect(),
         })
@@ -1598,6 +1660,7 @@ impl Infra for VastAdapter {
         }
         Connection {
             ssh,
+            endpoint: None,
             endpoints,
             read: vec![
                 read_text(inspected, "ssh_host"),
@@ -1740,8 +1803,16 @@ fn vast_release() -> Vec<String> {
 /// read 2026-09-21].
 const DEEPINFRA_CONTAINERS: &str = "https://api.deepinfra.com/v1/containers";
 
-/// The variable the service's own examples read the bearer token from.
-const DEEPINFRA_TOKEN: &str = "DEEPINFRA_TOKEN";
+/// The variable the service's key is read from.
+///
+/// `_API_KEY`, as every other platform's is here (`RUNPOD_API_KEY`) and
+/// as the service's own dashboard names the thing ("API Keys"), rather
+/// than the `DEEPINFRA_API_KEY` its curl examples happen to spell — one
+/// shape for the operator's credential file, and the name the routers
+/// that consume the resulting endpoint already read (LiteLLM's
+/// `deepinfra/` provider takes `DEEPINFRA_API_KEY`) [documented:
+/// docs.litellm.ai/docs/providers/deepinfra, read 2026-09-22].
+const DEEPINFRA_API_KEY: &str = "DEEPINFRA_API_KEY";
 
 /// The user the service's image creates and its documentation connects
 /// as (`ssh ubuntu@<container-ip>`) — not root, which is why the
@@ -1786,7 +1857,7 @@ const DEEPINFRA_CATALOGUE: &[Gpu] = &[Gpu {
 /// the REST surface through `curl`: the same judgment [`crate::image`]
 /// makes, for the same reason — a program already on the host over a
 /// second HTTP client tracking somebody else's schema. The credential
-/// travels **by name**: `--variable %DEEPINFRA_TOKEN` imports the
+/// travels **by name**: `--variable %DEEPINFRA_API_KEY` imports the
 /// variable inside curl and `--expand-header` writes it into the header
 /// there, so the value is in no argv, no dry-run artifact, and no
 /// process listing [measured: 2026-09-21, a local listener saw
@@ -1834,13 +1905,13 @@ impl Infra for DeepInfraAdapter {
         "deepinfra"
     }
 
-    /// The token, by the name the service's own examples use. Required
+    /// The key, by name. Required
     /// out here because there is no CLI holding its own key: `curl`
     /// reads it from the environment at the adapter's instruction, and
     /// a missing one is found before anything is spent rather than as
     /// a 401 in the middle of a create.
     fn credentials(&self) -> &'static [&'static str] {
-        &[DEEPINFRA_TOKEN]
+        &[DEEPINFRA_API_KEY]
     }
 
     /// The cheapest catalogued model that clears the floor, in the
@@ -1947,6 +2018,8 @@ impl Infra for DeepInfraAdapter {
             list: deepinfra_curl(DEEPINFRA_CONTAINERS),
             id: "id",
             stamp: "name",
+            stamp_namespaced: false,
+            ended: None,
             release: deepinfra_release(),
             inspect: deepinfra_inspect(),
         })
@@ -2036,6 +2109,7 @@ impl Infra for DeepInfraAdapter {
         };
         Connection {
             ssh,
+            endpoint: None,
             endpoints: BTreeMap::new(),
             read: vec![
                 read_text(inspected, "ip"),
@@ -2059,11 +2133,16 @@ fn deepinfra_curl(url: &str) -> Vec<String> {
     vec![
         "curl".to_string(),
         "-sS".to_string(),
-        "-f".to_string(),
+        // Fail on an HTTP error, keeping the body: the service says
+        // *why* in the body (`{"detail":{"error":"missing display
+        // name"}}` on a 409), and `-f` threw that away, leaving the
+        // operator a status code [measured: 2026-09-22, a create
+        // refused for an account setting, reported as "error: 409"].
+        "--fail-with-body".to_string(),
         "--variable".to_string(),
-        format!("%{DEEPINFRA_TOKEN}"),
+        format!("%{DEEPINFRA_API_KEY}"),
         "--expand-header".to_string(),
-        format!("Authorization: Bearer {{{{{DEEPINFRA_TOKEN}}}}}"),
+        format!("Authorization: Bearer {{{{{DEEPINFRA_API_KEY}}}}}"),
         url.to_string(),
     ]
 }
@@ -2195,6 +2274,505 @@ fn deepinfra_body(
     }
 
     Ok(serde_json::Value::Object(body).to_string())
+}
+
+/// The deployments collection on the managed-inference side of the
+/// same service [documented: docs.deepinfra.com/api-reference/
+/// dedicated-models, read 2026-09-22].
+const DEEPINFRA_DEPLOY: &str = "https://api.deepinfra.com/deploy";
+
+/// Where a deployment answers OpenAI-compatible requests [documented:
+/// docs.deepinfra.com/private-models/custom-llms, read 2026-09-22].
+const DEEPINFRA_OPENAI: &str = "https://api.deepinfra.com/v1/openai";
+
+/// The provider-slot namespace of [`DeepInfraDeployAdapter`], and the
+/// key the cloud-init-free half of this service is addressed by.
+const DEEPINFRA_DEPLOY_NS: &str = "deepinfra-deploy";
+
+/// The deploy API's `gpu` enum, in its own spelling, with the
+/// published custom-LLM hourly rate as the ordering key.
+///
+/// Partial as the pod service's catalogue is, and for the same reason;
+/// the enum also lists `L4-24GB` / `L40S-48GB` / `RTXPRO6000-96GB`,
+/// whose rates were not published where the others were [read
+/// 2026-09-21 from deepinfra.com/pricing via the provider survey;
+/// enum spelling from the deploy-create-llm reference]. A configuration
+/// outside this table is named directly with
+/// `provider."deepinfra-deploy.gpu"`. The memory a device carries is
+/// read off the enum value itself (`-80GB`) rather than from here, so
+/// a read-back of an uncatalogued device still observes its memory.
+const DEEPINFRA_DEPLOY_CATALOGUE: &[Gpu] = &[
+    Gpu {
+        id: "A100-80GB",
+        vram_gb: 80,
+        usd_cents_hr: 89,
+    },
+    Gpu {
+        id: "H100-80GB",
+        vram_gb: 80,
+        usd_cents_hr: 220,
+    },
+    Gpu {
+        id: "H200-141GB",
+        vram_gb: 141,
+        usd_cents_hr: 269,
+    },
+    Gpu {
+        id: "B200-180GB",
+        vram_gb: 180,
+        usd_cents_hr: 369,
+    },
+    Gpu {
+        id: "B300-270GB",
+        vram_gb: 270,
+        usd_cents_hr: 489,
+    },
+];
+
+/// The deploy API's `num_gpus` ceiling [documented: deploy-create-llm
+/// reference, `num_gpus` 1..8].
+const DEEPINFRA_DEPLOY_MAX_GPUS: u32 = 8;
+
+/// A managed LLM deployment: the machine is a **served model**, not a
+/// host. The service takes the model's repository, a GPU
+/// configuration and a replica range, pulls the weights itself, and
+/// answers OpenAI-compatible requests at its own address — nothing of
+/// this tool's ever runs on it [documented: docs.deepinfra.com/
+/// private-models/custom-llms and api-reference/dedicated-models/*,
+/// read 2026-09-22; the API facts below are from that reading].
+///
+/// **The same verbs, because the same lease.** A deployment is bought
+/// with `machine acquire`, listed with `machine list`, given back with
+/// `machine release`, and reaped by `machine sweep` exactly as a pod is,
+/// because what those verbs manage — a billable thing with an expiry
+/// stamped on it, enumerated from the platform's own list — is the
+/// same thing here. What differs is what the acquisition *renders*
+/// (the profile's `service.start`, carried in [`Requirements::serving`],
+/// becomes the request body) and what the machine *projects* (an
+/// inference endpoint rather than an SSH endpoint). The pod verbs
+/// (`apply`, `logs`, `exec`, `cp`, `port-forward`) have no session to
+/// open here and refuse by name.
+///
+/// **One call from repository to deployment.** `hf.repo` in the create
+/// body is a Hugging Face id the service pulls itself; the survey's
+/// other candidates need a model import step first (Together) or an
+/// operator-side weights upload (Fireworks), which is why this one is
+/// the first managed adapter [documented: workspace/drafts/
+/// managed-deployment-backend-verify.md §Q1-Q3].
+///
+/// **The lease is in `model_name`, and the endpoint does not read it.**
+/// The service has no label or description field on a deployment;
+/// `model_name` is the one operator-written string, and it doubles as
+/// the inference model id (`<username>/<model_name>`). Stamping the
+/// lease there would put `lmp-exp-…` in every request a router sends —
+/// except that the service also accepts `deploy_id:<id>` as the model,
+/// "before the model is running" and, by the same reading, after
+/// [documented: custom-llms guide]. So the projection names the
+/// deployment by id and the stamp stays where the sweeper reads it.
+/// The listing returns `model_name` under the account's namespace,
+/// which [`Fleet::stamp_namespaced`] tells the reader to step over.
+///
+/// **Not root, not anything.** There is no user, no remote directory,
+/// no port to declare: the capability lists no exposure, so a
+/// `requires_ports` profile is refused at admission, and the request
+/// carries nothing about ports.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeepInfraDeployAdapter;
+
+impl Infra for DeepInfraDeployAdapter {
+    /// No exposure: the service answers at its own address and maps
+    /// nothing of the deployment's. A profile that declares a port is
+    /// asking for something this cannot hand over.
+    fn capability(&self) -> Capability {
+        Capability {
+            target: DEEPINFRA_DEPLOY_NS,
+            exposures: &[],
+        }
+    }
+
+    /// Nothing: no port list travels in the request.
+    fn render(&self, _required: &Requirements) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn provider_namespace(&self) -> &'static str {
+        DEEPINFRA_DEPLOY_NS
+    }
+
+    /// The same token as the container half of this service, read by
+    /// the same name — one credential file entry covers both.
+    fn credentials(&self) -> &'static [&'static str] {
+        &[DEEPINFRA_API_KEY]
+    }
+
+    /// The cheapest catalogued configuration that clears the floor, in
+    /// the deploy API's own spelling. One configuration: the request
+    /// takes a single `gpu`.
+    fn gpu_answer(&self, required: &GpuRequirement) -> Answer {
+        if required.count == 0 {
+            return Answer::unmet(
+                "this service deploys a model onto GPUs; a profile asking for none \
+                 has nothing to deploy onto",
+            );
+        }
+        if required.count > DEEPINFRA_DEPLOY_MAX_GPUS {
+            return Answer::unmet(format!(
+                "a deployment here takes at most {DEEPINFRA_DEPLOY_MAX_GPUS} GPUs per \
+                 instance; {} were asked for",
+                required.count
+            ));
+        }
+        let floor = required.min_vram_gb.unwrap_or(0);
+        let cheapest = DEEPINFRA_DEPLOY_CATALOGUE
+            .iter()
+            .filter(|it| it.vram_gb >= floor)
+            .min_by_key(|it| (it.usd_cents_hr, it.id));
+        match cheapest {
+            Some(gpu) => Answer::met_using([gpu.id.to_string()]),
+            None => Answer::unmet(format!(
+                "no catalogued GPU carries {floor} GB; the largest known here is {} GB \
+                 (name a configuration directly with provider.deepinfra-deploy.gpu if \
+                 the catalogue is behind)",
+                DEEPINFRA_DEPLOY_CATALOGUE
+                    .iter()
+                    .map(|it| it.vram_gb)
+                    .max()
+                    .unwrap_or(0),
+            )),
+        }
+    }
+
+    /// No disk at all: the service holds the weights and the
+    /// deployment has no filesystem the profile could size or mount.
+    /// Any disk declaration is a requirement this target cannot meet.
+    fn disk_answer(&self, _required: &DiskRequirement) -> Answer {
+        Answer::unmet(
+            "a deployment here has no disk the profile could size or mount; the \
+             service holds the weights",
+        )
+    }
+
+    /// One `POST` with the create body built from the profile's
+    /// service and the adapter's answers, through `curl`.
+    ///
+    /// When the profile names a variable for the repository token
+    /// (`provider."deepinfra-deploy.hf.token_env"`), the body carries
+    /// `{{NAME:json}}` and the argv imports the variable inside curl
+    /// (`--variable %NAME`, `--expand-json`): the value is in no argv,
+    /// no dry-run and no record, the same way the bearer token travels
+    /// [measured: 2026-09-21, a local listener received the expanded
+    /// value from an argv that named only the variable].
+    fn acquisition(
+        &self,
+        required: &Requirements,
+        provider: &BTreeMap<String, String>,
+        expires_at: Option<jiff::Timestamp>,
+    ) -> Result<Acquisition, AcquisitionError> {
+        let (body, token_env) = deepinfra_deploy_body(
+            required,
+            provider,
+            required.gpu.as_ref().map(|it| self.gpu_answer(it)),
+            required.disk.as_ref().map(|it| self.disk_answer(it)),
+            expires_at,
+        )?;
+        let mut create = deepinfra_curl(&format!("{DEEPINFRA_DEPLOY}/llm"));
+        match token_env {
+            Some(name) => {
+                create.push("--variable".to_string());
+                create.push(format!("%{name}"));
+                create.push("--expand-json".to_string());
+            }
+            None => create.push("--json".to_string()),
+        }
+        Ok(Acquisition {
+            discover: None,
+            create,
+            body: Some(body),
+            created_id_key: "deploy_id",
+            inspect: deepinfra_deploy_inspect(),
+            release: deepinfra_deploy_release(),
+        })
+    }
+
+    /// The service lists this account's deployments, each row carrying
+    /// `deploy_id` and the `model_name` the create call set — under the
+    /// account's namespace, which is why the stamp is read past the
+    /// slash.
+    fn fleet(&self) -> Option<Fleet> {
+        Some(Fleet {
+            list: deepinfra_curl(&format!("{DEEPINFRA_DEPLOY}/list/")),
+            id: "deploy_id",
+            stamp: "model_name",
+            stamp_namespaced: true,
+            ended: Some(("status", &["failed", "deleted"])),
+            release: deepinfra_deploy_release(),
+            inspect: deepinfra_deploy_inspect(),
+        })
+    }
+
+    /// The serving image, when the profile names one — a Docker Hub
+    /// reference (`vllm/vllm-openai:v0.8.4` in the service's own
+    /// example) the registry can be asked about. Absent, the service's
+    /// default is used and there is nothing to preflight.
+    fn image_key(&self) -> Option<&'static str> {
+        Some("deepinfra-deploy.container_image")
+    }
+
+    /// `initializing`, `downloading`, `deploying`: the service's own
+    /// words for a deployment on its way up [documented: deploy-list
+    /// reference, `status`]. `updating` is a running deployment being
+    /// changed, and everything else makes no claim.
+    fn still_materializing(&self, inspected: &serde_json::Value) -> bool {
+        matches!(
+            inspected.get("status").and_then(|it| it.as_str()),
+            Some("initializing") | Some("downloading") | Some("deploying")
+        )
+    }
+
+    /// `config.gpu` and `config.num_gpus`, as the description carries
+    /// them. The memory is read off the configuration's own spelling
+    /// (`H100-80GB` says 80) through [`gb_to_mib`], so an uncatalogued
+    /// device is still observed. Ports and disk are never observed:
+    /// the service has neither.
+    fn read_state(&self, inspected: &serde_json::Value) -> MachineState {
+        let config = inspected.get("config");
+        MachineState {
+            exposed: BTreeMap::new(),
+            ports_observed: false,
+            gpu_count: config
+                .and_then(|it| it.get("num_gpus"))
+                .and_then(|it| it.as_u64())
+                .map(|it| it as u32),
+            gpu_vram_mib: config
+                .and_then(|it| it.get("gpu"))
+                .and_then(|it| it.as_str())
+                .and_then(deepinfra_gpu_vram_gb)
+                .map(gb_to_mib),
+            ephemeral_gb: None,
+            persistent_gb: None,
+            persistent_at: None,
+        }
+    }
+
+    /// The inference endpoint, **once the service calls the deployment
+    /// up** (`running`, or the `deployed` the status reference's own
+    /// example shows): the OpenAI-compatible base, the deployment named
+    /// by id, and the token's name. No SSH: there is no host.
+    fn connection(&self, inspected: &serde_json::Value) -> Connection {
+        let status = inspected.get("status").and_then(|it| it.as_str());
+        let id = inspected
+            .get("deploy_id")
+            .and_then(|it| it.as_str())
+            .filter(|it| !it.is_empty());
+        let endpoint = match (status, id) {
+            (Some("running") | Some("deployed"), Some(id)) => Some(InferenceEndpoint {
+                base_url: DEEPINFRA_OPENAI.to_string(),
+                model: format!("deploy_id:{id}"),
+                api_key_env: DEEPINFRA_API_KEY.to_string(),
+            }),
+            _ => None,
+        };
+        Connection {
+            ssh: None,
+            endpoint,
+            endpoints: BTreeMap::new(),
+            read: vec![
+                read_text(inspected, "deploy_id"),
+                format!("status: {}", status.unwrap_or("absent")),
+                read_text(inspected, "fail_reason"),
+            ],
+        }
+    }
+}
+
+/// What reads one deployment back, `{id}` unsubstituted — one spelling
+/// for the record and for the listing.
+fn deepinfra_deploy_inspect() -> Vec<String> {
+    deepinfra_curl(&format!("{DEEPINFRA_DEPLOY}/{{id}}"))
+}
+
+/// What destroys one deployment, `{id}` unsubstituted — one spelling
+/// for the record and for the listing.
+fn deepinfra_deploy_release() -> Vec<String> {
+    let mut argv = deepinfra_curl(&format!("{DEEPINFRA_DEPLOY}/{{id}}"));
+    argv.push("-X".to_string());
+    argv.push("DELETE".to_string());
+    argv
+}
+
+/// The memory a deploy-API configuration name states (`H200-141GB` →
+/// 141), or `None` for a spelling that states none (`other`).
+fn deepinfra_gpu_vram_gb(config: &str) -> Option<u32> {
+    config.rsplit_once('-')?.1.strip_suffix("GB")?.parse().ok()
+}
+
+/// A provider-slot value as the JSON scalar it spells.
+///
+/// The deploy API is typed — `num_gpus` and `settings.min_instances`
+/// are integers — while the profile's provider slot is strings, so a
+/// passthrough here reads each value as the scalar it spells rather
+/// than quoting it: `"0"` becomes `0`, `"true"` becomes `true`, and
+/// anything else stays the string it is. Only for this target: the
+/// pod service's own API takes strings where the profile writes them.
+fn deepinfra_scalar(value: &str) -> serde_json::Value {
+    if let Ok(number) = value.parse::<i64>() {
+        return serde_json::json!(number);
+    }
+    match value {
+        "true" => serde_json::json!(true),
+        "false" => serde_json::json!(false),
+        other => serde_json::json!(other),
+    }
+}
+
+/// The request body for [`DeepInfraDeployAdapter::acquisition`], and
+/// the name of the repository-token variable when the profile named
+/// one — built from the profile's service *and the adapter's answers*,
+/// the same gate `runpod_body` stands behind.
+///
+/// What the profile wrote becomes the service's own fields: the
+/// service's `model` is `hf.repo`, its `dtype` and `extra_args` are the
+/// engine's arguments, `requires_gpu` is `gpu` (selected) and
+/// `num_gpus`, and the lease is `model_name`. Everything addressed to
+/// this target in the provider slot lands after those, verbatim under
+/// the field it names — `settings.min_instances` into `settings`,
+/// `hf.revision` into `hf`, anything else at the top level — so the
+/// profile gets the last word on every field but the lease.
+///
+/// **Refused by name, not dropped:** a service on another engine, a
+/// phase besides the service, a tensor-parallel size that disagrees
+/// with the GPU count, a disk. Each is something the profile said and
+/// this target cannot do, and a request sent without it would deploy
+/// something the profile did not declare.
+fn deepinfra_deploy_body(
+    required: &Requirements,
+    provider: &BTreeMap<String, String>,
+    gpu_answer: Option<Answer>,
+    disk_answer: Option<Answer>,
+    expires_at: Option<jiff::Timestamp>,
+) -> Result<(String, Option<String>), AcquisitionError> {
+    let serving = required
+        .serving
+        .as_ref()
+        .ok_or(AcquisitionError::Incomplete {
+            target: DEEPINFRA_DEPLOY_NS,
+            missing: "a service.start phase naming the model to deploy",
+        })?;
+    let unmet = |reason: String| AcquisitionError::Unmet {
+        target: DEEPINFRA_DEPLOY_NS,
+        reason,
+    };
+
+    if serving.engine != "vllm" {
+        return Err(unmet(format!(
+            "this service deploys with vLLM; the profile's service `{}` is declared \
+             for `{}`",
+            serving.name, serving.engine
+        )));
+    }
+    if !serving.others.is_empty() {
+        return Err(unmet(format!(
+            "this target runs the declared service and nothing else; the profile also \
+             declares: {}",
+            serving.others.join(", ")
+        )));
+    }
+    let model = serving.model.as_ref().ok_or(AcquisitionError::Incomplete {
+        target: DEEPINFRA_DEPLOY_NS,
+        missing: "service.start's model (the Hugging Face repository to deploy)",
+    })?;
+    if let (Some(parallel), Some(gpu)) = (serving.tensor_parallel_size, &required.gpu) {
+        if u32::from(parallel) != gpu.count {
+            return Err(unmet(format!(
+                "the service declares tensor_parallel_size {parallel} but requires_gpu \
+                 asks for {} devices; a deployment here gives one instance exactly \
+                 num_gpus devices, so the two have to agree",
+                gpu.count
+            )));
+        }
+    }
+
+    let mut body = serde_json::Map::new();
+    let mut hf = serde_json::Map::new();
+    let mut settings = serde_json::Map::new();
+    hf.insert("repo".into(), serde_json::json!(model));
+
+    if let Some(answer) = gpu_answer {
+        if let Some(config) = admitted(DEEPINFRA_DEPLOY_NS, answer)?.into_iter().next() {
+            body.insert("gpu".into(), serde_json::json!(config));
+        }
+    }
+    if let Some(gpu) = &required.gpu {
+        body.insert("num_gpus".into(), serde_json::json!(gpu.count));
+    }
+    if let Some(answer) = disk_answer {
+        admitted(DEEPINFRA_DEPLOY_NS, answer)?;
+    }
+
+    let mut extra_args: Vec<String> = Vec::new();
+    if let Some(dtype) = &serving.dtype {
+        extra_args.push("--dtype".to_string());
+        extra_args.push(dtype.clone());
+    }
+    extra_args.extend(serving.extra_args.iter().cloned());
+    if !extra_args.is_empty() {
+        body.insert("extra_args".into(), serde_json::json!(extra_args));
+    }
+
+    // The profile's own words for this target, after the derived
+    // fields. The token variable is consumed rather than forwarded: it
+    // names where the value is, which is this adapter's vocabulary and
+    // not a field the service takes.
+    let mut token_env = None;
+    for (key, value) in provider {
+        let Some(field) = key.strip_prefix("deepinfra-deploy.") else {
+            continue;
+        };
+        match field {
+            "hf.token_env" => token_env = Some(value.clone()),
+            other => match other.split_once('.') {
+                Some(("hf", inner)) => {
+                    hf.insert(inner.to_string(), deepinfra_scalar(value));
+                }
+                Some(("settings", inner)) => {
+                    settings.insert(inner.to_string(), deepinfra_scalar(value));
+                }
+                _ => {
+                    body.insert(other.to_string(), deepinfra_scalar(value));
+                }
+            },
+        }
+    }
+    if let Some(name) = &token_env {
+        hf.insert(
+            "token".into(),
+            serde_json::json!(format!("{{{{{name}:json}}}}")),
+        );
+    }
+    body.insert("hf".into(), serde_json::Value::Object(hf));
+    if !settings.is_empty() {
+        body.insert("settings".into(), serde_json::Value::Object(settings));
+    }
+
+    if !body.contains_key("gpu") {
+        return Err(AcquisitionError::Incomplete {
+            target: DEEPINFRA_DEPLOY_NS,
+            missing: "requires_gpu (or provider.deepinfra-deploy.gpu)",
+        });
+    }
+
+    // The lease, last, for the reason `runpod_body` gives. `model_name`
+    // is required by the create call, so a rendering with no lease
+    // carries none and cannot be sent: an unstamped deployment is
+    // refused by the service itself.
+    if let Some(expires_at) = expires_at {
+        body.insert(
+            "model_name".into(),
+            serde_json::json!(expiry_stamp(expires_at)),
+        );
+    }
+
+    Ok((serde_json::Value::Object(body).to_string(), token_env))
 }
 
 /// A machine that exists because [`acquire`] made it.
@@ -2428,7 +3006,19 @@ fn run_output(argv: &[String], body: Option<&str>) -> Result<std::process::Outpu
                 .code()
                 .map(|it| it.to_string())
                 .unwrap_or_else(|| "signal".to_string()),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            stderr: {
+                // What it said, on either stream: a CLI explains itself
+                // on stderr, but `curl --fail-with-body` leaves the
+                // service's own explanation on stdout, and an error
+                // that dropped it would report a status and no reason.
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                match (stderr.is_empty(), stdout.is_empty()) {
+                    (_, true) => stderr,
+                    (true, false) => stdout,
+                    (false, false) => format!("{stderr}; {stdout}"),
+                }
+            },
         });
     }
     Ok(output)
@@ -3735,6 +4325,17 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(unstamped.body.as_deref().unwrap()).unwrap();
         assert_eq!(body.get("name"), None);
+
+        let deployment = DeepInfraDeployAdapter
+            .acquisition(
+                &deployment_requirements(),
+                &deployment_provider(),
+                Some(expires_at),
+            )
+            .expect("a service and a GPU were declared");
+        let body: serde_json::Value =
+            serde_json::from_str(deployment.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["model_name"], serde_json::json!(stamp));
         let unstamped = RunPodAdapter
             .acquisition(&full_requirements(), &image_provider(), None)
             .expect("an image was declared");
@@ -3791,11 +4392,25 @@ mod tests {
         assert_eq!(containers.release, container.release);
         assert_eq!(containers.inspect, container.inspect);
 
+        let deployment = DeepInfraDeployAdapter
+            .acquisition(&deployment_requirements(), &deployment_provider(), None)
+            .expect("a service and a GPU were declared");
+        let deployments = DeepInfraDeployAdapter
+            .fleet()
+            .expect("this target can be asked");
+        assert_eq!(deployments.release, deployment.release);
+        assert_eq!(deployments.inspect, deployment.inspect);
+
         // Every template takes the machine's id — as a word of its own
         // on the two CLIs, inside the URL on the REST surface; `substitute`
         // fills either — so a caller holding one identifier can reach
         // any of them.
-        for argv in [&pods.inspect, &instances.inspect, &containers.inspect] {
+        for argv in [
+            &pods.inspect,
+            &instances.inspect,
+            &containers.inspect,
+            &deployments.inspect,
+        ] {
             assert!(
                 argv.iter().any(|it| it.contains("{id}")),
                 "the read-back is a template an id fills: {argv:?}"
@@ -3819,6 +4434,8 @@ mod tests {
                 list: vec!["true".into()],
                 id: "id",
                 stamp: "name",
+                stamp_namespaced: false,
+                ended: None,
                 release: vec!["true".into()],
                 inspect: vec![
                     "printf".into(),
@@ -3954,6 +4571,8 @@ mod tests {
             ],
             id: "id",
             stamp: "label",
+            stamp_namespaced: false,
+            ended: None,
             release: vec!["true".into()],
             inspect: vec!["true".into()],
         })
@@ -4064,12 +4683,12 @@ mod tests {
     /// same name so it is required before anything is spent.
     #[test]
     fn the_container_service_is_authenticated_without_a_value_in_the_argv() {
-        assert_eq!(DeepInfraAdapter.credentials(), &["DEEPINFRA_TOKEN"]);
+        assert_eq!(DeepInfraAdapter.credentials(), &["DEEPINFRA_API_KEY"]);
         let fleet = DeepInfraAdapter.fleet().expect("this target can be asked");
         for argv in [&fleet.list, &fleet.inspect, &fleet.release] {
-            assert!(argv.contains(&"%DEEPINFRA_TOKEN".to_string()), "{argv:?}");
+            assert!(argv.contains(&"%DEEPINFRA_API_KEY".to_string()), "{argv:?}");
             assert!(
-                argv.contains(&"Authorization: Bearer {{DEEPINFRA_TOKEN}}".to_string()),
+                argv.contains(&"Authorization: Bearer {{DEEPINFRA_API_KEY}}".to_string()),
                 "{argv:?}"
             );
             assert!(
@@ -4401,6 +5020,447 @@ mod tests {
         assert!(
             refusal.contains("deepinfra"),
             "the way out names every wired platform: {refusal}"
+        );
+    }
+
+    // ---- The managed deployment ----
+
+    fn serving() -> lm_provision::machine::Serving {
+        lm_provision::machine::Serving {
+            name: "llm".to_string(),
+            engine: "vllm".to_string(),
+            model: Some("Qwen/Qwen3-8B".to_string()),
+            dtype: Some("bfloat16".to_string()),
+            tensor_parallel_size: Some(2),
+            extra_args: vec!["--max-model-len".to_string(), "32768".to_string()],
+            others: Vec::new(),
+        }
+    }
+
+    /// A profile for the managed deployment: two GPUs of at least 80 GB,
+    /// no ports, no disk, one vLLM service.
+    fn deployment_requirements() -> Requirements {
+        Requirements::from_slots(
+            &BTreeMap::new(),
+            &[("count", "2"), ("min_vram_gb", "80")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &BTreeMap::new(),
+        )
+        .expect("well-formed fixture")
+        .with_serving(Some(serving()))
+    }
+
+    fn deployment_provider() -> BTreeMap<String, String> {
+        [
+            ("deepinfra-deploy.settings.min_instances", "0"),
+            ("deepinfra-deploy.settings.max_instances", "1"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// **The profile's service becomes the service's own request.** The
+    /// model is `hf.repo`, dtype and extra args are the engine's
+    /// arguments, the GPU answer and count are `gpu` / `num_gpus`, the
+    /// slot's `settings.*` land nested and typed, and the lease is
+    /// `model_name`.
+    #[test]
+    fn the_deployment_request_is_built_from_the_service_and_the_answers() {
+        let expires_at = at("2026-09-02T06:30:00Z");
+        let acquisition = DeepInfraDeployAdapter
+            .acquisition(
+                &deployment_requirements(),
+                &deployment_provider(),
+                Some(expires_at),
+            )
+            .expect("a service and a GPU were declared");
+        let body: serde_json::Value = serde_json::from_str(
+            acquisition
+                .body
+                .as_deref()
+                .expect("this target takes a body"),
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "gpu": "A100-80GB",
+                "num_gpus": 2,
+                "extra_args": ["--dtype", "bfloat16", "--max-model-len", "32768"],
+                "hf": { "repo": "Qwen/Qwen3-8B" },
+                "settings": { "min_instances": 0, "max_instances": 1 },
+                "model_name": expiry_stamp(expires_at),
+            })
+        );
+        assert_eq!(acquisition.created_id_key, "deploy_id");
+        assert_eq!(
+            acquisition.create.last().map(String::as_str),
+            Some("--json")
+        );
+        assert!(
+            acquisition
+                .create
+                .contains(&format!("{DEEPINFRA_DEPLOY}/llm")),
+            "{:?}",
+            acquisition.create
+        );
+        assert!(acquisition.discover.is_none());
+    }
+
+    /// **The repository token travels by name.** Naming the variable
+    /// puts a placeholder in the body and the import in the argv; the
+    /// value is in neither.
+    #[test]
+    fn a_repository_token_is_a_placeholder_in_the_body_and_a_name_in_the_argv() {
+        let mut provider = deployment_provider();
+        provider.insert(
+            "deepinfra-deploy.hf.token_env".to_string(),
+            "HF_TOKEN".to_string(),
+        );
+        provider.insert(
+            "deepinfra-deploy.hf.revision".to_string(),
+            "main".to_string(),
+        );
+        let acquisition = DeepInfraDeployAdapter
+            .acquisition(&deployment_requirements(), &provider, None)
+            .expect("a service and a GPU were declared");
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["hf"],
+            serde_json::json!({ "repo": "Qwen/Qwen3-8B", "revision": "main", "token": "{{HF_TOKEN:json}}" })
+        );
+        assert!(
+            body.get("hf.token_env").is_none(),
+            "consumed, not forwarded: {body}"
+        );
+        assert!(
+            acquisition
+                .create
+                .windows(2)
+                .any(|it| it == ["--variable", "%HF_TOKEN"]),
+            "{:?}",
+            acquisition.create
+        );
+        assert_eq!(
+            acquisition.create.last().map(String::as_str),
+            Some("--expand-json")
+        );
+        assert!(
+            !acquisition.create.iter().any(|it| it.contains("hf_")),
+            "no argument carries a token value: {:?}",
+            acquisition.create
+        );
+        assert_eq!(
+            body.get("model_name"),
+            None,
+            "no lease, no name: the service refuses it"
+        );
+    }
+
+    /// **Refused by name, not dropped.** Each thing the profile said
+    /// that this target cannot do stops the request and says which.
+    #[test]
+    fn a_deployment_refuses_what_it_cannot_run_by_name() {
+        let refusal = |required: Requirements| {
+            DeepInfraDeployAdapter
+                .acquisition(&required, &deployment_provider(), None)
+                .expect_err("something the target cannot do")
+                .to_string()
+        };
+
+        let no_service = deployment_requirements().with_serving(None);
+        assert!(refusal(no_service).contains("service.start"));
+
+        let mut other_engine = serving();
+        other_engine.engine = "ollama".to_string();
+        let rendered = refusal(deployment_requirements().with_serving(Some(other_engine)));
+        assert!(
+            rendered.contains("vLLM") && rendered.contains("ollama"),
+            "{rendered}"
+        );
+
+        let mut with_others = serving();
+        with_others.others = vec!["system.apt".to_string(), "sh.exec".to_string()];
+        let rendered = refusal(deployment_requirements().with_serving(Some(with_others)));
+        assert!(rendered.contains("system.apt, sh.exec"), "{rendered}");
+
+        let mut no_model = serving();
+        no_model.model = None;
+        assert!(refusal(deployment_requirements().with_serving(Some(no_model))).contains("model"));
+
+        let mut disagreeing = serving();
+        disagreeing.tensor_parallel_size = Some(4);
+        let rendered = refusal(deployment_requirements().with_serving(Some(disagreeing)));
+        assert!(
+            rendered.contains("tensor_parallel_size 4") && rendered.contains("2 devices"),
+            "{rendered}"
+        );
+
+        let with_disk = Requirements::from_slots(
+            &BTreeMap::new(),
+            &[("count", "2")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            &[("ephemeral_gb", "60")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+        .unwrap()
+        .with_serving(Some(serving()));
+        assert!(refusal(with_disk).contains("no disk"));
+
+        let capability = DeepInfraDeployAdapter.capability();
+        assert!(capability.exposures.is_empty());
+        assert!(
+            lm_provision::machine::admit(&required(&[("8000", "raw_tcp")]), &capability).is_err(),
+            "a port declaration is refused at admission"
+        );
+    }
+
+    /// The count is bounded by the API, the floor selects the cheapest
+    /// configuration, and the way out names the slot key.
+    #[test]
+    fn a_deployment_selects_one_configuration_within_the_apis_bounds() {
+        assert_eq!(
+            DeepInfraDeployAdapter.gpu_answer(&GpuRequirement {
+                count: 1,
+                min_vram_gb: Some(100),
+            }),
+            Answer::Met {
+                using: vec!["H200-141GB".to_string()]
+            }
+        );
+        assert!(DeepInfraDeployAdapter
+            .gpu_answer(&GpuRequirement {
+                count: 9,
+                min_vram_gb: None
+            })
+            .blocks());
+        match DeepInfraDeployAdapter.gpu_answer(&GpuRequirement {
+            count: 1,
+            min_vram_gb: Some(300),
+        }) {
+            Answer::Unmet { reason } => {
+                assert!(reason.contains("provider.deepinfra-deploy.gpu"), "{reason}")
+            }
+            other => panic!("nothing catalogued carries 300 GB: {other:?}"),
+        }
+        let mut provider = deployment_provider();
+        provider.insert(
+            "deepinfra-deploy.gpu".to_string(),
+            "RTXPRO6000-96GB".to_string(),
+        );
+        let acquisition = DeepInfraDeployAdapter
+            .acquisition(&deployment_requirements(), &provider, None)
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["gpu"], "RTXPRO6000-96GB",
+            "the profile gets the last word"
+        );
+    }
+
+    /// **The endpoint is projected only once the service calls the
+    /// deployment up, and it names the deployment by id** — so the
+    /// lease in `model_name` never reaches a request.
+    #[test]
+    fn the_deployment_projects_an_endpoint_and_no_ssh() {
+        let deploying = serde_json::json!({
+            "deploy_id": "dep-1", "model_name": "me/lmp-exp-20260902T063000Z",
+            "status": "deploying", "fail_reason": null,
+            "config": { "gpu": "H100-80GB", "num_gpus": 2 }
+        });
+        let connection = DeepInfraDeployAdapter.connection(&deploying);
+        assert!(connection.ssh.is_none() && connection.endpoint.is_none());
+        assert!(
+            connection.read.contains(&"status: deploying".to_string()),
+            "{:?}",
+            connection.read
+        );
+        assert!(DeepInfraDeployAdapter.still_materializing(&deploying));
+
+        let mut running = deploying.clone();
+        running["status"] = serde_json::json!("running");
+        let connection = DeepInfraDeployAdapter.connection(&running);
+        let endpoint = connection.endpoint.as_ref().expect("running");
+        assert_eq!(endpoint.base_url, "https://api.deepinfra.com/v1/openai");
+        assert_eq!(endpoint.model, "deploy_id:dep-1");
+        assert_eq!(endpoint.api_key_env, "DEEPINFRA_API_KEY");
+        assert!(connection.ssh.is_none(), "there is no host");
+        assert!(!DeepInfraDeployAdapter.still_materializing(&running));
+        let artifact = serde_json::to_value(&connection).unwrap();
+        assert_eq!(
+            artifact,
+            serde_json::json!({ "endpoint": {
+                "base_url": "https://api.deepinfra.com/v1/openai",
+                "model": "deploy_id:dep-1",
+                "api_key_env": "DEEPINFRA_API_KEY",
+            }}),
+            "what a caller reads: the endpoint, and nothing that is not there"
+        );
+
+        let mut failed = deploying.clone();
+        failed["status"] = serde_json::json!("failed");
+        failed["fail_reason"] = serde_json::json!("out of quota");
+        let connection = DeepInfraDeployAdapter.connection(&failed);
+        assert!(connection.endpoint.is_none());
+        assert!(!DeepInfraDeployAdapter.still_materializing(&failed));
+        assert!(
+            connection
+                .read
+                .contains(&"fail_reason: present".to_string()),
+            "{:?}",
+            connection.read
+        );
+
+        let state = DeepInfraDeployAdapter.read_state(&running);
+        assert_eq!(state.gpu_count, Some(2));
+        assert_eq!(state.gpu_vram_mib, Some(gb_to_mib(80)));
+        assert!(!state.ports_observed);
+        let findings = lm_provision::machine::observe(&deployment_requirements(), &state);
+        assert_eq!(
+            lm_provision::machine::verdict(&findings),
+            lm_provision::machine::Outcome::Satisfied,
+            "{findings:#?}"
+        );
+        let uncatalogued = DeepInfraDeployAdapter.read_state(&serde_json::json!({
+            "config": { "gpu": "RTXPRO6000-96GB", "num_gpus": 1 }
+        }));
+        assert_eq!(
+            uncatalogued.gpu_vram_mib,
+            Some(gb_to_mib(96)),
+            "the memory is read off the configuration's own spelling"
+        );
+        assert_eq!(deepinfra_gpu_vram_gb("other"), None);
+    }
+
+    /// **The stamp is read past the account's namespace.** The listing
+    /// says `<username>/<model_name>`; the lease is what the create
+    /// call wrote, which is the part after the slash.
+    #[test]
+    fn the_deployment_listing_reads_the_stamp_past_the_namespace() {
+        let fleet = DeepInfraDeployAdapter
+            .fleet()
+            .expect("this target can be asked");
+        assert!(fleet.stamp_namespaced);
+        let listed = serde_json::json!([
+            { "deploy_id": "dep-a", "model_name": "me/lmp-exp-20260902T063000Z", "status": "running" },
+            { "deploy_id": "dep-b", "model_name": "me/scratch", "status": "stopped" },
+            { "deploy_id": "dep-c", "model_name": "lmp-exp-20260902T063000Z", "status": "running" },
+        ]);
+        let listed = machines(&listed, &fleet).expect("a bare array is the rows");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|it| (it.id.as_str(), it.name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("dep-a", Some("lmp-exp-20260902T063000Z")),
+                ("dep-b", Some("scratch")),
+                ("dep-c", Some("lmp-exp-20260902T063000Z")),
+            ]
+        );
+        assert!(expiry_of(listed[0].name.as_deref().unwrap()).is_some());
+
+        // The pod service's names are read whole: a slash in one of
+        // them is the operator's, not a namespace.
+        let pods = RunPodAdapter.fleet().unwrap();
+        assert!(!pods.stamp_namespaced);
+        let listed = serde_json::json!({ "pods": [{ "id": "p", "name": "team/box" }] });
+        assert_eq!(
+            machines(&listed, &pods).unwrap()[0].name.as_deref(),
+            Some("team/box")
+        );
+
+        assert_eq!(fleet.id, "deploy_id");
+        assert!(
+            fleet.list.contains(&format!("{DEEPINFRA_DEPLOY}/list/")),
+            "{:?}",
+            fleet.list
+        );
+        assert!(fleet.release.windows(2).any(|it| it == ["-X", "DELETE"]));
+        assert_eq!(DeepInfraDeployAdapter.credentials(), &["DEEPINFRA_API_KEY"]);
+        assert_eq!(
+            DeepInfraDeployAdapter.image_key(),
+            Some("deepinfra-deploy.container_image")
+        );
+        assert!(adapter_named("deepinfra-deploy").is_ok());
+    }
+
+    /// **A row the platform has already ended is not a machine.** The
+    /// deployment service lists `failed` and `deleted` deployments
+    /// beside the live ones; reading them as the fleet would have a
+    /// sweep releasing each of them every tick. An account whose rows
+    /// are all ended is an empty fleet, not an unreadable one.
+    #[test]
+    fn ended_rows_are_left_out_of_the_fleet() {
+        let fleet = DeepInfraDeployAdapter
+            .fleet()
+            .expect("this target can be asked");
+        let listed = serde_json::json!([
+            { "deploy_id": "live", "model_name": "me/lmp-exp-20260902T063000Z", "status": "running" },
+            { "deploy_id": "coming", "model_name": "me/lmp-exp-20260902T063000Z", "status": "deploying" },
+            { "deploy_id": "gone", "model_name": "me/lmp-exp-20260902T063000Z", "status": "deleted" },
+            { "deploy_id": "broke", "model_name": "me/lmp-exp-20260902T063000Z", "status": "failed" },
+        ]);
+        let ids: Vec<String> = machines(&listed, &fleet)
+            .expect("live rows are the fleet")
+            .into_iter()
+            .map(|it| it.id)
+            .collect();
+        assert_eq!(ids, vec!["live", "coming"]);
+
+        let all_ended = serde_json::json!([
+            { "deploy_id": "gone", "model_name": "me/x", "status": "deleted" },
+        ]);
+        assert_eq!(machines(&all_ended, &fleet), Ok(Vec::new()));
+
+        // A platform declaring no ended rows reads every row, as before.
+        let pods = RunPodAdapter.fleet().unwrap();
+        assert!(pods.ended.is_none());
+        let listed =
+            serde_json::json!({ "pods": [{ "id": "p", "name": "x", "status": "failed" }] });
+        assert_eq!(machines(&listed, &pods).unwrap().len(), 1);
+    }
+
+    /// **A failure explains itself from whichever stream carried the
+    /// explanation.** `curl --fail-with-body` leaves the service's
+    /// reason on stdout and says only the status on stderr; an error
+    /// built from stderr alone reported "error: 409".
+    #[test]
+    fn a_failed_command_reports_what_it_printed_on_either_stream() {
+        let failed = run(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "echo '{\"detail\":{\"error\":\"missing display name\"}}'; \
+                 echo 'curl: (22) The requested URL returned error: 409' >&2; exit 22"
+                    .into(),
+            ],
+            None,
+        )
+        .expect_err("exit 22");
+        let rendered = failed.to_string();
+        assert!(rendered.contains("returned error: 409"), "{rendered}");
+        assert!(rendered.contains("missing display name"), "{rendered}");
+
+        let quiet = run(
+            &["sh".into(), "-c".into(), "echo only-out; exit 1".into()],
+            None,
+        )
+        .expect_err("exit 1");
+        assert!(quiet.to_string().contains("only-out"), "{quiet}");
+
+        assert!(
+            deepinfra_curl("https://example.invalid").contains(&"--fail-with-body".to_string()),
+            "and the curl argv asks for the body to be kept"
         );
     }
 }

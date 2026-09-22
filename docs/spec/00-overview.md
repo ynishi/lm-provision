@@ -349,6 +349,12 @@ absorbs it, so the graph stays acyclic.
   own CLI, or `curl` where it has none (08 §Stability); start / stop
   stays with the external pod manager. The pod-provider API client
   is not pulled into the core.
+  **Revised (2026-09-22):** what is provisioned may be a machine this
+  tool configures, or an **endpoint a platform configures** from the
+  same profile's `service.start` — a managed deployment, acquired and
+  released by the same verbs and carrying the same lease, on which
+  nothing of this tool's ever runs (08 §Acquisitions and sweep).
+  Start / stop is still outside either way.
   Absorbed by 08; referenced by 10.
 - **Static provisioner.** The binary is musl-static and carries no
   language runtime and no runtime file dependencies, so the target

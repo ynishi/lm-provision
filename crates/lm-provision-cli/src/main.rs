@@ -192,8 +192,8 @@ enum MachineCommand {
 
 #[derive(Args)]
 struct ListArgs {
-    /// Ask this platform what it is running (`runpod`, `vast`, `deepinfra`).
-    /// Repeatable, and **required**.
+    /// Ask this platform what it is running (`runpod`, `vast`,
+    /// `deepinfra`, `deepinfra-deploy`). Repeatable, and **required**.
     ///
     /// There is no "all platforms" default and no empty run: a listing
     /// of nothing is indistinguishable from an account with nothing on
@@ -240,7 +240,8 @@ struct AcquireArgs {
     #[arg(long = "dry-run", default_value_t = true, action = clap::ArgAction::Set)]
     dry_run: bool,
 
-    /// Which platform to buy from (`runpod`, `vast`, `deepinfra`).
+    /// Which platform to buy from (`runpod`, `vast`, `deepinfra`,
+    /// `deepinfra-deploy`).
     ///
     /// The operator's choice, not the profile's: the profile says what
     /// the machine must be, and where to buy one meeting it is decided
@@ -271,7 +272,8 @@ struct AcquireArgs {
 #[derive(Args)]
 struct SweepArgs {
     /// Ask this platform what it is running, and judge those machines
-    /// by the lease stamped on each one (`runpod`, `vast`, `deepinfra`). Repeatable.
+    /// by the lease stamped on each one (`runpod`, `vast`, `deepinfra`,
+    /// `deepinfra-deploy`). Repeatable.
     ///
     /// **This is the inventory when it is given.** A machine whose
     /// acquisitions row was never written, was written on another host,
@@ -317,7 +319,8 @@ struct ReleaseArgs {
     #[arg(long = "id")]
     id: String,
 
-    /// The platform the machine was acquired from (`runpod`, `vast`, `deepinfra`).
+    /// The platform the machine was acquired from (`runpod`, `vast`,
+    /// `deepinfra`, `deepinfra-deploy`).
     #[arg(long = "provider", default_value = "runpod")]
     provider: String,
 
@@ -367,8 +370,9 @@ struct TargetArgs {
     #[arg(long = "ssh", help = ssh_help())]
     ssh: Option<String>,
 
-    /// Ask this platform (`runpod`, `vast`, `deepinfra`) where `--pod-id` is,
-    /// instead of naming an address.
+    /// Ask this platform (`runpod`, `vast`, `deepinfra`,
+    /// `deepinfra-deploy`) where `--pod-id` is, instead of naming an
+    /// address.
     ///
     /// The address and port come from the platform's own description
     /// of the machine, through the same projection `machine acquire`
@@ -1051,6 +1055,11 @@ struct ProfileFacts {
 /// importing profile would be refused here — before `acquire` or
 /// `check` ever looked at a requirement.
 ///
+/// The phases are read too, for the one service a target that runs the
+/// model itself is given ([`lm_provision::machine::Serving`]) — a
+/// profile declaring more than one is refused here, on the same path as
+/// an unreadable requirement, rather than after a machine exists.
+///
 /// The hash comes back with the requirements rather than from a second
 /// read: they are two answers to one question about one file, and a
 /// caller re-loading the profile to get the digest could stamp a row
@@ -1067,17 +1076,21 @@ fn requirements_of(profile: &std::path::Path) -> Result<ProfileFacts, String> {
         requires_gpu,
         requires_disk,
         provider,
+        phases,
         ..
     } = &root
     else {
         return Err("the profile's root is not a Spec".to_string());
     };
+    let serving =
+        lm_provision::machine::Serving::from_phases(phases).map_err(|err| err.to_string())?;
     let required = lm_provision::machine::Requirements::from_slots(
         requires_ports,
         requires_gpu,
         requires_disk,
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| err.to_string())?
+    .with_serving(serving);
     Ok(ProfileFacts {
         required,
         provider: provider.clone(),
@@ -1361,6 +1374,20 @@ fn run_acquire(args: AcquireArgs) -> ExitCode {
             continue;
         }
         connection = adapter.connection(&acquired.inspected);
+    }
+
+    // A machine that projects neither address has nothing in the
+    // artifact to read: `ssh` and `endpoint` are both absent, and what
+    // the projection saw is a diagnostic the artifact does not carry
+    // (`Connection::read` is `#[serde(skip)]`). Said here so that a
+    // deployment the platform gave up on — `failed`, with the reason in
+    // the read-back — is not reported as silence.
+    if connection.ssh.is_none() && connection.endpoint.is_none() {
+        eprintln!(
+            "note: {} projects no address; read from the platform: {}",
+            acquired.id,
+            connection.read.join("; ")
+        );
     }
 
     let state = adapter.read_state(&acquired.inspected);
@@ -2320,6 +2347,21 @@ fn resolve_target(
 
     let connection = inventory::connection(provider, id).map_err(|reason| (1, reason))?;
     let Some(endpoint) = connection.ssh else {
+        // A machine that projects an inference endpoint is not a pod
+        // that has yet to answer: it is a served model, and it will
+        // never have a session. Refused by what it is rather than by
+        // what it lacks, because "retry" is the wrong advice for a
+        // machine no retry will grow a shell onto.
+        if let Some(served) = connection.endpoint {
+            return Err((
+                1,
+                format!(
+                    "machine {id} is a managed deployment (OpenAI-compatible endpoint at {}, \
+                     model {}) and has no ssh session; the pod verbs do not apply to it",
+                    served.base_url, served.model
+                ),
+            ));
+        }
         // The second line is what the projection read (field by field,
         // presence and shape, no values): a pod still booting and a
         // description that came back without the field look the same
@@ -2987,6 +3029,89 @@ mod tests {
         assert_eq!(
             provider.get("runpod.imageName").map(String::as_str),
             Some("example/image:tag")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The one service travels with the requirements.** A target
+    /// that runs the model itself is told what to run from the same
+    /// read that says what machine to buy — and a profile declaring
+    /// two services is refused here, where a malformed requirement is
+    /// refused, rather than by whichever service would have been
+    /// picked.
+    #[test]
+    fn the_declared_service_rides_with_the_requirements() {
+        let dir = scratch("requirements-serving-test");
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let write = |name: &str, phases: serde_json::Value| {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "type": "Spec",
+                    "name": "serving-requirements",
+                    "capabilities": ["sh.exec", "net.http_get"],
+                    "http_allowlist": ["http://127.0.0.1:8000"],
+                    "requires_gpu": { "count": "1", "min_vram_gb": "80" },
+                    "phases": phases,
+                })
+                .to_string(),
+            )
+            .expect("write profile");
+            path
+        };
+
+        let serving = write(
+            "one-service.json",
+            serde_json::json!([
+                {
+                    "type": "ServiceStart",
+                    "name": "llm",
+                    "platform_kind": "vllm",
+                    "model": "Qwen/Qwen3-8B",
+                    "port": 8000,
+                },
+                {
+                    "type": "ServiceReady",
+                    "name": "llm",
+                    "check_url": "http://127.0.0.1:8000/v1/models",
+                },
+            ]),
+        );
+        let facts = super::requirements_of(&serving).expect("one service is readable");
+        let declared = facts.required.serving.expect("the profile declares one");
+        assert_eq!(declared.engine, "vllm");
+        assert_eq!(declared.model.as_deref(), Some("Qwen/Qwen3-8B"));
+        assert!(
+            declared.others.is_empty(),
+            "its own readiness poll is not something else: {:?}",
+            declared.others
+        );
+
+        let silent = write(
+            "no-service.json",
+            serde_json::json!([{ "type": "ShExec", "argv": ["true"] }]),
+        );
+        assert!(super::requirements_of(&silent)
+            .expect("a profile without a service is readable")
+            .required
+            .serving
+            .is_none(),);
+
+        let several = write(
+            "two-services.json",
+            serde_json::json!([
+                { "type": "ServiceStart", "name": "a", "platform_kind": "vllm" },
+                { "type": "ServiceStart", "name": "b", "platform_kind": "ollama" },
+            ]),
+        );
+        let Err(refusal) = super::requirements_of(&several) else {
+            panic!("two services, one deployment");
+        };
+        assert!(
+            refusal.contains("a, b"),
+            "the refusal names both services: {refusal}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
