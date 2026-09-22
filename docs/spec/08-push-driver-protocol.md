@@ -396,6 +396,21 @@ scrollback and a machine that billed until someone noticed.
   returns it under the account's namespace, so the stamp is read past
   the last slash; the endpoint names the deployment by `deploy_id:`
   rather than by that name, so the stamp never reaches a request.
+  Second: `--provider together`, a dedicated endpoint on a model the
+  service already serves (a catalogue id, or one uploaded out of band —
+  the v1 upload job publishes no status the driver could wait on, so
+  importing is not the acquisition's job). The lease rides in
+  `display_name`, which the service's **listing omits** (it carries
+  `id / name / state` and leaves the operator-set field to the
+  per-endpoint read) — so the fleet reader asks each listed endpoint
+  for its own description before judging it, and a read-back it cannot
+  get ends the sweep rather than passing as "unstamped" (unstamped is
+  never released, and an unreadable lease is not evidence of that).
+  The endpoint is the service's own `name` on a different host from
+  the management API, and the hardware configuration is the profile's
+  to name (`provider."together.hardware"`): the service publishes no
+  complete list to select from, so a memory floor is judged after the
+  fact from the configuration's own spelling.
 - A continuously running host daemon that enforces leases without
   being invoked is the control plane's job (chapter 09's record is
   the shared vocabulary for exactly that); `sweep` is the operator's

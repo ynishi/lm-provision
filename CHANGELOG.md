@@ -114,6 +114,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may project instead of an SSH one, and whether a platform returns
   its stamp field under an account namespace, which the fleet reader
   steps over.
+- **A fifth platform: Together AI dedicated endpoints (`--provider
+  together`).** A dedicated endpoint on a model the service already
+  serves — a catalogue id, or one uploaded out of band with `tg` — on a
+  hardware configuration the profile names
+  (`provider."together.hardware"`, an id from `GET /v1/hardware`; the
+  service publishes no complete list to select from, so a memory floor
+  is judged after the fact from the configuration's own spelling). One
+  `curl` to `POST /v1/endpoints` [documented:
+  docs.together.ai/reference/createendpoint, read 2026-09-22]. The
+  lease rides in `display_name`, which the listing **omits** (`id /
+  name / state` only), so the fleet reader asks each listed endpoint
+  for its own description — `Fleet::stamp_from_inspect` — and a
+  read-back it cannot get ends the sweep rather than passing as
+  unstamped. The projected endpoint is the service's own `name` on
+  `https://api-inference.together.ai/v1`, a different host from the
+  management API. Refused by name: engine arguments (`dtype`,
+  `extra_args` — the engine is the platform's), a `tensor_parallel_size`
+  disagreeing with the configuration's device count, other phases, a
+  disk, and `requires_ports` at admission. Model upload is not the
+  acquisition's job: the v1 upload job publishes no status the driver
+  could wait on. Not yet run against the service.
+- **Driver library: `Discovery` / `Wait`, `Fleet::stamp_from_inspect`,
+  `curl_bearer`.** The pre-create step an acquisition may carry is now
+  a `Discovery` — the argv, an optional body, a dotted path to the id
+  in what it prints, the placeholder that id fills in the create argv
+  **and** body, and an optional `Wait` that polls a read-back until a
+  status word says ready (or fails, or a cap is reached) — so a
+  platform that has to import a model before it can be referred to is
+  the same mechanism as the marketplace's offer query (`Acquisition
+  ::discover` was a bare argv whose first row's `id` filled
+  `{offer_id}`). A fleet whose listing omits the stamp field reads it
+  off each machine's own description. Every REST platform's `curl`
+  argv comes from one builder, bound to the platform's key name.
 
 ### Changed
 

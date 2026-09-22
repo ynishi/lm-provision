@@ -2922,7 +2922,7 @@ fn deepinfra_gpu_vram_gb(config: &str) -> Option<u32> {
 
 /// A provider-slot value as the JSON scalar it spells.
 ///
-/// shared by the typed REST targets (deepinfra-deploy and together):
+/// Shared by the typed REST targets (`deepinfra-deploy`, `together`):
 /// those APIs take typed fields (`num_gpus`,
 /// `settings.min_instances`, `min_replicas`) while the profile's
 /// provider slot is strings, so a passthrough here reads each value as

@@ -200,6 +200,25 @@ lm-provision machine acquire --provider deepinfra-deploy \
 # on any other platform; apply / logs / exec / cp / port-forward do not
 # apply and say so — there is no session to open.
 
+# A fifth: Together AI dedicated endpoints — a model the service already
+# serves (a catalogue id, or one uploaded with `tg` and listed by
+# GET /v1/models), on a hardware configuration you name. The profile
+# declares requires_gpu, exactly one ServiceStart whose "model" is that
+# id, no engine arguments (the engine is the platform's), no ports, no
+# disk. TOGETHER_API_KEY in the .env.
+#   "provider": {
+#     "together.hardware": "1x_nvidia_h100_80gb_sxm",   # GET /v1/hardware
+#     "together.autoscaling.min_replicas": "1",         # 0 + max > 0 is refused
+#     "together.autoscaling.max_replicas": "1",         #   by the service
+#     "together.inactive_timeout": "60"                 # minutes, 30-1440
+#   }
+lm-provision machine acquire --provider together \
+  --profile docs/profiles/together-dedicated-0.1.0.json --dry-run false
+# {"connection":{"endpoint":{"base_url":"https://api-inference.together.ai/v1",
+#   "model":"<account>/<model>-<hash>","api_key_env":"TOGETHER_API_KEY"}}}
+# The lease is the endpoint's display_name, which the listing omits, so
+# `machine list` / `sweep` read it back per endpoint (one GET each).
+
 # The MCP server, on stdio (see below for what it reads):
 lm-provision mcp
 ```

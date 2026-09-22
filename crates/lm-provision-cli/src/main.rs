@@ -193,7 +193,7 @@ enum MachineCommand {
 #[derive(Args)]
 struct ListArgs {
     /// Ask this platform what it is running (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`). Repeatable, and **required**.
+    /// `deepinfra`, `deepinfra-deploy`, `together`). Repeatable, and **required**.
     ///
     /// There is no "all platforms" default and no empty run: a listing
     /// of nothing is indistinguishable from an account with nothing on
@@ -241,7 +241,7 @@ struct AcquireArgs {
     dry_run: bool,
 
     /// Which platform to buy from (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`).
+    /// `deepinfra-deploy`, `together`).
     ///
     /// The operator's choice, not the profile's: the profile says what
     /// the machine must be, and where to buy one meeting it is decided
@@ -273,7 +273,7 @@ struct AcquireArgs {
 struct SweepArgs {
     /// Ask this platform what it is running, and judge those machines
     /// by the lease stamped on each one (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`). Repeatable.
+    /// `deepinfra-deploy`, `together`). Repeatable.
     ///
     /// **This is the inventory when it is given.** A machine whose
     /// acquisitions row was never written, was written on another host,
@@ -320,7 +320,7 @@ struct ReleaseArgs {
     id: String,
 
     /// The platform the machine was acquired from (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`).
+    /// `deepinfra`, `deepinfra-deploy`, `together`).
     #[arg(long = "provider", default_value = "runpod")]
     provider: String,
 
@@ -371,7 +371,7 @@ struct TargetArgs {
     ssh: Option<String>,
 
     /// Ask this platform (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`) where `--pod-id` is, instead of naming an
+    /// `deepinfra-deploy`, `together`) where `--pod-id` is, instead of naming an
     /// address.
     ///
     /// The address and port come from the platform's own description
