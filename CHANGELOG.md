@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.12.0] - 2026-09-22
+
+### Added
+
 - **A shared vocabulary for the targets that run the model:
   `provider."deploy.min_replicas"` / `"deploy.max_replicas"`**, read by
   both `deepinfra-deploy` (into `settings.min_instances` /
@@ -1172,7 +1186,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract, secret handling, CLI, push-driver protocol, apply report and
   ledger, MCP.
 
-[Unreleased]: https://github.com/ynishi/lm-provision/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/ynishi/lm-provision/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/ynishi/lm-provision/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ynishi/lm-provision/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ynishi/lm-provision/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ynishi/lm-provision/compare/v0.8.0...v0.9.0
