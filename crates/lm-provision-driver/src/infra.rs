@@ -291,6 +291,52 @@ pub struct SshEndpoint {
     pub user: String,
 }
 
+/// What runs before the create call, when the target cannot describe
+/// the machine in one request: a query whose answer names the thing
+/// the create call then refers to (a marketplace offer; a model the
+/// platform first has to import), optionally waited on until it is
+/// ready to be referred to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Discovery {
+    /// The program and arguments that run first. Prints JSON.
+    pub argv: Vec<String>,
+    /// The request body, when the call takes one (appended as the
+    /// last argument, as `Acquisition::body` is).
+    pub body: Option<String>,
+    /// Where the answer names what was found: a dotted path into the
+    /// document (`id`, `data.model_id`). When the document is an array
+    /// the path is read from its **first** element — the query's own
+    /// order is the selection policy, as before.
+    pub id_key: &'static str,
+    /// The placeholder the id replaces, in the create argv **and** in
+    /// the create body (`{offer_id}`, `{model_id}`).
+    pub placeholder: &'static str,
+    /// Wait for what was found to be ready before creating from it.
+    /// `None` when the create call can refer to it at once.
+    pub wait: Option<Wait>,
+}
+
+/// How to ask whether a discovered thing is ready, and how long to keep asking.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Wait {
+    /// What reads the thing back; the same placeholder as
+    /// `Discovery::placeholder`, substituted with the discovered id.
+    pub argv: Vec<String>,
+    /// Dotted path to the status word in what that prints.
+    pub status_key: &'static str,
+    /// The status words that mean "ready to refer to".
+    pub ready: &'static [&'static str],
+    /// The status words that mean "never will be" — the wait ends in
+    /// `ExecuteError::DiscoveryFailed` on the first read that says one.
+    pub failed: &'static [&'static str],
+    /// Seconds between reads.
+    pub poll_secs: u64,
+    /// Seconds after which a thing still neither ready nor failed is
+    /// `ExecuteError::DiscoveryTimeout` — the bound on trusting a
+    /// platform's "not yet".
+    pub cap_secs: u64,
+}
+
 /// What to run to obtain a machine, and what to run to give it back.
 ///
 /// Both halves together, because an acquisition whose release is worked
@@ -299,9 +345,8 @@ pub struct SshEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acquisition {
     /// What to run first, when the target sells *offers* rather than
-    /// letting a create call describe a machine: prints a JSON array of
-    /// candidates, and the first row's `id` fills `{offer_id}` in
-    /// `create`.
+    /// letting a create call describe a machine: prints a JSON document
+    /// whose first row names the thing the create call then refers to.
     ///
     /// **The query carries the policy.** Which offers qualify and which
     /// comes first are written into this argv as the service's own
@@ -310,8 +355,13 @@ pub struct Acquisition {
     /// an adapter "which one?". Taking the first row of a query that
     /// sorts by price *is* taking the cheapest thing that qualifies.
     ///
+    /// The import-then-create case is the same mechanism with an
+    /// additional wait — the discovery finds what to import, the
+    /// wait polls until the import is ready, and only then does the
+    /// create refer to it.
+    ///
     /// `None` for a target whose create call selects by itself.
-    pub discover: Option<Vec<String>>,
+    pub discover: Option<Discovery>,
     /// The program and arguments that create the machine.
     pub create: Vec<String>,
     /// The request body, when the create call takes one.
@@ -1748,17 +1798,23 @@ fn vast_acquisition(
     create.push("--raw".to_string());
 
     Ok(Acquisition {
-        discover: Some(vec![
-            "vastai".to_string(),
-            "search".to_string(),
-            "offers".to_string(),
-            query.join(" "),
-            // Ascending price: taking the first row of this *is* the
-            // selection policy.
-            "-o".to_string(),
-            "dph".to_string(),
-            "--raw".to_string(),
-        ]),
+        discover: Some(Discovery {
+            argv: vec![
+                "vastai".to_string(),
+                "search".to_string(),
+                "offers".to_string(),
+                query.join(" "),
+                // Ascending price: taking the first row of this *is* the
+                // selection policy.
+                "-o".to_string(),
+                "dph".to_string(),
+                "--raw".to_string(),
+            ],
+            body: None,
+            id_key: "id",
+            placeholder: "{offer_id}",
+            wait: None,
+        }),
         create,
         body: None,
         created_id_key: "new_contract",
@@ -2885,6 +2941,27 @@ pub enum ExecuteError {
         /// The discovery that came back empty.
         command: String,
     },
+
+    /// A discovered thing was reported as failed, so no create should
+    /// follow.
+    #[error("`{command}` says what was discovered has failed: {status}")]
+    DiscoveryFailed {
+        /// The wait command that reported failure.
+        command: String,
+        /// The status that meant failure.
+        status: String,
+    },
+
+    /// A discovered thing was still not ready after the allotted time.
+    #[error("`{command}` still not ready after {waited_secs}s (last status: {})", last_status.as_deref().unwrap_or("none read"))]
+    DiscoveryTimeout {
+        /// The wait command that timed out.
+        command: String,
+        /// How many seconds were waited.
+        waited_secs: u64,
+        /// The last status read, when any was.
+        last_status: Option<String>,
+    },
 }
 
 /// Create a machine from a rendered [`Acquisition`].
@@ -2895,25 +2972,68 @@ pub enum ExecuteError {
 /// design: a caller that only wants to show an operator what would
 /// happen cannot reach this by accident.
 pub fn acquire(mut acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
-    if let Some(discover) = &acquisition.discover {
-        let found = run_json(discover, None)?;
+    if let Some(discovery) = &acquisition.discover {
+        let found = run_json(&discovery.argv, discovery.body.as_deref())?;
+        let discovery_command = discovery.argv.join(" ");
         // The first row of a query whose argv already sorted and
         // filtered — see `Acquisition::discover` for why the policy
         // lives in the query rather than here.
-        let offer = found.as_array().and_then(|it| it.first()).ok_or_else(|| {
-            ExecuteError::NoCandidates {
-                command: discover.join(" "),
+        if found.as_array().is_some_and(|a| a.is_empty()) {
+            return Err(ExecuteError::NoCandidates {
+                command: discovery_command,
+            });
+        }
+        let id_value =
+            json_path(&found, discovery.id_key).ok_or_else(|| ExecuteError::Unreadable {
+                command: discovery_command.clone(),
+                detail: format!("nothing readable at {}: {}", discovery.id_key, found),
+            })?;
+        let id = match id_value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => {
+                return Err(ExecuteError::Unreadable {
+                    command: discovery_command,
+                    detail: format!("nothing readable at {}: {}", discovery.id_key, found),
+                });
             }
-        })?;
-        let offer_id = json_id(offer, "id").ok_or_else(|| ExecuteError::Unreadable {
-            command: discover.join(" "),
-            detail: format!("the first offer has no readable id: {offer}"),
-        })?;
-        acquisition.create = acquisition
-            .create
-            .iter()
-            .map(|it| it.replace("{offer_id}", &offer_id))
-            .collect();
+        };
+        // Substitute the discovered id into the create argv and body.
+        acquisition.create =
+            substitute_placeholder(&acquisition.create, discovery.placeholder, &id);
+        if let Some(ref mut body) = acquisition.body {
+            *body = body.replace(discovery.placeholder, &id);
+        }
+        // Wait for the discovered thing to be ready, when asked to.
+        if let Some(wait) = &discovery.wait {
+            let wait_argv = substitute_placeholder(&wait.argv, discovery.placeholder, &id);
+            let wait_command = wait_argv.join(" ");
+            let start = std::time::Instant::now();
+            loop {
+                let inspected = run_json(&wait_argv, None)?;
+                let status = json_path(&inspected, wait.status_key).and_then(|v| v.as_str());
+                if let Some(status) = status {
+                    if wait.ready.contains(&status) {
+                        break;
+                    }
+                    if wait.failed.contains(&status) {
+                        return Err(ExecuteError::DiscoveryFailed {
+                            command: wait_command,
+                            status: status.to_string(),
+                        });
+                    }
+                }
+                let elapsed = start.elapsed().as_secs();
+                if elapsed >= wait.cap_secs {
+                    return Err(ExecuteError::DiscoveryTimeout {
+                        command: wait_command,
+                        waited_secs: elapsed,
+                        last_status: status.map(str::to_string),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_secs(wait.poll_secs));
+            }
+        }
     }
     let created = run_json(&acquisition.create, acquisition.body.as_deref())?;
     let id =
@@ -2929,12 +3049,27 @@ pub fn acquire(mut acquisition: Acquisition) -> Result<Acquired, ExecuteError> {
     })
 }
 
+/// Walk a dotted path into a JSON document (`data.model_id` →
+/// `value["data"]["model_id"]`). When the document is an array the path
+/// is read from its **first** element.
+fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let current = match value {
+        serde_json::Value::Array(arr) => arr.first()?,
+        other => other,
+    };
+    let mut current = current;
+    for key in path.split('.') {
+        current = current.get(key)?;
+    }
+    Some(current)
+}
+
 /// The identifier under `key`, in the form every argv wants it.
 ///
 /// A string or a number — one service writes `"id": "abc"` and another
 /// writes `"new_contract": 9841205`, and both name a machine.
 fn json_id(value: &serde_json::Value, key: &str) -> Option<String> {
-    match value.get(key)? {
+    match json_path(value, key)? {
         serde_json::Value::String(it) => Some(it.clone()),
         serde_json::Value::Number(it) => Some(it.to_string()),
         _ => None,
@@ -2972,6 +3107,14 @@ fn fill_blanks(fresh: &mut serde_json::Value, earlier: &serde_json::Value) {
 fn substitute(argv: &[String], id: &str) -> Vec<String> {
     argv.iter()
         .map(|it| it.replace("{id}", id))
+        .collect::<Vec<_>>()
+}
+
+/// `{placeholder}` replaced throughout — exactly [`substitute`] but with
+/// an arbitrary placeholder string rather than the fixed `{id}`.
+fn substitute_placeholder(argv: &[String], placeholder: &str, id: &str) -> Vec<String> {
+    argv.iter()
+        .map(|it| it.replace(placeholder, id))
         .collect::<Vec<_>>()
 }
 
@@ -4005,6 +4148,7 @@ mod tests {
 
         let discover = acquisition.discover.as_ref().expect("offers come first");
         let query = discover
+            .argv
             .iter()
             .find(|it| it.contains("rentable=true"))
             .expect("the query is one argument");
@@ -4016,9 +4160,9 @@ mod tests {
         ] {
             assert!(query.contains(filter), "{filter} missing from: {query}");
         }
-        let sort = discover.iter().position(|it| it == "-o");
+        let sort = discover.argv.iter().position(|it| it == "-o");
         assert!(
-            sort.is_some_and(|at| discover.get(at + 1).is_some_and(|it| it == "dph")),
+            sort.is_some_and(|at| discover.argv.get(at + 1).is_some_and(|it| it == "dph")),
             "ascending price is the selection policy: {discover:?}"
         );
 
@@ -4085,10 +4229,16 @@ mod tests {
     #[test]
     fn the_discovery_feeds_the_create_call_and_the_numeric_id_is_read() {
         let acquired = acquire(Acquisition {
-            discover: Some(vec![
-                "echo".into(),
-                r#"[{"id": 123, "dph_total": 0.27}, {"id": 456, "dph_total": 0.44}]"#.into(),
-            ]),
+            discover: Some(Discovery {
+                argv: vec![
+                    "echo".into(),
+                    r#"[{"id": 123, "dph_total": 0.27}, {"id": 456, "dph_total": 0.44}]"#.into(),
+                ],
+                body: None,
+                id_key: "id",
+                placeholder: "{offer_id}",
+                wait: None,
+            }),
             create: vec!["echo".into(), r#"{"new_contract": {offer_id}}"#.into()],
             body: None,
             created_id_key: "new_contract",
