@@ -478,6 +478,11 @@ nothing. One row per endpoint:
   model?       = string,
   api_key_env? = string,   -- the variable's NAME, never its value
   expires_at?  = string,   -- the lease, for an acquired machine
+  price?       = { input, output, cache_read?, cache_write?,
+                   reasoning?, unit, as_of, source },
+                           -- the newest price-record row for
+                           -- (provider, model), or the static row's
+                           -- own; USD per million tokens, decimal text
   source       = string,   -- "acquisitions" | "forwards" | <static path>
 }
 ```
@@ -494,10 +499,16 @@ nothing. One row per endpoint:
 - **A tunnel's model is read off the pod** (`/v1/models` on the local
   port, the one question an OpenAI-compatible server answers without a
   key); absent when the pod does not answer.
+- **A price is a join, not a field the sources carry.** The inventory
+  reads the price record (§Price record) once and puts the newest row
+  for each endpoint's (`provider`, `model`) beside it; a static row may
+  carry its own `price` (the operator's word, which beats the record
+  for that row). No row prices it → no `price` key. A record that
+  cannot be read is one entry in `failed` and prices nothing.
 - The static file is a JSON array of `{name, base_url, model?,
-  api_key_env?}`; a field outside those four is refused by name rather
-  than dropped, since a mistyped `api_key_env` silently dropped would
-  be a row with no key that looked complete.
+  api_key_env?, provider?, price?}`; a field outside those is refused
+  by name rather than dropped, since a mistyped `api_key_env`
+  silently dropped would be a row with no key that looked complete.
 
 ## Error surface
 

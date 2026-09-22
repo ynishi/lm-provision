@@ -63,9 +63,9 @@ pub struct MachineListParams {
     pub provider: String,
 }
 
-/// `lm_endpoint_list(acquisitions?, forwards?, endpoints_file?)` request
-/// shape (10 §Tool set): every path optional, defaulting as the CLI's
-/// `machine endpoints` does.
+/// `lm_endpoint_list(acquisitions?, forwards?, endpoints_file?, prices?)`
+/// request shape (10 §Tool set): every path optional, defaulting as the
+/// CLI's `machine endpoints` does.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
 pub struct EndpointListParams {
     /// The acquisitions record; default `~/.lm-provision/acquisitions.jsonl`.
@@ -78,6 +78,9 @@ pub struct EndpointListParams {
     /// `~/.config/lm-provision/endpoints.json` when it exists.
     #[serde(default)]
     pub endpoints_file: Option<String>,
+    /// The price record; default `~/.lm-provision/prices.jsonl`.
+    #[serde(default)]
+    pub prices: Option<String>,
 }
 
 /// `lm_ledger_list(pod_id?, profile_hash?, limit?)` request shape (10
@@ -346,8 +349,10 @@ impl LmProvisionServer {
         description = "List every OpenAI-compatible endpoint this host knows (09 §Endpoint \
                         inventory): acquired machines asked about through their platforms, \
                         detached forwards whose ssh still runs, and the operator's static rows. \
-                        Keys by name, never by value. Read-only; a source that could not be read \
-                        is in the result's `failed`, not an error."
+                        Keys by name, never by value. Each row carries `price` (USD per million \
+                        tokens, decimal text) when the price record has a row for its provider \
+                        and model. Read-only; a source that could not be read is in the result's \
+                        `failed`, not an error."
     )]
     async fn lm_endpoint_list(
         &self,
@@ -371,6 +376,9 @@ impl LmProvisionServer {
                 "lm-provision-forwards.jsonl",
             )
         });
+        let prices = params.prices.map(PathBuf::from).unwrap_or_else(|| {
+            under_home(".lm-provision/prices.jsonl", "lm-provision-prices.jsonl")
+        });
         let statics = match params.endpoints_file {
             Some(path) => Some(PathBuf::from(path)),
             None => Some(under_home(
@@ -385,6 +393,7 @@ impl LmProvisionServer {
                     acquisitions: &acquisitions,
                     forwards: &forwards,
                     statics: statics.as_deref(),
+                    prices: &prices,
                 },
             )
         })

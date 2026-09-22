@@ -15,6 +15,8 @@
 
 use std::path::Path;
 
+use lm_provision_protocol::price::{self, PriceRow, UNIT_USD_PER_MTOK};
+
 use crate::credentials;
 use crate::infra::{self, Fleet, Machine};
 
@@ -236,8 +238,34 @@ pub struct Endpoint {
     /// The lease, for a machine this tool acquired.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// What a token costs here, when a price is known (09 §Price
+    /// record): the newest record row for this (`provider`, `model`),
+    /// or the amounts the operator wrote on a static row. Absent when
+    /// no row prices it — a tunnel to a pod's own vLLM, a machine no
+    /// row names, a model the record has not been synced for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<EndpointPrice>,
     /// Where the row came from: `acquisitions`, `forwards`, or the
     /// static file's path.
+    pub source: String,
+}
+
+/// A price beside an endpoint: the amounts of the newest price row
+/// for the endpoint's (`provider`, `model`) — or the operator's own
+/// amounts on a static row — with when they were read and from where.
+/// Amounts are decimal text in USD per million tokens
+/// (`lm_provision_protocol::price::UNIT_USD_PER_MTOK`); absent is
+/// not zero (09 §Price record).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EndpointPrice {
+    /// `input` / `output` / `cache_read?` / `cache_write?` / `reasoning?`.
+    #[serde(flatten)]
+    pub amounts: lm_provision_protocol::price::Price,
+    /// Always `usd_per_mtok`; written so a reader never has to guess.
+    pub unit: String,
+    /// RFC 3339 UTC: when the amounts were read.
+    pub as_of: String,
+    /// The record row's `source`, or the static file's path.
     pub source: String,
 }
 
@@ -263,8 +291,11 @@ pub struct EndpointSources<'a> {
     /// The forwards record (09 §Forwards record).
     pub forwards: &'a Path,
     /// The operator's static rows, when they keep any: a JSON array of
-    /// `{name, base_url, model?, api_key_env?}`.
+    /// `{name, base_url, model?, api_key_env?, provider?, price?}`.
     pub statics: Option<&'a Path>,
+    /// The price record (09 §Price record); a missing file is an empty
+    /// record, as for the acquisitions record.
+    pub prices: &'a Path,
 }
 
 /// The inventory: every row that could be read, and every source or
@@ -318,11 +349,27 @@ impl Endpoints {
 ///   when it answers. A row whose process is gone is left out, and
 ///   said in `failed` so the next `port-forward` can prune it.
 /// - **The static file**, when named: the operator's own rows, verbatim.
+///
+/// Then one join: the price record is read once and its newest row for
+/// each endpoint's (`provider`, `model`) is put beside it ([`priced`]).
 pub fn endpoints(sources: &EndpointSources<'_>) -> Endpoints {
     let mut out = Endpoints {
         rows: Vec::new(),
         failed: Vec::new(),
         said: Vec::new(),
+    };
+
+    // Read first and joined last: one reading prices every row, and a
+    // record that cannot be read prices nothing rather than ending the
+    // run — the rows it would have priced are still listed, and the
+    // file that could not be read is in `failed` under its own path.
+    let prices = match price::list(sources.prices) {
+        Ok(rows) => rows,
+        Err(err) => {
+            out.failed
+                .push((sources.prices.display().to_string(), err.to_string()));
+            Vec::new()
+        }
     };
 
     match lm_provision_protocol::acquisition::outstanding(sources.acquisitions) {
@@ -367,6 +414,7 @@ pub fn endpoints(sources: &EndpointSources<'_>) -> Endpoints {
                         base_url: Some(base_url),
                         api_key_env: None,
                         expires_at: None,
+                        price: None,
                         source: "forwards".to_string(),
                     });
                 }
@@ -384,7 +432,37 @@ pub fn endpoints(sources: &EndpointSources<'_>) -> Endpoints {
         }
     }
 
+    for row in &mut out.rows {
+        priced(row, &prices);
+    }
+
     out
+}
+
+/// Put the record's newest row for a row's (`provider`, `model`)
+/// beside it.
+///
+/// A row that already carries a price keeps it: that is a static row
+/// the operator priced themselves, and their word about their own row
+/// beats the record. A row the record does not price is left without
+/// one — absent is not zero (09 §Price record) — as is a row that
+/// names no provider or no model, since the join has nothing to be on.
+fn priced(row: &mut Endpoint, prices: &[PriceRow]) {
+    if row.price.is_some() {
+        return;
+    }
+    let (Some(provider), Some(model)) = (row.provider.as_deref(), row.model.as_deref()) else {
+        return;
+    };
+    let Some(found) = price::latest(prices, provider, model, None) else {
+        return;
+    };
+    row.price = Some(EndpointPrice {
+        amounts: found.price.clone(),
+        unit: found.unit.clone(),
+        as_of: found.as_of.clone(),
+        source: found.source.clone(),
+    });
 }
 
 /// The row an acquired machine makes, from its record and what its
@@ -404,6 +482,7 @@ fn endpoint_of_acquired(
             model: Some(served.model.clone()),
             api_key_env: Some(served.api_key_env.clone()),
             expires_at: Some(row.expires_at.clone()),
+            price: None,
             source: "acquisitions".to_string(),
         },
         None => Endpoint {
@@ -415,6 +494,7 @@ fn endpoint_of_acquired(
             model: None,
             api_key_env: None,
             expires_at: Some(row.expires_at.clone()),
+            price: None,
             source: "acquisitions".to_string(),
         },
     }
@@ -470,7 +550,8 @@ fn served_model_at(base_url: &str) -> Option<String> {
 }
 
 /// The operator's static rows: a JSON array of objects with `name` and
-/// `base_url` (required) and `model` / `api_key_env` (optional).
+/// `base_url` (required) and `model` / `api_key_env` / `provider` /
+/// `price` (optional).
 /// Anything else in an object is refused by name rather than dropped.
 fn static_rows(path: &Path) -> Result<Vec<Endpoint>, String> {
     let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
@@ -490,28 +571,121 @@ fn static_rows(path: &Path) -> Result<Vec<Endpoint>, String> {
                 .map(str::to_string)
         };
         for key in object.keys() {
-            if !["name", "base_url", "model", "api_key_env"].contains(&key.as_str()) {
+            if ![
+                "name",
+                "base_url",
+                "model",
+                "api_key_env",
+                "provider",
+                "price",
+            ]
+            .contains(&key.as_str())
+            {
                 return Err(format!(
                     "entry {index} carries `{key}`, which is not a field of a static row \
-                     (name, base_url, model, api_key_env)"
+                     (name, base_url, model, api_key_env, provider, price)"
                 ));
             }
         }
+        let provider = text_field("provider");
+        let model = text_field("model");
+        let price = match object.get("price") {
+            Some(price) => Some(static_price(
+                index,
+                price,
+                path,
+                provider.as_deref(),
+                model.as_deref(),
+            )?),
+            None => None,
+        };
         rows.push(Endpoint {
             name: text_field("name").ok_or_else(|| format!("entry {index} has no name"))?,
             kind: EndpointKind::Serverless,
-            provider: None,
+            provider,
             id: None,
             base_url: Some(
                 text_field("base_url").ok_or_else(|| format!("entry {index} has no base_url"))?,
             ),
-            model: text_field("model"),
+            model,
             api_key_env: text_field("api_key_env"),
             expires_at: None,
+            price,
             source: path.display().to_string(),
         });
     }
     Ok(rows)
+}
+
+/// The price the operator wrote on one static row.
+///
+/// Checked by the reader that checks a record row ([`PriceRow::check`])
+/// rather than by a second set of rules here: an amount this host would
+/// refuse in the record is refused on a static row too, so the two
+/// cannot disagree about what an amount is. A key outside the permitted
+/// set is refused by name, for the reason the row's own fields are — a
+/// mistyped `cache_read` dropped would be a price that looked complete.
+fn static_price(
+    index: usize,
+    price: &serde_json::Value,
+    path: &Path,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<EndpointPrice, String> {
+    let object = price
+        .as_object()
+        .ok_or_else(|| format!("entry {index} price: not an object"))?;
+    for key in object.keys() {
+        if ![
+            "input",
+            "output",
+            "cache_read",
+            "cache_write",
+            "reasoning",
+            "as_of",
+        ]
+        .contains(&key.as_str())
+        {
+            return Err(format!(
+                "entry {index} price carries `{key}`, which is not a field of a price \
+                 (input, output, cache_read, cache_write, reasoning, as_of)"
+            ));
+        }
+    }
+    let text_field = |key: &str| {
+        object
+            .get(key)
+            .and_then(|it| it.as_str())
+            .map(str::to_string)
+    };
+    let required =
+        |key: &str| text_field(key).ok_or_else(|| format!("entry {index} price has no {key}"));
+    // The check wants a whole row, and the row a static entry would
+    // make is this one: its own provider and model (empty where it
+    // names none — the check is about the amounts and the instant), the
+    // one unit this reader speaks, and the file as the source.
+    let row = PriceRow {
+        provider: provider.unwrap_or_default().to_string(),
+        model: model.unwrap_or_default().to_string(),
+        price: lm_provision_protocol::price::Price {
+            input: required("input")?,
+            output: required("output")?,
+            cache_read: text_field("cache_read"),
+            cache_write: text_field("cache_write"),
+            reasoning: text_field("reasoning"),
+        },
+        unit: UNIT_USD_PER_MTOK.to_string(),
+        as_of: required("as_of")?,
+        source: path.display().to_string(),
+    };
+    row.check()
+        .map_err(|err| format!("entry {index} price: {err}"))?;
+    Ok(EndpointPrice {
+        amounts: row.price,
+        unit: row.unit,
+        as_of: row.as_of,
+        source: row.source,
+    })
 }
 
 #[cfg(test)]
@@ -763,7 +937,8 @@ mod tests {
         std::fs::write(
             &path,
             r#"[{"name": "deepinfra-ds", "base_url": "https://api.deepinfra.com/v1/openai",
-                 "model": "deepseek-ai/DeepSeek-V4-Flash", "api_key_env": "DEEPINFRA_API_KEY"},
+                 "model": "deepseek-ai/DeepSeek-V4-Flash", "api_key_env": "DEEPINFRA_API_KEY",
+                 "provider": "deepinfra"},
                 {"name": "bare", "base_url": "http://127.0.0.1:8000/v1"}]"#,
         )
         .unwrap();
@@ -772,6 +947,11 @@ mod tests {
         assert_eq!(rows[0].kind, EndpointKind::Serverless);
         assert_eq!(rows[0].name, "deepinfra-ds");
         assert_eq!(rows[0].api_key_env.as_deref(), Some("DEEPINFRA_API_KEY"));
+        assert_eq!(
+            rows[0].provider.as_deref(),
+            Some("deepinfra"),
+            "the platform the operator named is the word the price record joins on"
+        );
         assert_eq!(rows[1].model, None);
         assert_eq!(rows[1].source, path.display().to_string());
 
@@ -782,8 +962,11 @@ mod tests {
         .unwrap();
         let refusal = static_rows(&path).expect_err("a key value is not a field of a row");
         assert!(
-            refusal.contains("`api_key`") && refusal.contains("api_key_env"),
-            "{refusal}"
+            refusal.contains("`api_key`")
+                && refusal.contains("api_key_env")
+                && refusal.contains("provider")
+                && refusal.contains("price"),
+            "the refusal names every field a row may carry: {refusal}"
         );
 
         std::fs::write(&path, r#"{"name": "x"}"#).unwrap();
@@ -802,6 +985,7 @@ mod tests {
             acquisitions: &none,
             forwards: &none,
             statics: Some(&path),
+            prices: &none,
         });
         assert!(inventory.complete(), "{:?}", inventory.failed);
         assert_eq!(inventory.rows.len(), 1);
@@ -809,6 +993,202 @@ mod tests {
             inventory.artifact()["endpoints"][0]["name"],
             serde_json::json!("only")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A price is a join, not a field a source carries** — and the
+    /// operator's word about their own row beats the record. A static
+    /// row that names a platform and a model is priced by the newest
+    /// record row for that pair; one carrying its own amounts keeps
+    /// them; one the join has nothing to stand on carries no price,
+    /// since an unpriced endpoint is not one that costs nothing.
+    #[test]
+    fn a_static_row_carries_its_own_price_or_the_records_newest() {
+        use lm_provision_protocol::price::{append, Price};
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-inventory-priced-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = dir.join("prices.jsonl");
+        let row = |input: &str, output: &str, as_of: &str| PriceRow {
+            provider: "deepinfra".to_string(),
+            model: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+            price: Price {
+                input: input.to_string(),
+                output: output.to_string(),
+                cache_read: None,
+                cache_write: None,
+                reasoning: None,
+            },
+            unit: UNIT_USD_PER_MTOK.to_string(),
+            as_of: as_of.to_string(),
+            source: "https://deepinfra.com/pricing".to_string(),
+        };
+        append(&record, &row("0.30", "0.44", "2026-09-01T00:00:00Z")).unwrap();
+        append(&record, &row("0.28", "0.42", "2026-09-22T00:00:00Z")).unwrap();
+
+        let path = dir.join("endpoints.json");
+        std::fs::write(
+            &path,
+            r#"[{"name": "from-record", "base_url": "https://api.deepinfra.com/v1/openai",
+                 "provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4-Flash"},
+                {"name": "own-price", "base_url": "https://api.deepinfra.com/v1/openai",
+                 "provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4-Flash",
+                 "price": {"input": "0.25", "output": "0.50",
+                           "as_of": "2026-09-20T00:00:00Z"}},
+                {"name": "no-model", "base_url": "http://127.0.0.1:8000/v1",
+                 "provider": "deepinfra"}]"#,
+        )
+        .unwrap();
+
+        let absent = dir.join("absent.jsonl");
+        let inventory = endpoints(&EndpointSources {
+            acquisitions: &absent,
+            forwards: &absent,
+            statics: Some(&path),
+            prices: &record,
+        });
+        assert!(inventory.complete(), "{:?}", inventory.failed);
+        assert_eq!(inventory.rows.len(), 3);
+
+        let joined = inventory.rows[0]
+            .price
+            .as_ref()
+            .expect("the record prices this pair");
+        assert_eq!(
+            joined.amounts.input, "0.28",
+            "the newest row for the pair, not the first one written"
+        );
+        assert_eq!(joined.amounts.output, "0.42");
+        assert_eq!(joined.unit, UNIT_USD_PER_MTOK);
+        assert_eq!(joined.as_of, "2026-09-22T00:00:00Z");
+        assert_eq!(
+            joined.source, "https://deepinfra.com/pricing",
+            "where the amounts were read, carried out of the record row"
+        );
+
+        let own = inventory.rows[1]
+            .price
+            .as_ref()
+            .expect("the operator priced this row");
+        assert_eq!(
+            own.amounts.input, "0.25",
+            "the operator's word about their own row beats the record"
+        );
+        assert_eq!(own.as_of, "2026-09-20T00:00:00Z");
+        assert_eq!(
+            own.source,
+            path.display().to_string(),
+            "the file the amounts were written in is the source"
+        );
+
+        assert!(
+            inventory.rows[2].price.is_none(),
+            "a row naming no model gives the join nothing to stand on"
+        );
+
+        let artifact = serde_json::to_value(&inventory.rows[0]).unwrap();
+        assert_eq!(artifact["price"]["input"], serde_json::json!("0.28"));
+        assert_eq!(artifact["price"]["unit"], serde_json::json!("usd_per_mtok"));
+        assert!(
+            artifact["price"].get("cache_write").is_none(),
+            "absent is not zero, so the key is not written: {artifact}"
+        );
+        let unpriced = serde_json::to_value(&inventory.rows[2]).unwrap();
+        assert!(
+            unpriced.get("price").is_none(),
+            "no price, no key: {unpriced}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A static price this host could not use is refused by field**,
+    /// through the same check a record row passes ([`PriceRow::check`]):
+    /// an amount or an instant the record would refuse is refused on a
+    /// static row too, and a mistyped amount is named rather than
+    /// dropped — a price missing its cache rate would otherwise look
+    /// complete.
+    #[test]
+    fn a_static_price_that_cannot_be_read_is_refused_by_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-inventory-price-refused-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.json");
+        let refusal_for = |price: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"[{{"name": "x", "base_url": "u", "provider": "deepinfra",
+                          "model": "m", "price": {price}}}]"#
+                ),
+            )
+            .unwrap();
+            static_rows(&path).expect_err("this price cannot be read")
+        };
+
+        let refusal =
+            refusal_for(r#"{"input": "1.2.3", "output": "1", "as_of": "2026-09-22T00:00:00Z"}"#);
+        assert!(
+            refusal.contains("input") && refusal.contains("1.2.3"),
+            "{refusal}"
+        );
+
+        let refusal = refusal_for(r#"{"input": "1", "output": "1", "as_of": "2026-09-22"}"#);
+        assert!(refusal.contains("as_of"), "{refusal}");
+
+        let refusal = refusal_for(
+            r#"{"input": "1", "output": "1", "as_of": "2026-09-22T00:00:00Z", "cache_reed": "0"}"#,
+        );
+        assert!(refusal.contains("cache_reed"), "{refusal}");
+
+        let refusal = refusal_for(r#"{"output": "1", "as_of": "2026-09-22T00:00:00Z"}"#);
+        assert!(refusal.contains("input"), "{refusal}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A record that cannot be read prices nothing, and says so.** It
+    /// is one entry in `failed` under its own path and costs the run
+    /// its completeness; the rows it would have priced are still
+    /// listed, because what the inventory is for — where the endpoints
+    /// are — does not depend on what they cost.
+    #[test]
+    fn a_price_record_that_cannot_be_read_lands_in_failed_and_prices_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "lm-provision-inventory-price-unreadable-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = dir.join("prices.jsonl");
+        std::fs::write(&record, "not json\n").unwrap();
+        let path = dir.join("endpoints.json");
+        std::fs::write(
+            &path,
+            r#"[{"name": "ds", "base_url": "https://api.deepinfra.com/v1/openai",
+                 "provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4-Flash"}]"#,
+        )
+        .unwrap();
+
+        let absent = dir.join("absent.jsonl");
+        let inventory = endpoints(&EndpointSources {
+            acquisitions: &absent,
+            forwards: &absent,
+            statics: Some(&path),
+            prices: &record,
+        });
+        assert_eq!(inventory.rows.len(), 1, "the row is still listed");
+        assert!(
+            inventory.rows[0].price.is_none(),
+            "a record nobody could read prices nothing"
+        );
+        assert_eq!(inventory.failed.len(), 1, "{:?}", inventory.failed);
+        assert_eq!(inventory.failed[0].0, record.display().to_string());
+        assert!(!inventory.complete());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

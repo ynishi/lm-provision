@@ -335,11 +335,15 @@ struct EndpointsArgs {
     #[arg(long = "forwards")]
     forwards: Option<PathBuf>,
     /// The operator's static rows — a JSON array of `{name, base_url,
-    /// model?, api_key_env?}`. Defaults to
+    /// model?, api_key_env?, provider?, price?}`. Defaults to
     /// `~/.config/lm-provision/endpoints.json` when that file exists;
     /// named explicitly, it has to.
     #[arg(long = "endpoints-file")]
     endpoints_file: Option<PathBuf>,
+    /// The price record to read token prices from (09 §Price record);
+    /// defaults to `~/.lm-provision/prices.jsonl`.
+    #[arg(long = "prices")]
+    prices: Option<PathBuf>,
     /// How to render the inventory on stdout.
     ///
     /// `json` is the artifact (07 §Stream split). `env` is a shell
@@ -2633,6 +2637,7 @@ fn default_ledger_path() -> PathBuf {
 fn run_endpoints(args: EndpointsArgs) -> ExitCode {
     let acquisitions = args.acquisitions.unwrap_or_else(default_acquisitions_path);
     let forwards = args.forwards.unwrap_or_else(default_forwards_path);
+    let prices = args.prices.unwrap_or_else(default_prices_path);
     // Named explicitly, the static file has to exist — a typo reported
     // as "no static rows" would be a file that quietly did not count.
     // Left to the default, it is read only when it is there.
@@ -2644,6 +2649,7 @@ fn run_endpoints(args: EndpointsArgs) -> ExitCode {
         acquisitions: &acquisitions,
         forwards: &forwards,
         statics: statics.as_deref(),
+        prices: &prices,
     });
     for (program, said) in &inventory.said {
         relay(program, said);
@@ -2671,6 +2677,17 @@ fn default_forwards_path() -> PathBuf {
             .join(".lm-provision")
             .join("forwards.jsonl"),
         None => PathBuf::from("lm-provision-forwards.jsonl"),
+    }
+}
+
+/// The price record's default location, beside the acquisitions
+/// record and for the same reason.
+fn default_prices_path() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".lm-provision")
+            .join("prices.jsonl"),
+        None => PathBuf::from("lm-provision-prices.jsonl"),
     }
 }
 
@@ -4037,6 +4054,7 @@ mod tests {
                     model: Some("slug/lmp-exp-x".to_string()),
                     api_key_env: Some("TOGETHER_API_KEY".to_string()),
                     expires_at: None,
+                    price: None,
                     source: "acquisitions".to_string(),
                 },
                 Endpoint {
@@ -4048,6 +4066,7 @@ mod tests {
                     model: None,
                     api_key_env: None,
                     expires_at: None,
+                    price: None,
                     source: "forwards".to_string(),
                 },
                 Endpoint {
@@ -4059,6 +4078,7 @@ mod tests {
                     model: None,
                     api_key_env: None,
                     expires_at: None,
+                    price: None,
                     source: "acquisitions".to_string(),
                 },
             ],
