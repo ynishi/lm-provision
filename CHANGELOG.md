@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.13.0] - 2026-09-23
+
+### Added
+
 - **`machine cost --period <YYYY.MM>` and `--endpoint <name>`.**
   `--period` reads the platform's own bill for a month — DeepInfra's
   `payment/usage`, one line per (model, bucket) with units, rate and
@@ -1269,7 +1283,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract, secret handling, CLI, push-driver protocol, apply report and
   ledger, MCP.
 
-[Unreleased]: https://github.com/ynishi/lm-provision/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/ynishi/lm-provision/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/ynishi/lm-provision/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/ynishi/lm-provision/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ynishi/lm-provision/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ynishi/lm-provision/compare/v0.9.0...v0.10.0
