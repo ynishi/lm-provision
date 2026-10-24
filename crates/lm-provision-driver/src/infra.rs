@@ -7,7 +7,7 @@
 //! one file would cost more than the convention is worth — `Transport`
 //! set that precedent, naming itself for what it does.
 //!
-//! # Two adapters from the start, deliberately (and a fifth since)
+//! # Two adapters from the start, deliberately (and more since)
 //!
 //! [`RunPodAdapter`] is the target this repo actually provisions.
 //! [`ContainerAdapter`] is here to keep the vocabulary honest: a
@@ -20,11 +20,12 @@
 //! The second adapter earns its place immediately: it is the one that
 //! *cannot* provide [`Exposure::PublicHttp`], so it is what proves the
 //! refusal path is real rather than theoretical. [`VastAdapter`],
-//! [`DeepInfraAdapter`], [`DeepInfraDeployAdapter`], and
-//! [`TogetherAdapter`] came after, each with a shape the first two do
-//! not have — offers selected before create, a machine with an
-//! address and no mapping at all, and a dedicated endpoint on a
-//! model the platform already serves.
+//! [`DeepInfraAdapter`], [`DeepInfraDeployAdapter`],
+//! [`TogetherAdapter`], and [`HetznerAdapter`] came after, each with a
+//! shape the first two do not have — offers selected before create, a
+//! machine with an address and no mapping at all, a dedicated endpoint
+//! on a model the platform already serves, and a CPU-only VPS with an
+//! address whose server type is named rather than selected.
 //!
 //! # What an adapter does not do
 //!
@@ -477,6 +478,28 @@ pub struct Fleet {
     /// of them on every tick, once their lease was reached, and write a
     /// correction row every time.
     pub ended: Option<(&'static str, &'static [&'static str])>,
+    /// Where one page of the listing names the **next page number**: a
+    /// dotted path into that page's document (`meta.pagination.next_page`).
+    /// `None` when the listing is one document.
+    ///
+    /// When it is `Some`, [`Fleet::list`] carries a `{page}` placeholder
+    /// that [`list`] fills starting at `1`, reads each page with
+    /// [`machines`], and concatenates; the walk ends on the page where
+    /// the path is `null` or absent. A page that cannot be read ends it
+    /// in that error, and so does a next page that does not advance or a
+    /// walk past 100 pages — a partial listing is never read as a
+    /// complete one, because the caller treats "absent from the list" as
+    /// proof a recorded machine is gone (see [`machines`]).
+    ///
+    /// **Page numbers can skip a row.** If a machine on an earlier page
+    /// disappears while the walk is in progress, the rows after it shift
+    /// down by one and the first row of the next page is read as part of
+    /// the page already taken. That needs more than one page, and the
+    /// machine it can hide is picked up by the next sweep if it is
+    /// stamped. The order is what keeps the shift to that one row: the
+    /// adapter fixes it in its own argv (`sort=id:asc`), so a new machine
+    /// lands after the last page rather than among the ones already read.
+    pub next_page: Option<&'static str>,
     /// How to destroy one, `{id}` unsubstituted — the same template
     /// [`Acquisition::release`] carries, from the same source, so a
     /// machine released off the record and one released off the list
@@ -506,27 +529,53 @@ pub struct Machine {
     pub name: Option<String>,
 }
 
+/// Every adapter an operator can name — **the one place a target is
+/// wired in**.
+///
+/// The name an operator passes is the adapter's own
+/// [`Infra::provider_namespace`]: the word its `provider` keys already
+/// start with, so a target's name is written once, in the adapter, and
+/// this table holds only which adapters exist. A table rather than a
+/// `match` so that the names can be listed as well as looked up: the
+/// refusal of an unknown name here, the MCP server's listing tool and
+/// the CLI's `--provider` values all come from [`provider_names`]. The
+/// adapters are unit structs, so each row is a reference to one, with
+/// `Sync` because a `static` is shared.
+static ADAPTERS: &[&(dyn Infra + Sync)] = &[
+    &RunPodAdapter,
+    &VastAdapter,
+    &DeepInfraAdapter,
+    &DeepInfraDeployAdapter,
+    &TogetherAdapter,
+    &HetznerAdapter,
+];
+
+/// The provider names [`adapter_named`] accepts, in the order the table
+/// lists them.
+pub fn provider_names() -> impl Iterator<Item = &'static str> {
+    ADAPTERS.iter().map(|adapter| adapter.provider_namespace())
+}
+
 /// The adapter sold under `name`, or which names would have worked.
 ///
 /// A static reference rather than a box because the adapters are unit
-/// structs: there is nothing to construct, only one of five
-/// vocabularies to speak.
+/// structs: there is nothing to construct, only vocabularies to speak.
 ///
 /// Here rather than beside the caller because there are now three
 /// callers — the operator CLI, the MCP server's listing tool, and
-/// [`crate::inventory`] between them — and a second `match` on these
+/// [`crate::inventory`] between them — and a second lookup on these
 /// names would be a second place a target has to be wired into.
 pub fn adapter_named(name: &str) -> Result<&'static dyn Infra, String> {
-    match name {
-        "runpod" => Ok(&RunPodAdapter),
-        "vast" => Ok(&VastAdapter),
-        "deepinfra" => Ok(&DeepInfraAdapter),
-        "deepinfra-deploy" => Ok(&DeepInfraDeployAdapter),
-        "together" => Ok(&TogetherAdapter),
-        other => Err(format!(
-            "unknown provider `{other}` (runpod, vast, deepinfra, deepinfra-deploy, together)"
-        )),
-    }
+    ADAPTERS
+        .iter()
+        .find(|adapter| adapter.provider_namespace() == name)
+        .map(|adapter| *adapter as &'static dyn Infra)
+        .ok_or_else(|| {
+            format!(
+                "unknown provider `{name}` ({})",
+                provider_names().collect::<Vec<_>>().join(", ")
+            )
+        })
 }
 
 /// The prefix that marks a name as this tool's lease stamp.
@@ -598,8 +647,14 @@ pub fn expiry_of(name: &str) -> Option<jiff::Timestamp> {
 /// disagree: read the [`Fleet::stamp`] field as a string, step over the
 /// platform's namespace when [`Fleet::stamp_namespaced`], and treat an
 /// empty string as `None`.
+///
+/// **The stamp key is a dotted path**, as [`Fleet::id`] already is: a
+/// platform that keeps operator text in a map rather than in a field of
+/// its own (`labels.lmp-exp`) is read the same way as one that names the
+/// field (`name`). A key with no dot walks one level, which is what a
+/// plain `get` did.
 fn stamp_of(row: &serde_json::Value, fleet: &Fleet) -> Option<String> {
-    row.get(fleet.stamp)
+    json_path(row, fleet.stamp)
         .and_then(|it| it.as_str())
         .map(|it| {
             if fleet.stamp_namespaced {
@@ -708,25 +763,77 @@ pub struct Listing {
 /// fails ends `list` with that error — a sweep that cannot read a lease
 /// must not proceed as though the machine were unstamped (unstamped is
 /// "never released", and an unreadable lease is not evidence of that).
+///
+/// **When the listing is paged** ([`Fleet::next_page`]) every page is
+/// asked for and read, the rows are concatenated, and what each page's
+/// CLI said is concatenated with them. Any page that fails ends `list`
+/// with that error, for the reason [`machines`] gives: a listing that
+/// stopped early would read as an account with fewer machines, and the
+/// machines past the stop would be retired from the record while they
+/// billed.
 pub fn list(fleet: &Fleet) -> Result<Listing, ExecuteError> {
-    let output = run_output(&fleet.list, None)?;
-    let command = fleet.list.join(" ");
-    let listed = payload(&String::from_utf8_lossy(&output.stdout), &command)?;
-    let mut machines = machines(&listed, fleet).map_err(|detail| ExecuteError::Unreadable {
-        command: command.clone(),
-        detail,
-    })?;
+    let mut found: Vec<Machine> = Vec::new();
+    let mut said: Vec<u8> = Vec::new();
+    let mut page: u64 = 1;
+    let mut walked: u32 = 0;
+    loop {
+        let argv = match fleet.next_page {
+            Some(_) => substitute_placeholder(&fleet.list, "{page}", &page.to_string()),
+            None => fleet.list.clone(),
+        };
+        let command = argv.join(" ");
+        let output = run_output(&argv, None)?;
+        walked += 1;
+        let listed = payload(&String::from_utf8_lossy(&output.stdout), &command)?;
+        found.extend(
+            machines(&listed, fleet).map_err(|detail| ExecuteError::Unreadable {
+                command: command.clone(),
+                detail,
+            })?,
+        );
+        said.extend(output.stderr);
+
+        let Some(path) = fleet.next_page else { break };
+        let next = match json_path(&listed, path) {
+            None | Some(serde_json::Value::Null) => break,
+            Some(value) => value.as_u64().ok_or_else(|| ExecuteError::Unreadable {
+                command: command.clone(),
+                detail: format!("{path} is {value}, not a page number"),
+            })?,
+        };
+        if next <= page {
+            return Err(ExecuteError::Unreadable {
+                command,
+                detail: format!(
+                    "page {page} names page {next} as the next, which does not advance"
+                ),
+            });
+        }
+        if walked >= MAX_LIST_PAGES {
+            return Err(ExecuteError::Unreadable {
+                command,
+                detail: format!("still a next page ({next}) after {MAX_LIST_PAGES} pages"),
+            });
+        }
+        page = next;
+    }
     if fleet.stamp_from_inspect {
-        for machine in &mut machines {
+        for machine in &mut found {
             let doc = inspect(fleet, &machine.id)?;
             machine.name = stamp_of(&doc, fleet);
         }
     }
     Ok(Listing {
-        machines,
-        said: output.stderr,
+        machines: found,
+        said,
     })
 }
+
+/// The most pages [`list`] walks before it gives up on a listing that
+/// will not end. Far past what one account here runs; reaching it means
+/// the platform's next page is not advancing the way this reads it, and
+/// the error says so rather than looping.
+const MAX_LIST_PAGES: u32 = 100;
 
 /// Ask a target about **one** machine, by the id it lists it under.
 ///
@@ -1081,6 +1188,7 @@ impl Infra for RunPodAdapter {
             stamp_namespaced: false,
             stamp_from_inspect: false,
             ended: None,
+            next_page: None,
             release: runpod_release(),
             inspect: runpod_inspect(),
         })
@@ -1671,6 +1779,7 @@ impl Infra for VastAdapter {
             stamp_namespaced: false,
             stamp_from_inspect: false,
             ended: None,
+            next_page: None,
             release: vast_release(),
             inspect: vast_inspect(),
         })
@@ -2166,6 +2275,7 @@ impl Infra for DeepInfraAdapter {
             stamp_namespaced: false,
             stamp_from_inspect: false,
             ended: None,
+            next_page: None,
             release: deepinfra_release(),
             inspect: deepinfra_inspect(),
         })
@@ -2683,6 +2793,7 @@ impl Infra for DeepInfraDeployAdapter {
             stamp_namespaced: true,
             stamp_from_inspect: false,
             ended: Some(("status", &["failed", "deleted"])),
+            next_page: None,
             release: deepinfra_deploy_release(),
             inspect: deepinfra_deploy_inspect(),
         })
@@ -2913,6 +3024,7 @@ impl Infra for TogetherAdapter {
             stamp_namespaced: true,
             stamp_from_inspect: false,
             ended: None,
+            next_page: None,
             release: together_release(),
             inspect: together_inspect(),
         })
@@ -3437,6 +3549,529 @@ fn deepinfra_deploy_body(
     }
 
     Ok((serde_json::Value::Object(body).to_string(), token_env))
+}
+
+/// The servers collection on the VPS platform's REST surface
+/// [documented: docs.hetzner.cloud, read 2026-10-24].
+const HETZNER_API: &str = "https://api.hetzner.cloud/v1";
+
+/// The variable the platform's project token is read from.
+///
+/// The platform's own CLI (`hcloud`) names it `HCLOUD_TOKEN`, and an
+/// environment value there overrides the token in its active context
+/// [documented: github.com/hetznercloud/cli internal/state/config/config.go,
+/// read 2026-10-24] — so the name an operator already has in their shell,
+/// and in the credential file the driver reads (`crate::credentials`),
+/// is the one this adapter asks for rather than a second spelling of it.
+const HCLOUD_TOKEN: &str = "HCLOUD_TOKEN";
+
+/// The provider-slot namespace, and the name the adapter answers to.
+const HETZNER_NS: &str = "hetzner";
+
+/// The two words the lease's place is spelled from, each written once:
+/// the request's labels field (the name [`HetznerCreate::labels`] and a
+/// listed server both carry it under) and the label key the lease rides
+/// under. Macros rather than consts because `concat!` takes literals, and
+/// the paths below are built from them at compile time.
+macro_rules! hetzner_labels_field {
+    () => {
+        "labels"
+    };
+}
+macro_rules! hetzner_lease_key {
+    () => {
+        "lmp-exp"
+    };
+}
+
+/// The label key the lease rides under. Not [`EXPIRY_PREFIX`]: the
+/// platform keeps operator text in a `labels` map, so the key says what
+/// the value is and the value is [`expiry_stamp`] whole, which is what
+/// [`expiry_of`] reads back.
+const HETZNER_LEASE_LABEL: &str = hetzner_lease_key!();
+
+/// The same label as the dotted path [`Fleet::stamp`] reads it off a
+/// listed server — built from the words the body writes, so the writer
+/// and the reader cannot name different labels.
+const HETZNER_LEASE_STAMP: &str = concat!(hetzner_labels_field!(), ".", hetzner_lease_key!());
+
+/// The prefix of the operator's own labels in the provider slot,
+/// `hetzner.labels.<key>` — the request field's name, so a label is
+/// addressed in the slot by where it lands.
+const HETZNER_LABEL_SLOT: &str = concat!(hetzner_labels_field!(), ".");
+
+/// A CPU-only VPS: an address, root over SSH, and nothing mapped in
+/// front of it.
+///
+/// **The shape the other adapters do not have.** The GPU platforms sell
+/// what a requirement selects; this one sells a *named server type* in
+/// a *named image* in a *named location*, and the requirement
+/// vocabulary has no words for CPU or memory. So the profile names the
+/// type (`provider."hetzner.server_type"`) rather than the adapter
+/// choosing from a catalogue: a vendor's price list embedded here would
+/// go stale on their schedule, and a vocabulary for CPU and memory is a
+/// change to the requirement language, not to one adapter.
+///
+/// **It creates no infrastructure.** The SSH key and the firewall are
+/// named, and must already exist in the project: `hetzner.ssh_keys` by
+/// name, `hetzner.firewalls` by id. A server without an SSH key would
+/// have only a root password the platform mails out, so a profile that
+/// names none is refused as incomplete rather than sent.
+///
+/// **The lease is a label, and the listing is not filtered by it.** The
+/// server `name` is unique per project, so it cannot carry a lease that
+/// two servers might share a spelling of; the label map can. The listing
+/// reads *every* server in the project, page by page
+/// ([`Fleet::next_page`]), rather than asking the platform for the ones
+/// carrying the label: a filtered list drops a server whose label was
+/// removed, the sweep then sees a recorded machine that is "absent from
+/// the list" and retires its record as gone while the server keeps
+/// billing (`lm-provision-cli`'s `bookkeeping`). Listed unfiltered, such
+/// a server is still there, without a stamp, and is judged by its
+/// record's own lease. A server nobody stamped (an operator's own) reads
+/// as unknown and is reported, never released.
+///
+/// **Exposes nothing.** The platform maps no port; its firewall is the
+/// operator's and is named in the slot, not examined. A `requires_ports`
+/// profile is refused at admission, as on the other address-only target.
+///
+/// **No GPU, no sized disk.** [`HetznerAdapter::gpu_answer`] refuses a
+/// GPU requirement, and [`HetznerAdapter::disk_answer`] does not examine
+/// an ephemeral size — the disk comes with the server type — which
+/// `admitted` turns into a refusal, so a profile that declares
+/// `requires_disk.ephemeral_gb` is refused on this target. Declare no
+/// `requires_disk`.
+///
+/// **Root over SSH**, once the platform calls the server `running`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HetznerAdapter;
+
+impl Infra for HetznerAdapter {
+    /// No exposure: the platform maps nothing and proxies nothing, and
+    /// saying none is what makes the refusal of a `requires_ports`
+    /// profile real (the same answer the other address-only target
+    /// gives).
+    fn capability(&self) -> Capability {
+        Capability {
+            target: HETZNER_NS,
+            exposures: &[],
+        }
+    }
+
+    /// Nothing to render: the create call takes no port list, and
+    /// admission has already refused any profile that declared one.
+    fn render(&self, _required: &Requirements) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn provider_namespace(&self) -> &'static str {
+        HETZNER_NS
+    }
+
+    /// The token, by name — required out here because `curl` reads it
+    /// from the environment at the adapter's instruction, and a missing
+    /// one is found before anything is spent rather than as a 401 in
+    /// the middle of a create.
+    fn credentials(&self) -> &'static [&'static str] {
+        &[HCLOUD_TOKEN]
+    }
+
+    /// Refused for any GPU count: this is a CPU VPS, and a profile that
+    /// asks for an accelerator would get a machine without one.
+    fn gpu_answer(&self, required: &GpuRequirement) -> Answer {
+        if required.count > 0 {
+            Answer::unmet(
+                "this target rents CPU-only VPS servers; a profile asking for a GPU \
+                 would get a machine without one",
+            )
+        } else {
+            Answer::met()
+        }
+    }
+
+    /// A persistent level is refused (a volume is a separate resource
+    /// this adapter does not create or attach); an ephemeral size is
+    /// **not examined**, because the create call takes none — the disk
+    /// comes with the server type.
+    ///
+    /// `admitted` turns `NotExamined` into a refusal on a target that
+    /// builds the request, so a profile that declares
+    /// `requires_disk.ephemeral_gb` is refused here; the way to a bigger
+    /// disk is a bigger `hetzner.server_type`.
+    fn disk_answer(&self, required: &DiskRequirement) -> Answer {
+        if required.persistent_gb.is_some() || required.persistent_at.is_some() {
+            return Answer::unmet(
+                "a persisted volume is a separate resource this target neither creates \
+                 nor attaches; the server's own disk lives and dies with it",
+            );
+        }
+        match required.ephemeral_gb {
+            Some(gb) => Answer::not_examined(format!(
+                "this target takes no disk size; how much a server gets comes with its \
+                 server type, so {gb} GB is a property of `hetzner.server_type` rather \
+                 than something to ask for"
+            )),
+            None => Answer::met(),
+        }
+    }
+
+    /// One `POST /servers` through `curl`; the body is the argument
+    /// after `--json`, which is why `--json` is the last word of the
+    /// argv ([`acquire`] appends the body as the final argument).
+    fn acquisition(
+        &self,
+        required: &Requirements,
+        provider: &BTreeMap<String, String>,
+        expires_at: Option<jiff::Timestamp>,
+    ) -> Result<Acquisition, AcquisitionError> {
+        // Every answer taken here and handed to the builder, for the
+        // reason `runpod_body` gives: a builder that reads a
+        // requirement without its answer can emit a request that
+        // quietly dropped one.
+        let body = hetzner_body(
+            provider,
+            required.gpu.as_ref().map(|it| self.gpu_answer(it)),
+            required.disk.as_ref().map(|it| self.disk_answer(it)),
+            expires_at,
+        )?;
+        let mut create = hetzner_curl(&format!("{HETZNER_API}/servers"));
+        create.push("--json".to_string());
+        Ok(Acquisition {
+            // The create call describes the machine itself.
+            discover: None,
+            create,
+            body: Some(body),
+            // The create answers `{"server": {"id": …}, "action": …}`;
+            // every read-back answers `{"server": {…}}`, and a listed
+            // row says `id`. All three are the server.
+            created_id_key: "server.id",
+            inspect: hetzner_inspect(),
+            release: hetzner_release(),
+        })
+    }
+
+    /// Every server in the project, **unfiltered** and in a fixed order,
+    /// page by page; the lease is read off `labels.lmp-exp`.
+    ///
+    /// No `label_selector`: see [`HetznerAdapter`] for why a filtered
+    /// list lets a billing server be retired from the record as gone.
+    /// `sort=id:asc` fixes the order the pages are taken in (the
+    /// skipped-row case in [`Fleet::next_page`] depends on it), at 50
+    /// rows a page. `deleting` rows are still listed by the platform
+    /// until they are gone and are left out, as a deployment the
+    /// platform has ended is on the other REST targets.
+    fn fleet(&self) -> Option<Fleet> {
+        Some(Fleet {
+            list: hetzner_curl(&format!(
+                "{HETZNER_API}/servers?sort=id:asc&per_page=50&page={{page}}"
+            )),
+            id: "id",
+            stamp: HETZNER_LEASE_STAMP,
+            stamp_namespaced: false,
+            stamp_from_inspect: false,
+            ended: Some(("status", &["deleting"])),
+            next_page: Some("meta.pagination.next_page"),
+            release: hetzner_release(),
+            inspect: hetzner_inspect(),
+        })
+    }
+
+    /// Observes nothing. The description names a server type and no
+    /// GPU, disk or port in the vocabulary the requirements are judged
+    /// in, and a zero would be a claim nothing made.
+    fn read_state(&self, _inspected: &serde_json::Value) -> MachineState {
+        MachineState {
+            exposed: BTreeMap::new(),
+            ports_observed: false,
+            gpu_count: None,
+            gpu_vram_mib: None,
+            ephemeral_gb: None,
+            persistent_gb: None,
+            persistent_at: None,
+        }
+    }
+
+    /// None: the `image` is a name in the platform's own catalogue
+    /// (`ubuntu-24.04`) or a snapshot id, not an entry in a registry the
+    /// preflight could ask.
+    fn image_key(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// `initializing` and `starting` are the platform's own words for a
+    /// server that exists and is not yet up (its `status` field);
+    /// `running` and everything else make no such claim.
+    fn still_materializing(&self, inspected: &serde_json::Value) -> bool {
+        matches!(
+            json_path(inspected, "server.status").and_then(|it| it.as_str()),
+            Some("initializing") | Some("starting")
+        )
+    }
+
+    /// `server.public_net.ipv4.ip`, port 22, root — **and only once the
+    /// platform calls the server `running`**. The address is assigned
+    /// while the server is still `initializing`, before sshd is up, so
+    /// the status gates it: absent means not reachable *yet*, same rule
+    /// as everywhere else. No endpoints: nothing is mapped.
+    ///
+    /// The status word is in what was read, beside the usual
+    /// presence-and-shape entries, for the operator refused because
+    /// there is no endpoint.
+    fn connection(&self, inspected: &serde_json::Value) -> Connection {
+        let status = json_path(inspected, "server.status").and_then(|it| it.as_str());
+        let ip = json_path(inspected, "server.public_net.ipv4.ip").and_then(|it| it.as_str());
+        let ssh = match (status, ip.filter(|it| !it.is_empty())) {
+            (Some("running"), Some(host)) => Some(SshEndpoint {
+                host: host.to_string(),
+                port: 22,
+                user: crate::ssh::DEFAULT_SSH_USER.to_string(),
+            }),
+            _ => None,
+        };
+        let ip_shape = match ip {
+            Some("") => "empty",
+            Some(_) => "present",
+            None => "absent",
+        };
+        Connection {
+            ssh,
+            endpoint: None,
+            endpoints: BTreeMap::new(),
+            read: vec![
+                format!("ip: {ip_shape}"),
+                format!("status: {}", status.unwrap_or("absent")),
+            ],
+        }
+    }
+}
+
+/// `curl_bearer` bound to this platform's credential variable.
+fn hetzner_curl(url: &str) -> Vec<String> {
+    curl_bearer(HCLOUD_TOKEN, url)
+}
+
+/// What reads one server back, `{id}` unsubstituted — one spelling for
+/// the record and for the listing, as `runpod_inspect` is.
+fn hetzner_inspect() -> Vec<String> {
+    hetzner_curl(&format!("{HETZNER_API}/servers/{{id}}"))
+}
+
+/// What destroys one server, `{id}` unsubstituted — one spelling for
+/// the record and for the listing, as `runpod_release` is.
+/// `--fail-with-body` (from `curl_bearer`) makes a server that was not
+/// there a failed release rather than a silent one.
+fn hetzner_release() -> Vec<String> {
+    let mut argv = hetzner_curl(&format!("{HETZNER_API}/servers/{{id}}"));
+    argv.push("-X".to_string());
+    argv.push("DELETE".to_string());
+    argv
+}
+
+/// The create-server request, as the fields [`hetzner_body`] sends — the
+/// shape of the body is this type, and nothing else writes it
+/// [documented: docs.hetzner.cloud/cloud.spec.json, the create-server
+/// request, read 2026-10-24].
+///
+/// `name` is optional here only because a lease-less rendering (a
+/// release template) carries none; the call itself requires it, and
+/// every rendering that is sent has one.
+#[derive(Debug, Default, serde::Serialize)]
+struct HetznerCreate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    server_type: String,
+    image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    datacenter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_data: Option<String>,
+    ssh_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    firewalls: Vec<HetznerFirewall>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    labels: BTreeMap<String, String>,
+}
+
+/// One entry of the create call's `firewalls`: the firewall's id, which
+/// is the only form the request takes.
+#[derive(Debug, serde::Serialize)]
+struct HetznerFirewall {
+    firewall: i64,
+}
+
+/// The request body for [`HetznerAdapter::acquisition`], built from the
+/// adapter's answers — the same gate `runpod_body` stands behind.
+///
+/// **An allowlist, and a key outside it is refused.** The create call is
+/// typed: a boolean or object field sent as a string is a 400, and a
+/// `labels` object written as a string is dropped by the caller's own
+/// reading rather than rejected. So the keys are the ones the `match`
+/// below reads into [`HetznerCreate`] — one place that both accepts and
+/// reads — and any other `hetzner.*` key is [`AcquisitionError::Unmet`],
+/// naming it, the same refusal `together_create` makes.
+///
+/// What it reads [documented: docs.hetzner.cloud/cloud.spec.json, the
+/// create-server request, read 2026-10-24]:
+///
+/// - `name`, `server_type`, `image` are required by the call. The first
+///   is derived (below); the other two are `Incomplete` when the slot
+///   lacks them.
+/// - `location`, `datacenter`, `user_data` are strings, sent as written
+///   (`user_data` is a plain string of at most 32 KiB). `location` and
+///   `datacenter` are exclusive — both is `Unmet`.
+/// - `ssh_keys` takes "SSH key IDs (integer) or names (string)", items
+///   typed string here: a comma-separated list of **names**, trimmed,
+///   empty entries dropped. **Required**, `Incomplete` when it names
+///   none — without it the server would have only a root password.
+/// - `firewalls` items are `{firewall: <int64 id>}`: a comma-separated
+///   list of integer ids, a non-integer is `Unmet`.
+/// - `labels.<key>` entries merge into the `labels` object. A label
+///   value must be "63 characters or less … begin and end with an
+///   alphanumeric character", which [`expiry_stamp`] satisfies.
+///
+/// **`name`** is `hetzner.name` when given, else — when there is a
+/// lease — the stamp lowercased (`lmp-exp-20260902t063000z`; the spec
+/// does not say whether letters may be upper case, so the conservative
+/// spelling). Server names are unique per project, so a fixed
+/// `hetzner.name` acquired twice is answered with a 409 and nothing is
+/// created: the second acquire fails loud, which is the right outcome.
+///
+/// **`expires_at: None`** is a caller that only wants the release
+/// template out of the rendering (`machine release` renders with no
+/// lease): no `lmp-exp` label, no derived name, and never a refusal for
+/// want of a lease. A rendering that is never sent has nothing the
+/// missing lease makes wrong, and refusing it would leave every server
+/// this adapter created unreleasable through the CLI — the failure
+/// `together_create` records [measured: 2026-09-23, fourteen release
+/// attempts refused for want of a lease while the endpoint sat in the
+/// account].
+///
+/// The lease label is inserted **last**, so the profile does not get the
+/// last word on it (see `runpod_body`).
+fn hetzner_body(
+    provider: &BTreeMap<String, String>,
+    gpu_answer: Option<Answer>,
+    disk_answer: Option<Answer>,
+    expires_at: Option<jiff::Timestamp>,
+) -> Result<String, AcquisitionError> {
+    let unmet = |reason: String| AcquisitionError::Unmet {
+        target: HETZNER_NS,
+        reason,
+    };
+
+    if let Some(answer) = gpu_answer {
+        admitted(HETZNER_NS, answer)?;
+    }
+    if let Some(answer) = disk_answer {
+        admitted(HETZNER_NS, answer)?;
+    }
+
+    // One pass over the slot, and one `match` that is both the allowlist
+    // and the reader of each key: a key gets a field here or it is
+    // refused, so what is accepted and what is read cannot drift apart.
+    // Refused before the required ones are looked for: a misspelt
+    // `server_typ` is better told "not a key" than "server_type is
+    // missing".
+    let mut server_type = None;
+    let mut image = None;
+    let mut ssh_keys = None;
+    let mut create = HetznerCreate::default();
+    for (key, value) in provider {
+        let Some(field) = key
+            .strip_prefix(HETZNER_NS)
+            .and_then(|it| it.strip_prefix('.'))
+        else {
+            continue;
+        };
+        match field {
+            "server_type" => server_type = Some(value.clone()),
+            "image" => image = Some(value.clone()),
+            "location" => create.location = Some(value.clone()),
+            "datacenter" => create.datacenter = Some(value.clone()),
+            "user_data" => create.user_data = Some(value.clone()),
+            "name" => create.name = Some(value.clone()),
+            "ssh_keys" => ssh_keys = Some(comma_list(value)),
+            "firewalls" => {
+                for id in comma_list(value) {
+                    let firewall = id.parse().map_err(|_| {
+                        unmet(format!(
+                            "hetzner.firewalls takes integer firewall ids, comma-separated; \
+                             `{id}` is not one"
+                        ))
+                    })?;
+                    create.firewalls.push(HetznerFirewall { firewall });
+                }
+            }
+            labelled => match labelled.strip_prefix(HETZNER_LABEL_SLOT) {
+                Some(label) if !label.is_empty() => {
+                    create.labels.insert(label.to_string(), value.clone());
+                }
+                _ => {
+                    return Err(unmet(format!(
+                        "provider key `{field}` is not one this target reads (the fields of \
+                         the create-server request that HetznerAdapter documents, and \
+                         labels.<key>)"
+                    )))
+                }
+            },
+        }
+    }
+
+    create.server_type = server_type.ok_or(AcquisitionError::Incomplete {
+        target: HETZNER_NS,
+        missing: "provider.hetzner.server_type",
+    })?;
+    create.image = image.ok_or(AcquisitionError::Incomplete {
+        target: HETZNER_NS,
+        missing: "provider.hetzner.image",
+    })?;
+    create.ssh_keys = ssh_keys.ok_or(AcquisitionError::Incomplete {
+        target: HETZNER_NS,
+        missing: "provider.hetzner.ssh_keys",
+    })?;
+    if create.ssh_keys.is_empty() {
+        return Err(AcquisitionError::Incomplete {
+            target: HETZNER_NS,
+            missing: "provider.hetzner.ssh_keys naming at least one key",
+        });
+    }
+
+    // The create call takes one placement or the other ("must not be
+    // used together with datacenter"); sending both is a 400 after the
+    // operator has already been told what would be sent.
+    if create.location.is_some() && create.datacenter.is_some() {
+        return Err(unmet(
+            "hetzner.location and hetzner.datacenter both place the server; name one".to_string(),
+        ));
+    }
+
+    // The lease, last: the one label the profile does not get the last
+    // word on.
+    let stamp = expires_at.map(expiry_stamp);
+    if let Some(stamp) = &stamp {
+        create
+            .labels
+            .insert(HETZNER_LEASE_LABEL.to_string(), stamp.clone());
+    }
+    if create.name.is_none() {
+        create.name = stamp.as_deref().map(str::to_ascii_lowercase);
+    }
+
+    serde_json::to_string(&create)
+        .map_err(|err| unmet(format!("the request did not encode: {err}")))
+}
+
+/// A comma-separated slot value as its entries, trimmed, empty ones
+/// dropped.
+fn comma_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|it| !it.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// A machine that exists because [`acquire`] made it.
@@ -5308,6 +5943,7 @@ mod tests {
                 stamp_namespaced: false,
                 stamp_from_inspect: false,
                 ended: None,
+                next_page: None,
                 release: vec!["true".into()],
                 inspect: vec![
                     "printf".into(),
@@ -5446,6 +6082,7 @@ mod tests {
             stamp_namespaced: false,
             stamp_from_inspect: false,
             ended: None,
+            next_page: None,
             release: vec!["true".into()],
             inspect: vec!["true".into()],
         })
@@ -6172,6 +6809,7 @@ mod tests {
             stamp_namespaced: false,
             stamp_from_inspect: true,
             ended: None,
+            next_page: None,
             release: vec!["true".into()],
             inspect: vec![
                 "sh".into(),
@@ -6232,6 +6870,7 @@ mod tests {
             stamp_namespaced: true,
             stamp_from_inspect: true,
             ended: None,
+            next_page: None,
             release: vec!["true".into()],
             inspect: vec![
                 "echo".into(),
@@ -6764,5 +7403,780 @@ mod tests {
             None,
             "the default says nothing"
         );
+    }
+
+    // ---- The stamp path, the paged listing, and the provider table ----
+
+    /// **The stamp key is a dotted path, and a plain key reads as it
+    /// always did.** A label map is read to a nested value; the
+    /// platforms whose stamp is a top-level `name` / `label` are
+    /// unchanged by it.
+    #[test]
+    fn a_dotted_stamp_key_reads_a_nested_label_and_a_plain_key_reads_as_before() {
+        let nested = HetznerAdapter.fleet().expect("this target can be asked");
+        assert_eq!(nested.stamp, "labels.lmp-exp");
+        assert_eq!(
+            stamp_of(
+                &serde_json::json!({ "id": 1, "labels": { "lmp-exp": "lmp-exp-20260902T063000Z" } }),
+                &nested
+            )
+            .as_deref(),
+            Some("lmp-exp-20260902T063000Z")
+        );
+        for unstamped in [
+            serde_json::json!({ "id": 1, "labels": {} }),
+            serde_json::json!({ "id": 1, "labels": { "owner": "ytk" } }),
+            serde_json::json!({ "id": 1, "labels": { "lmp-exp": "" } }),
+            serde_json::json!({ "id": 1 }),
+        ] {
+            assert_eq!(stamp_of(&unstamped, &nested), None, "{unstamped}");
+        }
+
+        let by_name = DeepInfraAdapter.fleet().expect("this target can be asked");
+        assert_eq!(
+            stamp_of(
+                &serde_json::json!({ "id": "c", "name": "lmp-exp-20260902T063000Z" }),
+                &by_name
+            )
+            .as_deref(),
+            Some("lmp-exp-20260902T063000Z")
+        );
+        assert_eq!(stamp_of(&serde_json::json!({ "name": "" }), &by_name), None);
+        let by_label = VastAdapter.fleet().expect("this target can be asked");
+        assert_eq!(
+            stamp_of(
+                &serde_json::json!({ "id": 7, "label": "lmp-exp-20260902T063000Z" }),
+                &by_label
+            )
+            .as_deref(),
+            Some("lmp-exp-20260902T063000Z")
+        );
+    }
+
+    /// A listing whose page `n` prints `n` as its one row and names
+    /// `next(n)` as the next page, or `null` — a stand-in for a paged
+    /// platform. `{page}` is the last argument, as the real listing's
+    /// URL carries it.
+    fn paged(script: &str, next_page: Option<&'static str>) -> Fleet {
+        Fleet {
+            list: vec![
+                "sh".into(),
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                "{page}".into(),
+            ],
+            id: "id",
+            stamp: "labels.lmp-exp",
+            stamp_namespaced: false,
+            stamp_from_inspect: false,
+            ended: None,
+            next_page,
+            release: vec!["true".into()],
+            inspect: vec!["true".into()],
+        }
+    }
+
+    /// **Two pages are one listing.** Every page is asked for in order,
+    /// the rows are concatenated, and what each page's CLI said on
+    /// stderr is concatenated with them.
+    #[test]
+    fn a_paged_listing_concatenates_its_pages() {
+        let fleet = paged(
+            r#"echo "asked page $1" >&2
+               case "$1" in
+                 1) echo '{"servers":[{"id":1},{"id":2}],"meta":{"pagination":{"next_page":2}}}';;
+                 2) echo '{"servers":[{"id":3,"labels":{"lmp-exp":"lmp-exp-20260902T063000Z"}}],"meta":{"pagination":{"next_page":null}}}';;
+               esac"#,
+            Some("meta.pagination.next_page"),
+        );
+        let listing = list(&fleet).expect("both pages are readable");
+        assert_eq!(
+            listing
+                .machines
+                .iter()
+                .map(|it| it.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+        assert_eq!(
+            listing.machines[2].name.as_deref(),
+            Some("lmp-exp-20260902T063000Z")
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&listing.said),
+            "asked page 1\nasked page 2\n"
+        );
+    }
+
+    /// A last page whose next-page path is absent ends the walk exactly
+    /// as a `null` does.
+    #[test]
+    fn a_page_without_a_next_page_ends_the_walk() {
+        let fleet = paged(
+            r#"echo '{"servers":[{"id":1}],"meta":{"pagination":{}}}'"#,
+            Some("meta.pagination.next_page"),
+        );
+        assert_eq!(list(&fleet).expect("one page").machines.len(), 1);
+    }
+
+    /// **A listing that will not advance is unreadable, never complete.**
+    /// A next page that is not past the one just read would loop; a
+    /// partial listing read as the whole is the failure that retires
+    /// recorded machines while they bill.
+    #[test]
+    fn a_next_page_that_does_not_advance_is_unreadable() {
+        let fleet = paged(
+            r#"echo '{"servers":[{"id":1}],"meta":{"pagination":{"next_page":1}}}'"#,
+            Some("meta.pagination.next_page"),
+        );
+        match list(&fleet) {
+            Err(ExecuteError::Unreadable { detail, .. }) => {
+                assert!(detail.contains("does not advance"), "{detail}")
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+
+        let words = paged(
+            r#"echo '{"servers":[{"id":1}],"meta":{"pagination":{"next_page":"two"}}}'"#,
+            Some("meta.pagination.next_page"),
+        );
+        match list(&words) {
+            Err(ExecuteError::Unreadable { detail, .. }) => {
+                assert!(detail.contains("not a page number"), "{detail}")
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+    }
+
+    /// A walk that never ends stops at the page bound with an error.
+    #[test]
+    fn a_walk_past_the_page_bound_is_unreadable() {
+        let fleet = paged(
+            r#"n=$(( $1 + 1 ))
+               echo "{\"servers\":[{\"id\":$1}],\"meta\":{\"pagination\":{\"next_page\":$n}}}""#,
+            Some("meta.pagination.next_page"),
+        );
+        match list(&fleet) {
+            Err(ExecuteError::Unreadable { detail, .. }) => {
+                assert!(detail.contains("100 pages"), "{detail}")
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+    }
+
+    /// **A page that fails fails the listing.** The first page's rows
+    /// are not handed back as though they were the account.
+    #[test]
+    fn a_page_that_fails_fails_the_listing() {
+        let fleet = paged(
+            r#"case "$1" in
+                 1) echo '{"servers":[{"id":1}],"meta":{"pagination":{"next_page":2}}}';;
+                 *) echo "rate limited" >&2; exit 3;;
+               esac"#,
+            Some("meta.pagination.next_page"),
+        );
+        match list(&fleet) {
+            Err(ExecuteError::Failed { stderr, .. }) => {
+                assert!(stderr.contains("rate limited"), "{stderr}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// **`next_page: None` is one document, run once.** The `{page}`
+    /// placeholder is not touched, and a `next_page` the document happens
+    /// to carry is not followed.
+    #[test]
+    fn a_listing_without_a_next_page_path_runs_once() {
+        let fleet = paged(
+            r#"echo "ran with $1" >&2
+               echo '{"servers":[{"id":1}],"meta":{"pagination":{"next_page":2}}}'"#,
+            None,
+        );
+        let listing = list(&fleet).expect("one document");
+        assert_eq!(listing.machines.len(), 1);
+        assert_eq!(
+            String::from_utf8_lossy(&listing.said),
+            "ran with {page}\n",
+            "run once, with the argv as written"
+        );
+    }
+
+    /// **The provider names are written once.** Every name the table
+    /// lists resolves, and the refusal of one it does not lists all of
+    /// them — a wired adapter cannot be missing from the way out.
+    #[test]
+    fn every_provider_name_resolves_and_an_unknown_one_lists_them_all() {
+        let names: Vec<&str> = provider_names().collect();
+        assert!(names.contains(&"hetzner"), "{names:?}");
+        for name in &names {
+            assert!(
+                adapter_named(name).is_ok(),
+                "{name} is listed but not wired"
+            );
+        }
+        let refusal = adapter_named("no-such-platform")
+            .err()
+            .expect("no such platform");
+        assert!(refusal.contains("`no-such-platform`"), "{refusal}");
+        for name in &names {
+            assert!(refusal.contains(name), "{name} missing from: {refusal}");
+        }
+        assert_eq!(
+            adapter_named("hetzner")
+                .expect("wired")
+                .provider_namespace(),
+            "hetzner"
+        );
+    }
+
+    // ---- Hetzner Cloud ----
+
+    /// The slot a profile writes for a server: the type, the image, the
+    /// location, and the one SSH key that must already exist.
+    fn hetzner_provider() -> BTreeMap<String, String> {
+        [
+            ("hetzner.server_type", "cpx62"),
+            ("hetzner.image", "ubuntu-24.04"),
+            ("hetzner.location", "fsn1"),
+            ("hetzner.ssh_keys", "dev-key"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// A profile with no GPU and no disk, which is all this target takes.
+    fn hetzner_requirements() -> Requirements {
+        required(&[])
+    }
+
+    fn hetzner_body_of(
+        provider: &BTreeMap<String, String>,
+        lease: Option<&str>,
+    ) -> serde_json::Value {
+        let acquisition = HetznerAdapter
+            .acquisition(&hetzner_requirements(), provider, lease.map(at))
+            .expect("a type, an image, and a key were declared");
+        serde_json::from_str(
+            acquisition
+                .body
+                .as_deref()
+                .expect("this target takes a body"),
+        )
+        .expect("the body is JSON")
+    }
+
+    /// **What the create call carries, each field traceable to a line
+    /// the profile wrote or to the lease** — and the argv shape the
+    /// executor depends on.
+    #[test]
+    fn the_hetzner_request_carries_what_the_profile_wrote_and_the_lease() {
+        let expires_at = at("2026-09-02T06:30:00Z");
+        let acquisition = HetznerAdapter
+            .acquisition(
+                &hetzner_requirements(),
+                &hetzner_provider(),
+                Some(expires_at),
+            )
+            .expect("a type, an image, and a key were declared");
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        let fields: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "image",
+                "labels",
+                "location",
+                "name",
+                "server_type",
+                "ssh_keys"
+            ],
+            "every field emitted is one the create call defines"
+        );
+        assert_eq!(body["server_type"], "cpx62");
+        assert_eq!(body["image"], "ubuntu-24.04");
+        assert_eq!(body["location"], "fsn1");
+        assert_eq!(body["ssh_keys"], serde_json::json!(["dev-key"]));
+        assert_eq!(
+            body["labels"],
+            serde_json::json!({ "lmp-exp": expiry_stamp(expires_at) })
+        );
+        assert_eq!(body["name"], "lmp-exp-20260902t063000z");
+
+        assert_eq!(
+            acquisition.create.last().map(String::as_str),
+            Some("--json"),
+            "the body is the argument after --json, appended last"
+        );
+        assert_eq!(acquisition.create[0], "curl");
+        assert!(acquisition
+            .create
+            .contains(&"https://api.hetzner.cloud/v1/servers".to_string()));
+        assert!(acquisition.discover.is_none());
+        assert_eq!(acquisition.created_id_key, "server.id");
+        assert!(acquisition
+            .inspect
+            .contains(&"https://api.hetzner.cloud/v1/servers/{id}".to_string()));
+        assert!(acquisition
+            .release
+            .windows(2)
+            .any(|it| it == ["-X", "DELETE"]));
+        assert!(acquisition
+            .release
+            .contains(&"https://api.hetzner.cloud/v1/servers/{id}".to_string()));
+    }
+
+    /// The token travels by name, as on every REST platform here.
+    #[test]
+    fn the_hetzner_token_is_authenticated_by_name() {
+        assert_eq!(HetznerAdapter.credentials(), &["HCLOUD_TOKEN"]);
+        let fleet = HetznerAdapter.fleet().expect("this target can be asked");
+        for argv in [&fleet.list, &fleet.inspect, &fleet.release] {
+            assert!(argv.contains(&"%HCLOUD_TOKEN".to_string()), "{argv:?}");
+            assert!(
+                argv.contains(&"Authorization: Bearer {{HCLOUD_TOKEN}}".to_string()),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(
+            fleet.list,
+            curl_bearer(
+                "HCLOUD_TOKEN",
+                "https://api.hetzner.cloud/v1/servers?sort=id:asc&per_page=50&page={page}"
+            )
+        );
+    }
+
+    /// **The three required fields, each `Incomplete` when missing** —
+    /// the SSH key included: without it the server has only a root
+    /// password nobody was given.
+    #[test]
+    fn a_hetzner_request_without_a_type_an_image_or_a_key_is_incomplete() {
+        for (removed, missing) in [
+            ("hetzner.server_type", "provider.hetzner.server_type"),
+            ("hetzner.image", "provider.hetzner.image"),
+            ("hetzner.ssh_keys", "provider.hetzner.ssh_keys"),
+        ] {
+            let mut provider = hetzner_provider();
+            provider.remove(removed);
+            match HetznerAdapter.acquisition(&hetzner_requirements(), &provider, None) {
+                Err(AcquisitionError::Incomplete {
+                    target: "hetzner",
+                    missing: said,
+                }) => assert!(said.starts_with(missing), "{said}"),
+                other => panic!("without {removed}: expected Incomplete, got {other:?}"),
+            }
+        }
+        let mut blank = hetzner_provider();
+        blank.insert("hetzner.ssh_keys".to_string(), " , ".to_string());
+        assert!(matches!(
+            HetznerAdapter.acquisition(&hetzner_requirements(), &blank, None),
+            Err(AcquisitionError::Incomplete {
+                target: "hetzner",
+                ..
+            })
+        ));
+    }
+
+    /// **The label the body writes is the label the sweep reads.** The
+    /// lease rendered into a create body, put on a listed row as the
+    /// platform would return it, reads back through [`machines`] as the
+    /// same expiry — the writer and the reader share one constant.
+    #[test]
+    fn the_hetzner_lease_written_is_the_lease_the_fleet_reads() {
+        let expires_at: jiff::Timestamp = "2026-10-25T03:00:00Z".parse().unwrap();
+        let acquisition = HetznerAdapter
+            .acquisition(
+                &hetzner_requirements(),
+                &hetzner_provider(),
+                Some(expires_at),
+            )
+            .expect("renders");
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        let listed = serde_json::json!({
+            "servers": [{"id": 7, "status": "running", "labels": body["labels"].clone()}],
+            "meta": {"pagination": {"next_page": null}}
+        });
+        let fleet = HetznerAdapter.fleet().unwrap();
+        let found = machines(&listed, &fleet).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].name.as_deref().and_then(expiry_of),
+            Some(expires_at)
+        );
+    }
+
+    /// **A key outside the allowlist is refused by name**, pointing at
+    /// where the accepted keys are written (the adapter's docs: the
+    /// `match` that reads them is the only list, so the message does not
+    /// carry a second one) — and a typo is told "not a key" rather than
+    /// "the type is missing".
+    #[test]
+    fn an_unknown_hetzner_key_is_refused_by_name() {
+        for stray in [
+            "hetzner.foo",
+            "hetzner.labels",
+            "hetzner.labels.",
+            "hetzner.server_typ",
+        ] {
+            let mut provider = hetzner_provider();
+            provider.insert(stray.to_string(), "x".to_string());
+            match HetznerAdapter.acquisition(&hetzner_requirements(), &provider, None) {
+                Err(AcquisitionError::Unmet {
+                    target: "hetzner",
+                    reason,
+                }) => {
+                    let key = stray.strip_prefix("hetzner.").unwrap();
+                    assert!(reason.contains(&format!("`{key}`")), "{reason}");
+                    assert!(reason.contains("HetznerAdapter"), "{reason}");
+                    assert!(reason.contains("labels.<key>"), "{reason}");
+                }
+                other => panic!("{stray}: expected Unmet, got {other:?}"),
+            }
+        }
+        // A key addressed to another target is not this adapter's to read.
+        let mut other_target = hetzner_provider();
+        other_target.insert("runpod.gpuTypeIds".to_string(), "x".to_string());
+        assert!(HetznerAdapter
+            .acquisition(&hetzner_requirements(), &other_target, None)
+            .is_ok());
+    }
+
+    /// `ssh_keys` and `firewalls` take comma-separated lists and send
+    /// the shapes the call types: names as strings, firewalls as
+    /// `{firewall: <id>}` objects. A firewall that is not an integer id
+    /// is refused rather than sent.
+    #[test]
+    fn hetzner_ssh_keys_and_firewalls_have_the_shapes_the_call_types() {
+        let mut provider = hetzner_provider();
+        provider.insert(
+            "hetzner.ssh_keys".to_string(),
+            "dev-key, ci-key,,".to_string(),
+        );
+        provider.insert("hetzner.firewalls".to_string(), "4242, 7".to_string());
+        let body = hetzner_body_of(&provider, None);
+        assert_eq!(body["ssh_keys"], serde_json::json!(["dev-key", "ci-key"]));
+        assert_eq!(
+            body["firewalls"],
+            serde_json::json!([{ "firewall": 4242 }, { "firewall": 7 }])
+        );
+
+        provider.insert("hetzner.firewalls".to_string(), "dev-hi-fw".to_string());
+        match HetznerAdapter.acquisition(&hetzner_requirements(), &provider, None) {
+            Err(AcquisitionError::Unmet {
+                target: "hetzner",
+                reason,
+            }) => assert!(reason.contains("`dev-hi-fw`"), "{reason}"),
+            other => panic!("expected Unmet, got {other:?}"),
+        }
+
+        assert!(
+            hetzner_body_of(&hetzner_provider(), None)
+                .get("firewalls")
+                .is_none(),
+            "none declared, none sent"
+        );
+    }
+
+    /// The strings a profile may set pass through as written.
+    #[test]
+    fn hetzner_string_fields_pass_through() {
+        let mut provider = hetzner_provider();
+        provider.insert("hetzner.datacenter".to_string(), "fsn1-dc14".to_string());
+        match HetznerAdapter.acquisition(&hetzner_requirements(), &provider, None) {
+            Err(AcquisitionError::Unmet {
+                target: "hetzner",
+                reason,
+            }) => assert!(reason.contains("name one"), "{reason}"),
+            other => panic!("location and datacenter together: expected Unmet, got {other:?}"),
+        }
+        provider.remove("hetzner.location");
+        provider.insert(
+            "hetzner.user_data".to_string(),
+            "#cloud-config\nruncmd: []\n".to_string(),
+        );
+        let body = hetzner_body_of(&provider, None);
+        assert_eq!(body["datacenter"], "fsn1-dc14");
+        assert_eq!(body["user_data"], "#cloud-config\nruncmd: []\n");
+    }
+
+    /// **The operator's labels are merged, and the lease wins on its
+    /// own key** — written last, so a profile cannot stamp a server
+    /// with a lease of its own choosing.
+    #[test]
+    fn hetzner_labels_merge_and_the_lease_overrides_its_key() {
+        let mut provider = hetzner_provider();
+        provider.insert("hetzner.labels.owner".to_string(), "ytk".to_string());
+        provider.insert("hetzner.labels.lmp-exp".to_string(), "never".to_string());
+        let body = hetzner_body_of(&provider, Some("2026-09-02T06:30:00Z"));
+        assert_eq!(
+            body["labels"],
+            serde_json::json!({
+                "owner": "ytk",
+                "lmp-exp": "lmp-exp-20260902T063000Z",
+            })
+        );
+    }
+
+    /// The name is the operator's when given; otherwise the stamp,
+    /// lowercased, when there is a lease; otherwise none.
+    #[test]
+    fn the_hetzner_name_is_the_operators_or_the_lowercase_stamp() {
+        let lease = Some("2026-09-02T06:30:00Z");
+        assert_eq!(
+            hetzner_body_of(&hetzner_provider(), lease)["name"],
+            "lmp-exp-20260902t063000z"
+        );
+        let mut named = hetzner_provider();
+        named.insert("hetzner.name".to_string(), "dev-hi".to_string());
+        assert_eq!(hetzner_body_of(&named, lease)["name"], "dev-hi");
+        assert_eq!(hetzner_body_of(&named, None)["name"], "dev-hi");
+        assert!(hetzner_body_of(&hetzner_provider(), None)
+            .get("name")
+            .is_none());
+    }
+
+    /// **A rendering with no lease is the release template, not a
+    /// refusal.** `machine release` renders with `expires_at: None` to
+    /// get the DELETE for a server it did not just buy; refusing that
+    /// left every endpoint on another platform unreleasable once.
+    #[test]
+    fn release_template_renders_without_a_lease() {
+        let acquisition = HetznerAdapter
+            .acquisition(&hetzner_requirements(), &hetzner_provider(), None)
+            .expect("no lease is not a reason to refuse");
+        let body: serde_json::Value =
+            serde_json::from_str(acquisition.body.as_deref().unwrap()).unwrap();
+        assert!(body.get("labels").is_none(), "no lease, no lmp-exp: {body}");
+        assert!(
+            body.get("name").is_none(),
+            "no lease, no derived name: {body}"
+        );
+        assert!(acquisition
+            .release
+            .iter()
+            .any(|it| it.contains("/servers/{id}")));
+
+        // An operator's own labels still ride, with no lease among them.
+        let mut labelled = hetzner_provider();
+        labelled.insert("hetzner.labels.owner".to_string(), "ytk".to_string());
+        assert_eq!(
+            hetzner_body_of(&labelled, None)["labels"],
+            serde_json::json!({ "owner": "ytk" })
+        );
+    }
+
+    /// No GPU is ever available; a persisted volume is refused; an
+    /// ephemeral size is not examined and, because this target builds the
+    /// request, that becomes a refusal at the body.
+    #[test]
+    fn hetzner_gpu_and_disk_answers() {
+        assert_eq!(
+            HetznerAdapter.gpu_answer(&GpuRequirement {
+                count: 0,
+                min_vram_gb: None
+            }),
+            Answer::met()
+        );
+        assert!(HetznerAdapter
+            .gpu_answer(&GpuRequirement {
+                count: 1,
+                min_vram_gb: None
+            })
+            .blocks());
+
+        assert_eq!(
+            HetznerAdapter.disk_answer(&DiskRequirement {
+                ephemeral_gb: None,
+                persistent_gb: None,
+                persistent_at: None,
+            }),
+            Answer::met()
+        );
+        assert!(HetznerAdapter
+            .disk_answer(&DiskRequirement {
+                ephemeral_gb: None,
+                persistent_gb: Some(80),
+                persistent_at: None,
+            })
+            .blocks());
+        assert!(HetznerAdapter
+            .disk_answer(&DiskRequirement {
+                ephemeral_gb: None,
+                persistent_gb: None,
+                persistent_at: Some("/data".to_string()),
+            })
+            .blocks());
+        let sized = HetznerAdapter.disk_answer(&DiskRequirement {
+            ephemeral_gb: Some(60),
+            persistent_gb: None,
+            persistent_at: None,
+        });
+        assert!(matches!(sized, Answer::NotExamined { .. }), "{sized:?}");
+
+        let slot = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let with_gpu =
+            Requirements::from_slots(&BTreeMap::new(), &slot(&[("count", "1")]), &BTreeMap::new())
+                .unwrap();
+        let with_disk = Requirements::from_slots(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &slot(&[("ephemeral_gb", "60")]),
+        )
+        .unwrap();
+        for requirements in [with_gpu, with_disk] {
+            let refusal = HetznerAdapter
+                .acquisition(&requirements, &hetzner_provider(), None)
+                .expect_err("a requirement nothing here can ask for is not sent");
+            assert!(
+                matches!(
+                    refusal,
+                    AcquisitionError::Unmet {
+                        target: "hetzner",
+                        ..
+                    }
+                ),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// The platform maps nothing, so the capability lists no exposure
+    /// and a port declaration is refused at admission by name.
+    #[test]
+    fn a_port_declaration_is_refused_at_admission_on_hetzner() {
+        let capability = HetznerAdapter.capability();
+        assert!(capability.exposures.is_empty());
+        let refusal = lm_provision::machine::admit(&required(&[("8000", "raw_tcp")]), &capability)
+            .expect_err("nothing here maps a port");
+        assert!(refusal.to_string().contains("hetzner"), "{refusal}");
+        assert!(HetznerAdapter
+            .render(&required(&[("8000", "raw_tcp")]))
+            .is_empty());
+        assert_eq!(HetznerAdapter.image_key(), None);
+        assert_eq!(HetznerAdapter.provider_namespace(), "hetzner");
+        let state = HetznerAdapter.read_state(&serde_json::json!({ "server": { "id": 1 } }));
+        assert!(!state.ports_observed);
+        assert_eq!(state.gpu_count, None);
+        assert_eq!(state.ephemeral_gb, None);
+    }
+
+    /// **The whole project is listed, unfiltered, and read into an id
+    /// and a lease.** A stamped server carries its lease, an operator's
+    /// own server reads as unstamped (reported, never released), and a
+    /// `deleting` row is left out.
+    #[test]
+    fn the_hetzner_listing_reads_stamped_and_unstamped_servers() {
+        let fleet = HetznerAdapter.fleet().expect("this target can be asked");
+        assert!(
+            fleet.list.iter().all(|it| !it.contains("label_selector")),
+            "a filtered listing drops a server whose label was removed: {:?}",
+            fleet.list
+        );
+        assert!(fleet.list.iter().any(|it| it.contains("sort=id:asc")));
+        assert!(fleet.list.iter().any(|it| it.contains("{page}")));
+        assert_eq!(fleet.next_page, Some("meta.pagination.next_page"));
+
+        let listed = serde_json::json!({
+            "servers": [
+                { "id": 11, "name": "lmp-exp-20260902t063000z", "status": "running",
+                  "labels": { "lmp-exp": "lmp-exp-20260902T063000Z" } },
+                { "id": 12, "name": "dev", "status": "running", "labels": {} },
+                { "id": 13, "name": "going", "status": "deleting",
+                  "labels": { "lmp-exp": "lmp-exp-20260902T063000Z" } },
+            ],
+            "meta": { "pagination": {
+                "page": 1, "per_page": 50, "previous_page": null,
+                "next_page": null, "last_page": 1, "total_entries": 3
+            } }
+        });
+        assert_eq!(
+            machines(&listed, &fleet).expect("the servers are the rows"),
+            vec![
+                Machine {
+                    id: "11".to_string(),
+                    name: Some("lmp-exp-20260902T063000Z".to_string()),
+                },
+                Machine {
+                    id: "12".to_string(),
+                    name: None,
+                },
+            ]
+        );
+        assert_eq!(
+            machines(
+                &serde_json::json!({ "servers": [], "meta": { "pagination": { "next_page": null } } }),
+                &fleet
+            )
+            .expect("an empty project is an empty fleet"),
+            Vec::<Machine>::new()
+        );
+
+        let acquisition = HetznerAdapter
+            .acquisition(&hetzner_requirements(), &hetzner_provider(), None)
+            .unwrap();
+        assert_eq!(fleet.release, acquisition.release);
+        assert_eq!(fleet.inspect, acquisition.inspect);
+    }
+
+    /// **The address is gated on the status.** The platform assigns the
+    /// IP while the server is still `initializing`, before sshd is up,
+    /// so an endpoint is projected only once it is `running`.
+    #[test]
+    fn a_hetzner_server_is_reached_as_root_only_once_it_is_running() {
+        let described = |status: &str, ip: serde_json::Value| {
+            serde_json::json!({
+                "server": { "id": 5, "status": status,
+                            "public_net": { "ipv4": { "ip": ip } } }
+            })
+        };
+
+        let initializing = described("initializing", serde_json::json!("203.0.113.9"));
+        let connection = HetznerAdapter.connection(&initializing);
+        assert!(connection.ssh.is_none(), "{connection:?}");
+        assert!(connection.read.contains(&"ip: present".to_string()));
+        assert!(connection
+            .read
+            .contains(&"status: initializing".to_string()));
+        assert!(HetznerAdapter.still_materializing(&initializing));
+
+        let starting = described("starting", serde_json::json!("203.0.113.9"));
+        assert!(HetznerAdapter.connection(&starting).ssh.is_none());
+        assert!(HetznerAdapter.still_materializing(&starting));
+
+        let running = described("running", serde_json::json!("203.0.113.9"));
+        assert_eq!(
+            HetznerAdapter.connection(&running).ssh,
+            Some(SshEndpoint {
+                host: "203.0.113.9".to_string(),
+                port: 22,
+                user: "root".to_string(),
+            })
+        );
+        assert!(!HetznerAdapter.still_materializing(&running));
+
+        for no_address in [serde_json::json!(null), serde_json::json!("")] {
+            let connection = HetznerAdapter.connection(&described("running", no_address));
+            assert!(connection.ssh.is_none(), "{connection:?}");
+        }
+        let absent = serde_json::json!({ "server": { "id": 5, "status": "running" } });
+        let connection = HetznerAdapter.connection(&absent);
+        assert!(connection.ssh.is_none());
+        assert!(connection.read.contains(&"ip: absent".to_string()));
+        assert!(!HetznerAdapter.still_materializing(&serde_json::json!({})));
     }
 }

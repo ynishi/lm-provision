@@ -420,6 +420,31 @@ scrollback and a machine that billed until someone noticed.
   that is relayed, because it is the platform's text about the machine
   and identifies nothing (2026-09-23; presence alone had told the
   operator nothing about a deployment the platform could not schedule).
+- **A CPU VPS is acquired, listed, released and swept with the same
+  verbs and the same record** (`--provider hetzner`): a billable server
+  with an address, reached over SSH as root once the platform calls it
+  `running` — the address is assigned while it is still `initializing`,
+  so the status gates the connection. It is the shape the GPU platforms
+  do not have: nothing is *selected*, the profile **names** the server
+  type, image and location under `hetzner.*` (the requirement
+  vocabulary has no words for CPU or memory), and any other `hetzner.*`
+  key is refused by name. The adapter creates no infrastructure: the SSH
+  key (by name) and the firewall (by id) must already exist, and a
+  profile naming no SSH key is refused as incomplete. The lease rides in
+  the `lmp-exp` **label** — the server name is unique per project and
+  human-facing — and the listing is read **unfiltered**: asking the
+  platform only for labelled servers would drop one whose label had been
+  removed, the sweep would then read its recorded machine as "absent
+  from the list" and retire the row while the server kept billing.
+  Listed unfiltered, it is still there without a stamp, reported as
+  `unknown`, and judged by its record's lease (the two halves meet on
+  the machine id, above). Because a project can hold more servers than
+  one page, a listing may be **paged**: the adapter names the path to the
+  next page number, the driver walks every page and reads them as one
+  listing, and a page that fails to read, a next page that does not
+  advance, or a walk past 100 pages fails the listing rather than being
+  read as a smaller account. The host daemon sweeps it once `hetzner`
+  is among its `--provider` flags (`crates/lm-provision-host/README.md`).
 - A continuously running host daemon that enforces leases without
   being invoked is the control plane's job (chapter 09's record is
   the shared vocabulary for exactly that); `sweep` is the operator's

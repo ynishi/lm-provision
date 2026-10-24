@@ -34,6 +34,13 @@
       "path": "together-dedicated-0.1.0.json",
       "profile_hash": "bc82e189bf95756bfff4aca286018b3414e99c9751fb3040a30d8a7a315b8e1e",
       "summary": "A model Together AI already serves, on a dedicated endpoint created through the service's own CLI (the platform runs the engine; what comes back is an OpenAI-compatible endpoint)."
+    },
+    {
+      "name": "rust-build-host",
+      "version": "0.1.0",
+      "path": "rust-build-host-0.1.0.json",
+      "profile_hash": "2f0ed85d4de8284116b11ffa447edd8a9c947f3c49eb18197a353ca484bfecc1",
+      "summary": "A CPU build host for Rust on a Hetzner Cloud server (apt build tools plus a version-pinned rustup toolchain with clippy and rustfmt)."
     }
   ]
 }

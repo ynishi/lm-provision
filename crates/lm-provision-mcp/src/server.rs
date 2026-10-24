@@ -58,8 +58,9 @@ pub struct ApplyParams {
 /// `lm_machine_list(provider)` request shape (10 §Tool set).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MachineListParams {
-    /// The platform to ask what it is running (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`, `together`).
+    /// The platform to ask what it is running, by the provider name the
+    /// CLI's `--provider` takes (`runpod`, for one); a name no adapter
+    /// speaks for is refused with the accepted names in the message.
     pub provider: String,
 }
 
@@ -755,10 +756,12 @@ impl LmProvisionServer {
         // asked at all, and the refusal is this crate's own words (the
         // known names), so it carries nothing external.
         if provider.trim().is_empty() {
-            return Err(precondition_error(
-                "provider is required: name a platform to list \
-                 (runpod, vast, deepinfra, deepinfra-deploy, together)",
-            ));
+            return Err(precondition_error(format!(
+                "provider is required: name a platform to list ({})",
+                lm_provision_driver::infra::provider_names()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
         lm_provision_driver::infra::adapter_named(&provider).map_err(precondition_error)?;
 

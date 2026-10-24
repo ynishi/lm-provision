@@ -298,9 +298,8 @@ what have I not given back":
 {
   id           = string,   -- the identifier the service gave the machine
   provider     = string,   -- which platform, as the operator named it
-                           -- (`runpod`, `vast`, `deepinfra`,
-                           -- `deepinfra-deploy`, `together`) — what a sweep looks
-                           -- the adapter up by
+                           -- (a `--provider` name, e.g. `runpod`) —
+                           -- what a sweep looks the adapter up by
   acquired_at  = string,   -- RFC 3339 UTC, driver clock
   expires_at   = string,   -- RFC 3339 UTC: acquired_at + the lease
   profile_hash = string,   -- 64-hex, chapter 03 hash of the profile the

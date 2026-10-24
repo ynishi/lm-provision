@@ -1,0 +1,29 @@
+{
+  "type": "Spec",
+  "name": "rust-build-host",
+  "version": "0.1.0",
+  "description": "A CPU build host for Rust on a Hetzner Cloud server: the apt packages a cargo build usually wants (build-essential, pkg-config, libssl-dev, git, rsync, curl) and a rustup toolchain pinned to an exact version with clippy and rustfmt, so `cargo build` / `cargo clippy` / `cargo fmt --check` run on the machine after `apply`. The toolchain is pinned to a release rather than `stable`, because `stable` moves under the same profile hash; bump the pin deliberately. Declares no requires_ports and no requires_disk: the platform maps no port, and the disk comes with the server type, so a size is refused at admission. The provider slot carries only the image; add the account-specific keys yourself — `hetzner.server_type` (e.g. cpx62), `hetzner.location`, `hetzner.ssh_keys` (names of keys already in the project; required, a server without one is refused) and, optionally, `hetzner.firewalls` (ids). The session is root over ssh, so the default remote dir applies.",
+  "capabilities": ["sh.exec"],
+  "paths": [],
+  "http_allowlist": [],
+  "provider": {
+    "hetzner.image": "ubuntu-24.04"
+  },
+  "phases": [
+    {
+      "type": "SystemApt",
+      "packages": [
+        "build-essential",
+        "pkg-config",
+        "libssl-dev",
+        "git",
+        "rsync",
+        "curl"
+      ]
+    },
+    {
+      "type": "PostInstall",
+      "script": "set -e\ncurl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile minimal --default-toolchain 1.97.1 -y\n. \"$HOME/.cargo/env\"\nrustup component add clippy rustfmt\nrustc --version\ncargo --version"
+    }
+  ]
+}
