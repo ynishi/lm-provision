@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--provider hetzner` (Hetzner Cloud) and a paginated fleet listing.**
+  A CPU-only VPS with an address, reached over ssh as root once the
+  platform calls it `running`, driven through `curl` with `HCLOUD_TOKEN`
+  imported by name. The profile names the server type, image and
+  location under `hetzner.*`, plus the ssh key (`hetzner.ssh_keys`, by
+  name — required) and firewall (`hetzner.firewalls`, by id) that must
+  already exist; any other `hetzner.*` key is refused by name. The lease
+  rides in the `lmp-exp` label and the sweep lists the whole project
+  unfiltered, so a server whose label was removed is still seen and is
+  judged by its record rather than retired as gone while it bills.
+  `Fleet` gains `next_page` — a path to the next page number — which
+  `list` follows page by page; a page that fails, a next page that does
+  not advance, or more than 100 pages is an error, never a smaller
+  account. The provider names are written once (`provider_names()`), and
+  the unknown-provider messages are built from them. A shared profile,
+  `docs/profiles/rust-build-host-0.1.0.json` (apt build tools plus a
+  pinned rustup toolchain), is in `docs/profiles/index.json`.
+
 ### Changed
 
 ### Deprecated

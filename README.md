@@ -255,6 +255,47 @@ lm-provision machine acquire --provider together \
 # `release` converges: the first call scales the deployment to zero and
 # is refused while it stops; call it again (or let the sweep) to delete.
 
+# Another: Hetzner Cloud — a CPU-only VPS with an address, reached over
+# ssh as root. The project token goes in the .env as HCLOUD_TOKEN (the
+# hcloud CLI's own name for it; curl reads it by name, the value is never
+# on an argv). Nothing is selected for you: the profile NAMES the server
+# type, image and location, and the ssh key (by name) and any firewall
+# (by id) must already exist in the project — the adapter creates
+# neither, and a profile naming no ssh key is refused. No requires_ports
+# (the platform maps none; its firewall is yours) and no requires_disk
+# (the disk comes with the server type, so a size is refused). Any other
+# hetzner.* key is refused by name rather than dropped.
+#   "provider": {
+#     "hetzner.server_type": "cpx62",
+#     "hetzner.image": "ubuntu-24.04",
+#     "hetzner.location": "fsn1",
+#     "hetzner.ssh_keys": "dev-key,ci-key",       # names, comma-separated
+#     "hetzner.firewalls": "4242",                # ids, comma-separated
+#     "hetzner.labels.owner": "ytk",              # your own labels (lmp-exp is the lease's)
+#     "hetzner.user_data": "#cloud-config\n...",  # cloud-init, as a string
+#     "hetzner.name": "build-host"                # default: the lease stamp, lowercased
+#   }
+# A fixed hetzner.name can be acquired once at a time: the platform keeps
+# server names unique per project, so a second acquire fails and creates
+# nothing.
+# The shared docs/profiles/rust-build-host-0.1.0.json names only the
+# image: copy it and add server_type and ssh_keys (and location) for
+# your project — as shipped it is refused as incomplete, and so is a
+# release rendered from it. build-host.json below is that copy.
+lm-provision machine acquire --provider hetzner \
+  --profile build-host.json   # shows the exact body
+lm-provision machine acquire --provider hetzner \
+  --profile build-host.json --dry-run false
+lm-provision apply --provider hetzner --pod-id <id> --profile build-host.json
+lm-provision machine release --provider hetzner --id <id> --profile build-host.json
+lm-provision machine sweep --provider hetzner --dry-run false
+# The lease is the `lmp-exp` label on the server. The sweep lists every
+# server in the project (page by page, not filtered by that label, so a
+# server whose label was taken off is still seen) and releases the
+# expired ones; a server you made yourself carries no stamp, is reported
+# as unknown, and is never released. The host daemon sweeps it too once
+# `--provider hetzner` is among its flags.
+
 # The MCP server, on stdio (see below for what it reads):
 lm-provision mcp
 ```

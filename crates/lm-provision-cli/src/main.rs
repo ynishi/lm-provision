@@ -331,8 +331,8 @@ struct PricesSyncArgs {
 
 #[derive(Args)]
 struct ListArgs {
-    /// Ask this platform what it is running (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`, `together`). Repeatable, and **required**.
+    /// Ask this platform what it is running. Repeatable, and
+    /// **required**.
     ///
     /// There is no "all platforms" default and no empty run: a listing
     /// of nothing is indistinguishable from an account with nothing on
@@ -345,7 +345,7 @@ struct ListArgs {
     /// asked is reported in `failed` and costs the zero exit; the others
     /// are still listed, because one unreadable key must not hide what
     /// is running elsewhere.
-    #[arg(long = "provider", required = true, num_args = 1..)]
+    #[arg(long = "provider", required = true, num_args = 1.., value_parser = provider_parser())]
     providers: Vec<String>,
 }
 
@@ -359,9 +359,9 @@ struct CheckArgs {
     #[arg(long = "inspected")]
     inspected: PathBuf,
 
-    /// Which platform's adapter reads the description (`runpod`,
-    /// `vast`) — each service writes its own field names.
-    #[arg(long = "provider", default_value = "runpod")]
+    /// Which platform's adapter reads the description — each service
+    /// writes its own field names.
+    #[arg(long = "provider", default_value = "runpod", value_parser = provider_parser())]
     provider: String,
 }
 
@@ -379,14 +379,13 @@ struct AcquireArgs {
     #[arg(long = "dry-run", default_value_t = true, action = clap::ArgAction::Set)]
     dry_run: bool,
 
-    /// Which platform to buy from (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`, `together`).
+    /// Which platform to buy from.
     ///
     /// The operator's choice, not the profile's: the profile says what
     /// the machine must be, and where to buy one meeting it is decided
     /// at acquisition time — today's prices and today's stock are not
     /// facts a profile could carry.
-    #[arg(long = "provider", default_value = "runpod")]
+    #[arg(long = "provider", default_value = "runpod", value_parser = provider_parser())]
     provider: String,
 
     /// How long the machine is being bought for, in hours.
@@ -411,8 +410,7 @@ struct AcquireArgs {
 #[derive(Args)]
 struct SweepArgs {
     /// Ask this platform what it is running, and judge those machines
-    /// by the lease stamped on each one (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`, `together`). Repeatable.
+    /// by the lease stamped on each one. Repeatable.
     ///
     /// **This is the inventory when it is given.** A machine whose
     /// acquisitions row was never written, was written on another host,
@@ -426,7 +424,7 @@ struct SweepArgs {
     ///
     /// Listing needs the platform's credential even under
     /// `--dry-run true` — the key buys the question here, not the kill.
-    #[arg(long = "provider")]
+    #[arg(long = "provider", value_parser = provider_parser())]
     providers: Vec<String>,
 
     /// The acquisitions record to sweep (09 §Acquisitions record);
@@ -514,9 +512,8 @@ struct ReleaseArgs {
     #[arg(long = "id")]
     id: String,
 
-    /// The platform the machine was acquired from (`runpod`, `vast`,
-    /// `deepinfra`, `deepinfra-deploy`, `together`).
-    #[arg(long = "provider", default_value = "runpod")]
+    /// The platform the machine was acquired from.
+    #[arg(long = "provider", default_value = "runpod", value_parser = provider_parser())]
     provider: String,
 
     /// The profile the machine was acquired from, which is where the
@@ -565,15 +562,19 @@ struct TargetArgs {
     #[arg(long = "ssh", help = ssh_help())]
     ssh: Option<String>,
 
-    /// Ask this platform (`runpod`, `vast`, `deepinfra`,
-    /// `deepinfra-deploy`, `together`) where `--pod-id` is, instead of naming an
+    /// Ask this platform where `--pod-id` is, instead of naming an
     /// address.
     ///
     /// The address and port come from the platform's own description
     /// of the machine, through the same projection `machine acquire`
     /// reports — so an operator who has a pod id does not hand-carry a
     /// `host:port` out of whatever printed it last.
-    #[arg(long = "provider", conflicts_with = "ssh", requires = "pod_id")]
+    #[arg(
+        long = "provider",
+        conflicts_with = "ssh",
+        requires = "pod_id",
+        value_parser = provider_parser()
+    )]
     provider: Option<String>,
 
     /// The machine, as the platform names it. With `--provider` it is
@@ -2715,6 +2716,14 @@ fn no_identity_file() -> String {
     message
 }
 
+/// The values a `--provider` that names an adapter accepts, read off
+/// [`infra::provider_names`] — so `--help` lists them as possible values
+/// and a misspelt name is refused while the arguments are parsed, with
+/// no list typed out beside each flag to fall behind the adapters.
+fn provider_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(infra::provider_names())
+}
+
 /// `--ssh` help text, built from [`DEFAULT_SSH_USER`] so the CLI's
 /// documented default is the same value [`parse_ssh_target`] falls
 /// back to.
@@ -4376,6 +4385,44 @@ mod tests {
         );
     }
 
+    /// **`--provider` takes the driver's own names and nothing else.**
+    /// The accepted values come from `infra::provider_names`, so a new
+    /// adapter is offered by every flag that names one without a list
+    /// here to update, and a misspelt name is refused while parsing
+    /// rather than after a profile was read.
+    #[test]
+    fn provider_flags_accept_exactly_the_driver_s_adapter_names() {
+        for name in lm_provision_driver::infra::provider_names() {
+            for argv in [
+                vec!["lm-provision", "machine", "list", "--provider", name],
+                vec!["lm-provision", "machine", "sweep", "--provider", name],
+                vec![
+                    "lm-provision",
+                    "machine",
+                    "release",
+                    "--id",
+                    "x",
+                    "--profile",
+                    "p.json",
+                    "--provider",
+                    name,
+                ],
+            ] {
+                assert!(
+                    Cli::try_parse_from(&argv).is_ok(),
+                    "{name} refused by {argv:?}"
+                );
+            }
+        }
+        let Err(err) =
+            Cli::try_parse_from(["lm-provision", "machine", "list", "--provider", "hetzer"])
+        else {
+            panic!("a misspelt platform must not parse");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{err}");
+        assert!(err.to_string().contains("hetzner"), "{err}");
+    }
+
     /// **What a sweep does with a machine it found by asking the
     /// platform** — no record, no profile, nothing but the name the
     /// machine carries. The two row shapes are the two platforms': a
@@ -4528,6 +4575,68 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// **A server whose label was removed is still on the list, and so
+    /// is judged by its record rather than retired as gone.** The VPS
+    /// platform's listing is read unfiltered for exactly this: a
+    /// recorded `hetzner` row whose server is listed **without** a
+    /// stamp reads as `Unknown` on the platform half, is never handled
+    /// there, and the record half must `Judge` it by the recorded lease
+    /// — `Gone` would retire the row while the server kept billing.
+    #[test]
+    fn a_recorded_hetzner_server_listed_without_its_stamp_is_judged_not_retired() {
+        use lm_provision_driver::infra::{self, HetznerAdapter, Infra as _};
+
+        let now: jiff::Timestamp = "2026-09-02T00:00:00Z".parse().expect("a fixed clock");
+        let fleet = HetznerAdapter.fleet().expect("this target can be asked");
+        let listed_doc = serde_json::json!({
+            "servers": [
+                // Ours, its label taken off by hand: still listed.
+                { "id": 4242, "status": "running", "labels": {} },
+                { "id": 4243, "status": "running",
+                  "labels": { "lmp-exp": "lmp-exp-20260903T000000Z" } },
+            ],
+            "meta": { "pagination": { "next_page": null } },
+        });
+        let machines = infra::machines(&listed_doc, &fleet).expect("the servers are the rows");
+        let standings: Vec<(String, super::Standing)> = machines
+            .iter()
+            .map(|it| (it.id.clone(), super::standing(it, now)))
+            .collect();
+        assert_eq!(
+            standings,
+            vec![
+                ("4242".to_string(), super::Standing::Unknown),
+                ("4243".to_string(), super::Standing::Live),
+            ]
+        );
+
+        // What the sweep's platform half leaves behind: every id the
+        // listing named (stamped or not), and the ones it dealt with.
+        let present: std::collections::BTreeSet<String> =
+            machines.iter().map(|it| it.id.clone()).collect();
+        let listed: super::BTreeMap<String, std::collections::BTreeSet<String>> =
+            [("hetzner".to_string(), present)].into_iter().collect();
+        let handled: std::collections::BTreeSet<String> =
+            ["4243".to_string()].into_iter().collect();
+
+        let mut row = recorded("4242", "2036-09-02T00:00:00Z");
+        row.provider = "hetzner".to_string();
+        assert_eq!(
+            super::bookkeeping(&row, &handled, &listed),
+            super::Bookkeeping::Judge,
+            "listed but unstamped: only the record knows when it expires"
+        );
+
+        // The contrast the unfiltered listing exists for: a server that
+        // really is not on the list is the one that is gone.
+        let mut absent = recorded("9999", "2036-09-02T00:00:00Z");
+        absent.provider = "hetzner".to_string();
+        assert_eq!(
+            super::bookkeeping(&absent, &handled, &listed),
+            super::Bookkeeping::Gone
+        );
     }
 
     /// **A dry run shows the lease the machine would carry.** The
